@@ -24,8 +24,9 @@ fn env(k: &str, d: &str) -> usize {
 fn main() {
     let (rows, cols) = (env("ROWS", "32"), env("COLS", "64"));
     let n = rows * cols;
-    let aiecc = std::env::var("AIECC").expect("set AIECC");
-    let peano = std::env::var("PEANO").expect("set PEANO");
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let aiecc = tc.aiecc_str();
+    let peano = tc.peano_str();
 
     // 1) emit + 2) compile
     let mlir = emit_softmax(rows, cols);

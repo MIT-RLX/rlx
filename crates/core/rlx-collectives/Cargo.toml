@@ -27,13 +27,19 @@ default = []
 # Zero-config LAN node discovery via mDNS-SD (Bonjour/Avahi). Opt-in; the
 # unicast rendezvous path (DISCOVER_HOST) needs no extra deps.
 mdns = ["rlx-driver/mdns"]
+# QUIC-over-UDP collectives (`TRANSPORT=quic`) — rlx-driver's iroh transport.
+iroh = ["rlx-driver/iroh"]
 
 [dev-dependencies]
 # Path-only (no version): test-only cycle on rlx-runtime, which publishes
 # right after rlx-collectives in the same tier (7). cargo strips path-only
 # dev-deps from the published manifest, so this never resolves against
 # crates.io and needs no per-release pin bump.
-rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["cpu"] }
+rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["cpu", "rlxp", "training", "mdns"] }
+# `MODE=model`'s error plumbing (dev-only).
+anyhow = "1"
+# `MODE=model` text prompts and datasets: the package's own tokenizer.
+rlx-text = { path = "../../io/rlx-text" }
 # The coordinator/worker mode ships serialized IR graphs over the wire, so the
 # example needs rlx-ir's serde derives + a JSON codec (dev-only).
 rlx-ir = { path = "../rlx-ir", features = ["serialize"] }
@@ -61,10 +67,12 @@ rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
 # Enable the backends a Linux x86_64 host may expose so `dist_node` can pin
-# ranks to Device::{Cuda,Rocm,Xdna,Cpu} — NVIDIA GPUs, ROCm GPUs, an XDNA NPU.
-# All build driverless (cudarc/hip are dlopen'd; xdna is libc/libloading), so
+# ranks to Device::{Cuda,Rocm,Xdna,Vulkan,Cpu} — NVIDIA GPUs, ROCm GPUs, an XDNA
+# NPU, and GPUs only Vulkan reaches (an Intel iGPU beside an NVIDIA card; pin
+# one with VK_ICD_FILENAMES). All build driverless (cudarc/hip are dlopen'd;
+# xdna is libc/libloading; ash loads libvulkan at runtime), so
 # the union is portable across CUDA and ROCm hosts alike.
-rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["cuda", "rocm", "xdna", "cpu"] }
+rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["cuda", "rocm", "xdna", "vulkan", "cpu"] }
 # `autofleet` runs the NPU's INT8 GEMM lane directly through rlx-xdna when an
 # overlay is configured (INT8/fixed-shape → not an f32-mesh rank).
 rlx-xdna = { path = "../../backends/rlx-xdna", features = ["xrt", "direct"] }

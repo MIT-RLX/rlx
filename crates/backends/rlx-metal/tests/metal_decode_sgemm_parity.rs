@@ -13,7 +13,11 @@ use rlx_runtime::{Device, Session};
 
 #[test]
 fn metal_decode_m2_sgemm_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -69,7 +73,11 @@ fn metal_decode_m2_sgemm_matches_cpu() {
 /// (n not a multiple of 32) and a K tail.
 #[test]
 fn metal_few_row_gemv_matches_each_row_alone() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }

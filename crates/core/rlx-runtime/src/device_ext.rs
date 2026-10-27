@@ -104,9 +104,22 @@ pub fn feature_compiled(device: Device) -> bool {
         // so a build without `cpu` panicked with "the `cpu` feature is enabled
         // but no such device was found" — the opposite of the fix it needed.
         Device::Cpu => cfg!(feature = "cpu"),
-        Device::Metal => cfg!(feature = "metal"),
+        // Host-gated like `is_available`'s fallback below: workspace feature
+        // unification turns `metal`/`coreml` on in a Linux build while the
+        // backend crates themselves are Apple-only dependencies. Reporting
+        // them as compiled there made `skip_unless_device` panic under
+        // `RLX_REQUIRE_DEVICE` on Linux rigs, and `cargo rlx doctor` call a
+        // backend the binary does not contain "unavailable".
+        Device::Metal => cfg!(all(
+            feature = "metal",
+            target_vendor = "apple",
+            not(target_os = "watchos")
+        )),
         Device::Mlx => cfg!(feature = "mlx"),
-        Device::Ane => cfg!(feature = "ane"),
+        Device::Ane => cfg!(all(
+            any(feature = "coreml", feature = "ane"),
+            target_vendor = "apple"
+        )),
         Device::Cuda => cfg!(feature = "cuda"),
         Device::Rocm => cfg!(feature = "rocm"),
         Device::Xdna => cfg!(feature = "xdna"),

@@ -1,0 +1,26 @@
+# device	component	version	hardware	result	date	notes
+# Written by `just toolchain-matrix --update` (scripts/toolchain_matrix.py); one row per
+# (device, component, version, hardware) the matrix has actually run. `doctor` shows the
+# passing rows as "tested". Do not add rows for versions that were not run.
+cuda	driver	13.2	RTX 3080 Ti Laptop (sm_86)	pass	2026-10-27
+cuda	nvrtc	13.1	RTX 3080 Ti Laptop (sm_86)	pass	2026-10-27
+gpu	adapter	Metal	Apple M4 Pro	pass	2026-10-27
+gpu	adapter	Vulkan NVIDIA	RTX 3080 Ti Laptop	pass	2026-10-27
+gpu	adapter	Vulkan RADV	Radeon 780M	pass	2026-10-27
+metal	macos	26	Apple M4 Pro	pass	2026-10-27
+rocm	rocm	7.1	Radeon 780M (gfx1103)	pass	2026-10-27
+vulkan	driver	NVIDIA	RTX 3080 Ti Laptop	pass	2026-10-27
+vulkan	driver	RADV (Mesa)	Radeon 780M (gfx1103)	pass	2026-10-27
+xdna	mlir-aie	1.3.0	Ryzen 9 8945HS npu1 fw 1.5.5.391	fail	2026-10-27	peano 21.0.0.2026061101
+xdna	mlir-aie	1.3.1	Ryzen 9 8945HS npu1 fw 1.5.5.391	fail	2026-10-27	peano 21.0.0.2026061101
+xdna	mlir-aie	1.3.2	Ryzen 9 8945HS npu1 fw 1.5.5.391	pass	2026-10-27	peano 21.0.0.2026061101
+xdna	mlir-aie	1.3.3	Ryzen 9 8945HS npu1 fw 1.5.5.391	fail	2026-10-27	peano 22.0.0.2026090701
+xdna	mlir-aie	1.3.3	Ryzen 9 8945HS npu1 fw 1.5.5.391	fail	2026-10-27	peano 21.0.0.2026062601
+xdna	mlir-aie	1.3.4	Ryzen 9 8945HS npu1 fw 1.5.5.391	pass	2026-10-27	peano 21.0.0.2026062301
+xdna	mlir-aie	1.4.0	Ryzen 9 8945HS npu1 fw 1.5.5.391	pass	2026-10-27	peano 21.0.0.2026072001
+xdna	mlir-aie	1.4.1	Ryzen 9 8945HS npu1 fw 1.5.5.391	pass	2026-10-27	peano 21.0.0.2026080301
+xdna	mlir-aie	1.4.2	Ryzen 9 8945HS npu1 fw 1.5.5.391	pass	2026-10-27	peano 21.0.0.2026080301
+xdna	mlir-aie	1.4.3	Ryzen 9 8945HS npu1 fw 1.5.5.391	pass	2026-10-27	peano 22.0.0.2026090701
+xdna	mlir-aie	1.4.4	Ryzen 9 8945HS npu1 fw 1.5.5.391	pass	2026-10-27	peano 22.0.0.2026092101
+xdna	xrt	2.21.75	Ryzen 9 8945HS npu1 fw 1.5.5.391	pass	2026-10-27	with mlir-aie 1.4.4
+xdna	xrt	2.21.75	Ryzen 9 8945HS npu1 fw 1.5.5.391	pass	2026-10-27	with mlir-aie 1.3.4

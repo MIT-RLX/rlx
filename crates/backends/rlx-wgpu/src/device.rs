@@ -112,6 +112,18 @@ impl WgpuDevice {
                     limits.max_uniform_buffer_binding_size.min(BIND_CAP);
             }
         }
+        // `RLX_WGPU_MAX_BIND_MB` caps the storage-binding size the device is
+        // created with, to exercise the over-the-binding-limit paths (arena
+        // windows, parked weights, staging) on an adapter whose real limit is
+        // larger — e.g. NVIDIA's 2 GiB on a Mac. It already capped the GGUF
+        // path; capping the device makes every path see the same limit.
+        if let Some(mb) =
+            rlx_ir::env::var("RLX_WGPU_MAX_BIND_MB").and_then(|v| v.parse::<u64>().ok())
+        {
+            let cap = (mb << 20) / 256 * 256;
+            limits.max_storage_buffer_binding_size =
+                limits.max_storage_buffer_binding_size.min(cap);
+        }
         if rlx_ir::env::flag("RLX_WGPU_PRINT_LIMITS") {
             eprintln!(
                 "[rlx-wgpu] adapter limits: max_buffer_size={:.3}GiB max_storage_binding={:.3}GiB",
@@ -298,6 +310,35 @@ pub fn adapter_name() -> Option<String> {
 }
 
 /// True on Vulkan or DX12 — discrete GPU cooperative-matrix backends.
+static FAST_MATH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Opt into fast WGSL arithmetic: `/`, `sqrt` and `1/sqrt` use the native
+/// WGSL operators instead of rlxsl's correctly-rounded helpers. Native `/` may
+/// be 2.5 ULP off and Metal's `sqrt` is often 1 ULP off, so results stop
+/// matching the CPU bit for bit. `fmod` stays exact (a fast one is wrong by
+/// whole multiples, not ULPs). Off by default.
+///
+/// Kernels are built once per process, so call this before the first
+/// compile; a later call does not rebuild kernels that already exist.
+pub fn set_fast_math(on: bool) {
+    FAST_MATH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_fast_math`] is on.
+pub fn fast_math() -> bool {
+    FAST_MATH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether discrete Vulkan/DX12 should still run elementwise, norm and
+/// structural ops on the host. Off by default: that policy was a workaround
+/// for a KittenTTS "NSF collapse" whose real causes (arena-stripe addressing
+/// past the 2 GiB binding limit) are fixed, and it cost EEGNet 295 s against
+/// 6.4 s on an RTX 3080 Ti with identical score bits. `RLX_WGPU_DISCRETE_HOST=1`
+/// restores it.
+pub fn discrete_hosts_ops() -> bool {
+    coop_discrete_backend() && rlx_ir::env::flag("RLX_WGPU_DISCRETE_HOST")
+}
+
 pub fn coop_discrete_backend() -> bool {
     wgpu_device()
         .map(|d| matches!(d.backend, wgpu::Backend::Vulkan | wgpu::Backend::Dx12))
@@ -317,6 +358,25 @@ pub fn coop_f32_8x8_supported() -> bool {
             && p.k_size == 8
             && p.ab_type == wgpu::CooperativeScalarType::F32
             && p.cr_type == wgpu::CooperativeScalarType::F32
+    })
+}
+
+/// True when the adapter reports 8×8×8 f16 cooperative-matrix support with an
+/// f16 accumulator — the one shape `matmul_coop16` uses. Apple reports it
+/// (`simdgroup_half8x8`); an RTX 3080 Ti reports only 16×16×16, 16×8×16 and
+/// 16×8×8, and there `matmul_coop16` failed its self-check under every
+/// load/store convention, because the shape itself is unsupported.
+pub fn coop_f16_8x8_supported() -> bool {
+    let dev = match wgpu_device() {
+        Some(d) => d,
+        None => return false,
+    };
+    dev.adapter.cooperative_matrix_properties().iter().any(|p| {
+        p.m_size == 8
+            && p.n_size == 8
+            && p.k_size == 8
+            && p.ab_type == wgpu::CooperativeScalarType::F16
+            && p.cr_type == wgpu::CooperativeScalarType::F16
     })
 }
 

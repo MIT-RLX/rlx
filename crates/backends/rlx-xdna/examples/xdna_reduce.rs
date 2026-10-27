@@ -23,10 +23,8 @@ fn envn(k: &str, d: &str) -> usize {
 fn main() {
     let (rows, cols) = (envn("ROWS", "32"), envn("COLS", "64"));
     let n = rows * cols;
-    let (aiecc, peano) = (
-        std::env::var("AIECC").unwrap(),
-        std::env::var("PEANO").unwrap(),
-    );
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let (aiecc, peano) = (tc.aiecc_str(), tc.peano_str());
 
     // Values near 1.0 so `prod` over `cols` stays well-conditioned.
     let input: Vec<f32> = (0..n).map(|i| 0.95 + (i % 7) as f32 * 0.015).collect();

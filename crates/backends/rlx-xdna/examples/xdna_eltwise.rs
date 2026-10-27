@@ -44,8 +44,9 @@ fn main() {
     );
 
     // 2) COMPILE it with the native aiecc (no Python).
-    let aiecc = std::env::var("AIECC").expect("set AIECC (.../mlir_aie/bin/aiecc)");
-    let peano = std::env::var("PEANO").expect("set PEANO (.../llvm-aie)");
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let aiecc = tc.aiecc_str();
+    let peano = tc.peano_str();
     let tmp = format!("/tmp/rlx_elt_{}", op.name());
     std::fs::create_dir_all(&tmp).ok();
     let mlir_path = format!("{tmp}/aie.mlir");

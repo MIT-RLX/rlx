@@ -3502,6 +3502,25 @@ impl CudaExecutable {
                             *w_byte_off as usize,
                             *out_byte_off as usize,
                         );
+                    } else if crate::gguf_gpu::gguf_gemv_rows_supported(
+                        *scheme_id,
+                        m_s as usize,
+                        *k as usize,
+                    ) && !crate::gguf_gpu::gguf_fused_m1_env_disabled()
+                    {
+                        // A verify step's 2–4 rows: the GEMV, each row as at m = 1.
+                        crate::gguf_gpu::run_dequant_matmul_gguf_gemv_rows(
+                            &self.ctx,
+                            &stream,
+                            self.arena.f32_buf_mut(),
+                            m_s as usize,
+                            *n as usize,
+                            *k as usize,
+                            *scheme_id,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            *out_byte_off as usize,
+                        );
                     } else {
                         // Keep the dequant+matmul on-device by DEFAULT, including
                         // decode (m=1) for schemes without a fused GEMV (e.g. Q5_0,

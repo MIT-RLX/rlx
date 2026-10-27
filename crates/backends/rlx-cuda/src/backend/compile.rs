@@ -4082,7 +4082,7 @@ impl CudaExecutable {
                     meta_buffers.push(meta);
                     schedule.push(Step::QuantizeI8 {
                         in_off: (arena.offset(node.inputs[0]) / 4) as u32,
-                        q_byte_off: arena.offset(node.id) as u32,
+                        q_byte_off: byte_off_u32(arena.offset(node.id), "q_byte_off"),
                         n: node.shape.num_elements().unwrap() as u32,
                         chan_dim: chan_dim as u32,
                         inner: inner as u32,
@@ -4119,7 +4119,7 @@ impl CudaExecutable {
                     let meta_idx = meta_buffers.len();
                     meta_buffers.push(meta);
                     schedule.push(Step::DequantizeI8 {
-                        q_byte_off: arena.offset(node.inputs[0]) as u32,
+                        q_byte_off: byte_off_u32(arena.offset(node.inputs[0]), "q_byte_off"),
                         out_off: (arena.offset(node.id) / 4) as u32,
                         n: node.shape.num_elements().unwrap() as u32,
                         chan_dim: chan_dim as u32,
@@ -4139,10 +4139,10 @@ impl CudaExecutable {
                         m: x_shape.dim(0).unwrap_static() as u32,
                         k: x_shape.dim(1).unwrap_static() as u32,
                         n: w_shape.dim(1).unwrap_static() as u32,
-                        x_byte_off: arena.offset(node.inputs[0]) as u32,
-                        w_byte_off: arena.offset(node.inputs[1]) as u32,
+                        x_byte_off: byte_off_u32(arena.offset(node.inputs[0]), "x_byte_off"),
+                        w_byte_off: byte_off_u32(arena.offset(node.inputs[1]), "w_byte_off"),
                         bias_off: (arena.offset(node.inputs[2]) / 4) as u32,
-                        out_byte_off: arena.offset(node.id) as u32,
+                        out_byte_off: byte_off_u32(arena.offset(node.id), "out_byte_off"),
                         x_zp: *x_zp,
                         w_zp: *w_zp,
                         out_zp: *out_zp,
@@ -4179,10 +4179,10 @@ impl CudaExecutable {
                         dh: dilation.first().copied().unwrap_or(1) as u32,
                         dw: dilation.get(1).copied().unwrap_or(1) as u32,
                         groups: *groups as u32,
-                        x_byte_off: arena.offset(node.inputs[0]) as u32,
-                        w_byte_off: arena.offset(node.inputs[1]) as u32,
+                        x_byte_off: byte_off_u32(arena.offset(node.inputs[0]), "x_byte_off"),
+                        w_byte_off: byte_off_u32(arena.offset(node.inputs[1]), "w_byte_off"),
                         bias_off: (arena.offset(node.inputs[2]) / 4) as u32,
-                        out_byte_off: arena.offset(node.id) as u32,
+                        out_byte_off: byte_off_u32(arena.offset(node.id), "out_byte_off"),
                         x_zp: *x_zp,
                         w_zp: *w_zp,
                         out_zp: *out_zp,
@@ -5121,4 +5121,16 @@ fn half_b_operand(
         Some(&dt) => (scratch_f32, Some((arena.offset(b_id) as u64, dt))),
         None => ((arena.offset(b_id) / 4) as u32, None),
     }
+}
+
+/// A byte offset for a kernel that takes it as `unsigned int` (the int8
+/// quantize / quantized-matmul kernels). Past 4 GiB it would wrap onto
+/// another buffer (bug #4's failure), so refuse instead.
+fn byte_off_u32(off: usize, what: &str) -> u32 {
+    u32::try_from(off).unwrap_or_else(|_| {
+        panic!(
+            "rlx-cuda: {what} is {off} bytes into the arena, past 4 GiB, and this \
+             kernel takes a 32-bit byte offset. Split the graph or run it elsewhere."
+        )
+    })
 }

@@ -154,6 +154,70 @@ fn is_lowp_layout_op(op: &Op) -> bool {
     )
 }
 
+/// [`crate::HalfCasts::Round`]: make every `Cast` to `f16` / `bf16` round.
+///
+/// Execution widens half graphs to f32 ([`promote_to_f32`]), which turns such a
+/// cast into a no-op. Rewriting `cast(x → h)` as `cast(round_h(x) → h)` (with
+/// `x` brought to f32 first when it is f64 or an integer) leaves a value the
+/// cast represents exactly, so widening it later changes nothing and the
+/// rounding survives on every backend. Casts between half formats and from
+/// half to wider formats are left alone.
+pub fn round_half_casts(graph: Graph) -> Graph {
+    use rlx_ir::number_format::{FloatFormat, FormatScaling};
+    let narrowing = |n: &rlx_ir::Node, g: &Graph| match n.op {
+        Op::Cast {
+            to: to @ (DType::F16 | DType::BF16),
+        } => {
+            let from = g.node(n.inputs[0]).shape.dtype();
+            (!matches!(from, DType::F16 | DType::BF16)).then_some(to)
+        }
+        _ => None,
+    };
+    if !graph.nodes().iter().any(|n| narrowing(n, &graph).is_some()) {
+        return graph;
+    }
+    let mut out = Graph::new(graph.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in graph.nodes() {
+        let mut inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        if let Some(to) = narrowing(node, &graph) {
+            let src = inputs[0];
+            let src_shape = out.node(src).shape.clone();
+            let f32_shape = src_shape.clone().with_dtype(DType::F32);
+            let x32 = if src_shape.dtype() == DType::F32 {
+                src
+            } else {
+                out.add_node(Op::Cast { to: DType::F32 }, vec![src], f32_shape.clone())
+            };
+            let format = if to == DType::F16 {
+                FloatFormat::F16
+            } else {
+                FloatFormat::BF16
+            };
+            let r = out.add_node(
+                Op::RoundToFormat {
+                    format,
+                    scaling: FormatScaling::None,
+                },
+                vec![x32],
+                f32_shape,
+            );
+            inputs[0] = r;
+        }
+        let new_id = out.add_node(node.op.clone(), inputs, node.shape.clone());
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(graph.outputs.iter().map(|o| id_map[o]).collect());
+    out.set_output_names(
+        graph
+            .output_names()
+            .iter()
+            .map(|(i, n)| (*i, n.clone()))
+            .collect(),
+    );
+    out
+}
+
 /// Rewrite F16/BF16 node shapes (and constant payloads) to F32 for CPU exec.
 ///
 /// Boundary tensors (`Param` / `Input`) keep their declared dtype so Metal (and

@@ -11,6 +11,10 @@ categories.workspace   = true
 readme                 = "README.md"
 repository.workspace   = true
 documentation.workspace = true
+# The NumPy routing fixtures (34 MB each, one per platform) and the parity
+# test that embeds them stay in the repo: with both, the package was 14.3 MiB
+# compressed, over crates.io's 10 MB limit.
+exclude = ["tests/vectors", "tests/numpy_routing.rs"]
 [features]
 default = ["cpu"]
 

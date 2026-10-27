@@ -154,7 +154,7 @@ unsafe extern "C" {
 /// which kernels a pipeline reaches.
 pub(crate) fn trace(f: impl FnOnce() -> String) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var("RLX_NUMPY_BLAS_TRACE").is_ok_and(|v| v == "1")) {
+    if *ON.get_or_init(|| rlx_ir::env::flag("RLX_NUMPY_BLAS_TRACE")) {
         eprintln!("[numpy_blas] {}", f());
     }
 }

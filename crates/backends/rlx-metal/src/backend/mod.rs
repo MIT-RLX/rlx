@@ -979,7 +979,7 @@ impl MetalExecutable {
             cache.preload_weight(inputs[3].0, w_b, w_sh.dtype(), k, n, w_zp, w_scale);
         }
         let loaded = cache.len().saturating_sub(before);
-        if loaded > 0 && rlx_ir::env::flag("KITTEN_RLX_TIMING") {
+        if loaded > 0 && std::env::var("KITTEN_RLX_TIMING").is_ok_and(|v| v != "0") {
             eprintln!("[metal] QMatMul weight preload: {loaded} tiles");
         }
     }

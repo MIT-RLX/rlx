@@ -392,3 +392,59 @@ fn coop_f16_vk_bench_vs_wide_dispatch_only() {
 
     eprintln!("CoopF16Vk 1024³ dispatch-only ≈ {coop_us} µs vs wide_nv ≈ {wide_us} µs");
 }
+
+/// Chained coop matmuls: every layer after the first reads an A that a
+/// `cast_f32_to_f16` step mirrored, which no single-matmul test reaches. M=64
+/// takes the 32×32-block kernel, M=48 the 16×16 one. Unit-gain random weights
+/// keep four layers inside f16 range; the oscillation heuristic is disabled so
+/// random weights stay on the coop path instead of the f32 fallback.
+#[test]
+fn coop_f16_vk_chained_layers_match_cpu() {
+    let _guard = CoopTestGuard::new();
+    if !require_coop_f16_vk_test() {
+        return;
+    }
+    rlx_ir::env::set("RLX_WGPU_COOP_F16_VK_NO_AUTO_WIDE", "1");
+    let (k, layers) = (128usize, 4usize);
+    let mut bad = Vec::new();
+    for m in [64usize, 48] {
+        let mut g = Graph::new("coop_chain");
+        let x = g.input("x", Shape::new(&[m, k], DType::F32));
+        let mut h = x;
+        let mut ws = Vec::new();
+        let mut st = 0x9e37_79b9u32;
+        for l in 0..layers {
+            let w = g.param(format!("w{l}"), Shape::new(&[k, k], DType::F32));
+            h = g.matmul(h, w, Shape::new(&[m, k], DType::F32));
+            let s = (3.0 / k as f32).sqrt();
+            let v: Vec<f32> = (0..k * k)
+                .map(|_| {
+                    st ^= st << 13;
+                    st ^= st >> 17;
+                    st ^= st << 5;
+                    s * ((st >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0)
+                })
+                .collect();
+            ws.push((format!("w{l}"), v));
+        }
+        g.set_outputs(vec![h]);
+        let xv: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.017).sin()).collect();
+        let mut want = xv.clone();
+        for (_, w) in &ws {
+            want = matmul_reference(&want, w, m, k, k);
+        }
+        let mut exe = WgpuExecutable::compile(g);
+        for (name, v) in &ws {
+            exe.set_param(name, v);
+        }
+        let out = exe.run(&[("x", xv.as_slice())]);
+        let abs_max = want.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        let rel = max_diff(&want, &out[0]) / abs_max;
+        eprintln!("CoopF16Vk chain m={m} k={k} x{layers}: rel = {rel:e}");
+        if rel.is_nan() || rel >= 5e-3 {
+            bad.push(format!("m={m}: rel {rel:e}"));
+        }
+    }
+    rlx_ir::env::unset("RLX_WGPU_COOP_F16_VK_NO_AUTO_WIDE");
+    assert!(bad.is_empty(), "chained CoopF16Vk matmuls off CPU: {bad:?}");
+}

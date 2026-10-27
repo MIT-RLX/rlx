@@ -8,6 +8,7 @@
 
 #import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
 
@@ -102,14 +103,29 @@ RlxCoremlModel *rlx_coreml_load(const char *mlpackage_path, int compute_units,
       }
       compiled = tmp;
       if (cacheURL) {
-        // Persist the compiled model to the cache (best-effort).
-        [fm removeItemAtURL:cacheURL error:nil];
-        [fm createDirectoryAtURL:[cacheURL URLByDeletingLastPathComponent]
+        // Persist the compiled model to the cache (best-effort). The cache key
+        // is a content hash, so several threads / processes compiling the
+        // same model race for one entry: copy into a private staging
+        // directory and rename(2) it into place, so a reader never sees a
+        // half-written .mlmodelc (which it would discard as invalid, deleting
+        // it under the writer). If another writer won, keep our compiled copy.
+        NSURL *dir = [cacheURL URLByDeletingLastPathComponent];
+        [fm createDirectoryAtURL:dir
             withIntermediateDirectories:YES
                              attributes:nil
                                   error:nil];
-        if ([fm copyItemAtURL:tmp toURL:cacheURL error:nil]) {
-          compiled = cacheURL;
+        NSURL *staging = [dir
+            URLByAppendingPathComponent:
+                [NSString stringWithFormat:@".%@.%d.%@",
+                                           cacheURL.lastPathComponent,
+                                           getpid(), NSUUID.UUID.UUIDString]];
+        if ([fm copyItemAtURL:tmp toURL:staging error:nil]) {
+          if (rename(staging.fileSystemRepresentation,
+                     cacheURL.fileSystemRepresentation) == 0) {
+            compiled = cacheURL;
+          } else {
+            [fm removeItemAtURL:staging error:nil];
+          }
         }
       }
       model = [MLModel modelWithContentsOfURL:compiled
@@ -271,19 +287,39 @@ int rlx_coreml_compute_plan(RlxCoremlModel *handle, int *counts, char *err,
       MLModelStructureProgramFunction *fn = program.functions[@"main"];
       if (!fn) return -1;
 
+      // RLX_COREML_PLAN_OPS=1: also print, per operator, how many ops land on
+      // each device and the estimated cost share of each device.
+      const char *dump_env = getenv("RLX_COREML_PLAN_OPS");
+      BOOL dump = dump_env && dump_env[0] == '1';
+      NSMutableDictionary<NSString *, NSNumber *> *per = [NSMutableDictionary dictionary];
+      double cost[4] = {0, 0, 0, 0};
       for (MLModelStructureProgramOperation *op in fn.block.operations) {
         MLComputePlanDeviceUsage *usage =
             [plan computeDeviceUsageForMLProgramOperation:op];
         id<MLComputeDeviceProtocol> dev = usage.preferredComputeDevice;
+        int d = 3;
         if ([dev isKindOfClass:[MLCPUComputeDevice class]]) {
-          counts[0]++;
+          d = 0;
         } else if ([dev isKindOfClass:[MLGPUComputeDevice class]]) {
-          counts[1]++;
+          d = 1;
         } else if ([dev isKindOfClass:[MLNeuralEngineComputeDevice class]]) {
-          counts[2]++;
-        } else {
-          counts[3]++;
+          d = 2;
         }
+        counts[d]++;
+        if (dump && usage) {
+          static const char *names[4] = {"cpu", "gpu", "ane", "none"};
+          NSString *key = [NSString stringWithFormat:@"%@ %s", op.operatorName, names[d]];
+          per[key] = @(per[key].intValue + 1);
+          MLComputePlanCost *c = [plan estimatedCostOfMLProgramOperation:op];
+          if (c) cost[d] += c.weight;
+        }
+      }
+      if (dump) {
+        for (NSString *key in [per.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+          fprintf(stderr, "[coreml-plan] %6d  %s\n", per[key].intValue, key.UTF8String);
+        }
+        fprintf(stderr, "[coreml-plan] est. cost share: cpu %.3f gpu %.3f ane %.3f\n",
+                cost[0], cost[1], cost[2]);
       }
       return 0;
     }

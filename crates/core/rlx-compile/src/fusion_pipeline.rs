@@ -208,8 +208,11 @@ impl FusionOptions {
         opts
     }
 
-    /// wgpu region kernel only supports trailing/scalar broadcast via
-    /// modulus — unfuse so LegalizeBroadcast Expand + Binary run separately.
+    /// wgpu unfuses `ElementwiseRegion` by default. Kept regions are correct
+    /// (`MarkElementwiseRegions` only admits scalar / trailing broadcasts, the
+    /// ones its `gid % len` reads express), but on EEGNet training they removed
+    /// 5 of 185 dispatches and no measurable time, so the default stays
+    /// unfused; `RLX_KEEP_ELEMENTWISE_REGIONS` keeps them.
     pub fn for_wgpu() -> Self {
         let keep = rlx_ir::env::flag("RLX_KEEP_ELEMENTWISE_REGIONS");
         Self {

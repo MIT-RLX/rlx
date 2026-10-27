@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! `import-mlx --keep-packed` for mlx-lm `nvfp4` → `MlxMxfp4` packs.
 
+#![cfg(feature = "convert")]
 use std::collections::HashMap;
 use std::fs;
 

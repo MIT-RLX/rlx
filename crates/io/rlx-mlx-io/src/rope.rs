@@ -33,6 +33,7 @@ pub fn build_default_tables(
     (cos, sin)
 }
 
+#[cfg(feature = "io")]
 pub fn f32_le_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }

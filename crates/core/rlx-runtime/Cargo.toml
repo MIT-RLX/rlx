@@ -15,8 +15,8 @@ documentation.workspace = true
 [features]
 default = ["cpu", "model-io"]
 
-# On-disk model containers: `.rlxp` packages, MLX weight dirs / `.npz`, and
-# HuggingFace `.dduf`. In `default` so nothing that takes the defaults notices,
+# On-disk model containers: `.rlxp` packages ([`rlxp`]), MLX weight dirs / `.npz`,
+# and HuggingFace `.dduf`. In `default` so nothing that takes the defaults notices,
 # but separable — a distributed **node** receives its stage over the wire and
 # never opens a model file, and these three crates drag in the whole archive
 # stack (zip ×2, zstd, bzip2, flate2, zopfli, npyz, safetensors, serde_yaml,
@@ -27,7 +27,11 @@ default = ["cpu", "model-io"]
 # `gguf://`, `safetensors://` and `file://` weight URIs keep working without
 # it: rlx-gguf is small and its quant kernels back `quantized_kv`, and the
 # safetensors reader here is a 40-line header parse, not the crate.
-model-io = ["dep:rlx-pkg", "dep:rlx-mlx-io", "dep:rlx-dduf", "dep:sha2"]
+model-io = ["rlxp", "dep:rlx-mlx-io", "dep:rlx-dduf"]
+# `.rlxp` packages alone — open, compile, save — and `rlxp://` weight URIs:
+# rlx-pkg's reader and hot-tier writer, pure Rust (wasm32 too), without the
+# MLX / DDUF / NeMo / GGUF importers or their archive stack.
+rlxp = ["dep:rlx-pkg", "rlx-pkg/write", "rlx-pkg/parallel", "dep:sha2"]
 # Package programs: an entry of kind `program`, the model's host logic as
 # WebAssembly run in a sandbox (`wasmi`, an interpreter: no JIT, so it runs
 # where code cannot be generated — iOS, watchOS).
@@ -136,6 +140,11 @@ android-blas = ["cpu", "gpu"]
 # decompose stays available even if a downstream build strips rlx-opt's defaults.
 # Off by default — inference builds keep the lean op surface and pay zero cost.
 training = ["rlx-opt/training", "rlx-coreml?/training", "dep:rlx-optim"]
+# Advertise this process as a node over Bonjour/Avahi
+# (`dist::node::advertise_here`; `_rlx-node._tcp`).
+mdns = ["rlx-driver/mdns"]
+# A node's mesh connections also over Bluetooth LE (`RLX_BLE_SERVE`).
+ble = ["rlx-driver/ble"]
 
 # NVIDIA CUDA native; native CUDA tile raster.
 cuda = ["cpu", "dep:rlx-cuda"]
@@ -249,7 +258,7 @@ inventory = "0.3"
 libloading = { version = "0.8", optional = true }
 memmap2 = { version = "0.9", optional = true }
 rlx-gguf = { workspace = true }
-rlx-pkg = { workspace = true, optional = true }
+rlx-pkg = { workspace = true, optional = true, default-features = false }
 rlx-program = { workspace = true, optional = true }
 wasmi = { version = "2", optional = true }
 # Referenced weight files' checksums (`model.weights[].sha256`); already in
@@ -292,6 +301,8 @@ rlxsl = { workspace = true }
 # a dev-dependency cycle (allowed by cargo, never a normal-build cycle).
 rlx-flow = { workspace = true }
 rayon = "1"
+# `rlxp_mlx_keep_packed_run` builds its package with the MLX importer.
+rlx-pkg = { workspace = true, features = ["convert"] }
 rlx-compile = { workspace = true, features = ["training"] }
 # rlx-splat moved out of tree; splat examples/tests below are disabled until it returns.
 # rlx-splat = { path = "../rlx-splat", version = "0.2.19", default-features = false, features = ["test-support", "io"] }

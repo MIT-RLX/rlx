@@ -54,7 +54,7 @@ pub(crate) fn dlapy2(x: f64, y: f64) -> f64 {
 }
 
 /// `DLARTG(f, g) → (c, s, r)` (LAPACK 3.10+ `dlartg.f90`).
-fn dlartg(f: f64, g: f64) -> (f64, f64, f64) {
+pub(crate) fn dlartg(f: f64, g: f64) -> (f64, f64, f64) {
     let safmin = SFMIN;
     let safmax = 1.0 / safmin;
     let rtmin = safmin.sqrt();
@@ -742,7 +742,7 @@ fn dormbr_left(
 
 /// `DLASR(side, 'V', direct, m, n, c, s, A)`.
 #[allow(clippy::too_many_arguments)]
-fn dlasr(
+pub(crate) fn dlasr(
     left: bool,
     forward: bool,
     m: usize,
@@ -1754,7 +1754,7 @@ fn dlalsd_dc(
 }
 
 /// `IDAMAX` (0-based, first maximum).
-fn ob_idamax(x: &[f64]) -> usize {
+pub(crate) fn ob_idamax(x: &[f64]) -> usize {
     let mut best = 0;
     for (i, v) in x.iter().enumerate() {
         if v.abs() > x[best].abs() {

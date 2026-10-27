@@ -828,8 +828,10 @@ pub enum Thunk {
         /// [`rlx_ir::shape::rope_table_stride`].
         cos_row_stride: u32,
     },
-    /// Softmax
+    /// Softmax over the last axis, written to `data`. Reads `src`; `src ==
+    /// data` is the in-place form.
     Softmax {
+        src: usize,
         data: usize,
         rows: u32,
         cols: u32,
@@ -5732,7 +5734,7 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             tw_im,
             ..
         } => vec![*state, *gate, *rev, *tw_re, *tw_im],
-        Thunk::Softmax { data, .. } => vec![*data],
+        Thunk::Softmax { src, .. } => vec![*src],
         Thunk::SoftmaxCrossEntropyDense {
             logits, targets, ..
         } => vec![*logits, *targets],

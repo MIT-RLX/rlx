@@ -263,6 +263,21 @@ unsafe fn cblas_sgemm(
     let trans_a = transa != NO_TRANS;
     let trans_b = transb != NO_TRANS;
 
+    // SME2 (Apple M4+) when compiled in and enabled: strided / transposed
+    // operands are first copied into the contiguous row-major layout the
+    // kernel packs from (O(mk + kn) next to the O(mnk) product).
+    #[cfg(rlx_cpu_amx_sme)]
+    if crate::intrinsics::apple_amx::sme::dispatch_enabled()
+        && crate::intrinsics::apple_amx::sme::worth_sme(m, k, n)
+    {
+        unsafe {
+            sme_strided(
+                m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
+            )
+        };
+        return;
+    }
+
     #[cfg(feature = "portable-gemm")]
     if m >= PORTABLE_GEMM_MIN_M && n > 0 && k > 0 {
         unsafe {
@@ -307,6 +322,55 @@ unsafe fn cblas_sgemm(
         return;
     }
 
+    // `Aᵀ·B`: the scalar loop below walks both A and B with a stride in its
+    // `p`-innermost loop. Pack B row-major instead so the inner loop runs over
+    // contiguous `j` (vectorizable), one accumulator per output column. Each C
+    // element still sees exactly the scalar loop's arithmetic — `acc` from 0,
+    // `acc += a·b` in `p` order, then `alpha·acc (+ beta·c)` — so the result is
+    // bit-identical to it. (With `trans_b` the scalar loop is already a
+    // contiguous dot product; packing would only add a copy.)
+    if trans_a && !trans_b {
+        let mut bp = vec![0f32; k * n];
+        for p in 0..k {
+            let row = &mut bp[p * n..(p + 1) * n];
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = if trans_b {
+                    unsafe { *b.add(j * ldb + p) }
+                } else {
+                    unsafe { *b.add(p * ldb + j) }
+                };
+            }
+        }
+        let mut acc = vec![0f32; n];
+        for i in 0..m {
+            acc.fill(0.0);
+            for p in 0..k {
+                let av = if trans_a {
+                    unsafe { *a.add(p * lda + i) }
+                } else {
+                    unsafe { *a.add(i * lda + p) }
+                };
+                let row = &bp[p * n..(p + 1) * n];
+                for (s, &bv) in acc.iter_mut().zip(row) {
+                    *s += av * bv;
+                }
+            }
+            let crow = unsafe { std::slice::from_raw_parts_mut(c.add(i * ldc), n) };
+            // CBLAS: `beta == 0` means C is not read, so stale NaN/Inf in a
+            // reused arena slot must not leak through `0 * NaN`.
+            if beta == 0.0 {
+                for (cv, &s) in crow.iter_mut().zip(&acc) {
+                    *cv = alpha * s;
+                }
+            } else {
+                for (cv, &s) in crow.iter_mut().zip(&acc) {
+                    *cv = alpha * s + beta * *cv;
+                }
+            }
+        }
+        return;
+    }
+
     for i in 0..m {
         for j in 0..n {
             let mut acc: f32 = 0.0;
@@ -335,6 +399,58 @@ unsafe fn cblas_sgemm(
             }
         }
     }
+}
+
+/// `C = alpha·op(A)·op(B) + beta·C` (row-major, strided) on SME2, packing
+/// straight from the strides (no intermediate copies).
+///
+/// # Safety
+/// Same contract as `cblas_sgemm`: the pointers cover the strided extents.
+#[cfg(all(not(rlx_cpu_blas), rlx_cpu_amx_sme))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sme_strided(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: *const f32,
+    lda: usize,
+    trans_a: bool,
+    b: *const f32,
+    ldb: usize,
+    trans_b: bool,
+    beta: f32,
+    c: *mut f32,
+    ldc: usize,
+) {
+    use crate::intrinsics::apple_amx::sme::{StridedMat, sme_sgemm_strided};
+    let a = if trans_a {
+        StridedMat {
+            ptr: a,
+            rs: 1,
+            cs: lda,
+        }
+    } else {
+        StridedMat {
+            ptr: a,
+            rs: lda,
+            cs: 1,
+        }
+    };
+    let b = if trans_b {
+        StridedMat {
+            ptr: b,
+            rs: 1,
+            cs: ldb,
+        }
+    } else {
+        StridedMat {
+            ptr: b,
+            rs: ldb,
+            cs: 1,
+        }
+    };
+    unsafe { sme_sgemm_strided(m, k, n, a, b, c, ldc, alpha, beta) };
 }
 
 /// Below this many rows the loop nest in `cblas_sgemm` beats the blocked
@@ -1239,93 +1355,6 @@ fn lu_colmajor(a: &mut [f64], m: usize, n: usize, ipiv: &mut [i32]) -> i32 {
     info
 }
 
-/// Symmetric eigendecomposition via cyclic Jacobi. `s` is a row-major
-/// `n×n` symmetric matrix (consumed). Returns `(eigenvalues ascending,
-/// eigenvectors)`, where eigenvector `j` is column `j` of the row-major
-/// `n×n` result (`evec[i*n + j]`). Orthonormal by construction.
-#[cfg(not(rlx_cpu_blas))]
-fn sym_eig_jacobi(mut s: Vec<f64>, n: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut v = vec![0f64; n * n];
-    for i in 0..n {
-        v[i * n + i] = 1.0;
-    }
-    if n <= 1 {
-        let w = if n == 1 { vec![s[0]] } else { vec![] };
-        return (w, v);
-    }
-    for _sweep in 0..100 {
-        let mut off = 0.0;
-        for p in 0..n {
-            for q in (p + 1)..n {
-                off += s[p * n + q] * s[p * n + q];
-            }
-        }
-        if off <= 1e-300 {
-            break;
-        }
-        let mut rotated = false;
-        for p in 0..n {
-            for q in (p + 1)..n {
-                let apq = s[p * n + q];
-                let app = s[p * n + p];
-                let aqq = s[q * n + q];
-                if apq.abs() <= f64::EPSILON * (app.abs() + aqq.abs()).max(f64::MIN_POSITIVE) {
-                    continue;
-                }
-                rotated = true;
-                // Rotation angle that annihilates s[p][q]: solves
-                // t² + 2θt − 1 = 0 for the smaller |t| (stable form).
-                let theta = (aqq - app) / (2.0 * apq);
-                let t = if theta == 0.0 {
-                    1.0
-                } else {
-                    theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt())
-                };
-                let c = 1.0 / (t * t + 1.0).sqrt();
-                let sn = t * c;
-                // s ← Gᵀ s G: column update (s·G) then row update (Gᵀ·).
-                for i in 0..n {
-                    let sip = s[i * n + p];
-                    let siq = s[i * n + q];
-                    s[i * n + p] = c * sip - sn * siq;
-                    s[i * n + q] = sn * sip + c * siq;
-                }
-                for i in 0..n {
-                    let spi = s[p * n + i];
-                    let sqi = s[q * n + i];
-                    s[p * n + i] = c * spi - sn * sqi;
-                    s[q * n + i] = sn * spi + c * sqi;
-                }
-                // Accumulate eigenvectors: V ← V·G.
-                for i in 0..n {
-                    let vip = v[i * n + p];
-                    let viq = v[i * n + q];
-                    v[i * n + p] = c * vip - sn * viq;
-                    v[i * n + q] = sn * vip + c * viq;
-                }
-            }
-        }
-        if !rotated {
-            break;
-        }
-    }
-    let evals: Vec<f64> = (0..n).map(|i| s[i * n + i]).collect();
-    let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| {
-        evals[a]
-            .partial_cmp(&evals[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let w: Vec<f64> = idx.iter().map(|&i| evals[i]).collect();
-    let mut vout = vec![0f64; n * n];
-    for (newj, &oldj) in idx.iter().enumerate() {
-        for i in 0..n {
-            vout[i * n + newj] = v[i * n + oldj];
-        }
-    }
-    (w, vout)
-}
-
 /// Thin SVD `A = U·diag(s)·Vᵀ` of a row-major `m×n` matrix via one-sided
 /// Jacobi. Returns `(U row-major m×k, s descending, Vᵀ row-major k×n)`,
 /// `k = min(m,n)`; singular values ≥ 0, `U`/`V` orthonormal.
@@ -1638,19 +1667,26 @@ unsafe fn lapack_dsyevd(
             }
         }
     }
-    let (evals, evecs) = sym_eig_jacobi(full, n);
-    unsafe {
-        for (i, &e) in evals.iter().enumerate() {
-            *w.add(i) = e;
-        }
-        if jobz == b'V' {
-            for j in 0..n {
-                for i in 0..n {
-                    *a.add(i + j * lda) = evecs[i * n + j];
+    // LAPACK's own DSYEVD('V', 'L') as the Linux reference runs it (numpy.linalg.eigh
+    // on OpenBLAS 0.3.30 — bit for bit; `rlx_linux_ref::dsyevd_lower`). `full` is
+    // symmetric, so its row-major buffer is also the column-major matrix; only its
+    // lower triangle is read. (`uplo = 'U'` is served from the same symmetric matrix:
+    // LAPACK's upper-triangle reduction has no reference here to match.)
+    match rlx_linux_ref::dsyevd_lower(n, &full, n) {
+        Ok((evals, evecs)) => unsafe {
+            for (i, &e) in evals.iter().enumerate() {
+                *w.add(i) = e;
+            }
+            if jobz == b'V' {
+                for j in 0..n {
+                    for i in 0..n {
+                        *a.add(i + j * lda) = evecs[i + j * n];
+                    }
                 }
             }
-        }
-        *info = 0;
+            *info = 0;
+        },
+        Err(e) => unsafe { *info = e as i32 },
     }
 }
 #[cfg(not(rlx_cpu_blas))]
@@ -4560,5 +4596,214 @@ pub fn round_half_into(src: &[f32], dst: &mut [u16], bf16: bool) {
         for (d, &v) in dst.iter_mut().zip(src) {
             *d = half::f16::from_f32(v).to_bits();
         }
+    }
+}
+
+/// The no-BLAS `cblas_sgemm`'s transposed path packs op(B) for a contiguous
+/// inner loop; it must stay bit-identical to the scalar loop it replaced.
+#[cfg(all(test, not(rlx_cpu_blas)))]
+mod fallback_gemm_tests {
+    use super::*;
+
+    /// The scalar loop the packed path replaced, verbatim in its arithmetic.
+    #[allow(clippy::too_many_arguments)]
+    fn scalar_ref(
+        ta: bool,
+        tb: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &[f32],
+        lda: usize,
+        b: &[f32],
+        ldb: usize,
+        beta: f32,
+        c: &mut [f32],
+        ldc: usize,
+    ) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc: f32 = 0.0;
+                for p in 0..k {
+                    let av = if ta { a[p * lda + i] } else { a[i * lda + p] };
+                    let bv = if tb { b[j * ldb + p] } else { b[p * ldb + j] };
+                    acc += av * bv;
+                }
+                let cv = &mut c[i * ldc + j];
+                *cv = if beta == 0.0 {
+                    alpha * acc
+                } else {
+                    alpha * acc + beta * *cv
+                };
+            }
+        }
+    }
+
+    /// The SME2 route of the BLAS-less `cblas_sgemm` (strided packing, any
+    /// transpose, alpha/beta, padded ldc) is one fused multiply-add per k step
+    /// in order: bit-identical to a sequential `mul_add` loop.
+    #[cfg(rlx_cpu_amx_sme)]
+    #[test]
+    fn sme_strided_route_is_sequential_fma() {
+        if !crate::intrinsics::apple_amx::sme::dispatch_enabled() {
+            return;
+        }
+        let mut x = 0x1234_5679u32;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        for &(m, n, k) in &[(48, 48, 96), (33, 70, 129), (64, 32, 64)] {
+            assert!(
+                crate::intrinsics::apple_amx::sme::worth_sme(m, k, n),
+                "{m}x{k}x{n} would not take the SME route"
+            );
+            for ta in [false, true] {
+                for tb in [false, true] {
+                    for (alpha, beta) in [(1.0f32, 0.0f32), (0.5, 0.0), (1.0, 2.0)] {
+                        let lda = if ta { m + 3 } else { k + 2 };
+                        let ldb = if tb { k + 1 } else { n + 5 };
+                        let ldc = n + 4;
+                        let a: Vec<f32> =
+                            (0..(if ta { k } else { m }) * lda).map(|_| rnd()).collect();
+                        let b: Vec<f32> =
+                            (0..(if tb { n } else { k }) * ldb).map(|_| rnd()).collect();
+                        let c0: Vec<f32> = (0..m * ldc)
+                            .map(|_| if beta == 0.0 { f32::NAN } else { rnd() })
+                            .collect();
+                        let mut got = c0.clone();
+                        unsafe {
+                            cblas_sgemm(
+                                ROW_MAJOR,
+                                if ta { TRANS } else { NO_TRANS },
+                                if tb { TRANS } else { NO_TRANS },
+                                m as i32,
+                                n as i32,
+                                k as i32,
+                                alpha,
+                                a.as_ptr(),
+                                lda as i32,
+                                b.as_ptr(),
+                                ldb as i32,
+                                beta,
+                                got.as_mut_ptr(),
+                                ldc as i32,
+                            )
+                        };
+                        for i in 0..m {
+                            for j in 0..n {
+                                let mut acc = 0f32;
+                                for p in 0..k {
+                                    let av = if ta { a[p * lda + i] } else { a[i * lda + p] };
+                                    let bv = if tb { b[j * ldb + p] } else { b[p * ldb + j] };
+                                    acc = av.mul_add(bv, acc);
+                                }
+                                let want = if beta == 0.0 {
+                                    alpha * acc
+                                } else {
+                                    alpha * acc + beta * c0[i * ldc + j]
+                                };
+                                assert_eq!(
+                                    want.to_bits(),
+                                    got[i * ldc + j].to_bits(),
+                                    "m{m} n{n} k{k} ta{ta} tb{tb} a{alpha} b{beta} [{i},{j}]"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transposed_fallback_matches_the_scalar_loop_bit_for_bit() {
+        let mut x = 0x2545_f491u32;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let mut cases = 0;
+        for &(m, n, k) in &[
+            (1, 1, 1),
+            (3, 5, 7),
+            (8, 33, 17),
+            (16, 129, 64),
+            (5, 2, 300),
+        ] {
+            for (ta, tb) in [(true, false), (false, true), (true, true)] {
+                for &(alpha, beta) in &[(1.0f32, 0.0f32), (1.0, 1.0), (0.5, -2.0), (1.0, 0.0)] {
+                    let (lda, ldb, ldc) = (
+                        if ta { m + 1 } else { k + 2 },
+                        if tb { k + 3 } else { n + 1 },
+                        n + 2,
+                    );
+                    let a: Vec<f32> = (0..(if ta { k } else { m }) * lda).map(|_| rnd()).collect();
+                    let b: Vec<f32> = (0..(if tb { n } else { k }) * ldb).map(|_| rnd()).collect();
+                    // beta == 0 must not read C: seed it with NaN
+                    let c0: Vec<f32> = (0..m * ldc)
+                        .map(|_| if beta == 0.0 { f32::NAN } else { rnd() })
+                        .collect();
+                    let (mut want, mut got) = (c0.clone(), c0.clone());
+                    scalar_ref(
+                        ta, tb, m, n, k, alpha, &a, lda, &b, ldb, beta, &mut want, ldc,
+                    );
+                    unsafe {
+                        cblas_sgemm(
+                            ROW_MAJOR,
+                            if ta { TRANS } else { NO_TRANS },
+                            if tb { TRANS } else { NO_TRANS },
+                            m as i32,
+                            n as i32,
+                            k as i32,
+                            alpha,
+                            a.as_ptr(),
+                            lda as i32,
+                            b.as_ptr(),
+                            ldb as i32,
+                            beta,
+                            got.as_mut_ptr(),
+                            ldc as i32,
+                        )
+                    };
+                    // `portable-gemm` (and SME) take m >= PORTABLE_GEMM_MIN_M
+                    // to blocked kernels with another summation order: those
+                    // shapes get an error bound (k terms of |a||b| <= 1, one
+                    // f32 rounding each), the loop-nest shapes stay bit-exact.
+                    #[cfg(feature = "portable-gemm")]
+                    let exact = m < PORTABLE_GEMM_MIN_M;
+                    #[cfg(not(feature = "portable-gemm"))]
+                    let exact = true;
+                    for i in 0..m {
+                        for j in 0..n {
+                            let (w, g) = (want[i * ldc + j], got[i * ldc + j]);
+                            if exact {
+                                assert_eq!(
+                                    w.to_bits(),
+                                    g.to_bits(),
+                                    "m{m} n{n} k{k} ta{ta} tb{tb} a{alpha} b{beta} [{i},{j}]: {w} vs {g}"
+                                );
+                            } else {
+                                let bound = 2.0
+                                    * (k as f32 + 2.0)
+                                    * f32::EPSILON
+                                    * (alpha.abs() + beta.abs()).max(1.0);
+                                assert!(
+                                    (w - g).abs() <= bound,
+                                    "m{m} n{n} k{k} ta{ta} tb{tb} a{alpha} b{beta} [{i},{j}]: {w} vs {g} (bound {bound})"
+                                );
+                            }
+                        }
+                    }
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 60);
     }
 }

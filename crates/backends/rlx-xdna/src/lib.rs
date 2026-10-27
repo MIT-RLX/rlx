@@ -68,6 +68,8 @@ pub mod direct;
 
 /// Python-free overlay compilation (drives the native `aiecc` binary).
 pub mod compile;
+pub mod setup;
+pub mod toolchain;
 
 /// rlx emits AIE-MLIR itself (native codegen seam; first increment).
 pub mod aie;
@@ -139,8 +141,8 @@ pub fn detect() -> XdnaStatus {
     }
 }
 
-/// The rlx XRT shim (`librlx_xdna_shim.so`), or `None` when `RLX_XDNA_SHIM` is
-/// unset or points at a missing file.
+/// The rlx XRT shim (`librlx_xdna_shim.so`), or `None` when [`shim_path`]
+/// cannot resolve or build one.
 ///
 /// This is rlx's own `extern "C"` wrapper built from `csrc/xrt_gemm_shim.cpp`,
 /// **not** XRT's `libxrt_driver_xdna.so`. Pointing it at the latter loads fine
@@ -151,9 +153,139 @@ pub fn detect() -> XdnaStatus {
 ///     -o librlx_xdna_shim.so csrc/xrt_gemm_shim.cpp \
 ///     -L$XILINX_XRT/lib -Wl,-rpath,$XILINX_XRT/lib -lxrt_coreutil
 /// ```
+///
+/// When `RLX_XDNA_SHIM` is unset, rlx builds that command itself — see
+/// [`shim_path`].
 pub fn shim_from_env() -> Option<String> {
-    let v = rlx_ir::env::var("RLX_XDNA_SHIM")?;
-    std::path::Path::new(&v).exists().then_some(v)
+    shim_path().ok()
+}
+
+/// rlx's XRT shim: `$RLX_XDNA_SHIM` when set, otherwise built once from the
+/// bundled `csrc/xrt_gemm_shim.cpp` with the host C++ compiler against the XRT
+/// runtime [`detect`] found, and cached under `$XDG_CACHE_HOME/rlx-xdna`
+/// (issue #11). `Err` says why neither worked. `RLX_XDNA_NO_SHIM_BUILD=1`
+/// disables the build.
+pub fn shim_path() -> Result<String, String> {
+    match rlx_ir::env::read("RLX_XDNA_SHIM") {
+        Ok(v) if std::path::Path::new(&v).exists() => Ok(v),
+        Ok(v) => Err(format!("RLX_XDNA_SHIM={v} does not exist")),
+        Err(_) => {
+            use std::sync::OnceLock;
+            static BUILT: OnceLock<Result<String, String>> = OnceLock::new();
+            BUILT.get_or_init(build_shim).clone()
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn build_shim() -> Result<String, String> {
+    Err("RLX_XDNA_SHIM is not set".into())
+}
+
+#[cfg(target_os = "linux")]
+fn build_shim() -> Result<String, String> {
+    use std::hash::{Hash, Hasher};
+    use std::path::{Path, PathBuf};
+    const SRC: &str = include_str!("../csrc/xrt_gemm_shim.cpp");
+    let unset = "RLX_XDNA_SHIM is not set";
+    if rlx_ir::env::flag("RLX_XDNA_NO_SHIM_BUILD") {
+        return Err(format!(
+            "{unset} (auto-build disabled by RLX_XDNA_NO_SHIM_BUILD)"
+        ));
+    }
+    let lib_dir = xrt_shim_dir()
+        .ok_or_else(|| format!("{unset}, and no XRT runtime was found to build it against"))?;
+    // Headers come from the -dev package (`libxrt-dev` on Debian/Ubuntu) or an
+    // XRT install tree; the runtime packages alone do not ship them.
+    let include = std::env::var("XILINX_XRT")
+        .ok()
+        .map(|r| format!("{r}/include"))
+        .into_iter()
+        .chain([
+            "/usr/include".to_string(),
+            "/opt/xilinx/xrt/include".to_string(),
+        ])
+        .find(|d| Path::new(d).join("xrt/xrt_device.h").exists())
+        .ok_or_else(|| {
+            format!(
+                "{unset}, and building it needs the XRT headers (xrt/xrt_device.h) — install \
+                 libxrt-dev, or set XILINX_XRT to an XRT tree with include/"
+            )
+        })?;
+    // Distro runtime packages ship only versioned sonames, which `-l` cannot
+    // name; link the file directly then.
+    let coreutil: Vec<String> = if Path::new(&lib_dir).join("libxrt_coreutil.so").exists() {
+        vec![format!("-L{lib_dir}"), "-lxrt_coreutil".into()]
+    } else {
+        let versioned = std::fs::read_dir(&lib_dir)
+            .ok()
+            .and_then(|rd| {
+                rd.flatten().map(|e| e.path()).find(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("libxrt_coreutil.so"))
+                })
+            })
+            .ok_or_else(|| format!("{unset}, and libxrt_coreutil.so* vanished from {lib_dir}"))?;
+        vec![versioned.to_string_lossy().into_owned()]
+    };
+    let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".into());
+    let mut args: Vec<String> = vec![
+        "-O2".into(),
+        "-fPIC".into(),
+        "-shared".into(),
+        "-std=c++17".into(),
+        format!("-I{include}"),
+    ];
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (SRC, &cxx, &args, &coreutil, &lib_dir).hash(&mut h);
+    let key = h.finish();
+
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("rlx-xdna");
+    let out = cache.join(format!("librlx_xdna_shim-{key:016x}.so"));
+    if out.exists() {
+        return Ok(out.to_string_lossy().into_owned());
+    }
+    std::fs::create_dir_all(&cache)
+        .map_err(|e| format!("{unset}; cannot create {}: {e}", cache.display()))?;
+    let src = cache.join(format!("xrt_gemm_shim-{key:016x}.cpp"));
+    std::fs::write(&src, SRC)
+        .map_err(|e| format!("{unset}; cannot write {}: {e}", src.display()))?;
+    // Build to a private name, then rename: a concurrent process must never
+    // dlopen a half-written library.
+    let tmp = cache.join(format!(
+        "librlx_xdna_shim-{key:016x}.so.{}",
+        std::process::id()
+    ));
+    args.push("-o".into());
+    args.push(tmp.to_string_lossy().into_owned());
+    args.push(src.to_string_lossy().into_owned());
+    args.extend(coreutil);
+    args.push(format!("-Wl,-rpath,{lib_dir}"));
+    eprintln!(
+        "[rlx-xdna] RLX_XDNA_SHIM unset — building {}",
+        out.display()
+    );
+    let output = std::process::Command::new(&cxx)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("{unset}, and running `{cxx}` to build it failed: {e} (set CXX)"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: Vec<&str> = stderr.lines().rev().take(12).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        return Err(format!(
+            "{unset}, and building it failed: `{cxx} {}`:\n{}",
+            args.join(" "),
+            tail.join("\n")
+        ));
+    }
+    std::fs::rename(&tmp, &out)
+        .map_err(|e| format!("{unset}; cannot install {}: {e}", out.display()))?;
+    Ok(out.to_string_lossy().into_owned())
 }
 
 /// `true` only when rlx can actually **execute a graph** on the NPU: the XRT
@@ -308,15 +440,13 @@ fn memlock_warning() -> Option<String> {
     }
 }
 
-/// `true` when the native mlir-aie toolchain is configured (`AIECC` + `PEANO`
-/// both set and present), so the backend can compile elementwise / softmax
+/// `true` when the native mlir-aie toolchain is available — `AIECC` + `PEANO`
+/// set, or found by [`toolchain::toolchain`] — so the backend can compile elementwise / softmax
 /// kernels **on demand** — no precompiled matmul overlay needed for those ops.
 /// The other half of [`is_available`]'s opt-in (overlay for MatMul, toolchain
 /// for the compile-on-demand op path).
 pub fn op_compile_available() -> bool {
-    env_path_problem("AIECC").is_none()
-        && env_path_problem("PEANO").is_none()
-        && toolchain_probe().is_ok()
+    toolchain::toolchain().is_ok() && toolchain_probe().is_ok()
 }
 
 /// Why env var `key` does not name an existing path (`"KEY is not set"` /
@@ -352,9 +482,8 @@ fn toolchain_probe() -> Result<(), String> {
             if rlx_ir::env::flag("RLX_XDNA_SKIP_PROBE") {
                 return Ok(());
             }
-            let (Ok(aiecc), Ok(peano)) = (std::env::var("AIECC"), std::env::var("PEANO")) else {
-                return Err("AIECC and PEANO must both be set".into());
-            };
+            let tc = toolchain::toolchain()?;
+            let (aiecc, peano) = (tc.aiecc_str(), tc.peano_str());
             let dir = std::env::temp_dir().join("rlx_xdna_probe");
             // Clear first. `compile_overlay` reports success by checking its outputs
             // exist, so a leftover `probe.xclbin` from an earlier good run makes a
@@ -370,13 +499,23 @@ fn toolchain_probe() -> Result<(), String> {
                 .map_err(|e| format!("cannot write {}: {e}", mlir.display()))?;
             let xclbin = dir.join("probe.xclbin");
             let insts = dir.join("probe_insts.bin");
+            // aiecc's scratch dir is wiped per attempt, so it must not be `dir`
+            // itself — that deleted probe.mlir before aiecc read it (issue #9).
+            let build = dir.join("build");
+            let utf8 = |p: &std::path::Path| {
+                p.to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("probe path is not UTF-8: {}", p.display()))
+            };
+            let (mlir, build, xclbin, insts) =
+                (utf8(&mlir)?, utf8(&build)?, utf8(&xclbin)?, utf8(&insts)?);
             let spec = crate::compile::OverlaySpec {
                 aiecc: &aiecc,
                 peano: &peano,
-                mlir: mlir.to_str().unwrap_or_default(),
-                tmpdir: dir.to_str().unwrap_or_default(),
-                out_xclbin: xclbin.to_str().unwrap_or_default(),
-                out_insts: insts.to_str().unwrap_or_default(),
+                mlir: &mlir,
+                tmpdir: &build,
+                out_xclbin: &xclbin,
+                out_insts: &insts,
             };
             crate::compile::compile_overlay(&spec).map(|_| ()).map_err(|e| {
             eprintln!(
@@ -425,10 +564,11 @@ pub fn overlay_problems() -> Vec<String> {
 }
 
 fn overlay_checked() -> Result<Overlay, Vec<String>> {
-    let mut problems: Vec<String> = ["RLX_XDNA_SHIM", "RLX_XDNA_XCLBIN", "RLX_XDNA_INSTS"]
+    let mut problems: Vec<String> = ["RLX_XDNA_XCLBIN", "RLX_XDNA_INSTS"]
         .into_iter()
         .filter_map(env_path_problem)
         .collect();
+    let shim = shim_path().map_err(|e| problems.push(e)).ok();
     let mkn: Option<Vec<usize>> = match rlx_ir::env::var("RLX_XDNA_GEMM") {
         None => {
             problems.push("RLX_XDNA_GEMM is not set".into());
@@ -450,7 +590,7 @@ fn overlay_checked() -> Result<Overlay, Vec<String>> {
         Some(d) if problems.is_empty() => {
             let read = |k: &str| rlx_ir::env::read(k).unwrap_or_default();
             Ok(Overlay {
-                shim: read("RLX_XDNA_SHIM"),
+                shim: shim.unwrap_or_default(),
                 xclbin: read("RLX_XDNA_XCLBIN"),
                 insts: read("RLX_XDNA_INSTS"),
                 m: d[0],
@@ -510,21 +650,16 @@ pub fn diagnostic() -> String {
                 .unwrap_or_default(),
             missing = {
                 let mut m: Vec<String> = host_blockers();
-                if let Some(why) = env_path_problem("RLX_XDNA_SHIM") {
+                if let Err(why) = shim_path() {
                     m.push(format!(
                         "RLX_XDNA_SHIM (rlx's own librlx_xdna_shim.so, built from \
                          csrc/xrt_gemm_shim.cpp — NOT libxrt_driver_xdna.so): {why}"
                     ));
                 }
                 if overlay_from_env().is_none() && !op_compile_available() {
-                    let toolchain: Vec<String> = ["AIECC", "PEANO"]
-                        .into_iter()
-                        .filter_map(env_path_problem)
-                        .collect();
-                    let toolchain = if toolchain.is_empty() {
-                        toolchain_probe().err().unwrap_or_default()
-                    } else {
-                        toolchain.join(", ")
+                    let toolchain = match toolchain::toolchain() {
+                        Err(e) => e,
+                        Ok(_) => toolchain_probe().err().unwrap_or_default(),
                     };
                     m.push(format!(
                         "a kernel path — either AIECC (native mlir_aie/bin/aiecc) + PEANO \

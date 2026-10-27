@@ -504,8 +504,44 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             (mb.max(b), ms.max(s), mh.max(h), md.max(d))
         });
     let (max_batch, max_seq, max_heads, _max_dh) = max_sdpa;
-    let max_units = max_batch * max_heads;
-    let mut sdpa_scores = vec![0f32; max_units * max_seq * max_seq];
+    let _ = (max_batch, max_seq, max_heads);
+    // Heads whose score matrix is large run row-blocked with per-worker
+    // buffers (`sdpa_row_blocked`): they need none of this up-front scratch,
+    // which for long sequences would be gigabytes zeroed on every run.
+    let sdpa_need = thunks
+        .iter()
+        .filter_map(|t| match t {
+            Thunk::Attention {
+                batch,
+                seq,
+                kv_seq,
+                heads,
+                mask_kind,
+                bhsd,
+                head_dim,
+                v_head_dim,
+                ..
+            } => {
+                let (b, q, k, h) = (
+                    *batch as usize,
+                    *seq as usize,
+                    *kv_seq as usize,
+                    *heads as usize,
+                );
+                if sdpa_row_blocked(q, k, *mask_kind, *bhsd)
+                    && sdpa_sme_blocks(q, k, *head_dim as usize, *v_head_dim as usize)
+                {
+                    Some(0)
+                } else {
+                    let s = q.max(k);
+                    Some(b * h * s * s)
+                }
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let mut sdpa_scores = vec![0f32; sdpa_need];
 
     // Pre-allocate fused layer buffers (reused across all 12+ layers — zero malloc per layer)
     let fl = thunks
@@ -552,7 +588,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     if trace_thunks {
         eprintln!(
             "[thunk] prealloc max_h={max_h} sdpa={} fl_m={fl_m} fl_h={fl_h} fl_int={fl_int}",
-            max_units * max_seq * max_seq
+            sdpa_need
         );
     }
     let profile = rlx_ir::env::var_os("RLX_PROFILE_THUNKS").is_some();
@@ -2624,6 +2660,139 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     }
                                 }
                             }
+                        }
+                    } else if sdpa_row_blocked(q_s, k_s, *mask_kind, bhsd)
+                        && sdpa_sme_blocks(q_s, k_s, dh, dh_v)
+                    {
+                        // ── Row-blocked path (long sequences, SME2) ──
+                        // One task per (batch, head): Kᵀ and V packed once,
+                        // then blocks of query rows whose scores stay
+                        // cache-sized (instead of a q_s×k_s matrix per head).
+                        // Each product is the SME kernel's sequential FMA per
+                        // element, so this equals the strided path bit for bit.
+                        #[cfg(rlx_cpu_amx_sme)]
+                        {
+                            use crate::intrinsics::apple_amx::sme::{
+                                PackedB, StridedMat, pack_b, sme_sgemm_packed_with,
+                            };
+                            let bq = sdpa_row_block(q_s, k_s);
+                            let n_qb = q_s.div_ceil(bq);
+                            let q_addr = q_data.as_ptr() as usize;
+                            let k_addr = k_data.as_ptr() as usize;
+                            let v_addr = v_data.as_ptr() as usize;
+                            let m_addr = mask_data.as_ptr() as usize;
+                            let o_addr = out_data.as_mut_ptr() as usize;
+                            // 1. Kᵀ and V of every (batch, KV head), packed once.
+                            let n_kv = b * nkv;
+                            let mut packed: Vec<Option<(PackedB, PackedB)>> =
+                                (0..n_kv).map(|_| None).collect();
+                            let pk_addr = packed.as_mut_ptr() as usize;
+                            crate::pool::par_for(n_kv, 1, &|off, cnt| {
+                                for j in off..off + cnt {
+                                    let (bi, kv_hi) = (j / nkv, j % nkv);
+                                    let k_start =
+                                        (k_addr as *const f32).add(bi * k_s * krs + kv_hi * dh);
+                                    let v_start =
+                                        (v_addr as *const f32).add(bi * k_s * vrs + kv_hi * dh_v);
+                                    // B for Q·Kᵀ is Kᵀ (dh × k_s); B for S·V is V (k_s × dh_v)
+                                    let kp = pack_b(
+                                        dh,
+                                        k_s,
+                                        StridedMat {
+                                            ptr: k_start,
+                                            rs: 1,
+                                            cs: krs,
+                                        },
+                                    );
+                                    let vp = pack_b(
+                                        k_s,
+                                        dh_v,
+                                        StridedMat {
+                                            ptr: v_start,
+                                            rs: vrs,
+                                            cs: 1,
+                                        },
+                                    );
+                                    // SAFETY: slot j is written by this task only.
+                                    *(pk_addr as *mut Option<(PackedB, PackedB)>).add(j) =
+                                        Some((kp, vp));
+                                }
+                            });
+                            let packed_ref: &[Option<(PackedB, PackedB)>] = &packed;
+                            // 2. Every (batch, head, query block) as one flat parallel loop;
+                            //    each product on its task's thread.
+                            crate::pool::par_for(b * nh * n_qb, 1, &|off, cnt| {
+                                let mut sc = vec![0f32; bq * k_s];
+                                for idx in off..off + cnt {
+                                    let qb = idx % n_qb;
+                                    let bh = idx / n_qb;
+                                    let (bi, hi) = (bh / nh, bh % nh);
+                                    let (kp, vp) =
+                                        packed_ref[bi * nkv + hi / group].as_ref().unwrap();
+                                    let q0 = qb * bq;
+                                    let rows = bq.min(q_s - q0);
+                                    let sc = &mut sc[..rows * k_s];
+                                    let q_start = (q_addr as *const f32)
+                                        .add(bi * q_s * qrs + q0 * qrs + hi * dh);
+                                    let o_start = (o_addr as *mut f32)
+                                        .add(bi * q_s * hs_v + q0 * hs_v + hi * dh_v);
+                                    sme_sgemm_packed_with(
+                                        1,
+                                        rows,
+                                        StridedMat {
+                                            ptr: q_start,
+                                            rs: qrs,
+                                            cs: 1,
+                                        },
+                                        kp,
+                                        sc.as_mut_ptr(),
+                                        k_s,
+                                        scale,
+                                        0.0,
+                                    );
+                                    match mask_kind {
+                                        rlx_ir::op::MaskKind::Custom => {
+                                            let mask_bi = std::slice::from_raw_parts(
+                                                (m_addr as *const f32).add(bi * k_s),
+                                                k_s,
+                                            );
+                                            for ki in 0..k_s {
+                                                if mask_bi[ki] < mask_thr {
+                                                    for qi in 0..rows {
+                                                        sc[qi * k_s + ki] = mask_neg;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        rlx_ir::op::MaskKind::Bias => {
+                                            let bias = std::slice::from_raw_parts(
+                                                (m_addr as *const f32)
+                                                    .add((bi * nh + hi) * q_s * k_s + q0 * k_s),
+                                                rows * k_s,
+                                            );
+                                            for i in 0..rows * k_s {
+                                                sc[i] += bias[i];
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    crate::kernels::neon_softmax(sc, rows, k_s);
+                                    sme_sgemm_packed_with(
+                                        1,
+                                        rows,
+                                        StridedMat {
+                                            ptr: sc.as_ptr(),
+                                            rs: k_s,
+                                            cs: 1,
+                                        },
+                                        vp,
+                                        o_start,
+                                        hs_v,
+                                        1.0,
+                                        0.0,
+                                    );
+                                }
+                            });
                         }
                     } else {
                         // ── Parallel strided BLAS path (high throughput) ──
@@ -4744,6 +4913,60 @@ unsafe fn dot8_avx(q: &[f32], rows: [&[f32]; 8]) -> [f32; 8] {
 pub(crate) fn exec_nop(t: &Thunk) {
     let Thunk::Nop = t else { unreachable!() };
     {}
+}
+
+/// Score-matrix size above which an attention head runs row-blocked
+/// (`RLX_SDPA_BLOCK_MIN`, default 4M floats = 16 MB): every mask that needs
+/// no query position (none, per-key `Custom`, additive `Bias`), `[B, S, H, D]`.
+pub(crate) fn sdpa_row_blocked(
+    q_s: usize,
+    k_s: usize,
+    mask: rlx_ir::op::MaskKind,
+    bhsd: bool,
+) -> bool {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let min = *MIN.get_or_init(|| {
+        rlx_ir::env::var("RLX_SDPA_BLOCK_MIN")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1 << 22)
+    });
+    !bhsd
+        && q_s.saturating_mul(k_s) > min
+        && matches!(
+            mask,
+            rlx_ir::op::MaskKind::None | rlx_ir::op::MaskKind::Custom | rlx_ir::op::MaskKind::Bias
+        )
+}
+
+/// Query rows per block: ~2M scores (8 MB), a multiple of 32 (the SME tile).
+/// Only the SME row-blocked attention path uses it.
+#[cfg(rlx_cpu_amx_sme)]
+pub(crate) fn sdpa_row_block(q_s: usize, k_s: usize) -> usize {
+    let rows = ((1usize << 21) / k_s.max(1)).max(32) / 32 * 32;
+    rows.clamp(32, q_s.max(1))
+}
+
+/// The row-blocked attention path runs on SME2 (packed Kᵀ / V reused across
+/// blocks): only when that route is compiled in, enabled, and takes both
+/// products at block size — so it is also what the per-head path would use.
+/// (Re-packing per block through a generic GEMM was measured 1.5× slower than
+/// the per-head path on V-JEPA2-giant.)
+pub(crate) fn sdpa_sme_blocks(q_s: usize, k_s: usize, dh: usize, dh_v: usize) -> bool {
+    #[cfg(all(rlx_cpu_amx_sme, not(rlx_cpu_blas)))]
+    {
+        use crate::intrinsics::apple_amx::sme::{dispatch_enabled, worth_sme};
+        let bq = sdpa_row_block(q_s, k_s);
+        dispatch_enabled()
+            && worth_sme(bq, dh, k_s)
+            && worth_sme(bq, k_s, dh_v)
+            && worth_sme(q_s, dh, k_s)
+            && worth_sme(q_s, k_s, dh_v)
+    }
+    #[cfg(not(all(rlx_cpu_amx_sme, not(rlx_cpu_blas))))]
+    {
+        let _ = (q_s, k_s, dh, dh_v);
+        false
+    }
 }
 
 #[cfg(test)]

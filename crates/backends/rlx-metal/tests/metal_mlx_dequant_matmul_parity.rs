@@ -31,7 +31,11 @@ fn assert_close(cpu: &[f32], gpu: &[f32], label: &str) {
 }
 
 fn run_affine(m: usize, k: usize, n: usize, bits: u8, group_size: u32) {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -91,7 +95,11 @@ fn run_affine(m: usize, k: usize, n: usize, bits: u8, group_size: u32) {
 }
 
 fn run_mxfp(m: usize, k: usize, n: usize, group_size: u32, mxfp8: bool) {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }

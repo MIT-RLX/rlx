@@ -20,7 +20,7 @@
 use anyhow::{Context, Result, bail};
 use rlx_driver::{DEFAULT_HEAP_BYTES, ProcessGroup, TcpTransport, ThunderboltTransport, Transport};
 use serde::{Deserialize, Serialize};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -137,10 +137,7 @@ impl Hostfile {
             .iter()
             .enumerate()
             .map(|(r, h)| {
-                h.to_socket_addrs()
-                    .with_context(|| format!("resolving host[{r}] = {h:?}"))?
-                    .next()
-                    .with_context(|| format!("host[{r}] = {h:?} resolved to no address"))
+                rlx_driver::resolve_addr(h).with_context(|| format!("resolving host[{r}] = {h:?}"))
             })
             .collect()
     }

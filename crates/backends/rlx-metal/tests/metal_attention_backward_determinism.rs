@@ -100,7 +100,11 @@ fn check(b: usize, h: usize, s: usize, d: usize, causal: bool) {
 
 #[test]
 fn attention_backward_is_reproducible() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -158,7 +162,11 @@ fn run_norm_backward(b: usize, s: usize, h: usize, layer_norm: bool) -> Vec<Vec<
 /// the odd element at every level.
 #[test]
 fn norm_backwards_are_reproducible() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }

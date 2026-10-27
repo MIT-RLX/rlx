@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Native INT8 `Op::Quantize` / `Op::Dequantize` / `Op::QMatMul` / `Op::QConv2d`
-//! on wgpu vs the rlx-cpu oracle.
+//! on wgpu (and CUDA / ROCm when present) vs the rlx-cpu reference.
 //!
 //! All four took the generic CPU host route on wgpu. The kernels are ported
 //! from Vulkan's, with both of that port's bugs already fixed: the affine table
@@ -67,6 +67,17 @@ fn both(what: &str, build: impl Fn() -> Graph, inputs: &[(&str, &[u8], DType)]) 
         gpu, cpu,
         "{what}: wgpu != cpu\n  gpu={gpu:?}\n  cpu={cpu:?}"
     );
+    // CUDA and ROCm run the shared kernels these ports came from (and take
+    // their byte offsets as 32-bit): hold them to the same exact gate.
+    for d in [Device::Cuda, Device::Rocm] {
+        if rlx_runtime::available_devices().contains(&d) {
+            let got = run(d);
+            assert_eq!(
+                got, cpu,
+                "{what}: {d:?} != cpu\n  got={got:?}\n  cpu={cpu:?}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

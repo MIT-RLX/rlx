@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![cfg(target_os = "macos")]
+
 //! **A run of this suite that never touched the GPU must not report `ok`.**
 //!
 //! Every other test in this crate skips when the device is missing, which is
@@ -21,7 +23,11 @@
 
 #[test]
 fn the_device_this_crate_targets_is_actually_present() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_metal::is_available(),
+    ) {
         return;
     }
     eprintln!("metal: device present — the suite's skips are genuine skips");

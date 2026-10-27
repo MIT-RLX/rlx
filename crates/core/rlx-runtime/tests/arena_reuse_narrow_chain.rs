@@ -359,7 +359,7 @@ fn run_ladder(device: Device) {
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn narrow_sum_slot_reuse_metal() {
     let _gpu = common::serialize_gpu();

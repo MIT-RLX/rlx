@@ -480,15 +480,27 @@ impl CompiledGraph {
         data: &[f32],
     ) -> Result<(), crate::io_check::IoError> {
         if let Some(io) = self.io.as_ref() {
-            io.check_param_len(name, data.len())?;
+            let elems = if self.df_param(name) {
+                data.len() * 2
+            } else {
+                data.len()
+            };
+            io.check_param_len(name, elems)?;
         }
         self.set_param(name, data);
         Ok(())
     }
 
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
+        // A double-single param's declared shape carries the (hi, lo) pair
+        // axis; the caller uploads one value per f64 element.
+        let elems = if self.df_param(name) {
+            data.len() * 2
+        } else {
+            data.len()
+        };
         if let Some(io) = self.io.as_mut()
-            && let Err(e) = io.note_param(name, Some(data.len()))
+            && let Err(e) = io.note_param(name, Some(elems))
         {
             panic!("{e}");
         }
@@ -634,12 +646,24 @@ impl CompiledGraph {
 
     /// Async WebGPU execution on wasm (non-blocking GPU→CPU readback).
     /// WebGL and CPU backends fall back to synchronous [`Self::run`].
+    ///
+    /// Same contract as [`Self::run`]: params passed as inputs are uploaded,
+    /// the inputs are checked, staged weights are prepared and fed, and a
+    /// [tap](crate::taps)'s outputs are stripped and handed to it. (This used
+    /// to forward the inputs straight to the backend, so in the browser a
+    /// tapped graph never reported its pre-head features and every exgb
+    /// frozen-encoder trial embedded to the same vector.)
     #[cfg(target_arch = "wasm32")]
     pub async fn run_async(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>, String> {
-        match self.device {
-            Device::WebGpu | Device::Gpu => self.inner.wgpu_run_async(inputs, None).await,
-            _ => Ok(self.run(inputs)),
+        if !matches!(self.device, Device::WebGpu | Device::Gpu) {
+            return Ok(self.run(inputs));
         }
+        let inputs = self
+            .upload_param_inputs(inputs)
+            .map_err(|e| e.to_string())?;
+        self.check_f32_run(&inputs).map_err(|e| e.to_string())?;
+        let outs = self.run_staged_async(&inputs, None).await?;
+        Ok(crate::taps::on_run(outs, self.tap_extra))
     }
 
     /// [`Self::run_read_outputs`] on wasm WebGPU: reads back only
@@ -653,9 +677,66 @@ impl CompiledGraph {
         read_indices: Option<&[usize]>,
     ) -> Result<Vec<Vec<f32>>, String> {
         match self.device {
-            Device::WebGpu | Device::Gpu => self.inner.wgpu_run_async(inputs, read_indices).await,
+            Device::WebGpu | Device::Gpu => self.run_staged_async(inputs, read_indices).await,
             _ => Ok(self.run_read_outputs(inputs, read_indices)),
         }
+    }
+
+    /// The async WebGPU run with staged weights fed as [`Self::run_read_outputs`]
+    /// feeds them.
+    #[cfg(target_arch = "wasm32")]
+    async fn run_staged_async(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        read_indices: Option<&[usize]>,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        if self.df.is_some()
+            || inputs
+                .iter()
+                .any(|(n, _)| self.narrow_boundary(n).is_some())
+        {
+            return Err(
+                "WebGPU wasm runs f32 input boundaries only; this graph declares an \
+                        F16/BF16 input or a dataflow schedule — run it on the CPU"
+                    .to_string(),
+            );
+        }
+        self.ensure_prepared_async().await?;
+        match self.staging.as_ref() {
+            Some(st) if !st.bound => {
+                let mut merged: Vec<(&str, &[f32])> =
+                    Vec::with_capacity(inputs.len() + st.boundary.len());
+                merged.extend_from_slice(inputs);
+                for (name, vals) in st.boundary.iter().zip(st.values.iter()) {
+                    merged.push((name.as_str(), vals.as_slice()));
+                }
+                self.inner.wgpu_run_async(&merged, read_indices).await
+            }
+            _ => self.inner.wgpu_run_async(inputs, read_indices).await,
+        }
+    }
+
+    /// [`Self::ensure_prepared`] with the prepare graph's run awaited.
+    #[cfg(target_arch = "wasm32")]
+    async fn ensure_prepared_async(&mut self) -> Result<(), String> {
+        let Some(st) = self.staging.as_mut() else {
+            return Ok(());
+        };
+        if st.prepared {
+            return Ok(());
+        }
+        st.prepare.finalize_params();
+        let outs = Box::pin(st.prepare.run_async(&[])).await?;
+        let mut all_bound = !outs.is_empty();
+        for (name, out) in st.boundary.iter().zip(outs.iter()) {
+            if !self.inner.bind_handle(name, out) {
+                all_bound = false;
+            }
+        }
+        st.bound = all_bound;
+        st.values = if all_bound { Vec::new() } else { outs };
+        st.prepared = true;
+        Ok(())
     }
 
     /// Run and read back only selected outputs (logits-only decode on MLX).

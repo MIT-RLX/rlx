@@ -193,10 +193,10 @@ pub fn miopen_has_kernels() -> bool {
     }
 
     let mut roots: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(dir) = rlx_ir::env::var("MIOPEN_SYSTEM_DB_PATH") {
+    if let Ok(dir) = std::env::var("MIOPEN_SYSTEM_DB_PATH") {
         roots.push(std::path::PathBuf::from(dir));
     }
-    if let Some(rocm) = rlx_ir::env::var("ROCM_PATH") {
+    if let Ok(rocm) = std::env::var("ROCM_PATH") {
         roots.push(std::path::Path::new(&rocm).join("share/miopen/db"));
     }
     roots.push(std::path::PathBuf::from("/opt/rocm/share/miopen/db"));

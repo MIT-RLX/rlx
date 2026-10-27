@@ -75,20 +75,46 @@ impl Eltwise {
             Eltwise::Relu => "relu",
         }
     }
-    /// MLIR binding `out` = op(`inp`) on a `vector<VEC x i32>` (the AIE2 vector
-    /// unit processes 16 i32 lanes per instruction); `k` disambiguates temporaries
-    /// so several ops can be chained (fused) in one vectorized core body.
-    fn core_expr_named(&self, inp: &str, out: &str, k: usize) -> String {
+    /// MLIR binding `out` = op(`inp`) on `lanes` i32 — a `vector<lanes x i32>`
+    /// (the AIE2 vector unit processes 16 i32 lanes per instruction), or a
+    /// scalar when `lanes == 1`; `k` disambiguates temporaries so several ops
+    /// can be chained (fused) in one core body.
+    fn core_expr_named(&self, inp: &str, out: &str, k: usize, lanes: usize) -> String {
+        let vt = v_type("i32", lanes);
         match self {
-            Eltwise::AddScalar(s) => format!(
-                "          %cs{k} = arith.constant {s} : i32\n          %vs{k} = vector.broadcast %cs{k} : i32 to vector<{VEC}xi32>\n          {out} = arith.addi {inp}, %vs{k} : vector<{VEC}xi32>\n"
-            ),
-            Eltwise::MulScalar(s) => format!(
-                "          %cs{k} = arith.constant {s} : i32\n          %vs{k} = vector.broadcast %cs{k} : i32 to vector<{VEC}xi32>\n          {out} = arith.muli {inp}, %vs{k} : vector<{VEC}xi32>\n"
-            ),
-            Eltwise::Relu => format!(
-                "          %vz{k} = arith.constant dense<0> : vector<{VEC}xi32>\n          {out} = arith.maxsi {inp}, %vz{k} : vector<{VEC}xi32>\n"
-            ),
+            Eltwise::AddScalar(s) | Eltwise::MulScalar(s) => {
+                let op = if matches!(self, Eltwise::AddScalar(_)) {
+                    "arith.addi"
+                } else {
+                    "arith.muli"
+                };
+                if lanes > 1 {
+                    format!(
+                        "          %cs{k} = arith.constant {s} : i32\n          %vs{k} = vector.broadcast %cs{k} : i32 to {vt}\n          {out} = {op} {inp}, %vs{k} : {vt}\n"
+                    )
+                } else {
+                    format!(
+                        "          %vs{k} = arith.constant {s} : i32\n          {out} = {op} {inp}, %vs{k} : i32\n"
+                    )
+                }
+            }
+            Eltwise::Relu => {
+                let zero = if lanes > 1 { "dense<0>" } else { "0" };
+                format!(
+                    "          %vz{k} = arith.constant {zero} : {vt}\n          {out} = arith.maxsi {inp}, %vz{k} : {vt}\n"
+                )
+            }
+        }
+    }
+    /// Lanes a chain of `ops` runs at: [`VEC`], unless it multiplies — Peano's
+    /// `llc` can't legalize a `<16 x i32>` multiply ("unable to legalize
+    /// instruction … G_MUL"), so a chain with `MulScalar` runs scalar, like
+    /// [`BinaryOp::Mul`] in [`emit_binary`].
+    fn chain_lanes(ops: &[Eltwise]) -> usize {
+        if ops.iter().any(|o| matches!(o, Eltwise::MulScalar(_))) {
+            1
+        } else {
+            VEC
         }
     }
     /// Apply on the host (CPU reference for validation).
@@ -127,15 +153,17 @@ pub fn emit_eltwise_chain(n: usize, chunk: usize, ops: &[Eltwise]) -> String {
         "chunk ({chunk}) must be a multiple of the vector width ({VEC})"
     );
     assert!(!ops.is_empty(), "need at least one op");
+    let lanes = Eltwise::chain_lanes(ops);
     // Thread the value through the chain: %v0 = load; op0 → %v1; op1 → %v2; …
     let mut expr = String::new();
     let mut cur = "%v0".to_string();
     for (k, op) in ops.iter().enumerate() {
         let next = format!("%v{}", k + 1);
-        expr += &op.core_expr_named(&cur, &next, k);
+        expr += &op.core_expr_named(&cur, &next, k, lanes);
         cur = next;
     }
-    let store_ssa = cur;
+    let load = v_load("i32", lanes, "%v0", "%in", chunk);
+    let store = v_store("i32", lanes, &cur, "%out", chunk);
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
@@ -155,11 +183,9 @@ pub fn emit_eltwise_chain(n: usize, chunk: usize, ops: &[Eltwise]) -> String {
         %out = aie.objectfifo.subview.access %out_sv[0] : !aie.objectfifosubview<memref<{chunk}xi32>> -> memref<{chunk}xi32>
         %lo = arith.constant 0 : index
         %hi = arith.constant {chunk} : index
-        %st = arith.constant {VEC} : index
+        %st = arith.constant {lanes} : index
         scf.for %i = %lo to %hi step %st {{
-          %v0 = vector.load %in[%i] : memref<{chunk}xi32>, vector<{VEC}xi32>
-{expr}          vector.store {store_ssa}, %out[%i] : memref<{chunk}xi32>, vector<{VEC}xi32>
-        }}
+{load}{expr}{store}        }}
         aie.objectfifo.release @in0(Consume, 1)
         aie.objectfifo.release @out0(Produce, 1)
       }}
@@ -349,15 +375,17 @@ pub fn emit_eltwise_multicol(n: usize, chunk: usize, cols: usize, ops: &[Eltwise
     );
     assert!(!ops.is_empty());
 
-    // Shared per-element (vectorized) op chain.
+    // Shared per-element op chain.
+    let lanes = Eltwise::chain_lanes(ops);
     let mut expr = String::new();
     let mut cur = "%v0".to_string();
     for (k, op) in ops.iter().enumerate() {
         let next = format!("%v{}", k + 1);
-        expr += &op.core_expr_named(&cur, &next, k);
+        expr += &op.core_expr_named(&cur, &next, k, lanes);
         cur = next;
     }
-    let store_ssa = cur;
+    let load = v_load("i32", lanes, "%v0", "%in", chunk);
+    let store = v_store("i32", lanes, &cur, "%out", chunk);
 
     let mut tiles = String::new();
     let mut fifos = String::new();
@@ -385,11 +413,9 @@ pub fn emit_eltwise_multicol(n: usize, chunk: usize, cols: usize, ops: &[Eltwise
         %out = aie.objectfifo.subview.access %osv[0] : !aie.objectfifosubview<memref<{chunk}xi32>> -> memref<{chunk}xi32>
         %lo = arith.constant 0 : index
         %hi = arith.constant {chunk} : index
-        %st = arith.constant {VEC} : index
+        %st = arith.constant {lanes} : index
         scf.for %i = %lo to %hi step %st {{
-          %v0 = vector.load %in[%i] : memref<{chunk}xi32>, vector<{VEC}xi32>
-{expr}          vector.store {store_ssa}, %out[%i] : memref<{chunk}xi32>, vector<{VEC}xi32>
-        }}
+{load}{expr}{store}        }}
         aie.objectfifo.release @in{c}(Consume, 1)
         aie.objectfifo.release @out{c}(Produce, 1)
       }}
@@ -1313,10 +1339,9 @@ impl BinaryOp {
     /// back to a scalar core (still correct, just 1-lane). Float (bf16) mul/div DO
     /// vectorize on the native bf16 FPU, so this gate is i32-specific.
     ///
-    /// NOTE: `Shr` (arith.shrsi) is scalar here and additionally *deviates* on the
-    /// AIE2 for negative operands — the hardware arithmetic right-shift rounds
-    /// toward zero (`-125>>1 = -62`), not toward −∞ (`-63`). Fine for the usual
-    /// non-negative bit-manipulation use; a caveat for signed data.
+    /// NOTE: `Shr` is scalar here, and AIE2's `arith.shrsi` rounds toward zero
+    /// for negative operands (`-125>>1 = -62`), so [`emit_binary`] lowers it as a
+    /// sign-aware pair of logical shifts that rounds toward −∞ like the CPU.
     fn i32_vectorizable(&self) -> bool {
         matches!(
             self,
@@ -1406,11 +1431,28 @@ pub fn emit_binary(op: BinaryOp, ty: Ty, n: usize, chunk: usize) -> String {
     );
     let t = ty.mlir();
     let step = lanes;
-    let expr = format!(
-        "          %vo = {} %va, %vb : {}\n",
-        op.opcode(ty),
-        v_type(t, lanes)
-    );
+    let expr = if op == BinaryOp::Shr && ty == Ty::I32 {
+        // Arithmetic right shift rounds toward −∞ (Rust `>>`, the CPU backend),
+        // but AIE2's `arith.shrsi` rounds toward zero for negative operands
+        // (`-125 >> 1` gave -62, not -63). For a < 0, `a >> b == !((!a) >>> b)`,
+        // and a logical shift of a non-negative value rounds the same every way
+        // — so this stays right whatever the hardware does with `shrsi`.
+        "          %sh_m1 = arith.constant -1 : i32\n\
+         \x20         %sh_z = arith.constant 0 : i32\n\
+         \x20         %sh_pos = arith.shrui %va, %vb : i32\n\
+         \x20         %sh_na = arith.xori %va, %sh_m1 : i32\n\
+         \x20         %sh_nq = arith.shrui %sh_na, %vb : i32\n\
+         \x20         %sh_neg = arith.xori %sh_nq, %sh_m1 : i32\n\
+         \x20         %sh_isneg = arith.cmpi slt, %va, %sh_z : i32\n\
+         \x20         %vo = arith.select %sh_isneg, %sh_neg, %sh_pos : i32\n"
+            .to_string()
+    } else {
+        format!(
+            "          %vo = {} %va, %vb : {}\n",
+            op.opcode(ty),
+            v_type(t, lanes)
+        )
+    };
     let load_a = v_load(t, lanes, "%va", "%A", chunk);
     let load_b = v_load(t, lanes, "%vb", "%B", chunk);
     let store = v_store(t, lanes, "%vo", "%O", chunk);
@@ -3697,6 +3739,23 @@ pub fn emit_gather(outer: usize, in_axis: usize, inner: usize, num_idx: usize) -
 
 #[cfg(test)]
 mod tests {
+
+    /// Peano can't legalize a 16-lane i32 multiply, so a chain that multiplies
+    /// runs scalar; one that doesn't stays vectorized.
+    #[test]
+    fn eltwise_chain_runs_scalar_only_when_it_multiplies() {
+        let fused = emit_eltwise_chain(
+            4096,
+            2048,
+            &[Eltwise::MulScalar(3), Eltwise::AddScalar(5), Eltwise::Relu],
+        );
+        assert!(fused.contains("memref.load %in[%i]") && !fused.contains("vector<"));
+        assert!(fused.contains("arith.muli %v0, %vs0 : i32"));
+        let relu = emit_eltwise(4096, 2048, Eltwise::Relu);
+        assert!(relu.contains("vector.load %in[%i] : memref<2048xi32>, vector<16xi32>"));
+        let multi = emit_eltwise_multicol(8192, 2048, 2, &[Eltwise::MulScalar(2)]);
+        assert!(multi.contains("step %st") && !multi.contains("vector<"));
+    }
 
     /// What the vendor `matmul_bf16_f32` does to one core's tiles: `C += A·B` over
     /// 4×8 A / 8×4 B subtiles, writing 4×4 C subtiles (all row-major tile order).

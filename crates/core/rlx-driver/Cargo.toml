@@ -17,6 +17,8 @@ half = "2"
 # Zero-config LAN discovery (Bonjour/Avahi-compatible mDNS-SD), opt-in: the
 # unicast rendezvous path needs no extra deps, so keep this off by default.
 mdns-sd = { version = "0.13", optional = true }
+webbluetooth = { version = "0.0.4", optional = true }
+futures-executor = { version = "0.3", optional = true }
 # Optional pure-Rust MPI backend — the C-free `mpi-rs` crate (lib name `mpi`,
 # rsmpi-compatible API). Off by default so the native `NetTransport` stays the
 # zero-dep path. Published as `mpi-rs` (the bare `mpi` name is rsmpi's); code
@@ -34,6 +36,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util"
 default = []
 # mDNS-SD service discovery for `Node` (advertise/browse `_rlx-coord._udp`).
 mdns = ["dep:mdns-sd"]
+# A TCP link carried over Bluetooth LE L2CAP (`ble::serve` / `ble::bridge`).
+ble = ["dep:webbluetooth", "dep:futures-executor"]
 # Route RLX collectives over the pure-Rust MPI backend (`MpiTransport`), reusing
 # MPI process bootstrap (mpirun/mpiexec) instead of manually wiring TCP peers.
 mpi = ["dep:mpi"]

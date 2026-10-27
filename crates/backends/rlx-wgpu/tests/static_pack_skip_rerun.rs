@@ -69,6 +69,9 @@ fn wave(n: usize, f: f32, a: f32) -> Vec<f32> {
 
 #[test]
 fn skipped_weight_pack_does_not_drop_deferred_host_writes() {
+    // Pin f32 matmul: the f16 opt-in (`RLX_WGPU_COOP_F16_VK_ENABLE`) gives up
+    // the 1e-5 agreement with CPU this file checks.
+    rlx_ir::env::remove("RLX_WGPU_COOP_F16_VK_ENABLE");
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         eprintln!("skip: wgpu unavailable");
         return;

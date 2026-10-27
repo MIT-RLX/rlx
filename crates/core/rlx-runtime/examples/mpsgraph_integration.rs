@@ -39,9 +39,9 @@ fn main() {
 
     let run_with = |use_mpsgraph: bool| -> Vec<f32> {
         if use_mpsgraph {
-            rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
+            rlx_ir::env::set("RLX_MPSGRAPH_FORCE", "1");
         } else {
-            rlx_ir::env::unset("RLX_USE_MPSGRAPH");
+            rlx_ir::env::unset("RLX_MPSGRAPH_FORCE");
         }
         let session = Session::new(Device::Metal);
         let mut compiled = session.compile(build());

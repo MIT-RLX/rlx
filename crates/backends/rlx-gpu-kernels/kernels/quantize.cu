@@ -38,7 +38,12 @@ extern "C" __global__ void quantize_i8(
     int zp = (int)affine[2u * c + 1u];
     float inv = 1.0f / s;
     float scaled = arena[in_off + i] * inv;
-    int v = (int)round_half_away(scaled) + zp;
+    // Clamp before the cast: float→int of an out-of-range value is undefined
+    // (NVIDIA gives INT_MIN, so 1e30 quantized to -128). Rust's `as i32`
+    // saturates and sends NaN to 0; ±1024 is far past any code after zp.
+    float r = round_half_away(scaled);
+    r = (r != r) ? 0.0f : fminf(fmaxf(r, -1024.0f), 1024.0f);
+    int v = (int)r + zp;
     if (v < -128) v = -128;
     if (v > 127) v = 127;
     signed char* q = reinterpret_cast<signed char*>(arena) + q_byte_off;

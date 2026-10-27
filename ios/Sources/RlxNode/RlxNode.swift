@@ -33,6 +33,13 @@ public enum RlxNode {
         case infer
         /// Join a data-parallel training run; **not** stoppable partway.
         case train
+        /// Be a `dist_node MODE=trainserve` worker for a cluster-options job
+        /// (`rlx-vision-bench --coordinate --cluster`); **not** stoppable partway.
+        case trainserve
+        /// Serve whatever a `dist_node MODE=model` coordinator ships — a
+        /// package function's pipeline stage, or its training. Needs the
+        /// node built with `--model` (`build-xcframework.sh --apple --model`).
+        case model
     }
 
     public struct Error: Swift.Error, CustomStringConvertible {
@@ -86,6 +93,17 @@ public enum RlxNode {
         return String(cString: p)
     }
 
+    /// What this node advertises (`_rlx-node._tcp` TXT records): platform,
+    /// devices, version — the same keys a desktop node publishes.
+    public static var advert: [String: String] {
+        var out: [String: String] = [:]
+        for line in read(rlx_node_advert).split(separator: "\n") {
+            let kv = line.split(separator: "=", maxSplits: 1)
+            if kv.count == 2 { out[String(kv[0])] = String(kv[1]) }
+        }
+        return out
+    }
+
     /// Ask the node to leave the mesh after its current activation.
     ///
     /// Cooperative: a node parked in `recv` exits when its peer sends or the
@@ -102,5 +120,49 @@ public enum RlxNode {
         let n = buf.withUnsafeMutableBufferPointer { f($0.baseAddress, $0.count) }
         guard n >= 0 else { return "" }
         return String(cString: buf)
+    }
+}
+
+/// Advertises this device as an RLX node over Bonjour (`_rlx-node._tcp`), so
+/// `cargo rlx nodes` lists it and a cluster file can name it (`addr = "mdns"`).
+///
+/// Network.framework-era Bonjour through `NetService`: publishing a record
+/// needs no listening socket (the node opens its own when it joins) and no
+/// multicast entitlement — only `_rlx-node._tcp` in `NSBonjourServices`.
+public final class RlxAdvertiser: NSObject, NetServiceDelegate {
+    private var service: NetService?
+    /// The publish outcome, for a shell to show or log.
+    public private(set) var state = "idle"
+    public var onChange: ((String) -> Void)?
+
+    public override init() {}
+
+    public func netServiceDidPublish(_ sender: NetService) {
+        state = "published as \(sender.name)"
+        onChange?(state)
+    }
+
+    public func netService(_ sender: NetService, didNotPublish errorDict: [String: NSNumber]) {
+        state = "not published: \(errorDict)"
+        onChange?(state)
+    }
+
+    /// Publish `name` (Bonjour renames on a clash) taking traffic on `port`.
+    public func start(name: String, port: Int32, extra: [String: String] = [:]) {
+        stop()
+        var txt = RlxNode.advert.merging(extra) { _, new in new }
+        txt["mem_gb"] = txt["mem_gb"]
+            ?? String(Int((Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824).rounded()))
+        let s = NetService(domain: "local.", type: "_rlx-node._tcp.", name: name, port: port)
+        s.setTXTRecord(NetService.data(fromTXTRecord: txt.mapValues { Data($0.utf8) }))
+        s.delegate = self
+        s.schedule(in: .main, forMode: .common)
+        s.publish()
+        service = s
+    }
+
+    public func stop() {
+        service?.stop()
+        service = nil
     }
 }

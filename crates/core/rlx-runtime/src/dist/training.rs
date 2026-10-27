@@ -82,6 +82,16 @@ pub struct TrainSpec {
     /// node-locally (shared FS / pre-staged data).
     #[serde(default)]
     pub push_data: bool,
+    /// Cluster options (accumulation, wire dtype, overlap, balance, local SGD,
+    /// ZeRO-1, checkpoints). `Some` selects [`super::run_train_group`] on the
+    /// worker; `None` is the options-free [`run_train`] loop.
+    #[serde(default)]
+    pub options: Option<super::TrainOptions>,
+    /// Params the graph reads but does not train (a LoRA's base, a frozen
+    /// backbone): bound once, never updated. Resolved like `params`; with
+    /// `push_data`, rank 0 sends them. Read by [`super::run_train_group`].
+    #[serde(default)]
+    pub frozen: Vec<WeightRef>,
 }
 
 /// Per-worker training result.
@@ -102,6 +112,22 @@ pub struct TrainMetrics {
     pub comm_s: f64,
     pub first_loss: f32,
     pub last_loss: f32,
+    /// Time spent uploading parameters to the device (slowest lane).
+    pub upload_s: f64,
+    /// Gradient (or parameter-averaging) syncs completed.
+    pub syncs: usize,
+    /// Micro-batches per sync on this rank.
+    pub micro_steps: usize,
+    /// Gradient wire width actually used (`Auto` resolved).
+    pub wire: String,
+    /// Bytes this rank sent in reduces (ring: 2·(n−1)/n of each buffer).
+    pub wire_bytes: u64,
+    /// Mean relative RMS error of rounding the gradient bucket to the wire
+    /// width, per sync (0 for f32).
+    pub wire_rel_err: f64,
+    /// Syncs whose reduced gradient was not finite, so their update was
+    /// skipped (and the loss scale halved).
+    pub skipped: usize,
 }
 
 /// Coordinator: ship a training job to worker `rank`.
@@ -202,29 +228,67 @@ pub fn pull_shards(
     Ok(())
 }
 
-/// Pick this node's training lanes. `device:"all"` fans the backward out over
-/// **every live local backend at once** — intra-node data parallelism, so the
-/// CPU trains alongside the GPU on each connected node instead of sitting idle;
-/// any other directive is a single lane. ANE is excluded (its training path is a
-/// separate gated route).
+/// Pick this node's training lanes.
 ///
-/// This is safe across a **heterogeneous** cluster because [`run_train`] combines
-/// gradients with a **sample-count-weighted** reduce on a **uniform sync cadence**
-/// (see there): a node casts one weighted vote per local lane, so a 3-lane Mac
-/// and a 1-lane CUDA box average correctly and never desync. The two failure
-/// modes of naïve multi-lane DP — deadlock from unequal per-node sync counts, and
-/// gradient bias from equal-weighting unequal lane counts — are handled in the
-/// reduce, not by forcing every node down to a single lane.
-fn training_lanes(spec_device: &str, available: &[Device], graph: &Graph) -> Vec<Device> {
+/// * `"all"` — one lane per **physical** compute unit, so the CPU trains
+///   alongside the GPU instead of idling: the CPU plus each vendor-native GPU
+///   backend (Metal, CUDA, ROCm, oneAPI, …). Portable layers (wgpu, Vulkan,
+///   OpenGL, DirectX, WebGPU) and MLX are skipped when a native backend is
+///   present — they drive the same adapter, so a second lane would only
+///   contend for it. ANE and XDNA are skipped too (fixed-function / INT8; not
+///   a generic f32 training target).
+/// * a comma list (`"cuda,cpu,vulkan"`) — exactly those available devices,
+///   e.g. to add an integrated GPU reachable only through Vulkan.
+/// * anything else — a single resolved device.
+///
+/// This is safe across a **heterogeneous** cluster because the reduce weights
+/// every contribution by its sample count on a cluster-uniform sync cadence: a
+/// 3-lane node and a 1-lane node average correctly and never desync.
+pub(super) fn training_lanes(
+    spec_device: &str,
+    available: &[Device],
+    graph: &Graph,
+) -> Vec<Device> {
     if spec_device.eq_ignore_ascii_case("all") {
         let native = crate::devices_for(graph);
+        let portable = |d: &Device| {
+            matches!(
+                d,
+                Device::Gpu | Device::Vulkan | Device::OpenGl | Device::DirectX | Device::WebGpu
+            )
+        };
+        let has_native_gpu = available
+            .iter()
+            .any(|d| !matches!(d, Device::Cpu | Device::Ane | Device::Xdna) && !portable(d));
         let mut ds: Vec<Device> = available
             .iter()
             .copied()
-            .filter(|d| !matches!(d, Device::Ane))
+            .filter(|d| !matches!(d, Device::Ane | Device::Xdna))
+            .filter(|d| !(has_native_gpu && portable(d)))
+            .filter(|d| !(*d == Device::Mlx && available.contains(&Device::Metal)))
             .collect();
         // Native-supporting backends first (they run without host fallback).
         ds.sort_by_key(|d| !native.contains(d));
+        if ds.is_empty() {
+            vec![crate::fastest_device()]
+        } else {
+            ds
+        }
+    } else if spec_device.contains(',') {
+        let mut ds = Vec::new();
+        for s in spec_device.split(',').map(str::trim) {
+            match crate::parse_device(s) {
+                Ok(d) if available.contains(&d) => ds.push(d),
+                // Said, not silently dropped: a lane asked for and missing is
+                // usually a backend this binary was built without.
+                Ok(d) => eprintln!(
+                    "  training lane {s:?} skipped: {} is not available here \
+                     (not built into this binary, or no such hardware)",
+                    crate::device_label(d)
+                ),
+                Err(e) => eprintln!("  training lane {s:?} skipped: {e}"),
+            }
+        }
         if ds.is_empty() {
             vec![crate::fastest_device()]
         } else {
@@ -464,6 +528,13 @@ where
         comm_s,
         first_loss,
         last_loss,
+        upload_s: 0.0,
+        syncs: 0,
+        micro_steps: 1,
+        wire: "f32".into(),
+        wire_bytes: 0,
+        wire_rel_err: 0.0,
+        skipped: 0,
     };
     let final_params = names.into_iter().zip(params).collect();
     Ok((metrics, final_params))
@@ -471,16 +542,16 @@ where
 
 /// One fed input's node-local **shard** (already sliced to this rank) + its row
 /// stride, so batch `b` is `data[b*batch*elem .. (b+1)*batch*elem]`.
-struct Feed {
-    input: String,
-    elem: usize,
-    data: Vec<f32>,
+pub(super) struct Feed {
+    pub(super) input: String,
+    pub(super) elem: usize,
+    pub(super) data: Vec<f32>,
 }
 
 /// Read only samples `[start, start+len)` of a tensor. For `file://` this is a
 /// `seek` + bounded read (the worker never loads the whole dataset — the IO
 /// win); other schemes fall back to a full resolve then slice.
-fn resolve_shard<W: FnMut(&str) -> Vec<f32>>(
+pub(super) fn resolve_shard<W: FnMut(&str) -> Vec<f32>>(
     uri: &str,
     elem: usize,
     start: usize,
@@ -575,7 +646,7 @@ fn weighted_sync<R: FnMut(&[f32]) -> Vec<f32>>(
 
 /// Fold one epoch's mean loss into the run metrics (first/last loss) and log it —
 /// the bookkeeping shared by the single-lane and multi-lane training loops.
-fn record_epoch(
+pub(super) fn record_epoch(
     epoch: usize,
     mean: f32,
     first_loss: &mut f32,
@@ -702,6 +773,27 @@ mod tests {
         assert_eq!(training_lanes("all", &[Device::Cpu], &g).len(), 1);
         // An explicit device directive is always a single lane.
         assert_eq!(training_lanes("cpu", &avail, &g).len(), 1);
+        // One lane per physical unit: wgpu/Vulkan on the same adapter as a
+        // native backend, MLX beside Metal, and ANE/XDNA are skipped.
+        let mac = [
+            Device::Cpu,
+            Device::Metal,
+            Device::Mlx,
+            Device::Ane,
+            Device::Gpu,
+        ];
+        let l = training_lanes("all", &mac, &g);
+        assert!(
+            l.contains(&Device::Cpu) && l.contains(&Device::Metal) && l.len() == 2,
+            "{l:?}"
+        );
+        let amd = [Device::Cpu, Device::Rocm, Device::Xdna];
+        let l = training_lanes("all", &amd, &g);
+        assert!(l.contains(&Device::Cpu) && l.contains(&Device::Rocm) && l.len() == 2);
+        // A list pins exact lanes (the integrated GPU only Vulkan reaches).
+        let msi = [Device::Cpu, Device::Cuda, Device::Vulkan];
+        let l = training_lanes("cuda,cpu,vulkan", &msi, &g);
+        assert_eq!(l, vec![Device::Cuda, Device::Cpu, Device::Vulkan]);
     }
 
     #[test]

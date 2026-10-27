@@ -118,7 +118,11 @@ fn check(gate_per_channel: bool, carry_state: bool) {
     //
     // The skip is announced rather than silent: a parity test that quietly does
     // nothing is worse than one that fails, because it reads as coverage.
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!(
             "skip gated_delta_net_backward_parity (gate_per_channel={gate_per_channel}, \
              carry_state={carry_state}): Metal unavailable"

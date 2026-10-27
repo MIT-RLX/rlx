@@ -115,6 +115,8 @@ fn regression_spec(
         device: device.into(),
         grad_group: 0,
         push_data: false,
+        options: None,
+        frozen: Vec::new(),
     };
     (spec, w_true)
 }

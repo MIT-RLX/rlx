@@ -1,0 +1,36 @@
+name: Bug report
+description: Something fails, is wrong, or a device is not available
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Many setup problems already have a fix: `cargo rlx doctor`
+        diagnoses this machine and prints it, and [docs/known-issues.md](https://github.com/MIT-RLX/rlx/blob/main/docs/known-issues.md)
+        lists every known issue with the error text to search for.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran, what you expected, and what happened instead. Paste the full error.
+      render: console
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: cargo rlx doctor --report
+      description: |
+        Install with the backends you use, then paste the output:
+        `cargo install --path crates/tooling/rlx-check --features <your backends, e.g. cuda,vulkan or metal,gpu or xdna,rocm>`
+        then `cargo rlx doctor --report`. It redacts your home directory. If the build itself fails,
+        paste the build error above and the output of `rustc --version` here instead.
+      placeholder: "<details open><summary><code>cargo rlx doctor --report</code></summary> …"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction (optional)
+      description: A small graph or program that shows the problem, if you have one.
+      render: rust

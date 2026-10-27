@@ -88,8 +88,8 @@ once per device context on Metal/CUDA/ROCm/WGPU.
 | Backend | GPU dequant | Fused GEMV (`m = 1`) | On-device constexpr (ANE) | Host / compile fallback |
 |---------|-------------|----------------------|----------------------------|-------------------------|
 | **CPU** | — | block-wise fused matmul in `rlx-cpu::gguf_matmul` | — | always available |
-| **Metal** | `dequant_gguf.msl` → MPS sgemm | Q4_K, Q4_0, Q4_1, Q8_0, IQ4NL, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M | MIL `mul`+`sub` for K/IQ/TQ/MX (see ANE) | `RLX_METAL_DEQUANT_GPU_DISABLE=1` |
-| **CUDA / ROCm** | `dequant_gguf.cu` → BLAS | — | — | same disable pattern |
+| **Metal** | `dequant_gguf.msl` → MPS sgemm | Q4_K, Q4_0, Q4_1, Q8_0, IQ4NL, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M (2–4 rows: the GEMV per row) | MIL `mul`+`sub` for K/IQ/TQ/MX (see ANE) | `RLX_METAL_DEQUANT_GPU_DISABLE=1` |
+| **CUDA / ROCm** | `dequant_gguf.cu` → BLAS | Q8_0, Q4_K, Q5_K, Q6_K (`dequant_matmul_gguf_gemv_elem`; 2–4 rows, a verify step's, `dequant_matmul_gguf_gemv_rows`, each row as at `m = 1`); CUDA also Q1_0, Q2_0, G8_0 | — | same disable pattern |
 | **WGPU** | `dequant_gguf.wgsl` → `matmul_bt`; grouped MoE GPU | — | — | `gguf_host` when scratch exceeds limits |
 | **ANE (CoreML)** | hybrid host segments | — | MIL `mul` + optional `sub` | `RLX_COREML_HOST_DEQUANT=1` |
 | **TPU** | — | — | — | host dequant at HLO emit (`Constant`, `quant_param_bindings`, or runtime `set_param_typed` on deferred Param) |
@@ -232,6 +232,7 @@ Non-GGUF schemes still use the in-HLO `convert + scale/zp tile + dot` path.
 | Variable | Backend | Effect |
 |----------|---------|--------|
 | `RLX_METAL_DEQUANT_GPU_DISABLE=1` | Metal | Force CPU GGUF dequant |
+| `RLX_GGUF_GEMV_ELEM=0` | CUDA / ROCm | Q4_K / Q6_K decode GEMV on the older block-strided kernels, Q5_K on dequant + matmul (Q8_0 keeps the element-strided kernel) |
 | `RLX_METAL_Q4K_FUSED_DISABLE=1` | Metal | Disable Q4_K fused GEMV |
 | `RLX_METAL_Q4K_SG_DISABLE=1` | Metal | Disable simdgroup Q4_K GEMV |
 | `RLX_METAL_Q40_FUSED_DISABLE=1` | Metal | Disable Q4_0 fused GEMV |

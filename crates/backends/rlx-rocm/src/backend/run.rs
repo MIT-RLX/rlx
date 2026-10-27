@@ -1928,7 +1928,13 @@ impl RocmExecutable {
                     // it can return an error we could catch and fall back on. `RLX_ROCM_
                     // NO_VENDOR_GEMM=1` skips the vendor tiers and routes matmul straight
                     // to the custom Tier-4 kernel (no Tensile), which computes correctly.
-                    let no_vendor = rlx_ir::env::flag("RLX_ROCM_NO_VENDOR_GEMM");
+                    // A one-row matmul (decode) on RDNA goes to the split-K
+                    // GEMV first: on a 780M (gfx1103) Qwen3.5-0.8B's decode
+                    // matmuls took 1.39 ms there against hipBLAS's 1.81 ms
+                    // and the tiled kernel's 1.82 ms. CDNA (MI100) keeps its
+                    // order — the GEMV lost there (see Tier 3.5).
+                    let gemv_first = *m == 1 && rdna_decode_gemv();
+                    let no_vendor = rlx_ir::env::flag("RLX_ROCM_NO_VENDOR_GEMM") || gemv_first;
                     let used_mixed = !no_vendor
                         && try_mixed_precision_gemm_rocm(
                             &self.ctx,
@@ -2165,7 +2171,7 @@ impl RocmExecutable {
                     // register pressure, atomicAdd contention, and 3-launches-per-matmul
                     // cost real time. Kept behind a flag as a documented non-win; the
                     // default rocm fallback stays the faster Tier-4 tiled kernel below.
-                    if *m > 0 && *m <= 16 && rlx_ir::env::flag("RLX_ROCM_GEMV") {
+                    if *m > 0 && *m <= 16 && (gemv_first || rlx_ir::env::flag("RLX_ROCM_GEMV")) {
                         let total = m * n * batch;
                         // Zero C — it is the atomicAdd accumulator.
                         let zk = rms_norm_bwd_zero_kernel(&self.ctx);
@@ -2675,6 +2681,28 @@ impl RocmExecutable {
                             &self.arena.buffer,
                             *n as usize,
                             *k as usize,
+                            *scheme_id,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            *out_byte_off as usize,
+                        );
+                    } else if use_gpu
+                        && crate::gguf_gpu::gguf_gemv_rows_supported(
+                            *scheme_id,
+                            *m as usize,
+                            *k as usize,
+                        )
+                        && !rlx_ir::env::flag("RLX_ROCM_GGUF_FUSED_DISABLE")
+                    {
+                        // A verify step's 2–4 rows: the GEMV, each row as at m = 1.
+                        crate::gguf_gpu::run_dequant_matmul_gguf_gemv_rows(
+                            &self.ctx,
+                            stream,
+                            &self.arena.buffer,
+                            *m as usize,
+                            *n as usize,
+                            *k as usize,
+                            *scheme_id,
                             *x_byte_off as usize,
                             *w_byte_off as usize,
                             *out_byte_off as usize,
@@ -3174,6 +3202,60 @@ impl RocmExecutable {
                             in_off,
                             out_off,
                             &n_total
+                        ]
+                    );
+                }
+                Step::GatedDeltaNet {
+                    q_byte_off,
+                    k_byte_off,
+                    v_byte_off,
+                    g_byte_off,
+                    beta_byte_off,
+                    state_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    heads,
+                    state_size,
+                    use_carry,
+                    gate_per_channel,
+                } if super::step::gdn_on_device(*use_carry, *state_size) => {
+                    // On the GPU, with the state carried in the arena (a decode
+                    // step's recurrent state). The host path below downloaded
+                    // the operands, ran the recurrence on the CPU and uploaded
+                    // the result: 512 ms a launch on a 780M for Qwen3.5-0.8B's
+                    // 16 heads × 128², 95% of its stage.
+                    let kernel = gated_delta_net_kernel(&self.ctx);
+                    // `unsigned long long` offsets in the kernel (f32 elements).
+                    let q_off = *q_byte_off / 4;
+                    let k_off = *k_byte_off / 4;
+                    let v_off = *v_byte_off / 4;
+                    let g_off = *g_byte_off / 4;
+                    let beta_off = *beta_byte_off / 4;
+                    let state_off = *state_byte_off / 4;
+                    let dst_off = *dst_byte_off / 4;
+                    let carry_u: u32 = 1;
+                    let gate_pc_u: u32 = if *gate_per_channel { 1 } else { 0 };
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (*batch * *heads, 1, 1),
+                        (*state_size, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            &q_off,
+                            &k_off,
+                            &v_off,
+                            &g_off,
+                            &beta_off,
+                            &state_off,
+                            &dst_off,
+                            batch,
+                            seq,
+                            heads,
+                            state_size,
+                            &carry_u,
+                            &gate_pc_u
                         ]
                     );
                 }
@@ -4028,6 +4110,12 @@ impl RocmExecutable {
                     let beta_off = *beta_byte_off / 4;
                     let dy_off = *dy_byte_off / 4;
                     let dx_off = *dx_byte_off / 4;
+                    // `unsigned int` parameters: HIP copies the low 4 bytes.
+                    debug_assert!(
+                        [x_off, gamma_off, beta_off, dy_off, dx_off]
+                            .iter()
+                            .all(|&o| o <= u32::MAX as u64)
+                    );
                     let wrt = 0u32;
                     let kernel = rms_norm_backward_kernel(&self.ctx);
                     crate::launch_kernel!(
@@ -4064,6 +4152,12 @@ impl RocmExecutable {
                     let beta_off = *beta_byte_off / 4;
                     let dy_off = *dy_byte_off / 4;
                     let dgamma_off = *dgamma_byte_off / 4;
+                    // `unsigned int` parameters: HIP copies the low 4 bytes.
+                    debug_assert!(
+                        [x_off, gamma_off, beta_off, dy_off, dgamma_off]
+                            .iter()
+                            .all(|&o| o <= u32::MAX as u64)
+                    );
                     let wrt = 1u32;
                     let zk = rms_norm_bwd_zero_kernel(&self.ctx);
                     let (zgrid, zblock) = dispatch_grid_1d(*h, 256);
@@ -4109,6 +4203,12 @@ impl RocmExecutable {
                     let beta_off = *beta_byte_off / 4;
                     let dy_off = *dy_byte_off / 4;
                     let dbeta_off = *dbeta_byte_off / 4;
+                    // `unsigned int` parameters: HIP copies the low 4 bytes.
+                    debug_assert!(
+                        [x_off, gamma_off, beta_off, dy_off, dbeta_off]
+                            .iter()
+                            .all(|&o| o <= u32::MAX as u64)
+                    );
                     let wrt = 2u32;
                     let zk = rms_norm_bwd_zero_kernel(&self.ctx);
                     let (zgrid, zblock) = dispatch_grid_1d(*h, 256);
@@ -4157,6 +4257,12 @@ impl RocmExecutable {
                     let cos_off = *cos_byte_off / 4;
                     let sin_off = *sin_byte_off / 4;
                     let dx_off = *dx_byte_off / 4;
+                    // `unsigned int` parameters: HIP copies the low 4 bytes.
+                    debug_assert!(
+                        [dy_off, cos_off, sin_off, dx_off]
+                            .iter()
+                            .all(|&o| o <= u32::MAX as u64)
+                    );
                     let interleaved_u: u32 = *interleaved as u32;
                     let kernel = rope_backward_kernel(&self.ctx);
                     let total = batch * seq * hidden;
@@ -6251,4 +6357,17 @@ impl RocmExecutable {
             }
         }
     }
+}
+
+/// Whether one-row matmuls on this GPU take the split-K GEMV before the
+/// vendor GEMM: RDNA (`gfx10*`/`gfx11*`/`gfx12*`), unless
+/// `RLX_ROCM_NO_DECODE_GEMV` is set.
+fn rdna_decode_gemv() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !rlx_ir::env::flag("RLX_ROCM_NO_DECODE_GEMV")
+            && crate::hip::rocm_target_arch()
+                .is_some_and(|a| ["gfx10", "gfx11", "gfx12"].iter().any(|p| a.starts_with(p)))
+    })
 }

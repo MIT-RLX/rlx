@@ -562,47 +562,106 @@ pub fn dgemm_ab(
             .any(|&(s, w)| w % 2 == 1 && ci == s + w - 1)
     };
     let in_4row_tile = |ri: usize| row_parts.iter().any(|&(s, w)| ri >= s && ri - s < (w & !3));
+    // Pack A's rows and B's columns contiguously (in the operands' own
+    // values, untouched), so the k loop below is unit-stride. Every element of
+    // C keeps exactly the arithmetic of the per-element formulation: the same
+    // k blocks, the same accumulator chain, the same fused multiply-adds.
+    let ap: Vec<f64> = (0..m)
+        .flat_map(|i| (0..k).map(move |l| el(a, lda, ta, i, l)))
+        .collect();
+    let bp: Vec<f64> = (0..n)
+        .flat_map(|j| (0..k).map(move |l| el(b, ldb, tb, l, j)))
+        .collect();
+    let scaled = |o: usize, c: &[f64]| {
+        if beta == 0.0 {
+            0.0
+        } else if beta == 1.0 {
+            c[o]
+        } else {
+            c[o] * beta
+        }
+    };
     for i in 0..m {
-        for j in 0..n {
-            let (ri, ci) = if row_major { (j, i) } else { (i, j) };
-            // the single-column tile (a call's last column when its width is odd) on
-            // 4-row tiles: `KERNEL4x1` rotates k over four accumulators, `SAVE4x1` sums them
-            let rotated = last_of_odd(ci) && in_4row_tile(ri);
-            let prod = |l: usize, acc: f64| el(a, lda, ta, i, l).mul_add(el(b, ldb, tb, l, j), acc);
-            let o = if row_major { i * ldc + j } else { i + j * ldc };
-            let mut s = if beta == 0.0 {
-                0.0
-            } else if beta == 1.0 {
-                c[o]
-            } else {
-                c[o] * beta
+        let ar = &ap[i * k..(i + 1) * k];
+        let mut j = 0;
+        while j < n {
+            let at = |j: usize| if row_major { i * ldc + j } else { i + j * ldc };
+            let rotated_at = |j: usize| {
+                let (ri, ci) = if row_major { (j, i) } else { (i, j) };
+                // the single-column tile (a call's last column when its width is
+                // odd) on 4-row tiles: `KERNEL4x1` rotates k over four
+                // accumulators, `SAVE4x1` sums them
+                last_of_odd(ci) && in_4row_tile(ri)
             };
             if alpha == 0.0 {
-                c[o] = s;
+                let o = at(j);
+                c[o] = scaled(o, c);
+                j += 1;
                 continue;
             }
+            // Four plain columns advance together: four independent chains,
+            // each the same as on its own.
+            if j + 4 <= n && !(j..j + 4).any(rotated_at) {
+                let bs = [0, 1, 2, 3].map(|q| &bp[(j + q) * k..(j + q + 1) * k]);
+                let mut s = [0, 1, 2, 3].map(|q| scaled(at(j + q), c));
+                for &(ls, len) in &blocks {
+                    let mut acc = [0, 1, 2, 3].map(|q| ar[ls] * bs[q][ls]);
+                    for l in ls + 1..ls + len {
+                        for q in 0..4 {
+                            acc[q] = fmadd(ar[l], bs[q][l], acc[q]);
+                        }
+                    }
+                    for q in 0..4 {
+                        s[q] += alpha * acc[q];
+                    }
+                }
+                for q in 0..4 {
+                    c[at(j + q)] = s[q];
+                }
+                j += 4;
+                continue;
+            }
+            let br = &bp[j * k..(j + 1) * k];
+            let o = at(j);
+            let mut s = scaled(o, c);
             for &(ls, len) in &blocks {
-                let acc = if rotated {
+                let acc = if rotated_at(j) {
                     let mut r = [0.0f64; 4];
                     let full = len / 8 * 8;
                     for l in 0..full {
-                        r[l % 4] = prod(ls + l, r[l % 4]);
+                        r[l % 4] = fmadd(ar[ls + l], br[ls + l], r[l % 4]);
                     }
                     for l in full..len {
-                        r[0] = prod(ls + l, r[0]);
+                        r[0] = fmadd(ar[ls + l], br[ls + l], r[0]);
                     }
                     (r[0] + r[1]) + (r[2] + r[3])
                 } else {
-                    let mut acc = el(a, lda, ta, i, ls) * el(b, ldb, tb, ls, j);
+                    let mut acc = ar[ls] * br[ls];
                     for l in ls + 1..ls + len {
-                        acc = prod(l, acc);
+                        acc = fmadd(ar[l], br[l], acc);
                     }
                     acc
                 };
                 s += alpha * acc;
             }
             c[o] = s;
+            j += 1;
         }
+    }
+}
+
+/// `a·b + c` with one rounding. Native targets have the instruction; wasm has
+/// none, and `f64::mul_add` there is a call to a software `fma` — so the
+/// kernels inline the exact `f64`-arithmetic emulation instead.
+#[inline(always)]
+fn fmadd(a: f64, b: f64, c: f64) -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        rlx_libm::fma_emulated(a, b, c)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        a.mul_add(b, c)
     }
 }
 

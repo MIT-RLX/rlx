@@ -450,11 +450,11 @@ pub fn raw_weight_off(off: usize) -> usize {
 /// nondeterministically, and only on backends that host: Metal keeps these on
 /// the GPU, which is why it presented as a family of Vulkan-only DSP/eig/pad
 /// bugs rather than one allocator issue.
-fn hosts_structural_ops() -> bool {
+pub fn hosts_structural_ops() -> bool {
     if rlx_ir::env::flag("RLX_WGPU_SHARD_GPU") {
         return false;
     }
-    rlx_ir::env::flag("RLX_WGPU_FORCE_HOST") || crate::device::coop_discrete_backend()
+    rlx_ir::env::flag("RLX_WGPU_FORCE_HOST") || crate::device::discrete_hosts_ops()
 }
 
 /// Tell the planner about it before every plan — the device is resolved lazily,
@@ -509,6 +509,12 @@ impl Arena {
         arena.scratch_bytes = scratch_aligned;
         // After possible shard-boundary repack, scratch is the last zone.
         arena.scratch_off = arena.size.saturating_sub(scratch_aligned);
+        assert!(
+            cfg!(target_pointer_width = "64") || arena.scratch_off < WEIGHT_BUF_TAG,
+            "rlx-wgpu: the scratch zone starts at {:.2} GiB; a 32-bit target addresses \
+             below 2 GiB only (bit 31 tags weight offsets)",
+            arena.scratch_off as f64 / (1u64 << 30) as f64,
+        );
         arena
     }
 
@@ -572,6 +578,29 @@ impl Arena {
     }
 
     pub fn from_plan(device: &wgpu::Device, plan: &MemoryPlan) -> Self {
+        // On 32-bit targets bit 31 of an offset is `WEIGHT_BUF_TAG`: a tensor
+        // placed at or past 2 GiB would be read as a weight-buffer offset (in
+        // the browser that surfaced as "weight-tagged off without
+        // weight_buffer" on a 2.x GiB training arena). The arena itself may
+        // extend past 2 GiB (a 2.02 GiB inference arena whose tensors all start
+        // below it runs exactly); what must not is a tensor's start.
+        if cfg!(not(target_pointer_width = "64")) {
+            let top = plan
+                .assignments
+                .values()
+                .map(|s| s.offset)
+                .max()
+                .unwrap_or(0);
+            assert!(
+                top < WEIGHT_BUF_TAG,
+                "rlx-wgpu: a tensor of this {:.2} GiB activation arena starts at {:.2} GiB; \
+                 a 32-bit target addresses tensors below 2 GiB only (bit 31 tags weight \
+                 offsets). Use a smaller batch (`rlx_runtime::arena_budget::fit_batch` \
+                 stays under it) or the CPU.",
+                plan.arena_size as f64 / (1u64 << 30) as f64,
+                top as f64 / (1u64 << 30) as f64,
+            );
+        }
         let max_buf = device.limits().max_buffer_size as usize;
         let max_binding = device.limits().max_storage_buffer_binding_size as usize;
         // 256-byte alignment for storage-buffer bind offsets.
@@ -1244,6 +1273,20 @@ impl Arena {
 
     /// Logical byte offset of the staging reserve for the shard that contains
     /// `logical_off` (end of that stripe minus [`shard_stage_reserve`]).
+    /// End of the stage reserve that [`Self::shard_stage_off`] starts: the
+    /// reserve, clamped to the stripe. A reserve wider than the stripe (the
+    /// default reserve against a test-lowered `RLX_WGPU_SHARD_CAP_MIB`, or a
+    /// large `RLX_WGPU_SHARD_STAGE_MIB`) otherwise "contains" addresses in later
+    /// stripes, and a staged copy placed there is outside the bound stripe.
+    pub fn shard_stage_end(&self, logical_off: usize) -> usize {
+        if !self.is_sharded() {
+            return self.scratch_off + self.scratch_bytes;
+        }
+        let s = self.shard_size;
+        let shard_end = ((logical_off / s) * s + s).min(self.size);
+        (self.shard_stage_off(logical_off) + shard_stage_reserve()).min(shard_end)
+    }
+
     pub fn shard_stage_off(&self, logical_off: usize) -> usize {
         if !self.is_sharded() {
             return self.scratch_off;

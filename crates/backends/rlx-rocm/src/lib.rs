@@ -78,6 +78,7 @@ pub mod mamba2_host {
 }
 pub mod mamba2_gpu;
 pub mod miopen;
+mod numa_guard;
 pub mod ms_deform_attn_host {
     pub use super::host_ops::run_ms_deform_attn;
 }

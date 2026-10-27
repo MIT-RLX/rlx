@@ -91,6 +91,88 @@ impl B {
         self.constant(&[v], &[1])
     }
 
+    /// An f32 node: `lower_f64` leaves f32 tensors alone, so exact integer
+    /// work (labels, one-hots) and f32 seeds for Newton steps stay plain f32.
+    fn f32_node(&mut self, op: Op, ins: Vec<NodeId>, dims: &[usize], dt: DType) -> NodeId {
+        self.g.add_node(op, ins, Shape::new(dims, dt))
+    }
+
+    /// `x` as f32 (`df → f32` is `hi + lo`); f32 input passes through.
+    fn narrow_f32(&mut self, x: NodeId) -> Result<NodeId, String> {
+        if self.g.node(x).shape.dtype() == DType::F32 {
+            return Ok(x);
+        }
+        let d = self.dims(x)?;
+        Ok(self.f32_node(Op::Cast { to: DType::F32 }, vec![x], &d, DType::F32))
+    }
+
+    /// Natural log in double-single: an f32 log seeds one Newton step on
+    /// `e^y = x` (`y ← y + x·e^{-y} − 1`), which squares the f32 seed's
+    /// relative error (~1e-7 → ~1e-14). Uses only df `Exp`, `Mul`, `Add`.
+    fn log(&mut self, x: NodeId) -> Result<NodeId, String> {
+        let d = self.dims(x)?;
+        let x32 = self.narrow_f32(x)?;
+        let y32 = self.f32_node(Op::Activation(Activation::Log), vec![x32], &d, DType::F32);
+        let y0 = self
+            .g
+            .add_node(Op::Cast { to: DType::F64 }, vec![y32], Self::f64(&d));
+        let ny = self.mul_s(y0, -1.0)?;
+        let e = self.unary(Activation::Exp, ny)?;
+        let xe = self.mul(x, e)?;
+        let one = self.scalar(1.0);
+        let step = self.sub(xe, one)?;
+        self.add(y0, step)
+    }
+
+    /// `[n, c]` one-hot of f32-encoded class indices `labels [n]`, as F64.
+    /// Built in f32 (exact for indices below 2^24).
+    fn one_hot(&mut self, labels: NodeId, n: usize, c: usize) -> Result<NodeId, String> {
+        let l32 = self.narrow_f32(labels)?;
+        let l2 = self.f32_node(
+            Op::Reshape {
+                new_shape: vec![n as i64, 1],
+            },
+            vec![l32],
+            &[n, 1],
+            DType::F32,
+        );
+        let iota: Vec<u8> = (0..c).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let iota = self.f32_node(Op::Constant { data: iota }, vec![], &[1, c], DType::F32);
+        // Expand both sides to `[n, c]` first: some backends (Metal) only
+        // broadcast a scalar operand of a compare.
+        let full = |b: &mut Self, x: NodeId| {
+            b.f32_node(
+                Op::Expand {
+                    target_shape: vec![n as i64, c as i64],
+                },
+                vec![x],
+                &[n, c],
+                DType::F32,
+            )
+        };
+        let (l2, iota) = (full(self, l2), full(self, iota));
+        let eq = self.f32_node(
+            Op::Compare(rlx_ir::op::CmpOp::Eq),
+            vec![l2, iota],
+            &[n, c],
+            DType::Bool,
+        );
+        let oh = self.f32_node(Op::Cast { to: DType::F32 }, vec![eq], &[n, c], DType::F32);
+        Ok(self
+            .g
+            .add_node(Op::Cast { to: DType::F64 }, vec![oh], Self::f64(&[n, c])))
+    }
+
+    /// Row softmax pieces of `z [n, c]`: `(e = exp(z − max), s = Σ e, max)`,
+    /// each kept `[n, 1]`-broadcastable.
+    fn softmax_parts(&mut self, z: NodeId) -> Result<(NodeId, NodeId, NodeId), String> {
+        let m = self.reduce(ReduceOp::Max, z, 1)?;
+        let sh = self.sub(z, m)?;
+        let e = self.unary(Activation::Exp, sh)?;
+        let s = self.reduce(ReduceOp::Sum, e, 1)?;
+        Ok((e, s, m))
+    }
+
     fn bin(&mut self, op: BinaryOp, a: NodeId, b: NodeId) -> Result<NodeId, String> {
         let (da, db) = (self.dims(a)?, self.dims(b)?);
         let r = da.len().max(db.len());
@@ -271,6 +353,88 @@ impl B {
                 let ax = self.axis(x, *axis)?;
                 self.softmax(x, ax)?
             }
+            // loss[n] = logsumexp(z[n]) − z[n, label[n]]
+            Op::SoftmaxCrossEntropyWithLogits => {
+                let (z, labels) = (ins[0], ins[1]);
+                let d = self.dims(z)?;
+                let (n, c) = (d[0], d[1]);
+                let (_, s, m) = self.softmax_parts(z)?;
+                let ls = self.log(s)?;
+                let lse = self.add(m, ls)?;
+                let oh = self.one_hot(labels, n, c)?;
+                let zl = self.mul(z, oh)?;
+                let zl = self.reduce(ReduceOp::Sum, zl, 1)?;
+                let l = self.sub(lse, zl)?;
+                self.reshape(l, &[n])
+            }
+            // dz[n, c] = (softmax(z)[n, c] − one_hot[n, c]) · d_loss[n]
+            Op::SoftmaxCrossEntropyBackward => {
+                let (z, labels, dl) = (ins[0], ins[1], ins[2]);
+                let d = self.dims(z)?;
+                let (n, c) = (d[0], d[1]);
+                let (e, s, _) = self.softmax_parts(z)?;
+                let p = self.div(e, s)?;
+                let oh = self.one_hot(labels, n, c)?;
+                let g = self.sub(p, oh)?;
+                let dl = self.reshape(dl, &[n, 1]);
+                self.mul(g, dl)?
+            }
+            // dx = dy · [x > 0]: the mask is exact in f32 (a double-single
+            // value's sign is its `hi`'s).
+            Op::ReluBackward => {
+                let (x, dy) = (ins[0], ins[1]);
+                let d = self.dims(x)?;
+                let x32 = self.narrow_f32(x)?;
+                let zero = self.f32_node(
+                    Op::Constant {
+                        data: 0f32.to_le_bytes().to_vec(),
+                    },
+                    vec![],
+                    &[1],
+                    DType::F32,
+                );
+                let gt = self.f32_node(
+                    Op::Compare(rlx_ir::op::CmpOp::Gt),
+                    vec![x32, zero],
+                    &d,
+                    DType::Bool,
+                );
+                let m32 = self.f32_node(Op::Cast { to: DType::F32 }, vec![gt], &d, DType::F32);
+                let m = self
+                    .g
+                    .add_node(Op::Cast { to: DType::F64 }, vec![m32], Self::f64(&d));
+                self.mul(dy, m)?
+            }
+            // mean = sum · 1/n: double-single lowers Sum, not Mean.
+            Op::Reduce {
+                op: ReduceOp::Mean,
+                axes,
+                keep_dim,
+            } => {
+                let x = ins[0];
+                let d = self.dims(x)?;
+                let n: usize = axes
+                    .iter()
+                    .map(|&a| self.axis(x, a as i32).map(|a| d[a]))
+                    .product::<Result<usize, String>>()?;
+                let out: Vec<usize> = shape.dims().iter().map(|d| d.unwrap_static()).collect();
+                let sum = self.g.add_node(
+                    Op::Reduce {
+                        op: ReduceOp::Sum,
+                        axes: axes.clone(),
+                        keep_dim: *keep_dim,
+                    },
+                    vec![x],
+                    Self::f64(&out),
+                );
+                let m = self.mul_s(sum, 1.0 / n.max(1) as f64)?;
+                // The `[1]` scale broadcasts a rank-0 mean up to `[1]`.
+                if self.dims(m)? == out {
+                    m
+                } else {
+                    self.reshape(m, &out)
+                }
+            }
             Op::Activation(a) => match a {
                 Activation::Silu => {
                     let s = self.sigmoid(ins[0])?;
@@ -293,6 +457,11 @@ impl B {
                     self.mul(h, p)?
                 }
                 Activation::Neg => self.mul_s(ins[0], -1.0)?,
+                // max(x, 0): a double-single value carries its sign in `hi`.
+                Activation::Relu => {
+                    let z = self.scalar(0.0);
+                    self.bin(BinaryOp::Max, ins[0], z)?
+                }
                 Activation::Exp | Activation::Sqrt => return Ok(None),
                 other => {
                     return Err(format!(
@@ -575,6 +744,30 @@ impl B {
 mod tests {
     use super::*;
     use rlx_ir::op::Activation;
+
+    #[test]
+    fn softmax_cross_entropy_decomposes_and_lowers() {
+        let sh = |d: &[usize]| Shape::new(d, DType::F64);
+        let mut g = Graph::new("sce");
+        let z = g.input("z", sh(&[3, 5]));
+        let y = g.input("y", sh(&[3]));
+        let l = g.add_node(Op::SoftmaxCrossEntropyWithLogits, vec![z, y], sh(&[3]));
+        let dl = g.input("dl", sh(&[3]));
+        let dz = g.add_node(Op::SoftmaxCrossEntropyBackward, vec![z, y, dl], sh(&[3, 5]));
+        let dr = g.add_node(Op::ReluBackward, vec![z, dz], sh(&[3, 5]));
+        g.set_outputs(vec![l, dz, dr]);
+        let d = decompose_f64(&g).expect("decompose");
+        assert!(
+            !d.nodes().iter().any(|n| matches!(
+                n.op,
+                Op::SoftmaxCrossEntropyWithLogits
+                    | Op::SoftmaxCrossEntropyBackward
+                    | Op::ReluBackward
+            )),
+            "both lowered to primitives"
+        );
+        crate::lower_f64::lower_f64(&d).expect("lowers to double-single");
+    }
 
     /// Every composite a transformer uses lowers to double-single once
     /// decomposed (numerics: `rlx-runtime/tests/f64_number_format.rs`).

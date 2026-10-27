@@ -79,7 +79,7 @@ The `[net] discovery` key selects how nodes find each other:
 
 | `discovery`  | How peers are found                                            | Scope |
 |--------------|----------------------------------------------------------------|-------|
-| `static`     | hand-listed `peers = ["ip:port", …]`, one per rank             | any (you address them) |
+| `static`     | hand-listed `peers = ["ip:port", …]`, one per rank (IPv4, `[v6]:port`, or `[fe80::1%en0]:port`) | any (you address them) |
 | `mdns`       | zero-config — coordinator advertises, workers browse (Bonjour/Avahi) | one LAN (`--features mdns`) |
 | `rendezvous` | workers unicast a query to `coordinator` (LAN IP / `host.docker.internal` / Tailscale name) | across NAT / networks |
 

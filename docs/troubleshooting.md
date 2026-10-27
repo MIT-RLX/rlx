@@ -2,6 +2,53 @@
 
 Start from the symptom. Each section names the tool that answers it.
 
+## A device is missing, or you are not sure what this host can run
+
+```sh
+cargo rlx doctor                 # every device, a check run, RLX_* settings
+cargo rlx doctor --device cuda,vulkan --json
+cargo rlx doctor --report        # paste-ready Markdown for a GitHub issue
+cargo rlx doctor --known         # every known issue, its symptom and fix
+```
+
+Full guide: [DOCTOR.md](../DOCTOR.md).
+
+`doctor` also matches the host against the [known issues](known-issues.md)
+table (missing XRT runtime, ROCm not seeing a 780M, NVRTC not found, …) and
+prints each match with its fix. Build-time failures are listed there too, by
+the error text they produce.
+
+For each device the binary was built with, `doctor` reports whether it is
+ready, and if not, the backend's own reason (driver, runtime library,
+toolchain, env var). Each available device runs a small `relu(a·b + c)` graph,
+scored against an f64 reference. The output also shows the adapter name and
+external toolchain versions (CUDA driver and NVRTC, mlir-aie), next to the
+versions rlx has actually been run against. It lists every `RLX_*` variable
+that is set, and flags unknown ones with the nearest registered name. It
+reports only backends compiled into `cargo-rlx`, so install it with the ones
+you use: `cargo install … --features cuda,vulkan` (or `metal,gpu`). The exit
+code is non-zero when an available device fails its check, or when an `RLX_*`
+variable is unknown. A typo is also caught at run time: the first `RLX_*` read
+prints `<name> is not a variable rlx reads; did you mean …?` (silence it with
+`RLX_ENV_WARN_UNKNOWN=0`).
+
+## Too many `RLX_*` switches
+
+Three ways to set several at once. Anything set explicitly still wins.
+
+- **Lists:** `RLX_DISABLE=cse,sccp` sets `RLX_DISABLE_CSE` and
+  `RLX_DISABLE_SCCP`. `RLX_TRACE=metal,gguf` sets the `RLX_*_TRACE` switches,
+  and `RLX_DEBUG` the `RLX_*_DEBUG` ones.
+- **Profiles:** `RLX_PROFILE=debug` (logging, dispatch report, NaN lint),
+  `nans`, `parity` (tightest GPU numerics), `deterministic`, or `ci`. List
+  several to combine them; later ones win.
+- **A settings file:** `RLX_CONFIG=rlx.toml`, with `KEY = value` lines (the
+  `RLX_` prefix is optional) and `[profile.NAME]` sections that `RLX_PROFILE`
+  can select.
+
+`cargo rlx doctor` shows which variables each of these set, and from where.
+The full list is in [rlx-env-vars.md](rlx-env-vars.md).
+
 ## `run` panics, or `try_run` returns an `IoError`
 
 The compiled graph checks what you feed it against what it declares:

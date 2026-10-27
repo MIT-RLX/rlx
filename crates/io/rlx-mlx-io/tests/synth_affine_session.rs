@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Synthetic mlx-community dir → load → `Op::DequantMatMul` on CPU (+ Metal).
 
+#![cfg(feature = "io")]
 use std::collections::HashMap;
 use std::fs;
 

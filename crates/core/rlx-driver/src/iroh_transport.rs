@@ -66,6 +66,8 @@ const MAX_FRAME_BYTES: usize = 512 * 1024 * 1024;
 /// resolving their address via pkarr/DNS discovery, when the first message is
 /// handed off.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// One dial attempt's limit inside [`DIAL_TIMEOUT`].
+const DIAL_ATTEMPT: Duration = Duration::from_secs(2);
 
 fn terr(reason: impl Into<String>) -> CollectiveError {
     CollectiveError::TransportError {
@@ -131,6 +133,10 @@ impl IrohPeer {
 }
 
 type Mailbox = Arc<(Mutex<HashMap<(u32, u32), VecDeque<Vec<u8>>>>, Condvar)>;
+
+/// Mailbox key that marks a peer gone (its inbound stream ended): no real
+/// frame uses this tag.
+const TAG_LOST: u32 = u32::MAX;
 
 /// A [`Transport`] over iroh QUIC connections. See the module docs.
 pub struct IrohTransport {
@@ -242,6 +248,44 @@ impl IrohTransport {
         )
     }
 
+    /// **LAN mode**: QUIC over UDP straight between known addresses — no
+    /// relays, no discovery service, nothing leaves the network. Binds this
+    /// rank's UDP socket at `addrs[rank]` and dials every peer at its address;
+    /// keys come from the shared `seed` (see [`Self::connect_seeded`] for the
+    /// trust model). The UDP counterpart of [`crate::TcpTransport::bind`].
+    pub fn connect_lan(
+        rank: u32,
+        world: u32,
+        seed: &[u8],
+        addrs: &[std::net::SocketAddr],
+        alpn: &[u8],
+    ) -> Result<Self, CollectiveError> {
+        if seed.is_empty() {
+            return Err(terr("the iroh seed is empty"));
+        }
+        if addrs.len() != world as usize {
+            return Err(terr(format!(
+                "connect_lan: {} addresses for WORLD={world}",
+                addrs.len()
+            )));
+        }
+        let peers = seeded_peers(seed, world)
+            .into_iter()
+            .zip(addrs)
+            .map(|(p, &a)| p.with_direct(a))
+            .collect();
+        Self::connect_impl(
+            rank,
+            world,
+            seeded_secret(seed, rank),
+            peers,
+            alpn,
+            false,
+            RelayMode::Disabled,
+            Some(addrs[rank as usize]),
+        )
+    }
+
     fn connect_bind(
         rank: u32,
         world: u32,
@@ -250,6 +294,22 @@ impl IrohTransport {
         alpn: &[u8],
         use_n0: bool,
         relay_mode: RelayMode,
+    ) -> Result<Self, CollectiveError> {
+        Self::connect_impl(
+            rank, world, secret_key, peers, alpn, use_n0, relay_mode, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn connect_impl(
+        rank: u32,
+        world: u32,
+        secret_key: SecretKey,
+        peers: Vec<IrohPeer>,
+        alpn: &[u8],
+        use_n0: bool,
+        relay_mode: RelayMode,
+        bind: Option<std::net::SocketAddr>,
     ) -> Result<Self, CollectiveError> {
         if peers.len() != world as usize {
             return Err(terr(format!(
@@ -275,6 +335,29 @@ impl IrohTransport {
                         .alpns(vec![alpn_v.clone()])
                         .bind()
                         .await
+                        .map_err(|e| e.to_string())
+                } else if let Some(at) = bind {
+                    // LAN: exactly one UDP socket, at this rank's address.
+                    Endpoint::builder(presets::Minimal)
+                        .secret_key(secret_key)
+                        .alpns(vec![alpn_v.clone()])
+                        .relay_mode(relay_mode)
+                        .clear_ip_transports()
+                        .bind_addr(std::net::SocketAddr::new(
+                            match at {
+                                std::net::SocketAddr::V4(_) => {
+                                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                                }
+                                std::net::SocketAddr::V6(_) => {
+                                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                                }
+                            },
+                            at.port(),
+                        ))
+                        .map_err(|e| format!("{at}: {e}"))?
+                        .bind()
+                        .await
+                        .map_err(|e| e.to_string())
                 } else {
                     Endpoint::builder(presets::Minimal)
                         .secret_key(secret_key)
@@ -282,6 +365,7 @@ impl IrohTransport {
                         .relay_mode(relay_mode)
                         .bind()
                         .await
+                        .map_err(|e| e.to_string())
                 }
             })
             .map_err(|e| terr(format!("iroh bind: {e}")))?;
@@ -385,11 +469,16 @@ impl IrohTransport {
         let deadline = Instant::now() + DIAL_TIMEOUT;
         let (conn, stream) = loop {
             let attempt = self.rt.block_on(async {
-                let conn = self
-                    .endpoint
-                    .connect(addr.clone(), &self.alpn)
-                    .await
-                    .map_err(|e| terr(e.to_string()))?;
+                // Bound each attempt: a QUIC dial to a peer whose socket is not
+                // up yet gets no refusal (unlike TCP), it just waits out the
+                // handshake — retry quickly instead.
+                let conn = tokio::time::timeout(
+                    DIAL_ATTEMPT,
+                    self.endpoint.connect(addr.clone(), &self.alpn),
+                )
+                .await
+                .map_err(|_| terr(format!("no answer within {DIAL_ATTEMPT:?}")))?
+                .map_err(|e| terr(e.to_string()))?;
                 let stream = conn.open_uni().await.map_err(|e| terr(e.to_string()))?;
                 Ok::<_, CollectiveError>((conn, stream))
             });
@@ -427,11 +516,28 @@ async fn reader_loop(conn: iroh::endpoint::Connection, mailbox: Mailbox) {
         Err(_) => return, // connection closed before any stream
     };
     let mut header = [0u8; 12];
+    let mut peer: Option<u32> = None;
+    // When the stream ends (peer finished, crashed, or went away), record it so
+    // a receive waiting on this peer fails instead of blocking forever. Data
+    // already delivered stays queued and is read first.
+    let mark_lost = |peer: Option<u32>| {
+        if let Some(p) = peer {
+            let (lock, cv) = &*mailbox;
+            lock.lock()
+                .unwrap()
+                .entry((p, TAG_LOST))
+                .or_default()
+                .push_back(Vec::new());
+            cv.notify_all();
+        }
+    };
     loop {
         if recv.read_exact(&mut header).await.is_err() {
+            mark_lost(peer);
             return; // stream finished / connection closed
         }
         let from = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        peer = Some(from);
         let tag = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
         let len = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
         if len > MAX_FRAME_BYTES {
@@ -439,6 +545,7 @@ async fn reader_loop(conn: iroh::endpoint::Connection, mailbox: Mailbox) {
         }
         let mut payload = vec![0u8; len];
         if len > 0 && recv.read_exact(&mut payload).await.is_err() {
+            mark_lost(peer);
             return;
         }
         let (lock, cv) = &*mailbox;
@@ -523,6 +630,12 @@ impl Transport for IrohTransport {
             {
                 return Ok(v);
             }
+            if guard.get(&(from, TAG_LOST)).is_some_and(|q| !q.is_empty()) {
+                return Err(terr(format!(
+                    "rank {from} disconnected (its stream to rank {} ended) while waiting on tag {tag}",
+                    self.rank
+                )));
+            }
             guard = cv.wait(guard).unwrap();
         }
     }
@@ -562,8 +675,25 @@ impl Transport for IrohTransport {
 
 impl Drop for IrohTransport {
     fn drop(&mut self) {
-        // Drop cached send streams / connections first.
-        self.out.lock().unwrap().clear();
+        // Flush first: `send_bytes` returns once a frame is in the stream's
+        // buffer, so a rank that sends its last message (a barrier release)
+        // and exits would otherwise lose it. Finish every outbound stream and
+        // wait — bounded — until the peer acknowledges all of its data.
+        let edges: Vec<Arc<OutEdge>> = self.out.lock().unwrap().drain().map(|(_, e)| e).collect();
+        let _ = self.rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                for e in &edges {
+                    let stopped = {
+                        let mut st = e.stream.lock().unwrap();
+                        let _ = st.finish();
+                        st.stopped()
+                    };
+                    let _ = stopped.await;
+                }
+            })
+            .await
+        });
+        drop(edges);
         let ep = self.endpoint.clone();
         // Bounded graceful close: `ep.close()` can otherwise block indefinitely
         // when the peer has already gone away (e.g. the other rank finished and

@@ -30,7 +30,11 @@ fn run_case(
     k: usize,
     n: usize,
 ) -> Option<f32> {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return None;
     }
@@ -86,7 +90,11 @@ fn run_case(
 /// bit-exact; this checks the metal segmentation/boundary-I/O across many.
 #[test]
 fn gguf_dequant_matmul_chain_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -156,7 +164,11 @@ fn gguf_dequant_matmul_chain_matches_cpu() {
 /// `RLX_HYBRID_M` overrides m (default 96); set 4 to see it pass.
 #[test]
 fn hybrid_rmsnorm_dequant_large_m_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -251,7 +263,11 @@ fn hybrid_rmsnorm_dequant_large_m_matches_cpu() {
 /// correctness rather than reproducing the race itself.)
 #[test]
 fn gguf_dequant_matmul_multi_large_n_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -434,7 +450,11 @@ fn gguf_dequant_matmul_prefill_matches_cpu() {
 
 #[test]
 fn q1_0_decode_amp_f16_gemv_only_matches_f32() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -497,7 +517,11 @@ fn q1_0_decode_amp_f16_gemv_only_matches_f32() {
 /// simdgroup Q1 kernels (weight-BW path: packed W + half activation traffic).
 #[test]
 fn q1_0_decode_amp_f16_residual_matches_f32() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -578,7 +602,11 @@ fn q1_0_decode_amp_f16_residual_matches_f32() {
 
 #[test]
 fn q2_0_decode_gemv_matches_reference() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -633,7 +661,11 @@ fn q2_0_decode_gemv_matches_reference() {
 /// since group 3 is 64× group 0.
 #[test]
 fn g8_0_decode_gemv_matches_reference() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -710,7 +742,11 @@ fn g8_0_decode_gemv_matches_reference() {
 /// model's widths.
 #[test]
 fn ptq1_0_decode_gemv_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -743,7 +779,11 @@ fn ptq1_0_decode_gemv_matches_cpu() {
 /// Metal-vs-CPU difference.
 #[test]
 fn ptq1_0_fused_gemv_matches_the_scratch_path() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -794,7 +834,11 @@ fn ptq1_0_fused_gemv_matches_the_scratch_path() {
 /// correct even while it is not the one that runs.
 #[test]
 fn ptq1_0_int_pipe_gemv_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -839,7 +883,11 @@ fn ptq1_0_int_pipe_gemv_matches_cpu() {
 #[test]
 #[ignore = "benchmark, not a correctness check"]
 fn ptq1_0_gemv_bandwidth() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }

@@ -24,6 +24,11 @@ documentation.workspace = true
 # use Accelerate.
 [features]
 default = ["blas"]
+# Parity with NumPy / SciPy / torch: the accurate f32 tier (`vmath::vv*`
+# outside Accelerate builds) and the FFT twiddles use rlx-libm's reference
+# ports (add `rlx-libm/libm` for Apple's own libm on macOS). Off (default):
+# `fastmath` (NEON, <= 1.33 ulp over all f32) and the pure-Rust `libm` crate.
+parity = ["dep:rlx-libm"]
 blas = []
 blas-mkl = ["blas"]
 # Route sgemm_auto through the `gemm` crate (the same CPU BLAS candle
@@ -38,6 +43,10 @@ parity-gemm = ["dep:gemm"]
 # QKᵀ) on an AVX2 core. Small-m products keep the loop, which is faster there.
 # No effect when a real BLAS is linked.
 portable-gemm = ["dep:gemm"]
+# No native libraries at all: overrides `blas` (no Accelerate / OpenBLAS /
+# MKL link), vector exp/tanh/log in Rust instead of Accelerate's vForce, the
+# `gemm` crate's pure-Rust kernels for GEMM, and rlx-ir's BNNS stubs.
+pure-rust = ["portable-gemm", "amx-sme", "rlx-ir/pure-rust"]
 # x86-64 AVX2 int8 decode GEMVs (`m == 1`) for Q4_K / Q5_K / Q6_K / Q8_0 /
 # Q4_0 / Q4_1, which otherwise dequantize each block to f32 before the dot.
 # Rounds the activation to int8 like llama.cpp, so it is not bit-identical to
@@ -78,7 +87,16 @@ amx-sme = []
 [dependencies]
 libm = "0.2"
 rlx-ir = { workspace = true }
+rlx-fastmath = { workspace = true }
+# `simple_broadcast`: the `(rep, len)` index of a broadcast operand, shared with
+# the GPU backends' in-kernel broadcast.
+rlx-unfuse = { workspace = true }
 rlx-pocketfft = { workspace = true }
+# The reference platform's sin/cos for FFT twiddles (std's on wasm is Rust's
+# own libm, which matches neither the Linux nor the Apple reference).
+# Bit-exact reference math for parity (feature `parity`); the default is
+# rlx-cpu's own vectorized `fastmath`.
+rlx-libm = { workspace = true, optional = true }
 # the Linux x86-64 reference BLAS/LAPACK (non-Apple fallbacks of numpy_blas)
 rlx-linux-ref = { workspace = true }
 # Double-single (df) host arithmetic — the reference every df kernel matches.
@@ -88,7 +106,7 @@ rlx-opt = { workspace = true }
 # schemes so packed weight bytes can stay in the arena until matmul
 # time instead of round-tripping through f32 at load.
 rlx-gguf = { workspace = true, features = ["ir"] }
-rlx-mlx-io = { workspace = true }
+rlx-mlx-io = { workspace = true, default-features = false }  # dequant kernels only
 # F16/BF16 conversion for the CastDtype thunk (and any future
 # half-precision kernel work). Already in the workspace via
 # rlx-runtime / rlx-metal.

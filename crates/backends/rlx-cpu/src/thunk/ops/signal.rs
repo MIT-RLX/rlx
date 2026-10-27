@@ -1062,8 +1062,8 @@ pub(crate) fn fft_radix2_inplace_f32(re: &mut [f32], im: &mut [f32], inverse: bo
     while len <= n {
         let half = len / 2;
         let theta = sign * 2.0 * std::f64::consts::PI / (len as f64);
-        let w_re_step = theta.cos();
-        let w_im_step = theta.sin();
+        let w_re_step = ref_cos(theta);
+        let w_im_step = ref_sin(theta);
         let mut i = 0usize;
         while i < n {
             let mut wre = 1.0_f64;
@@ -1134,8 +1134,8 @@ pub(crate) fn fft_radix4_inplace_f32(re: &mut [f32], im: &mut [f32], inverse: bo
     while len <= n {
         let q = len / 4;
         let theta = tw_sign * 2.0 * std::f64::consts::PI / (len as f64);
-        let wstep_re = theta.cos();
-        let wstep_im = theta.sin();
+        let wstep_re = ref_cos(theta);
+        let wstep_im = ref_sin(theta);
         let mut base = 0usize;
         while base < n {
             let mut w1_re = 1.0_f64;
@@ -1228,8 +1228,8 @@ pub(crate) fn fft_radix2_inplace_f64(re: &mut [f64], im: &mut [f64], inverse: bo
     while len <= n {
         let half = len / 2;
         let theta = sign * 2.0 * std::f64::consts::PI / (len as f64);
-        let w_re_step = theta.cos();
-        let w_im_step = theta.sin();
+        let w_re_step = ref_cos(theta);
+        let w_im_step = ref_sin(theta);
         let mut i = 0usize;
         while i < n {
             // Twiddle starts at 1+0i for each segment.
@@ -1307,8 +1307,8 @@ impl BluesteinScratchF64 {
         for k in 0..n {
             let k2 = (k as u64).wrapping_mul(k as u64) % mod_2n;
             let theta = sign * std::f64::consts::PI * (k2 as f64) / (n as f64);
-            w_re[k] = theta.cos();
-            w_im[k] = theta.sin();
+            w_re[k] = ref_cos(theta);
+            w_im[k] = ref_sin(theta);
         }
 
         // Embed b[k] = conj(w[|k|]) into length M with the negative
@@ -1353,8 +1353,8 @@ pub(crate) fn fft_naive_inplace_f64(re: &mut [f64], im: &mut [f64], inverse: boo
     for k in 0..n {
         for nn in 0..n {
             let theta = sign * 2.0 * std::f64::consts::PI * (nn as f64) * (k as f64) / (n as f64);
-            let c = theta.cos();
-            let s = theta.sin();
+            let c = ref_cos(theta);
+            let s = ref_sin(theta);
             out_re[k] += re[nn] * c - im[nn] * s;
             out_im[k] += re[nn] * s + im[nn] * c;
         }
@@ -1374,8 +1374,7 @@ pub(crate) fn fft_naive_inplace_f32(re: &mut [f32], im: &mut [f32], inverse: boo
     for k in 0..n {
         for nn in 0..n {
             let theta = sign * 2.0 * std::f32::consts::PI * (nn as f32) * (k as f32) / (n as f32);
-            let c = theta.cos();
-            let s = theta.sin();
+            let (s, c) = ref_sincosf(theta);
             out_re[k] += re[nn] * c - im[nn] * s;
             out_im[k] += re[nn] * s + im[nn] * c;
         }
@@ -1487,8 +1486,8 @@ impl BluesteinScratchF32 {
         for k in 0..n {
             let k2 = (k as u64).wrapping_mul(k as u64) % mod_2n;
             let theta = sign * std::f64::consts::PI * (k2 as f64) / (n as f64);
-            w_re[k] = theta.cos() as f32;
-            w_im[k] = theta.sin() as f32;
+            w_re[k] = ref_cos(theta) as f32;
+            w_im[k] = ref_sin(theta) as f32;
         }
 
         let mut bf_re = vec![0.0_f32; m];
@@ -1698,4 +1697,28 @@ pub unsafe fn execute_fft1d_pocketfft(
             other => panic!("Op::Fft on CPU requires F32/F64/C64, got {other:?}"),
         }
     }
+}
+
+// FFT twiddles: rlx-libm's reference ports for parity (feature `parity`),
+// the pure-Rust `libm` crate (musl, < 1 ulp) otherwise. Setup cost only.
+#[inline(always)]
+fn ref_cos(x: f64) -> f64 {
+    #[cfg(feature = "parity")]
+    return rlx_libm::reference::cos(x);
+    #[cfg(not(feature = "parity"))]
+    libm::cos(x)
+}
+#[inline(always)]
+fn ref_sin(x: f64) -> f64 {
+    #[cfg(feature = "parity")]
+    return rlx_libm::reference::sin(x);
+    #[cfg(not(feature = "parity"))]
+    libm::sin(x)
+}
+#[inline(always)]
+fn ref_sincosf(x: f32) -> (f32, f32) {
+    #[cfg(feature = "parity")]
+    return rlx_libm::reference::sincosf(x);
+    #[cfg(not(feature = "parity"))]
+    libm::sincosf(x)
 }

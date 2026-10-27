@@ -68,8 +68,16 @@ targets:
         # nothing. iOS, tvOS and visionOS all gate on it.
         NSLocalNetworkUsageDescription: >-
           Joins a nearby RLX compute cluster to share model execution.
-        # Only needed for mDNS-based discovery (the `mdns` feature).
+        # A cluster link over Bluetooth LE (`via = "ble"`): without it the
+        # app is never given the radio.
+        NSBluetoothAlwaysUsageDescription: >-
+          Links to a nearby RLX compute cluster over Bluetooth.
+        # Bonjour service types the app publishes or browses: its own node
+        # record (`_rlx-node._tcp`, see RlxAdvertiser), and the mDNS paths
+        # of coordinator / rendezvous discovery.
         NSBonjourServices:
+          - _rlx-node._tcp
+          - _rlx-rdv._tcp
           - _rlx-coord._udp
 
   RlxDemoTV:

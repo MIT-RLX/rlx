@@ -20,10 +20,11 @@ minijinja    = { version = "2.24", default-features = false, features = ["builti
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
 
-# Regex backend per target: `onig` is C and does not build for wasm32, where
-# tokenizers' pure-Rust `fancy-regex` path (`unstable_wasm`) is used instead.
+# Regex backend: tokenizers' pure-Rust `fancy-regex` everywhere (no C:
+# `onig` is the C Oniguruma library). wasm32 additionally needs
+# `unstable_wasm` (getrandom's JS backend).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokenizers   = { version = "0.22", default-features = false, features = ["onig"] }
+tokenizers   = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokenizers   = { version = "0.22", default-features = false, features = ["unstable_wasm"] }

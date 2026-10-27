@@ -32,7 +32,7 @@ fn devices() -> Vec<Device> {
     // `cpu_gru_parity.rs` and `host_fallback_never_nops.rs`.
     #[allow(unused_mut)]
     let mut v = vec![Device::Cpu];
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     v.push(Device::Metal);
     #[cfg(feature = "mlx")]
     v.push(Device::Mlx);

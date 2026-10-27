@@ -235,7 +235,7 @@ fn no_backend_both_claims_and_host_routes_a_cpu_nop_op() {
 /// there requires a case to exist for each pair this function reports.
 fn risky_claims() -> Vec<(&'static str, Vec<OpKind>)> {
     let mut out: Vec<(&'static str, &[OpKind])> = Vec::new();
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
     out.push(("metal", rlx_metal::supported_ops::SUPPORTED_OPS));
     #[cfg(feature = "gpu")]
     out.push(("wgpu", rlx_wgpu::supported_ops::SUPPORTED_OPS));

@@ -69,6 +69,9 @@ fn case_amp(lead: &[usize], k: usize, n: usize, gelu: bool, amp: f32) -> Option<
 
 #[test]
 fn fused_matmul_bias_matches_cpu_at_trunk_shapes() {
+    // Pin f32 matmul: the f16 opt-in (`RLX_WGPU_COOP_F16_VK_ENABLE`) gives up
+    // the 1e-5 agreement with CPU this file checks.
+    rlx_ir::env::remove("RLX_WGPU_COOP_F16_VK_ENABLE");
     let mut bad = Vec::new();
     for (lead, k, n, gelu) in [
         (vec![64usize], 64usize, 64usize, false),
@@ -105,6 +108,9 @@ fn fused_matmul_bias_matches_cpu_at_trunk_shapes() {
 /// differ most, at the transformer shape that selects the wide kernels.
 #[test]
 fn fused_gelu_epilogue_is_exact_at_large_preactivations() {
+    // Pin f32 matmul: the f16 opt-in (`RLX_WGPU_COOP_F16_VK_ENABLE`) gives up
+    // the 1e-5 agreement with CPU this file checks.
+    rlx_ir::env::remove("RLX_WGPU_COOP_F16_VK_ENABLE");
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         eprintln!("skip: wgpu unavailable");
         return;

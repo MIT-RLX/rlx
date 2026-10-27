@@ -20,17 +20,31 @@
 //!
 //! # Features
 //!
+//! Reading ([`Package`], every tier) is always built, in pure Rust — wasm32 too.
+//!
+//! - `write` (default) — [`write_package`], [`build`], auto-tiering, [`package_from_bake`]
+//! - `convert` (default) — the `*_to_rlxp` importers (GGUF, MLX, DDUF, NeMo, PyTorch)
+//! - `parallel` (default) — warm blocks decoded on rayon
+//! - `zstd-native` — libzstd for the warm/cold codec (native; faster, real levels)
 //! - `encrypt` — [`seal_bytes`] / [`unseal_bytes`] (`RLXSEAL1`)
 //! - `remote` — [`RemoteFlat`] HTTP Range reader
 
+#[cfg(feature = "write")]
 mod auto_tier;
+#[cfg(feature = "write")]
 pub mod build;
 mod flat;
+#[cfg(feature = "write")]
 mod from_bake;
+#[cfg(feature = "convert")]
 mod from_dduf;
+#[cfg(feature = "convert")]
 mod from_gguf;
+#[cfg(feature = "convert")]
 mod from_mlx;
+#[cfg(feature = "convert")]
 mod from_nemo;
+#[cfg(feature = "convert")]
 mod from_pt;
 mod manifest;
 mod package;
@@ -40,27 +54,35 @@ mod store_zip;
 mod tier;
 mod verify;
 mod weights_index;
+#[cfg(feature = "write")]
 mod write;
 
 #[cfg(feature = "remote")]
 mod remote;
 
+#[cfg(feature = "write")]
 pub use auto_tier::{AutoTierOptions, apply_auto_tier};
 pub use flat::{
     FLAG_BINCODE_TOC, FLAG_HYBRID, FLAT_CONTAINER_VERSION, FLAT_MAGIC, FlatHeader, FlatToc,
     is_flat_magic,
 };
+#[cfg(feature = "write")]
 pub use from_bake::{BakeWeight, package_from_bake};
+#[cfg(feature = "convert")]
 pub use from_dduf::{DdufImportOptions, dduf_to_rlxp};
+#[cfg(feature = "convert")]
 pub use from_gguf::{GgufImportOptions, gguf_to_rlxp};
+#[cfg(feature = "convert")]
 pub use from_mlx::{MlxImportOptions, mlx_to_rlxp};
+#[cfg(feature = "convert")]
 pub use from_nemo::{NemoImportOptions, nemo_to_rlxp};
+#[cfg(feature = "convert")]
 pub use from_pt::{PtImportOptions, pt_to_rlxp};
 pub use manifest::{
     COMPAT_VERSION, DistRef, FORMAT_NAME, FORMAT_VERSION, GRAPH_BINCODE, GRAPH_RLXMODEL, GraphRef,
     Manifest, SidecarRef, WeightsRef,
 };
-pub use package::{MaterializeMode, MemberSource, Package, dtype_for_weight_scheme};
+pub use package::{Bytes, MaterializeMode, MemberSource, Package, dtype_for_weight_scheme};
 pub use placement::{ExpertPlacement, Placement, TensorShard};
 pub use seals::{SEAL_MAGIC, is_sealed, seal_bytes, unseal_bytes};
 pub use tier::{
@@ -69,6 +91,7 @@ pub use tier::{
 };
 pub use verify::{VerifyReport, verify_package};
 pub use weights_index::{WeightEntry, WeightsIndex};
+#[cfg(feature = "write")]
 pub use write::{
     ContainerKind, PackedWeight, WriteOptions, graph_with_stripped_weights, infer_container,
     infer_zip_from_path, write_package, write_package_dir, write_package_flat, write_package_zip,

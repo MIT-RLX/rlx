@@ -34,6 +34,13 @@ default = []
 apple = ["rlx-runtime/metal", "rlx-runtime/coreml"]
 # Portable GPU (wgpu → Vulkan/Metal) for Android and desktop shells.
 gpu = ["rlx-runtime/gpu"]
+# `mode = "model"`: serve any package function the coordinator ships
+# (`rlx_runtime::model::distributed` — `dist_node MODE=model`), inference or
+# training, with no model code on the device.
+model = ["rlx-runtime/rlxp", "rlx-runtime/training"]
+# Mesh connections over Bluetooth LE too, when a launcher asks
+# (`RLX_BLE_SERVE`); the app needs `NSBluetoothAlwaysUsageDescription`.
+ble = ["rlx-runtime/ble"]
 
 [dev-dependencies]
 # The coordinator example builds the demo stage graph the phones run.

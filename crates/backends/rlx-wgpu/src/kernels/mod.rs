@@ -23,12 +23,17 @@ pub const MATMUL_F16W_WGSL: &str = include_str!("matmul_f16w.wgsl");
 pub const MATMUL_F16_COMPUTE_WGSL: &str = include_str!("matmul_f16_compute.wgsl");
 pub const MATMUL_COOP16_WGSL: &str = include_str!("matmul_coop16.wgsl");
 pub const MATMUL_COOP_F32_WGSL: &str = include_str!("matmul_coop_f32.wgsl");
+pub const MATMUL_COOP_F32_EDGE_WGSL: &str = include_str!("matmul_coop_f32_edge.wgsl");
+pub const MATMUL_COOP_F32_STRIDED_WGSL: &str = include_str!("matmul_coop_f32_strided.wgsl");
 pub const MATMUL_COOP_F32_PORTABLE_WGSL: &str = include_str!("matmul_coop_f32_portable.wgsl");
 pub const MATMUL_COOP_F16_VULKAN_WGSL: &str = include_str!("matmul_coop_f16_vulkan.wgsl");
 pub const MATMUL_COOP_F16_VULKAN_WIDEN_WGSL: &str =
     include_str!("matmul_coop_f16_vulkan_widen.wgsl");
 pub const MATMUL_COOP_F16_VULKAN_F32ACC_WGSL: &str =
     include_str!("matmul_coop_f16_vulkan_f32acc.wgsl");
+/// 32×32-block, 2×2 register-blocked variant of the f32-accumulator kernel.
+pub const MATMUL_COOP_F16_VULKAN_F32ACC_32_WGSL: &str =
+    include_str!("matmul_coop_f16_vulkan_f32acc_32.wgsl");
 pub const MATMUL_COOP_F16_VULKAN_WIDEN_F32ACC_WGSL: &str =
     include_str!("matmul_coop_f16_vulkan_widen_f32acc.wgsl");
 pub const MATMUL_QKV_COOP_F16_VK_WGSL: &str = include_str!("matmul_qkv_coop_f16_vk.wgsl");
@@ -89,7 +94,8 @@ pub const COMPLEX_CAST_WGSL: &str = include_str!("complex_cast.wgsl");
 pub const BINARY_C64_WGSL: &str = include_str!("binary_c64.wgsl");
 pub const COMPLEX_WIRINGER_WGSL: &str = include_str!("complex_wirtinger.wgsl");
 pub const FFT_BUTTERFLY_STAGE_WGSL: &str = include_str!("fft_butterfly_stage.wgsl");
-pub const ELEMENTWISE_REGION_WGSL: &str = include_str!("elementwise_region.wgsl");
+pub const ELEMENTWISE_REGION_WGSL: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/elementwise_region.wgsl"));
 pub const TRANSPOSE_WGSL: &str = include_str!("transpose.wgsl");
 pub const NARROW_WGSL: &str = include_str!("narrow.wgsl");
 pub const CONCAT_WGSL: &str = include_str!("concat.wgsl");
@@ -115,7 +121,8 @@ pub const Q_MATMUL_WGSL: &str = include_str!("q_matmul.wgsl");
 /// Real INT8 `Op::QConv2d` (i32 accumulate + float requantize).
 pub const Q_CONV2D_WGSL: &str = include_str!("q_conv2d.wgsl");
 /// `Op::BatchNormInference` and its three backwards (channels-last).
-pub const BATCH_NORM_INFERENCE_WGSL: &str = include_str!("batch_norm_inference.wgsl");
+pub const BATCH_NORM_INFERENCE_WGSL: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/batch_norm_inference.wgsl"));
 pub const ARGMAX_WGSL: &str = include_str!("argmax.wgsl");
 pub const POOL2D_WGSL: &str = include_str!("pool2d.wgsl");
 pub const CONV2D_WGSL: &str = include_str!("conv2d.wgsl");
@@ -1736,6 +1743,35 @@ pub struct MatmulQkvParams {
     pub _p4: u32,
 }
 
+/// `matmul_coop_f32_strided` uniform: C[z] = A[z]·B[z], where element
+/// (z, r, c) of A, B and C each lives at
+/// `off + (z / b2)·s0 + (z % b2)·s1 + r·sr + c·sc`. All offsets / strides are
+/// f32 elements, offsets relative to the bind window. 80 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct MatmulStridedParams {
+    pub m: u32,
+    pub k: u32,
+    pub n: u32,
+    pub batch: u32,
+    pub b2: u32,
+    pub c_off: u32,
+    pub c_s0: u32,
+    pub c_s1: u32,
+    pub a_off: u32,
+    pub a_s0: u32,
+    pub a_s1: u32,
+    pub a_sr: u32,
+    pub a_sc: u32,
+    pub b_off: u32,
+    pub b_s0: u32,
+    pub b_s1: u32,
+    pub b_sr: u32,
+    pub b_sc: u32,
+    pub c_sr: u32,
+    pub c_sc: u32,
+}
+
 /// Layout for FusedResidualRmsNorm (same bind layout as FusedResidualLN).
 pub type FusedResidualRmsNormParams = FusedResidualLnParams;
 
@@ -2166,6 +2202,68 @@ impl Kernel {
     }
 }
 
+/// Compile one of this crate's own kernels.
+///
+/// Bounds checks stay on; only naga's forced loop bounding is off. That guard
+/// wraps every loop in an iteration counter so an infinite loop in an
+/// *untrusted* shader cannot be assumed away by the backend compiler — and on
+/// Metal it also kept the tiled matmul's fixed 4×4 accumulator loops from
+/// unrolling: `matmul` at 32×128×2 took 440 µs with it, 37 µs without
+/// (bounds checks alone made no difference). Every loop in these kernels is
+/// bounded by its params, so the guard protects nothing here. User shaders
+/// (`wgpu_gpu_custom`) still go through the fully checked path. The browser's
+/// WebGPU backend ignores these flags and applies its own.
+/// With `RLX_WGPU_DUMP_WGSL=<dir>` (native only), write every shader module
+/// this crate creates to `<dir>/<hash>.wgsl`, its label on the first line —
+/// so the exact sources can be put through another compiler (the browser's
+/// Tint rejects some WGSL that naga accepts; see `fft_gpu.wgsl`'s `fft_inner`).
+pub(crate) fn dump_wgsl(label: &str, wgsl: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(dir) = std::env::var_os("RLX_WGPU_DUMP_WGSL") {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        wgsl.hash(&mut h);
+        let path = std::path::Path::new(&dir).join(format!("{:016x}.wgsl", h.finish()));
+        if !path.exists() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(&path, format!("// {label}\n{wgsl}"));
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (label, wgsl);
+}
+
+pub(crate) fn kernel_module(device: &wgpu::Device, label: &str, wgsl: &str) -> wgpu::ShaderModule {
+    // Fast math swaps the prepended exact helpers for native operators; a
+    // shader without them is unchanged.
+    let fast;
+    let wgsl = if crate::device::fast_math() {
+        fast = wgsl.replace(
+            rlxsl::exact::wgsl_numeric_helpers(),
+            rlxsl::exact::wgsl_fast_numeric_helpers(),
+        );
+        fast.as_str()
+    } else {
+        wgsl
+    };
+    dump_wgsl(label, wgsl);
+    let checks = wgpu::ShaderRuntimeChecks {
+        force_loop_bounding: false,
+        ..wgpu::ShaderRuntimeChecks::checked()
+    };
+    // SAFETY: the only relaxed check is loop bounding, and every loop in this
+    // crate's WGSL terminates on a bound read from its params or a constant.
+    unsafe {
+        device.create_shader_module_trusted(
+            wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+            },
+            checks,
+        )
+    }
+}
+
 /// Build a 4-binding compute kernel: storage(rw) / uniform / storage(ro)
 /// / storage(ro). Currently unused — `matmul_coop16` switched to a
 /// 3-binding layout (A is staged from arena through workgroup memory
@@ -2180,10 +2278,7 @@ fn build_kernel_4(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -2251,10 +2346,7 @@ fn build_kernel_3(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -2317,10 +2409,7 @@ fn build_kernel_ro_u_ro_rw(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let storage = |read_only: bool| wgpu::BindingType::Buffer {
         ty: wgpu::BufferBindingType::Storage { read_only },
         has_dynamic_offset: false,
@@ -2384,10 +2473,7 @@ fn build_kernel_cast_f32_to_f16(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -2446,10 +2532,7 @@ fn build_kernel_f32_rw_uniform_f16_rw(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -2508,10 +2591,7 @@ fn build_kernel_coop_f16_vk(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -2581,10 +2661,7 @@ fn build_kernel(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -2634,10 +2711,13 @@ static MATMUL_BF16W: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_F16_COMPUTE: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP16: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F32: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_COOP_F32_EDGE: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_COOP_F32_STRIDED: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F32_PORTABLE: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F16_VULKAN: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F16_VULKAN_WIDEN: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F16_VULKAN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
+static MATMUL_COOP_F16_VULKAN_F32ACC_32: OnceLock<Option<Kernel>> = OnceLock::new();
 static MATMUL_COOP_F16_VULKAN_WIDEN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
 static CAST_F32_TO_F16: OnceLock<Kernel> = OnceLock::new();
 static BINARY: OnceLock<Kernel> = OnceLock::new();
@@ -2943,6 +3023,7 @@ pub fn matmul_coop16_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     let feats = device.features();
     if !feats.contains(wgpu::Features::SHADER_F16)
         || !feats.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        || !crate::device::coop_f16_8x8_supported()
     {
         return None;
     }
@@ -2973,6 +3054,62 @@ pub fn matmul_coop_f32_kernel(device: &wgpu::Device) -> Option<&'static Kernel> 
             "matmul_coop_f32",
         )
     }))
+}
+/// Edge-tolerant Metal CoopF32 (`matmul_coop_f32_edge.wgsl`): any K / N, B may
+/// be an activation. Same bind layout and grid as [`matmul_coop_f32_kernel`].
+pub fn matmul_coop_f32_edge_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !device
+        .features()
+        .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+    {
+        return None;
+    }
+    Some(MATMUL_COOP_F32_EDGE.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu matmul_coop_f32_edge",
+            MATMUL_COOP_F32_EDGE_WGSL,
+            "matmul_coop_f32_edge",
+        )
+    }))
+}
+/// `matmul_coop_f32_strided.wgsl` — batched matmul reading A and B through
+/// strided views (see [`MatmulStridedParams`]). Metal + cooperative matrix only.
+pub fn matmul_coop_f32_strided_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !device
+        .features()
+        .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+    {
+        return None;
+    }
+    Some(MATMUL_COOP_F32_STRIDED.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu matmul_coop_f32_strided",
+            MATMUL_COOP_F32_STRIDED_WGSL,
+            "matmul_coop_f32_strided",
+        )
+    }))
+}
+/// True when the aligned Metal CoopF32 kernel can take this shape directly.
+pub fn coop_f32_metal_aligned(k: u32, n: u32) -> bool {
+    k.is_multiple_of(8) && n.is_multiple_of(32)
+}
+/// The CoopF32 kernel for one matmul. The bind group (built at compile time)
+/// and the pipeline (set at dispatch) must both come from here so they agree.
+pub fn matmul_coop_f32_kernel_for(
+    device: &wgpu::Device,
+    k: u32,
+    n: u32,
+) -> Option<&'static Kernel> {
+    if matches!(
+        crate::device::wgpu_device().map(|d| d.backend),
+        Some(wgpu::Backend::Metal)
+    ) && !coop_f32_metal_aligned(k, n)
+    {
+        return matmul_coop_f32_edge_kernel(device);
+    }
+    matmul_coop_f32_active_kernel(device)
 }
 /// Vulkan/DX12-oriented coop f32 matmul (`coopLoad`, 8×8 workgroups).
 pub fn matmul_coop_f32_portable_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
@@ -3011,6 +3148,25 @@ fn coop_f16_vk_device_ready(device: &wgpu::Device) -> bool {
 
 fn coop_f16_vk_f32acc_device_ready(device: &wgpu::Device) -> bool {
     coop_f16_vk_device_ready(device) && crate::device::coop_f16_16x16_f32_acc_supported()
+}
+
+/// The 32×32-block f32-accumulator coop kernel (one subgroup, 2×2 tiles). Same
+/// bind layout and params as [`matmul_coop_f16_vulkan_f32acc_kernel`]; dispatch
+/// `(m / 32, n / 32, batch)`, so M and N must be multiples of 32.
+pub fn matmul_coop_f16_vulkan_f32acc_32_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !coop_f16_vk_f32acc_device_ready(device) {
+        return None;
+    }
+    MATMUL_COOP_F16_VULKAN_F32ACC_32
+        .get_or_init(|| {
+            try_build_kernel_coop_f16_vk(
+                device,
+                "rlx-wgpu matmul_coop_f16_vulkan_f32acc_32",
+                MATMUL_COOP_F16_VULKAN_F32ACC_32_WGSL,
+                "matmul_coop_f16_vulkan_f32acc_32",
+            )
+        })
+        .as_ref()
 }
 
 pub fn matmul_coop_f16_vulkan_f32acc_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
@@ -3801,10 +3957,7 @@ fn build_kernel_region(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -4536,4 +4689,282 @@ pub fn matmul_qkv_coop_f16_vk_widen_kernel(device: &wgpu::Device) -> Option<&'st
             "matmul_qkv_coop_f16_vk_widen",
         )
     }))
+}
+
+#[cfg(test)]
+mod fast_math_tests {
+    use super::*;
+
+    /// `set_fast_math` works by replacing the exact helper block with the fast
+    /// one in `kernel_module`. That is a string match: if a shader stopped
+    /// embedding the helpers verbatim, fast math would silently be a no-op for
+    /// it. Every shader that calls them must carry the exact block once.
+    #[test]
+    fn every_helper_shader_carries_the_exact_block_once() {
+        let exact = rlxsl::exact::wgsl_numeric_helpers();
+        for (name, src) in [
+            ("unary", UNARY_WGSL),
+            ("binary", BINARY_WGSL),
+            ("activation_backward", ACTIVATION_BACKWARD_WGSL),
+            ("elementwise_region", ELEMENTWISE_REGION_WGSL),
+            ("batch_norm_inference", BATCH_NORM_INFERENCE_WGSL),
+        ] {
+            assert_eq!(
+                src.matches(exact).count(),
+                1,
+                "{name} must embed the exact helpers once"
+            );
+            let fast = src.replace(exact, rlxsl::exact::wgsl_fast_numeric_helpers());
+            assert!(!fast.contains("rlxsl::exact — correctly-rounded"), "{name}");
+            assert_eq!(fast.matches("fn rlx_div_rn").count(), 1, "{name}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod literal_range_tests {
+    use super::*;
+
+    /// Decimal float literals in `src`, as written.
+    fn decimal_literals(src: &str) -> Vec<String> {
+        let b = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let starts = b[i].is_ascii_digit()
+                && (i == 0
+                    || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'.'));
+            if !starts
+                || (b[i] == b'0' && i + 1 < b.len() && (b[i + 1] == b'x' || b[i + 1] == b'X'))
+            {
+                i += 1;
+                continue;
+            }
+            let s = i;
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                i += 1;
+            }
+            if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+                i += 1;
+                if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+                    i += 1;
+                }
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            out.push(src[s..i].to_string());
+        }
+        out
+    }
+
+    /// WGSL makes a float literal outside f32's finite range a shader-creation
+    /// error. Chrome's compiler (Tint) enforces it; naga, which wgpu uses
+    /// natively, rounds such a literal to `f32::MAX` and accepts it. So
+    /// `3.4028235e38` — a hair ABOVE `f32::MAX` — passed every native test while
+    /// the browser refused the binary/unary shaders and ran nothing. Spell the
+    /// maximum as `0x1.fffffep+127f`, and build a NaN or inf from a runtime
+    /// value (`(bits & 0u) | 0x7fc00000u`).
+    #[test]
+    fn no_wgsl_float_constant_is_outside_the_f32_range() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels");
+        let mut sources: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .expect("kernels dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "wgsl"))
+            .map(|p| {
+                (
+                    p.display().to_string(),
+                    std::fs::read_to_string(&p).unwrap(),
+                )
+            })
+            .collect();
+        assert!(
+            sources.len() > 50,
+            "found only {} kernel files",
+            sources.len()
+        );
+        for (name, src) in [
+            ("unary (generated)", UNARY_WGSL),
+            ("binary (generated)", BINARY_WGSL),
+            ("activation_backward (generated)", ACTIVATION_BACKWARD_WGSL),
+            ("elementwise_region (generated)", ELEMENTWISE_REGION_WGSL),
+            (
+                "batch_norm_inference (generated)",
+                BATCH_NORM_INFERENCE_WGSL,
+            ),
+            ("fast helpers", rlxsl::exact::wgsl_fast_numeric_helpers()),
+        ] {
+            sources.push((name.to_string(), src.to_string()));
+        }
+        let mut bad = Vec::new();
+        for (name, src) in &sources {
+            // A constant `bitcast<f32>` of an inf/NaN pattern is just as fatal:
+            // Tint const-evaluates it and refuses the non-finite result.
+            for (at, _) in src.match_indices("bitcast<f32>(0x") {
+                let hex: String = src[at + 15..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .collect();
+                let closes = src[at + 15 + hex.len()..].starts_with("u)");
+                if let Ok(bits) = u32::from_str_radix(&hex, 16) {
+                    if closes && (bits >> 23) & 0xff == 0xff {
+                        bad.push(format!("{name}: bitcast<f32>(0x{hex}u)"));
+                    }
+                }
+            }
+            for lit in decimal_literals(src) {
+                let v: f64 = lit.parse().unwrap_or(0.0);
+                if v.abs() > f32::MAX as f64 {
+                    bad.push(format!("{name}: {lit}"));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "f32 literals out of range (Tint rejects them):\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// Every WGSL kernel source: the `.wgsl` files plus the generated modules.
+    fn all_sources() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels");
+        let mut sources: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .expect("kernels dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "wgsl"))
+            .map(|p| {
+                (
+                    p.display().to_string(),
+                    std::fs::read_to_string(&p).unwrap(),
+                )
+            })
+            .collect();
+        for (name, src) in [
+            ("unary (generated)", UNARY_WGSL),
+            ("binary (generated)", BINARY_WGSL),
+            ("activation_backward (generated)", ACTIVATION_BACKWARD_WGSL),
+            ("elementwise_region (generated)", ELEMENTWISE_REGION_WGSL),
+            (
+                "batch_norm_inference (generated)",
+                BATCH_NORM_INFERENCE_WGSL,
+            ),
+            ("fast helpers", rlxsl::exact::wgsl_fast_numeric_helpers()),
+        ] {
+            sources.push((name.to_string(), src.to_string()));
+        }
+        sources
+    }
+
+    /// WGSL reserves a long list of words (`active`, `filter`, `self`, …) that
+    /// no declaration may use. Tint enforces it; naga accepts most of them, so
+    /// `let active = …` in `fft_gpu.wgsl` passed every native test and made
+    /// Chrome reject the whole FFT module. (Subset of the spec's list: the ones
+    /// plausible as variable names.)
+    #[test]
+    fn no_wgsl_declaration_uses_a_reserved_word() {
+        const RESERVED: &[&str] = &[
+            "active",
+            "attribute",
+            "auto",
+            "cast",
+            "class",
+            "common",
+            "demote",
+            "do",
+            "enum",
+            "export",
+            "filter",
+            "final",
+            "from",
+            "get",
+            "impl",
+            "import",
+            "inline",
+            "interface",
+            "layout",
+            "macro",
+            "match",
+            "meta",
+            "mod",
+            "module",
+            "move",
+            "mut",
+            "namespace",
+            "new",
+            "nil",
+            "null",
+            "of",
+            "package",
+            "partition",
+            "pass",
+            "patch",
+            "precision",
+            "priv",
+            "pub",
+            "public",
+            "readonly",
+            "ref",
+            "regardless",
+            "register",
+            "require",
+            "resource",
+            "self",
+            "set",
+            "shared",
+            "sizeof",
+            "smooth",
+            "static",
+            "std",
+            "target",
+            "template",
+            "this",
+            "type",
+            "typedef",
+            "typename",
+            "union",
+            "unless",
+            "unsized",
+            "use",
+            "using",
+            "varying",
+            "virtual",
+            "volatile",
+            "wgsl",
+            "where",
+            "with",
+            "writeonly",
+            "yield",
+        ];
+        let sources = all_sources();
+        assert!(
+            sources.len() > 50,
+            "found only {} kernel files",
+            sources.len()
+        );
+        let mut bad = Vec::new();
+        for (name, src) in &sources {
+            let words: Vec<&str> = src
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|w| !w.is_empty())
+                .collect();
+            for w in words.windows(2) {
+                if matches!(
+                    w[0],
+                    "let" | "var" | "const" | "fn" | "struct" | "alias" | "override"
+                ) && RESERVED.contains(&w[1])
+                {
+                    bad.push(format!("{name}: {} {}", w[0], w[1]));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "WGSL reserved words declared (Tint rejects them):\n{}",
+            bad.join("\n")
+        );
+    }
 }

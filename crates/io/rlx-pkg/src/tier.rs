@@ -96,40 +96,62 @@ pub fn decode_zstd_blocks_parallel(comp: &[u8]) -> Result<Vec<u8>> {
     decode_zstd_blocks_impl(comp, true)
 }
 
-/// Streaming zstd decode bounded to `expected + 1` bytes, then required to equal
-/// `expected`. A decompression bomb (a small frame declaring a huge content
-/// size) is stopped at `expected + 1` — peak memory is tied to the block's
-/// deterministic declared length, not the attacker's frame header — and then
-/// rejected. Replaces `zstd::decode_all`, which has no output cap.
-// zstd is C-backed (won't build for wasm32). These thin wrappers keep it behind
-// `cfg`: native links zstd; wasm returns a clear error (the browser path loads
-// uncompressed / hot-tier packages, so the compressed codec is never invoked).
-#[cfg(not(target_arch = "wasm32"))]
+// The codec: pure-Rust `zstd-rs` by default (any target, wasm32 included);
+// libzstd with `zstd-native` on native targets. Both read and write standard
+// zstd frames, so a package written by either is read by either.
+#[cfg(all(feature = "zstd-native", not(target_arch = "wasm32")))]
 fn z_encode_all(data: &[u8], level: i32) -> Result<Vec<u8>> {
     zstd::encode_all(data, level).context("zstd compress")
 }
-#[cfg(not(target_arch = "wasm32"))]
-fn z_decode_all(data: &[u8]) -> Result<Vec<u8>> {
-    zstd::decode_all(data).context("zstd decompress")
-}
-#[cfg(target_arch = "wasm32")]
-fn z_encode_all(_data: &[u8], _level: i32) -> Result<Vec<u8>> {
-    bail!("rlx-pkg: zstd compression unavailable on wasm32 (use uncompressed/hot-tier packages)")
-}
-#[cfg(target_arch = "wasm32")]
-fn z_decode_all(_data: &[u8]) -> Result<Vec<u8>> {
-    bail!("rlx-pkg: zstd decompression unavailable on wasm32 (use uncompressed/hot-tier packages)")
+#[cfg(not(all(feature = "zstd-native", not(target_arch = "wasm32"))))]
+fn z_encode_all(data: &[u8], level: i32) -> Result<Vec<u8>> {
+    let cfg = zstd_rs::CompressionConfig {
+        level,
+        ..zstd_rs::CompressionConfig::DEFAULT
+    };
+    let mut out = Vec::new();
+    zstd_rs::Compressor::new(cfg)
+        .and_then(|mut c| c.compress(data, None, &mut out))
+        .map_err(|e| anyhow::anyhow!("zstd compress: {e}"))?;
+    Ok(out)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn zstd_decode_bounded(input: &[u8], expected: usize) -> Result<Vec<u8>> {
+/// Decode `data` (every frame in it), failing rather than producing more than
+/// `cap` bytes: a decompression bomb is stopped at the cap, so peak memory is
+/// tied to what the caller expects, not to the attacker's frame header.
+#[cfg(all(feature = "zstd-native", not(target_arch = "wasm32")))]
+fn z_decode_capped(data: &[u8], cap: usize) -> Result<Vec<u8>> {
     use std::io::Read;
-    let mut dec = zstd::Decoder::new(input).context("init zstd block decoder")?;
     let mut out = Vec::new();
-    dec.by_ref()
-        .take(expected as u64 + 1)
+    zstd::Decoder::new(data)
+        .context("init zstd decoder")?
+        .take((cap as u64).saturating_add(1))
         .read_to_end(&mut out)
-        .context("zstd decode block")?;
+        .context("zstd decompress")?;
+    if out.len() > cap {
+        bail!("zstd output exceeds {cap} bytes");
+    }
+    Ok(out)
+}
+#[cfg(not(all(feature = "zstd-native", not(target_arch = "wasm32"))))]
+fn z_decode_capped(data: &[u8], cap: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    zstd_rs::Decompressor::new()
+        .decompress(data, None, cap, &mut out)
+        .map_err(|e| anyhow::anyhow!("zstd decompress: {e}"))?;
+    Ok(out)
+}
+
+/// A cold blob: its decoded size is not recorded, so there is no cap.
+fn z_decode_all(data: &[u8]) -> Result<Vec<u8>> {
+    z_decode_capped(data, usize::MAX)
+}
+
+/// One warm block, which must decode to exactly `expected` bytes (and is stopped
+/// at `expected` if it would produce more). Replaces `zstd::decode_all`, which
+/// has no output cap.
+fn zstd_decode_bounded(input: &[u8], expected: usize) -> Result<Vec<u8>> {
+    let out = z_decode_capped(input, expected).context("zstd decode block")?;
     if out.len() != expected {
         bail!(
             "warm block decoded len {} != expected {expected}",
@@ -137,10 +159,6 @@ fn zstd_decode_bounded(input: &[u8], expected: usize) -> Result<Vec<u8>> {
         );
     }
     Ok(out)
-}
-#[cfg(target_arch = "wasm32")]
-fn zstd_decode_bounded(_input: &[u8], _expected: usize) -> Result<Vec<u8>> {
-    bail!("rlx-pkg: zstd block decode unavailable on wasm32 (use uncompressed/hot-tier packages)")
 }
 
 fn decode_zstd_blocks_impl(comp: &[u8], parallel: bool) -> Result<Vec<u8>> {
@@ -212,25 +230,21 @@ fn decode_zstd_blocks_impl(comp: &[u8], parallel: bool) -> Result<Vec<u8>> {
             raw_len - block_size * (n_blocks - 1)
         }
     };
+    let decode = |(i, (a, b)): (usize, &(usize, usize))| {
+        zstd_decode_bounded(&comp[*a..*b], expected(i))
+            .with_context(|| format!("zstd decompress block {i}"))
+    };
+    #[cfg(feature = "parallel")]
     let pieces: Result<Vec<Vec<u8>>> = if parallel && n_blocks > 1 {
         use rayon::prelude::*;
-        ranges
-            .par_iter()
-            .enumerate()
-            .map(|(i, (a, b))| {
-                zstd_decode_bounded(&comp[*a..*b], expected(i))
-                    .with_context(|| format!("zstd decompress block {i}"))
-            })
-            .collect()
+        ranges.par_iter().enumerate().map(decode).collect()
     } else {
-        ranges
-            .iter()
-            .enumerate()
-            .map(|(i, (a, b))| {
-                zstd_decode_bounded(&comp[*a..*b], expected(i))
-                    .with_context(|| format!("zstd decompress block {i}"))
-            })
-            .collect()
+        ranges.iter().enumerate().map(decode).collect()
+    };
+    #[cfg(not(feature = "parallel"))]
+    let pieces: Result<Vec<Vec<u8>>> = {
+        let _ = parallel;
+        ranges.iter().enumerate().map(decode).collect()
     };
     let pieces = pieces?;
     // Size the output from the bytes we actually decoded, not the untrusted
@@ -252,10 +266,21 @@ pub fn decode_zstd_block_at(comp: &[u8], block_index: usize) -> Result<Vec<u8>> 
     if comp.len() < 20 || &comp[..4] != ZBLK_MAGIC {
         bail!("not a ZBLK warm blob");
     }
+    let block_size = u32::from_le_bytes(comp[4..8].try_into().unwrap()) as usize;
+    let raw_len = u64::from_le_bytes(comp[8..16].try_into().unwrap()) as usize;
     let n_blocks = u32::from_le_bytes(comp[16..20].try_into().unwrap()) as usize;
     if block_index >= n_blocks {
         bail!("block_index {block_index} out of range ({n_blocks})");
     }
+    // the block's decoded size, from the header (as `decode_zstd_blocks` checks it)
+    let expected = if block_index + 1 < n_blocks {
+        block_size
+    } else {
+        block_size
+            .checked_mul(n_blocks - 1)
+            .and_then(|full| raw_len.checked_sub(full))
+            .context("warm blob header inconsistent")?
+    };
     let mut pos = 20usize;
     for i in 0..=block_index {
         if pos + 4 > comp.len() {
@@ -267,13 +292,14 @@ pub fn decode_zstd_block_at(comp: &[u8], block_index: usize) -> Result<Vec<u8>> 
             bail!("warm blob truncated");
         }
         if i == block_index {
-            return z_decode_all(&comp[pos..pos + clen]);
+            return zstd_decode_bounded(&comp[pos..pos + clen], expected);
         }
         pos += clen;
     }
     unreachable!()
 }
 
+#[cfg(feature = "write")]
 pub fn encode_zstd(raw: &[u8]) -> Result<Vec<u8>> {
     z_encode_all(raw, 3)
 }
@@ -300,6 +326,7 @@ pub fn decode_payload_parallel(codec: Codec, stored: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+#[cfg(feature = "write")]
 /// Encode raw bytes for a tier (picks codec).
 pub fn encode_for_tier(tier: StorageTier, raw: &[u8], warm_block: u32) -> Result<(Codec, Vec<u8>)> {
     match tier {

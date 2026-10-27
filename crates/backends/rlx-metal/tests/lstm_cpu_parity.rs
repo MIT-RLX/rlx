@@ -74,7 +74,11 @@ fn run(device: Device, b: usize, s: usize, d: usize, h: usize, bidir: bool) -> V
 
 #[test]
 fn metal_matches_cpu_at_every_width_and_length() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("metal not available in this build — skipped");
         return;
     }

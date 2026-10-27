@@ -119,6 +119,8 @@ fn spec_for(dir: &std::path::Path, shard: usize, world: usize) -> TrainSpec {
         device: "cpu".into(),
         grad_group: 0,
         push_data: false,
+        options: None,
+        frozen: Vec::new(),
     }
 }
 

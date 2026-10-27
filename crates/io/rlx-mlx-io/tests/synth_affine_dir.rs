@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Synthetic mlx-community dir → `load_path` → packed affine Linear.
 
+#![cfg(feature = "io")]
 use std::collections::HashMap;
 use std::fs;
 

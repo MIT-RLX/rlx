@@ -10,11 +10,17 @@
 //! is a regime a conv kernel can easily get wrong while still being exact for
 //! the usual seq >> k case.
 
+#![cfg(target_os = "macos")]
+
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 
 fn case(channels: usize, seq: usize, k: usize) -> Option<f32> {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_metal::is_available(),
+    ) {
         eprintln!("skip: metal unavailable");
         return None;
     }

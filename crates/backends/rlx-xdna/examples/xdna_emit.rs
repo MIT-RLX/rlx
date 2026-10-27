@@ -22,8 +22,9 @@ fn main() {
     );
 
     // 2) COMPILE it with the native aiecc binary (no Python).
-    let aiecc = std::env::var("AIECC").expect("set AIECC (.../mlir_aie/bin/aiecc)");
-    let peano = std::env::var("PEANO").expect("set PEANO (.../llvm-aie)");
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let aiecc = tc.aiecc_str();
+    let peano = tc.peano_str();
     let (xclbin, insts_path) =
         rlx_xdna::compile::compile_overlay(&rlx_xdna::compile::OverlaySpec {
             aiecc: &aiecc,

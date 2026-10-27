@@ -373,14 +373,32 @@ fn dequant_matmul_q4k_metal_matches_cpu() {
 /// this targets the native decode GEMV added for `Device::Gpu`.
 #[cfg(feature = "gpu")]
 fn run_gguf_gemv_case(scheme: QuantScheme, k: usize, n: usize) {
-    use half::f16;
     if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("skip: wgpu unavailable");
         return;
     }
+    run_gguf_gemv_on(Device::Gpu, scheme, k, n);
+}
+
+/// The decode GEMV case on `device` (the caller checks it is available).
+#[cfg(any(feature = "gpu", feature = "cuda", feature = "rocm"))]
+fn run_gguf_gemv_on(device: Device, scheme: QuantScheme, k: usize, n: usize) {
+    let x: Vec<f32> = (0..k).map(|i| 0.01 * (i as f32 + 1.0) - 1.0).collect();
+    run_gguf_gemv_x(device, scheme, k, n, &x);
+}
+
+/// `x` (`[m, k]`, row-major) through the packed weight on `device`, checked
+/// against the rlx-gguf dequant; returns the device's `[m, n]`.
+fn run_gguf_gemv_x(device: Device, scheme: QuantScheme, k: usize, n: usize, x: &[f32]) -> Vec<f32> {
+    use half::f16;
     assert_eq!(k % QK_K, 0, "k must be a multiple of {QK_K}");
-    let nbk = k / QK_K;
-    let m = 1usize;
+    // Q8_0 blocks are 32 elements; the K-quants 256.
+    let nbk = if scheme == QuantScheme::GgufQ8_0 {
+        k / 32
+    } else {
+        k / QK_K
+    };
+    let m = x.len() / k;
 
     // Row-major blocks: row r occupies `nbk` consecutive 256-elem blocks.
     let mut packed = Vec::new();
@@ -410,6 +428,25 @@ fn run_gguf_gemv_case(scheme: QuantScheme, k: usize, n: usize) {
             }
             packed.extend_from_slice(&f16::from_f32(0.5).to_le_bytes());
         }
+        QuantScheme::GgufQ5K => {
+            packed.extend_from_slice(&f16::from_f32(0.5).to_le_bytes());
+            packed.extend_from_slice(&f16::from_f32(0.125).to_le_bytes());
+            for i in 0..12 {
+                packed.push(((row * 5 + b + i * 7) % 256) as u8);
+            }
+            for i in 0..(QK_K / 8) {
+                packed.push(((row * 11 + b * 3 + i * 29) % 256) as u8);
+            }
+            for i in 0..(QK_K / 2) {
+                packed.push(((row + b * 7 + i * 13) % 256) as u8);
+            }
+        }
+        QuantScheme::GgufQ8_0 => {
+            packed.extend_from_slice(&f16::from_f32(0.03 + 0.01 * (b % 5) as f32).to_le_bytes());
+            for i in 0..32 {
+                packed.push((((row * 7 + b * 3 + i * 5) % 255) as i32 - 127) as i8 as u8);
+            }
+        }
         other => panic!("unsupported gemv test scheme {other:?}"),
     };
     for row in 0..n {
@@ -421,18 +458,19 @@ fn run_gguf_gemv_case(scheme: QuantScheme, k: usize, n: usize) {
     let w_ref = match scheme {
         QuantScheme::GgufQ4K => rlx_gguf::dequant_q4_k(&packed, k * n).unwrap(),
         QuantScheme::GgufQ6K => rlx_gguf::dequant_q6_k(&packed, k * n).unwrap(),
+        QuantScheme::GgufQ8_0 => rlx_gguf::dequant_q8_0(&packed, k * n).unwrap(),
+        QuantScheme::GgufQ5K => rlx_gguf::dequant_q5_k(&packed, k * n).unwrap(),
         _ => unreachable!(),
     };
-    let x: Vec<f32> = (0..(m * k))
-        .map(|i| 0.01 * (i as f32 + 1.0) - 1.0)
-        .collect();
     let mut expected = vec![0f32; m * n];
-    for c in 0..n {
-        let mut acc = 0f32;
-        for i in 0..k {
-            acc += x[i] * w_ref[c * k + i];
+    for r in 0..m {
+        for c in 0..n {
+            let mut acc = 0f32;
+            for i in 0..k {
+                acc += x[r * k + i] * w_ref[c * k + i];
+            }
+            expected[r * n + c] = acc;
         }
-        expected[c] = acc;
     }
 
     let mut g = Graph::new("gguf_gemv");
@@ -445,10 +483,10 @@ fn run_gguf_gemv_case(scheme: QuantScheme, k: usize, n: usize) {
     );
     g.set_outputs(vec![y]);
 
-    let session = Session::new(Device::Gpu);
+    let session = Session::new(device);
     let mut compiled = session.compile(g);
     compiled.set_param_typed("w_packed", &packed, DType::U8);
-    let actual = compiled.run(&[("x", x.as_slice())]).pop().unwrap();
+    let actual = compiled.run(&[("x", x)]).pop().unwrap();
     assert_eq!(actual.len(), expected.len());
     let mut max_rel = 0f32;
     for i in 0..actual.len() {
@@ -461,7 +499,63 @@ fn run_gguf_gemv_case(scheme: QuantScheme, k: usize, n: usize) {
             expected[i]
         );
     }
-    eprintln!("{scheme:?} wgpu gemv (k={k} n={n}) max_rel={max_rel:.2e}");
+    eprintln!("{scheme:?} {device:?} gemv (m={m} k={k} n={n}) max_rel={max_rel:.2e}");
+    actual
+}
+
+/// A speculative verify step's 2–3 rows (`gguf_gemv_rows`): against the
+/// reference, and each row bit for bit what that row alone (`m = 1`) gives,
+/// so verifying matches one-token decoding exactly.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn run_gguf_gemv_rows_on(device: Device, scheme: QuantScheme, k: usize, n: usize, m: usize) {
+    let x: Vec<f32> = (0..m * k)
+        .map(|i| ((i * 37 % 101) as f32) * 0.02 - 1.0)
+        .collect();
+    let all = run_gguf_gemv_x(device, scheme, k, n, &x);
+    for r in 0..m {
+        let one = run_gguf_gemv_x(device, scheme, k, n, &x[r * k..(r + 1) * k]);
+        assert_eq!(
+            &all[r * n..(r + 1) * n],
+            one.as_slice(),
+            "{scheme:?} m={m} row {r} differs from the row alone"
+        );
+    }
+}
+
+/// Q8_0 / Q4_K / Q5_K / Q6_K decode GEMV on CUDA and ROCm (`gguf_gemv_elem`), against
+/// the rlx-gguf dequant. k = 1024 is Qwen3.5-0.8B's hidden size, where the
+/// block-strided kernels idled most threads.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn gguf_gemv_cases(device: Device, name: &str) {
+    if common::skip_unless_available(device, name) {
+        eprintln!("skip: {name} unavailable");
+        return;
+    }
+    for scheme in [
+        QuantScheme::GgufQ8_0,
+        QuantScheme::GgufQ4K,
+        QuantScheme::GgufQ5K,
+        QuantScheme::GgufQ6K,
+    ] {
+        run_gguf_gemv_on(device, scheme, 256, 6);
+        run_gguf_gemv_on(device, scheme, 1024, 10);
+        run_gguf_gemv_rows_on(device, scheme, 1024, 10, 2);
+        run_gguf_gemv_rows_on(device, scheme, 256, 9, 3);
+    }
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+fn dequant_matmul_gguf_gemv_cuda_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    gguf_gemv_cases(Device::Cuda, "cuda");
+}
+
+#[test]
+#[cfg(feature = "rocm")]
+fn dequant_matmul_gguf_gemv_rocm_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    gguf_gemv_cases(Device::Rocm, "rocm");
 }
 
 #[test]

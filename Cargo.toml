@@ -94,6 +94,8 @@ members = [
     "crates/numerics/rlx-special",   # Bit-exact Boost.Math special functions as SciPy computes them
     "crates/numerics/rlx-pocketfft", # scipy.fft bit-for-bit (SciPy's pinned pocketfft header)
     "crates/numerics/rlx-libm",      # glibc libm (x86_64 FMA variants) bit-for-bit, pure Rust
+    "crates/numerics/rlx-fastmath",  # Accurate vectorized f32 exp/log/tanh (NEON), pure Rust
+    "crates/numerics/rlx-spectral",  # FFT plans, windows, STFT, mel filterbanks, log-mel / fbank (f32 + f64)
     "crates/numerics/rlx-nnpack",    # torch CPU's NNPACK ft16x16 convolution bit-for-bit
     "crates/numerics/rlx-signal",    # scipy.signal bit-for-bit (IIR/FIR design, lfilter/sosfilt)
     "crates/numerics/rlx-search",    # Host sequence search: argmax/top-k, beam, CTC, forced alignment
@@ -243,6 +245,8 @@ rlx-special = { path = "crates/numerics/rlx-special", version = "0.2.19" }
 rlx-nnpack = { path = "crates/numerics/rlx-nnpack", version = "0.2.19" }
 rlx-pocketfft = { path = "crates/numerics/rlx-pocketfft", version = "0.2.19" }
 rlx-libm = { path = "crates/numerics/rlx-libm", version = "0.2.19" }
+rlx-fastmath = { path = "crates/numerics/rlx-fastmath", version = "0.2.19" }
+rlx-spectral = { path = "crates/numerics/rlx-spectral", version = "0.2.19" }
 rlx-linux-ref = { path = "crates/numerics/rlx-linux-ref", version = "0.2.19" }
 rlx-signal = { path = "crates/numerics/rlx-signal", version = "0.2.19" }
 rlx-search = { path = "crates/numerics/rlx-search", version = "0.2.19" }

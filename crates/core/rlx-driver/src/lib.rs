@@ -28,16 +28,26 @@
 //! keep working without import changes.
 
 pub mod arena;
+/// A TCP link over Bluetooth LE L2CAP (no L2CAP channels on Windows or the web).
+#[cfg(all(
+    feature = "ble",
+    not(target_os = "windows"),
+    not(target_arch = "wasm32")
+))]
+pub mod ble;
 pub mod buffer;
 pub mod collective;
 pub mod device;
 pub mod handle;
 #[cfg(feature = "iroh")]
 pub mod iroh_transport;
+#[cfg(feature = "mdns")]
+pub mod mdns;
 #[cfg(feature = "mpi")]
 pub mod mpi_transport;
 pub mod net;
 pub mod node;
+pub mod rendezvous;
 pub mod stream;
 pub mod symmetric;
 pub mod transport;
@@ -58,7 +68,8 @@ pub use iroh_transport::{
 pub use mpi_transport::MpiTransport;
 pub use net::{DEFAULT_HEAP_BYTES, NetTransport, TcpTransport, ThunderboltTransport};
 pub use node::{
-    Node, Topology, announce_coordinator, discover_coordinator, discover_peers, local_ip,
+    Node, NodeTransport, RANK_UNASSIGNED, Topology, announce_coordinator, discover_coordinator,
+    discover_peers, local_ip, resolve_addr,
 };
 pub use stream::{CommandStream, SyncStream};
 pub use symmetric::{

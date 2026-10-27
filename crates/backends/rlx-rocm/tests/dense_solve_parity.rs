@@ -24,8 +24,8 @@ fn cpu_run(g: Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
 
 #[test]
 fn dense_solve_f32_matches_cpu() {
-    if !rlx_rocm::is_available() || !rlx_rocm::dense_solve_native::is_available() {
-        eprintln!("[rlx-rocm dense_solve] no ROCm/hipSOLVER — skipping");
+    let available = rlx_rocm::is_available() && rlx_rocm::dense_solve_native::is_available();
+    if rlx_ir::env::skip_unless_device("rocm + hipSOLVER", true, available) {
         return;
     }
     let n = 2usize;

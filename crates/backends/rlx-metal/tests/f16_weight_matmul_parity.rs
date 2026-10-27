@@ -58,7 +58,7 @@ fn f16_weight_matmul_matches_f32_weight() {
             if device == Device::Metal
                 && rlx_ir::env::skip_unless_device(
                     "metal",
-                    true,
+                    cfg!(target_os = "macos"),
                     rlx_runtime::is_available(Device::Metal),
                 )
             {

@@ -16,10 +16,10 @@ use crate::kernels::{
     GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
     GatherBwdParams, GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams,
     GruParams, Im2Col2dParams, IndexingNdParams, LayerNormBwdParams, LayerNormParams, LstmParams,
-    Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams,
-    Pool1dParams, Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams, QuantI8Params,
-    ReduceParams, ResizeNearest2xParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
-    RoundToFormatParams, SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams,
+    Mamba2Params, MatmulQkvParams, MatmulStridedParams, MaxPool2dBwdParams, MaxPool3dBwdParams,
+    NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams,
+    QuantI8Params, ReduceParams, ResizeNearest2xParams, RmsNormBwdParams, RnnParams, RopeBwdParams,
+    RopeParams, RoundToFormatParams, SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams,
     ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
     TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
 };
@@ -38,9 +38,9 @@ use super::helpers::{MatmulCompute, MatmulQkvKind};
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CastF32ToF16Params {
-    pub src_off: u32, // f32-element offset into arena (also f16-element offset)
+    pub src_off: u32, // f32-element offset into the bound f32 arena window
     pub len: u32,
-    pub _p0: u32,
+    pub dst_off: u32, // f16-element offset into the bound f16 shadow window
     pub _p1: u32,
 }
 unsafe impl bytemuck::Pod for CastF32ToF16Params {}
@@ -1013,8 +1013,9 @@ pub(crate) enum Step {
     /// reference, and writes the result back. See `crate::custom_host`.
     CustomHost {
         name: String,
-        in_specs: Vec<(u32, rlx_ir::Shape)>, // (byte_off, shape)
-        out_byte_off: u32,
+        // `usize`, not `u32`: a parked param's offset carries `WEIGHT_BUF_TAG`.
+        in_specs: Vec<(usize, rlx_ir::Shape)>, // (byte_off, shape)
+        out_byte_off: usize,
         out_shape: rlx_ir::Shape,
         attrs: Vec<u8>,
     },
@@ -1159,6 +1160,11 @@ pub(crate) enum Step {
     MatmulQkv {
         params: MatmulQkvParams,
         kind: MatmulQkvKind,
+    },
+    /// Batched matmul reading A / B through strided views
+    /// (`matmul_coop_f32_strided`); lowered from `crate::unfuse::STRIDED_BMM`.
+    MatmulStrided {
+        params: MatmulStridedParams,
     },
     /// `fused_residual_ln_tee` — does (Add → LN) but writes the sum to
     /// a separate arena slot (the eliminated Add's old slot). Fires
@@ -1335,6 +1341,8 @@ impl Step {
             // strides are baked at compile time, scaling m only adjusts
             // the per-thread bound check.
             Step::MatmulQkv { .. } => true,
+            // Strides are fixed at compile time from the full shapes.
+            Step::MatmulStrided { .. } => false,
             Step::CastF32ToF16 { .. } => true,
             // Attention: WGSL kernel uses `seq_q_stride`/`seq_k_stride`
             // (full extent, set at compile time) for per-(batch, head)
@@ -1592,6 +1600,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::AdaLayerNormBackward { .. } => "ada_layer_norm_backward",
         Step::GatedResidualBackward { .. } => "gated_residual_backward",
         Step::MatmulQkv { .. } => "matmul_qkv",
+        Step::MatmulStrided { .. } => "matmul_strided",
         Step::ElementwiseRegion { .. } => "elementwise_region",
         Step::BatchElementwiseRegion { .. } => "batch_elementwise_region",
     }

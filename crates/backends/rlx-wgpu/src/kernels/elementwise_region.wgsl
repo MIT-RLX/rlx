@@ -81,17 +81,6 @@ fn region_resolve_row(
 // `array<u32, N>` packed layout. Storage allows any stride.
 @group(0) @binding(1) var<storage, read>        params: Params;
 
-fn gelu_erf(x: f32) -> f32 {
-    let arg = x * 0.70710678118654752;
-    let s = select(-1.0, 1.0, arg >= 0.0);
-    let xa = abs(arg);
-    let t = 1.0 / (1.0 + 0.3275911 * xa);
-    let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
-                + t * (-1.453152027 + t * 1.061405429))));
-    let e = s * (1.0 - poly * exp(-xa * xa));
-    return 0.5 * x * (1.0 + e);
-}
-
 fn resolve_operand(
     enc: u32,
     i: u32,
@@ -110,40 +99,23 @@ fn resolve_operand(
     }
 }
 
+// `sub` is `rlx_ir::activation_sub(act)`. The step runs the shared rlxsl
+// manifest math (`rlx_activation_apply`, generated under
+// `OpcodeScheme::Region` and prepended by build.rs). The hand-written switch
+// that stood here covered 17 of the 18 region-fusable activations: `Round`
+// (12) and `Recip` (17) fell through to `return x`, and `Sqrt`/`Rsqrt` were the
+// uncorrected WGSL forms.
 fn apply_activation(sub: u32, x: f32) -> f32 {
-    if (sub == 3u) { return max(x, 0.0); }                // Relu
-    if (sub == 0u) { return gelu_erf(x); }                   // Gelu (exact erf)
-    if (sub == 1u) {                                          // GeluApprox
-        let c = 0.7978845608028654;
-        let x3 = x * x * x;
-        let inner = clamp(c * (x + 0.044715 * x3), -15.0, 15.0);
-        return 0.5 * x * (1.0 + tanh(inner));
-    }
-    if (sub == 2u) { return x / (1.0f + exp(-x)); }       // Silu
-    if (sub == 4u) { return 1.0f / (1.0f + exp(-x)); }    // Sigmoid
-    if (sub == 5u) { return tanh(x); }                     // Tanh
-    if (sub == 6u) { return exp(x); }                      // Exp
-    if (sub == 7u) { return log(x); }                      // Log
-    if (sub == 8u) { return sqrt(x); }                     // Sqrt
-    if (sub == 9u) { return 1.0f / sqrt(x); }              // Rsqrt
-    if (sub == 10u) { return -x; }                         // Neg
-    if (sub == 11u) { return abs(x); }                     // Abs
-    if (sub == 13u) { return sin(x); }                     // Sin
-    if (sub == 14u) { return cos(x); }                     // Cos
-    if (sub == 15u) { return tan(x); }                     // Tan
-    if (sub == 16u) { return atan(x); }                    // Atan
-    return x;
+    return rlx_activation_apply(sub, x);
 }
 
+// `sub` is the `BinaryOp` opcode (`rlx_ir::binary_sub`), so the step runs the
+// standalone kernel's math: `rlx_binary_apply` is @generated from the rlxsl
+// manifest and prepended by build.rs. A hand-written copy here had drifted —
+// approximate `/`, and bare `pow`, which WGSL leaves undefined for a negative
+// base.
 fn apply_binary(sub: u32, a: f32, b: f32) -> f32 {
-    if (sub == 0u) { return a + b; }   // Add
-    if (sub == 1u) { return a - b; }   // Sub
-    if (sub == 2u) { return a * b; }   // Mul
-    if (sub == 3u) { return a / b; }   // Div
-    if (sub == 4u) { return max(a, b); } // Max
-    if (sub == 5u) { return min(a, b); } // Min
-    if (sub == 6u) { return pow(a, b); } // Pow
-    return a;
+    return rlx_binary_apply(sub, a, b);
 }
 
 // Fused `ChainStep::Cast` on the f32-uniform arena. `sub` is the target-class

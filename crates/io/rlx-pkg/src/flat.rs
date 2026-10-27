@@ -6,12 +6,17 @@
 
 use crate::manifest::Manifest;
 use crate::placement::Placement;
-use crate::tier::{Codec, StorageTier, decode_payload, encode_for_tier};
+#[cfg(feature = "write")]
+use crate::tier::encode_for_tier;
+use crate::tier::{Codec, StorageTier, decode_payload};
 use crate::weights_index::{WeightEntry, WeightsIndex};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "write")]
 use std::collections::HashMap;
+#[cfg(feature = "write")]
 use std::io::Write;
+#[cfg(feature = "write")]
 use std::path::Path;
 
 /// Magic for the flat package (`RLXPFLAT`).
@@ -315,6 +320,7 @@ impl From<FlatSidecarBin> for FlatSidecar {
 }
 
 impl FlatTocBin {
+    #[cfg(feature = "write")]
     pub(crate) fn from_toc(toc: &FlatToc) -> Result<Self> {
         Ok(Self {
             manifest_json: serde_json::to_vec(&toc.manifest)
@@ -355,6 +361,7 @@ impl FlatTocBin {
     }
 }
 
+#[cfg(feature = "write")]
 /// Payload pieces for [`write_flat`].
 pub struct FlatPayload {
     pub graph: Vec<u8>,
@@ -374,6 +381,7 @@ pub struct FlatPayload {
     pub include_graph: bool,
 }
 
+#[cfg(feature = "write")]
 /// Tensor metadata without bytes.
 #[derive(Debug, Clone)]
 pub struct FlatTensorMeta {
@@ -386,6 +394,7 @@ pub struct FlatTensorMeta {
     pub checksum: Option<String>,
 }
 
+#[cfg(feature = "write")]
 /// Serialize a flat (optionally hybrid) package to `path`.
 pub fn write_flat(path: impl AsRef<Path>, manifest: Manifest, payload: FlatPayload) -> Result<()> {
     let path = path.as_ref();
@@ -561,6 +570,7 @@ pub fn write_flat(path: impl AsRef<Path>, manifest: Manifest, payload: FlatPaylo
     Ok(())
 }
 
+#[cfg(feature = "write")]
 fn meta_checksum_for_sidecar(raw: &[u8], payload: &FlatPayload) -> Option<String> {
     // Checksums for sidecars follow the same policy as weights: only when any
     // weight carried a checksum (write_checksums). Detect via first weight.
@@ -571,6 +581,7 @@ fn meta_checksum_for_sidecar(raw: &[u8], payload: &FlatPayload) -> Option<String
     }
 }
 
+#[cfg(feature = "write")]
 fn push_feat(feats: &mut Vec<String>, f: &str) {
     if !feats.iter().any(|x| x == f) {
         feats.push(f.to_string());

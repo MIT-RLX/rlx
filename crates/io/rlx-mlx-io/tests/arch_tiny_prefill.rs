@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Tiny Llama-like mlx-lm graph builds and runs on CPU.
 
+#![cfg(feature = "io")]
 use rlx_ir::quant::QuantScheme;
 use rlx_mlx_io::{
     MlxArchConfig, MlxPackedLinear, PackedLinearBinding, build_llama_like_prefill,

@@ -210,6 +210,8 @@ fn train_spec(dir: &std::path::Path, shard: usize, world: usize, push_data: bool
         // over the wire instead and the worker rewrites its `DataRef`s to the
         // files it received. Only loopback can get away with `false`.
         push_data,
+        options: None,
+        frozen: Vec::new(),
     }
 }
 

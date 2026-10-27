@@ -37,19 +37,21 @@ use serde_json::{Value, json};
 use crate::lm::LmRunner;
 use crate::{Device, SampleOpts};
 
-#[cfg(feature = "model-io")]
+#[cfg(all(feature = "rlxp", feature = "training"))]
+pub mod distributed;
+#[cfg(feature = "rlxp")]
 mod entries;
 pub mod image_resize;
 pub mod json_prefix;
 pub mod plugin;
 #[cfg(feature = "program")]
 mod program;
-#[cfg(feature = "model-io")]
+#[cfg(feature = "rlxp")]
 pub mod rlxp;
-#[cfg(feature = "model-io")]
+#[cfg(feature = "rlxp")]
 mod sae;
 pub mod tasks;
-#[cfg(all(feature = "model-io", feature = "training"))]
+#[cfg(all(feature = "rlxp", feature = "training"))]
 pub mod trainer;
 #[cfg(feature = "program")]
 mod wasi;
@@ -403,9 +405,9 @@ fn with_providers<R>(f: impl FnOnce(&[&dyn ModelProvider]) -> R) -> R {
 }
 
 fn builtin_providers() -> Vec<&'static dyn ModelProvider> {
-    #[cfg(feature = "model-io")]
+    #[cfg(feature = "rlxp")]
     return vec![&rlxp::RlxpProvider];
-    #[cfg(not(feature = "model-io"))]
+    #[cfg(not(feature = "rlxp"))]
     Vec::new()
 }
 

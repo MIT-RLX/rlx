@@ -9,11 +9,17 @@
 //! (cos 0.64 on all five). 160 is not a multiple of a typical threadgroup
 //! width, so widths are swept either side of the power-of-two boundaries.
 
+#![cfg(target_os = "macos")]
+
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 
 fn max_abs_diff(inner: usize, outer: usize) -> Option<f32> {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_metal::is_available(),
+    ) {
         eprintln!("skip: metal unavailable");
         return None;
     }

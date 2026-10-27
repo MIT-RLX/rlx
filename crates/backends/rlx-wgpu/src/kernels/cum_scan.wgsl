@@ -25,7 +25,7 @@ fn cum_scan(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
     if (row >= params.outer) { return; }
     let in_base  = params.in_off  + row * params.inner;
     let out_base = params.out_off + row * params.inner;
-    var acc: f32 = select(1.0, -3.4028235e38, params.is_max != 0u);
+    var acc: f32 = select(1.0, -0x1.fffffep+127f, params.is_max != 0u);
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
         let v = arena[in_base + i];
         if (params.exclusive != 0u) {

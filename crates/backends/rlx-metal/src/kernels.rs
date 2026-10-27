@@ -1466,6 +1466,80 @@ kernel void sgemm_simd_4x4(
     }
 }
 
+// Batched `sgemm_simd_4x4`: one dispatch for a whole `BatchedSgemm`, batch on
+// grid z. `strides` = per-matrix element strides of (A, B, C); 0 broadcasts
+// matrix 0. Same tile math as `sgemm_simd_4x4` — replaces `batch` separate MPS
+// encodes, which dominated many-head attention (B*H tiny matmuls per call).
+kernel void bmm_simd_4x4(
+    device const float* A0 [[buffer(0)]],
+    device const float* B0 [[buffer(1)]],
+    device float* C0       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& K      [[buffer(4)]],
+    constant uint& N      [[buffer(5)]],
+    constant uint3& strides [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint slid  [[thread_index_in_simdgroup]]
+) {
+    device const float* A = A0 + (ulong)tgid.z * strides.x;
+    device const float* B = B0 + (ulong)tgid.z * strides.y;
+    device float* C = C0 + (ulong)tgid.z * strides.z;
+
+    uint sg_row = sgid / 4;
+    uint sg_col = sgid % 4;
+    uint tg_row_base = tgid.y * 32;
+    uint tg_col_base = tgid.x * 32;
+
+    threadgroup float A_tg[32 * 32];
+    threadgroup float B_tg[32 * 32];
+
+    simdgroup_float8x8 a, b, c;
+    c = simdgroup_float8x8(0.0f);
+
+    for (uint kk = 0; kk < K; kk += 32) {
+        uint linear = sgid * 32 + slid;
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 512 + linear;
+            uint ar = tg_row_base + idx / 32;
+            uint ac = kk + idx % 32;
+            A_tg[idx] = (ar < M && ac < K) ? A[ar * K + ac] : 0.0f;
+        }
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 512 + linear;
+            uint br = kk + idx / 32;
+            uint bc = tg_col_base + idx % 32;
+            B_tg[idx] = (br < K && bc < N) ? B[br * N + bc] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k_inner = 0; k_inner < 32; k_inner += 8) {
+            simdgroup_load(a, &A_tg[sg_row * 8 * 32 + k_inner], 32);
+            simdgroup_load(b, &B_tg[k_inner * 32 + sg_col * 8], 32);
+            simdgroup_multiply_accumulate(c, a, b, c);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint out_row = tg_row_base + sg_row * 8;
+    uint out_col = tg_col_base + sg_col * 8;
+    if (out_row + 8u <= M && out_col + 8u <= N) {
+        simdgroup_store(c, &C[out_row * N + out_col], N);
+    } else if (out_row < M && out_col < N) {
+        // Masked edge store — see `sgemm_simd_4x4`.
+        threadgroup float* stage = &A_tg[sgid * 64];
+        simdgroup_store(c, stage, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 32 + slid;
+            uint r = out_row + idx / 8;
+            uint cc = out_col + idx % 8;
+            if (r < M && cc < N) {
+                C[r * N + cc] = stage[idx];
+            }
+        }
+    }
+}
+
 // Register-blocked simdgroup GEMM family (plain + split-K) — generated per tile
 // config by `sgemm_tile_variant!` / `sgemm_splitk_variant!` (see msl_source). Each
 // config is TROWS×TCOLS output/threadgroup, TROWS/8 simdgroups × NACC 8×8-col
@@ -4352,6 +4426,31 @@ kernel void transpose_swap12_batched_trail_f32(
     dst[dst_idx] = src[src_idx];
 }
 
+// Same permutation, one thread per OUTPUT element in output order (`d`
+// fastest): writes coalesce fully and reads come in contiguous `trail` runs.
+// The 3-D kernel above puts `d` on grid z, so neighbouring threads stride by
+// whole rows on both sides — ~9 GB/s on multi-head attention's
+// `[B,S,H,Dh] <-> [B,H,S,Dh]` (H rows, too few for the tiled kernel).
+kernel void transpose_swap12_trail_rows_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst       [[buffer(1)]],
+    constant uint& batch    [[buffer(2)]],
+    constant uint& rows     [[buffer(3)]],
+    constant uint& cols     [[buffer(4)]],
+    constant uint& trail    [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint block = rows * cols * trail;
+    if (gid >= batch * block) return;
+    uint d = gid % trail;
+    uint t = gid / trail;
+    uint c = t % cols;
+    t /= cols;
+    uint r = t % rows;
+    uint b = t / rows;
+    dst[gid] = src[b * block + c * rows * trail + r * trail + d];
+}
+
 kernel void transpose_swap12_batched_trail_tiled_f32(
     device const float* src [[buffer(0)]],
     device float* dst       [[buffer(1)]],
@@ -5219,6 +5318,93 @@ kernel void softmax_lastax(
     // Pass 3: normalize.
     for (uint i = tid; i < cols; i += tsize) {
         data[base + i] *= inv_sum;
+    }
+}
+
+// `softmax_lastax` reading `src` and writing `data` — the same arithmetic in the
+// same order, so bit-identical to Copy(src→data) + the in-place kernel, minus
+// the copy's full read+write pass.
+kernel void softmax_lastax_out(
+    device const float* src [[buffer(0)]],
+    constant uint& cols   [[buffer(1)]],
+    device float* data    [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    // Each thread's elements (tid, tid+tsize, ...) are kept in registers when
+    // the row fits (cols <= 8*tsize): one read of `src` and one write of `data`
+    // instead of two reads + read-modify-write. Per-thread order and the tree
+    // reductions are unchanged, so the bits are too.
+    constexpr uint MAXV = 8;
+    threadgroup float partial[256];
+    uint base = row * cols;
+    bool cached = cols <= MAXV * tsize;
+    float v[MAXV];
+
+    float local_max = -INFINITY;
+    if (cached) {
+        for (uint j = 0; j < MAXV; ++j) {
+            uint i = tid + j * tsize;
+            if (i < cols) {
+                v[j] = src[base + i];
+                local_max = max(local_max, v[j]);
+            }
+        }
+    } else {
+        for (uint i = tid; i < cols; i += tsize) {
+            local_max = max(local_max, src[base + i]);
+        }
+    }
+    partial[tid] = (float)local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial[tid] = max(partial[tid], partial[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = partial[0];
+    // See `softmax_lastax`: `partial` is reused below.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_sum = 0.0f;
+    if (cached) {
+        for (uint j = 0; j < MAXV; ++j) {
+            uint i = tid + j * tsize;
+            if (i < cols) {
+                v[j] = exp(v[j] - row_max);
+                local_sum += v[j];
+            }
+        }
+    } else {
+        for (uint i = tid; i < cols; i += tsize) {
+            float e = exp(src[base + i] - row_max);
+            data[base + i] = e;
+            local_sum += e;
+        }
+    }
+    partial[tid] = (float)local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0f / partial[0];
+
+    if (cached) {
+        for (uint j = 0; j < MAXV; ++j) {
+            uint i = tid + j * tsize;
+            if (i < cols) {
+                data[base + i] = v[j] * inv_sum;
+            }
+        }
+    } else {
+        for (uint i = tid; i < cols; i += tsize) {
+            data[base + i] *= inv_sum;
+        }
     }
 }
 
@@ -14108,6 +14294,7 @@ pub struct Kernels {
     pub sgemm_simd: ComputePipelineState,
     pub sgemm_simd_bias: ComputePipelineState,
     pub sgemm_simd_4x4: ComputePipelineState,
+    pub bmm_simd_4x4: ComputePipelineState,
     pub sgemm_simd64: ComputePipelineState,
     pub sgemm_simd64_splitk: ComputePipelineState,
     pub zero_f32: ComputePipelineState,
@@ -14340,6 +14527,7 @@ pub struct Kernels {
     pub transpose_last2_batched_tiled_f32: ComputePipelineState,
     pub transpose_swap12_batched_trail_f32: ComputePipelineState,
     pub transpose_swap12_batched_trail_tiled_f32: ComputePipelineState,
+    pub transpose_swap12_trail_rows_f32: ComputePipelineState,
     pub gather_axis: ComputePipelineState,
     pub pool2d: ComputePipelineState,
     pub pool3d: ComputePipelineState,
@@ -14380,6 +14568,7 @@ pub struct Kernels {
     pub tan_inplace: ComputePipelineState,
     pub atan_inplace: ComputePipelineState,
     pub softmax_lastax: ComputePipelineState,
+    pub softmax_lastax_out: ComputePipelineState,
     pub softmax_lastax_causal: ComputePipelineState,
     pub softmax_cross_entropy_dense: ComputePipelineState,
     pub softmax_cross_entropy_with_logits: ComputePipelineState,
@@ -14911,6 +15100,7 @@ impl Kernels {
             sgemm_simd: pipeline("sgemm_simd"),
             sgemm_simd_bias: pipeline("sgemm_simd_bias"),
             sgemm_simd_4x4: pipeline("sgemm_simd_4x4"),
+            bmm_simd_4x4: pipeline("bmm_simd_4x4"),
             sgemm_simd64: pipeline("sgemm_simd64"),
             sgemm_simd64_splitk: pipeline("sgemm_simd64_splitk"),
             zero_f32: pipeline("zero_f32"),
@@ -15124,6 +15314,7 @@ impl Kernels {
             transpose_swap12_batched_trail_tiled_f32: pipeline(
                 "transpose_swap12_batched_trail_tiled_f32",
             ),
+            transpose_swap12_trail_rows_f32: pipeline("transpose_swap12_trail_rows_f32"),
             gather_axis: pipeline("gather_axis"),
             pool2d: pipeline("pool2d"),
             pool3d: pipeline("pool3d"),
@@ -15163,6 +15354,7 @@ impl Kernels {
             tan_inplace: pipeline("tan_inplace"),
             atan_inplace: pipeline("atan_inplace"),
             softmax_lastax: pipeline("softmax_lastax"),
+            softmax_lastax_out: pipeline("softmax_lastax_out"),
             softmax_lastax_causal: pipeline("softmax_lastax_causal"),
             softmax_cross_entropy_dense: pipeline("softmax_cross_entropy_dense"),
             softmax_cross_entropy_with_logits: pipeline("softmax_cross_entropy_with_logits"),

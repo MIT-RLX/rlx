@@ -9105,6 +9105,24 @@ pub(crate) fn encode_transpose_swap12_batched_trailing(
     enc.set_bytes(3, 4, &rows as *const u32 as *const _);
     enc.set_bytes(4, 4, &cols as *const u32 as *const _);
     enc.set_bytes(5, 4, &trail as *const u32 as *const _);
+    // A contiguous trailing run of >= 4 floats: copy in output order.
+    if trail >= 4 && !rlx_ir::env::flag("RLX_METAL_TRANSPOSE_TRAIL_3D") {
+        enc.set_compute_pipeline_state(&k.transpose_swap12_trail_rows_f32);
+        let total = (batch as u64) * (rows as u64) * (cols as u64) * (trail as u64);
+        enc.dispatch_threads(
+            crate::mtl::MTLSize {
+                width: total,
+                height: 1,
+                depth: 1,
+            },
+            crate::mtl::MTLSize {
+                width: 256.min(total),
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
     if use_tiled {
         enc.set_compute_pipeline_state(&k.transpose_swap12_batched_trail_tiled_f32);
         let tg = crate::mtl::MTLSize {
@@ -10198,13 +10216,20 @@ pub(crate) fn encode_softmax(
     enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
     buffer: &crate::mtl::Buffer,
+    src: usize,
     data: usize,
     rows: u32,
     cols: u32,
     dt: crate::thunk::HalfFlag,
 ) {
     use crate::thunk::HalfFlag;
+    let out_of_place = src != data;
+    assert!(
+        !out_of_place || dt == HalfFlag::F32,
+        "out-of-place softmax is f32-only"
+    );
     let pipeline = match dt {
+        HalfFlag::F32 if out_of_place => &k.softmax_lastax_out,
         HalfFlag::F32 => &k.softmax_lastax,
         HalfFlag::F16 => &k.softmax_lastax_h,
     };
@@ -10216,7 +10241,10 @@ pub(crate) fn encode_softmax(
         eprintln!("[softmax-trace] rows={rows} cols={cols} tg_w={tg_w} dt={dt:?}");
     }
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(buffer), data as u64);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    if out_of_place {
+        enc.set_buffer(2, Some(buffer), data as u64);
+    }
     enc.set_bytes(
         1,
         std::mem::size_of::<u32>() as u64,

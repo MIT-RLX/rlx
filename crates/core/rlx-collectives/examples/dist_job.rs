@@ -165,7 +165,15 @@ fn build_node(rank: u32, world: u32, net: &Net) -> Node {
             };
             Node::new(rank, world)
                 .topology(topo)
-                .peers(net.peers.iter().map(String::as_str))
+                .peers(
+                    net.peers
+                        .iter()
+                        .map(|p| rlx_driver::resolve_addr(p))
+                        .collect::<std::io::Result<Vec<_>>>()
+                        .unwrap_or_else(|e| {
+                            config_error(format!("[net] peers has a bad address: {e}"))
+                        }),
+                )
                 .unwrap_or_else(|e| config_error(format!("[net] peers has a bad address: {e}")))
         }
         // Zero-config LAN discovery: coordinator advertises, workers browse.

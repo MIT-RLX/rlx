@@ -82,7 +82,10 @@ extern "C" __global__ void q_conv2d(
         }
     }
     float mult = __uint_as_float(mult_bits);
-    int r = (int)round_half_away((float)acc * mult) + out_zp;
+    // Clamp before the cast (out-of-range float→int is undefined; see quantize.cu).
+    float rf = round_half_away((float)acc * mult);
+    rf = (rf != rf) ? 0.0f : fminf(fmaxf(rf, -1024.0f), 1024.0f);
+    int r = (int)rf + out_zp;
     if (r < -128) r = -128;
     if (r > 127) r = 127;
     out[i] = (signed char)r;

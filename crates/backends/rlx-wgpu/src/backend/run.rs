@@ -46,7 +46,7 @@ use crate::kernels::{
     grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layernorm_kernel,
     lstm_kernel, mamba2_kernel, matmul_bf16w_kernel, matmul_coop_f16_vulkan_active_kernel,
-    matmul_coop_f16_vulkan_kernel, matmul_coop_f32_active_kernel, matmul_coop16_kernel,
+    matmul_coop_f16_vulkan_kernel, matmul_coop_f32_kernel_for, matmul_coop16_kernel,
     matmul_f16_compute_kernel, matmul_f16w_kernel, matmul_gemv_kernel, matmul_kernel,
     matmul_qkv_coop_f16_vk_active_kernel, matmul_qkv_coop_f16_vk_kernel,
     matmul_qkv_coop_f32_kernel, matmul_qkv_kernel, matmul_wide_active_kernel, matmul_wide_kernel,
@@ -603,6 +603,18 @@ impl WgpuExecutable {
     }
 
     pub(crate) fn run_inner(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        // In the browser a GPU→CPU readback completes only after control returns
+        // to the event loop, which a synchronous `run` is blocking: the read
+        // below would spin forever (an exgb sweep sat at 0% CPU in Chrome). Fail
+        // with the way out instead. `run_async` and the snapshot replay set
+        // `dispatch_only` and read back without blocking.
+        #[cfg(target_arch = "wasm32")]
+        assert!(
+            self.dispatch_only,
+            "rlx-wgpu: a synchronous `run` on WebGPU cannot read its results back in \
+             the browser — await `CompiledGraph::run_async`, or compile this graph \
+             for the CPU"
+        );
         // Lazy compile path: if we deferred compile waiting for shapes,
         // infer the binding from input data lengths now and compile.
         if self.unresolved.is_some() {
@@ -780,7 +792,8 @@ impl WgpuExecutable {
                             has_bias: *has_bias,
                             bias_off: *bias_off_f32,
                             act_id: *act_id,
-                            _pad0: 0,
+                            // CoopF16Vk only: A's offset in its f16 window.
+                            _pad0: self.coop_f16_vk_a_off.get(&step_i).copied().unwrap_or(0),
                             _pad1: 0,
                             _pad2: 0,
                         };
@@ -1395,6 +1408,13 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::MatmulStrided { params } => {
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
+                    }
                     // Raw-GPU custom op: its storage params buffer is written at
                     // compile time (mapped_at_creation) with static, window-
                     // relative offsets — no active-extent scaling. No-op here so
@@ -1442,7 +1462,6 @@ impl WgpuExecutable {
         let mm_f16c = matmul_f16_compute_kernel(&dev.device);
         let mm_coop = matmul_coop16_kernel(&dev.device);
         let mm_coop_f16_vk = matmul_coop_f16_vulkan_kernel(&dev.device);
-        let mm_coop_f32 = matmul_coop_f32_active_kernel(&dev.device);
         let mm_cast = cast_f32_to_f16_kernel(&dev.device);
         let bk = binary_kernel(&dev.device);
         let uk = unary_kernel(&dev.device);
@@ -1605,6 +1624,7 @@ impl WgpuExecutable {
                                 }
                                 Step::Matmul {
                                     m,
+                                    k,
                                     n,
                                     batch,
                                     b_off_f32,
@@ -1641,7 +1661,7 @@ impl WgpuExecutable {
                                         );
                                     pass.set_bind_group(
                                         0,
-                                        coop_f16_vk_bind_group(self, gpu_bi, coop_f16_wide),
+                                        coop_f16_vk_bind_group(self, step_i, gpu_bi, coop_f16_wide),
                                         &[],
                                     );
                                     // Kernel selection priority:
@@ -1694,6 +1714,17 @@ impl WgpuExecutable {
                                                 *n,
                                                 *batch,
                                             );
+                                        } else if let Some(k32) = (m_s.is_multiple_of(32)
+                                            && n.is_multiple_of(32)
+                                            && crate::kernels::coop_f16_vk_use_f32acc(&dev.device))
+                                        .then(crate::coop_probe::f16_vk_32_kernel)
+                                        .flatten()
+                                        {
+                                            // 32×32 block per subgroup, 2×2 tiles:
+                                            // same bindings and params as the
+                                            // f32-accumulator 16×16 kernel.
+                                            pass.set_pipeline(&k32.pipeline);
+                                            pass.dispatch_workgroups(m_s / 32, n / 32, *batch);
                                         } else {
                                             let n_eff = scale(*n);
                                             let coop_vk = matmul_coop_f16_vulkan_active_kernel(
@@ -1708,9 +1739,9 @@ impl WgpuExecutable {
                                                 *batch,
                                             );
                                         }
-                                    } else if let Some(coop_f32) = mm_coop_f32.as_ref()
-                                        && *b_is_param
-                                        && *compute_precision == MatmulCompute::CoopF32
+                                    } else if *compute_precision == MatmulCompute::CoopF32
+                                        && let Some(coop_f32) =
+                                            matmul_coop_f32_kernel_for(&dev.device, *k, *n)
                                     {
                                         // CoopF32: Metal uses 32×32 simdgroup tiles;
                                         // Vulkan uses 8×8 coopLoadT portable kernel.
@@ -1889,6 +1920,20 @@ impl WgpuExecutable {
                                         let (gx, gy, gz) = dispatch_dims(total_out, 1);
                                         pass.dispatch_workgroups(gx, gy, gz);
                                     }
+                                }
+                                Step::MatmulStrided { params } => {
+                                    let sk =
+                                        crate::kernels::matmul_coop_f32_strided_kernel(&dev.device)
+                                            .expect(
+                                                "matmul_coop_f32_strided needs cooperative matrix",
+                                            );
+                                    pass.set_pipeline(&sk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(
+                                        params.n.div_ceil(32),
+                                        params.m.div_ceil(32),
+                                        params.batch,
+                                    );
                                 }
                                 Step::Softmax { params } => {
                                     let outer_s = scale(params.outer);
@@ -2770,7 +2815,8 @@ impl WgpuExecutable {
                                         * params.kd
                                         * params.kh
                                         * params.kw;
-                                    let (gx, gy, gz) = dispatch_dims(total, 256);
+                                    // one workgroup per weight element (see the kernel)
+                                    let (gx, gy, gz) = dispatch_dims(total, 1);
                                     pass.dispatch_workgroups(gx, gy, gz);
                                 }
                                 Step::GroupNormBackwardInput { params } => {
@@ -3390,7 +3436,7 @@ impl WgpuExecutable {
                                         );
                                     pass.set_bind_group(
                                         0,
-                                        coop_f16_vk_bind_group(self, gpu_bi, qkv_coop_wide),
+                                        coop_f16_vk_bind_group(self, step_i, gpu_bi, qkv_coop_wide),
                                         &[],
                                     );
                                     match kind {
@@ -3602,10 +3648,6 @@ impl WgpuExecutable {
                     }
                     break;
                 }
-                let needs_f16_drain = step_i < self.schedule.len()
-                    && !step_runs_on_host(&self.schedule[step_i])
-                    && step_i > 0
-                    && step_needs_pass_flush(&self.schedule[step_i], &self.schedule[step_i - 1]);
                 let gpu_schedule_done = step_i >= self.schedule.len();
                 let skip_readback =
                     rlx_ir::env::flag("RLX_BENCH_DISPATCH_ONLY") || self.dispatch_only;
@@ -3730,9 +3772,12 @@ impl WgpuExecutable {
                         }
                     }
                 }
-                if needs_f16_drain {
-                    let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
-                }
+                // A pass split by `step_needs_pass_flush` (an f32→f16 mirror
+                // feeding a CoopF16Vk matmul) needs no CPU wait: the encoder
+                // was submitted above, and the queue runs the next submission
+                // after it. The wait that used to sit here was a full GPU round
+                // trip per coop matmul — 14 of 20 ms per run for an 8-layer
+                // 512×768 chain on an RTX 3080 Ti.
                 // A GGUF matmul that takes the fused GEMV only encodes and
                 // submits its own dispatches — the queue orders it after this
                 // section, so waiting for the GPU here is pure stall (one full
@@ -4758,7 +4803,7 @@ impl WgpuExecutable {
                         &dev.queue,
                         name,
                         in_specs,
-                        *out_byte_off as usize,
+                        *out_byte_off,
                         out_shape,
                         attrs,
                     );
@@ -5548,14 +5593,31 @@ impl WgpuExecutable {
                 .collect();
         }
         self.arm_static_once();
-        let out_ids: Vec<_> = self.graph.outputs.clone();
-        read_f32_many_pooled(
+        // A schedule that ends on a host step reads back here, not in the GPU
+        // section, so the handle feeds have to be made here too. Without them a
+        // resident trainer's `p' / m' / v'` never reached the next step's
+        // inputs: on NVIDIA Vulkan, where this graph's last step is host-staged,
+        // `b` never moved and the Adam moments froze after step 1, while Metal
+        // (ending on a GPU step) was exact.
+        if !self.gpu_handle_feeds.is_empty() {
+            let mut enc = dev
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rlx-wgpu handle feeds after host tail"),
+                });
+            self.propagate_gpu_handle_feeds_on_gpu(dev, &mut enc);
+            dev.queue.submit(std::iter::once(enc.finish()));
+        }
+        let plan = self.readback_plan();
+        let out_ids: Vec<_> = plan.iter().map(|&i| self.graph.outputs[i]).collect();
+        let partial = read_f32_many_pooled(
             &self.arena,
             &dev.device,
             &dev.queue,
             &out_ids,
             &mut self.readback_staging,
-        )
+        );
+        self.pack_readback_outputs(&plan, partial)
     }
 }
 

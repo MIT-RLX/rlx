@@ -226,7 +226,7 @@ fn exp_source(lang: Lang) -> String {
              \x20   let h = k / 2;\n\
              \x20   return x * bitcast<f32>(u32(h + 127) << 23u) * bitcast<f32>(u32(k - h + 127) << 23u);\n}}\n\
              fn dw_exp(a: DwF32) -> DwF32 {{\n\
-             \x20   if (a.hi > {hi}) {{ return DwF32(bitcast<f32>(0x7f800000u), 0.0); }}\n\
+             \x20   if (a.hi > {hi}) {{ return DwF32(bitcast<f32>((bitcast<u32>(a.hi) & 0u) | 0x7f800000u), 0.0); }}\n\
              \x20   if (a.hi < {lo}) {{ return {zero}; }}\n\
              \x20   let k = floor(a.hi * {log2e} + 0.5);\n\
              \x20   let r1 = dw_sub(a, DwF32(k * {l1}, 0.0));\n\

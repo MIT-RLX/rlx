@@ -152,7 +152,7 @@ fn a_plugin_table_round_trips_through_the_c_boundary() {
 
 /// A package with the model but not its weights: the model block names a
 /// safetensors file beside it, and each param is read from there.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn an_rlxp_package_reads_weights_it_references() {
     use rlx_ir::{Graph, Shape};
@@ -253,7 +253,7 @@ fn an_rlxp_package_reads_weights_it_references() {
 /// function, and a model opened on that device runs it: here Metal's f16
 /// weight rounds 1/3 where the CPU's f32 one does not. The build is written
 /// elsewhere, so its referenced weights are found from there.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn a_build_for_a_device_runs_on_that_device_only() {
     use rlx_ir::{Graph, Shape};
@@ -305,7 +305,7 @@ fn a_build_for_a_device_runs_on_that_device_only() {
 
 /// A param declared f16 binds from a bf16 checkpoint tensor in its own
 /// dtype: converted once, two bytes an element, on every backend.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn a_referenced_weight_binds_in_the_dtype_its_param_declares() {
     use rlx_ir::{Graph, Shape};
@@ -343,7 +343,7 @@ fn a_referenced_weight_binds_in_the_dtype_its_param_declares() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn an_rlxp_package_runs_as_a_model() {
     use rlx_ir::{Graph, Shape};
@@ -674,7 +674,7 @@ fn claims_read_gguf_architecture_and_hf_model_type() {
 
 /// A package's `embed` entry, run by rlx alone: tokenize with the package's
 /// tokenizer, run the smallest function that fits, pool.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn a_package_embed_entry_tokenizes_buckets_and_pools() {
     use rlx_ir::{Graph, Shape};
@@ -737,7 +737,7 @@ fn a_package_embed_entry_tokenizes_buckets_and_pools() {
 
 /// A package's `generate` entry: decode functions, a cache carried from
 /// step to step, a table row per position, the package's stop id.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn a_package_generate_entry_decodes_with_its_cache() {
     use rlx_ir::{Graph, Shape};
@@ -815,7 +815,7 @@ fn a_package_generate_entry_decodes_with_its_cache() {
 /// A symbolic step listed at one short size grows with the context: past
 /// 4 tokens it is specialized at 9, then 19, up to the entry's
 /// `max_context`.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn a_symbolic_step_grows_with_the_context_to_max_context() {
     use rlx_ir::{Graph, Shape};
@@ -907,7 +907,7 @@ fn a_symbolic_step_grows_with_the_context_to_max_context() {
 /// for them all: next id = (the sum of the sequence's ids so far + 1) mod
 /// 8, so every cached row of its own sequence matters. The batch gives what
 /// each prompt gives alone, each stopping at the tokenizer's stop id.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn prompts_decode_together_as_each_does_alone() {
     use rlx_ir::{Graph, Op, Shape};
@@ -1032,7 +1032,7 @@ fn prompts_decode_together_as_each_does_alone() {
 /// A stateful step (its cache a variable) keeps the cache in the
 /// executable, and carries it into a longer step when the context outgrows
 /// the short one.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn a_stateful_step_keeps_its_cache_across_steps_and_functions() {
     use rlx_ir::op::{CmpOp, ReduceOp, ScatterNdReduction};
@@ -1224,7 +1224,7 @@ fn a_stateful_step_keeps_its_cache_across_steps_and_functions() {
 /// context over all of it, as a runner without a cache does. The next id is
 /// 1 + the sum of every id so far, mod 8, so each run must see the whole
 /// context. One function per length (`prefill.functions`), 4 and 8.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn a_package_with_no_step_recomputes_the_context_each_token() {
     use rlx_ir::op::{CmpOp, ReduceOp};
@@ -1324,7 +1324,7 @@ fn a_package_with_no_step_recomputes_the_context_each_token() {
 /// Recurrent state (`kind: "replace"`) becomes its step's whole output, with
 /// no length bounding it: here a running sum of the ids, the next id
 /// `sum + 1` mod 8.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn a_recurrent_state_is_replaced_whole() {
     use rlx_ir::{Graph, Op, Shape};
@@ -1385,7 +1385,7 @@ fn a_recurrent_state_is_replaced_whole() {
 
 /// The same encoder as one symbolic graph: generalized from two builds,
 /// stored once, specialized at the sizes its entry lists.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn a_symbolic_function_runs_at_the_sizes_its_entry_lists() {
     use rlx_ir::{Graph, Shape};
@@ -1448,7 +1448,7 @@ fn a_symbolic_function_runs_at_the_sizes_its_entry_lists() {
 /// two pipelines in one package, opened as one model. `run` goes to the
 /// entry whose inputs are the tensors given; `options.entry`, or the open
 /// option, picks one by name; the package says it needs `entry.kind`.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn named_entries_route_by_their_inputs() {
     use rlx_ir::{Graph, GraphExt, Shape};
@@ -1514,7 +1514,7 @@ fn named_entries_route_by_their_inputs() {
 /// A package with several entries opens the one the option `entry` names:
 /// here its `pipeline`, where it would open its `embed` (which needs a
 /// tokenizer it lacks) by default; an entry it does not have is refused.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn the_entry_option_picks_one_of_several_entries() {
     use rlx_ir::{Graph, GraphExt, Shape};
@@ -1558,7 +1558,7 @@ fn the_entry_option_picks_one_of_several_entries() {
 /// A pipeline entry: a front end from its own package, symbolic in its
 /// input's length and reading that length (`x#shape`), then a sum; run at
 /// two lengths, from a u8 tensor.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn a_pipeline_runs_its_stages_at_each_input_shape() {
     use rlx_ir::{Graph, GraphExt, Shape};
@@ -1656,7 +1656,7 @@ fn a_pipeline_runs_its_stages_at_each_input_shape() {
 
 /// A package's model block as a Hugging Face `README.md`: `card_data` as
 /// the front matter, the block's own fields where it has none, then the body.
-#[cfg(feature = "model-io")]
+#[cfg(feature = "rlxp")]
 #[test]
 fn a_model_block_renders_as_a_huggingface_model_card() {
     let model = json!({
@@ -1688,7 +1688,7 @@ fn a_model_block_renders_as_a_huggingface_model_card() {
 
 /// A package lists the entry features it uses; an rlx that lacks one
 /// refuses it by name rather than run without it.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn a_package_using_an_unknown_feature_is_refused_by_name() {
     use rlx_ir::{Graph, Shape};
@@ -1781,7 +1781,7 @@ fn json_output_keeps_to_a_json_prefix() {
 /// `x²` is within 1e-4 of `a`, each step scaled by its `schedule` value (1),
 /// counting its steps; then a finish stage doubles it. It stops well before
 /// its 20 steps, and the `steps` option caps it.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn a_pipeline_loops_until_its_state_says_done() {
     use rlx_ir::op::{BinaryOp, CmpOp};
@@ -1861,7 +1861,7 @@ fn a_pipeline_loops_until_its_state_says_done() {
 /// placeholder was, then decoding goes on by tokens. Next id = (the sum
 /// of every embedding value so far + 1) mod 8: `abPc` with image rows 3
 /// and 4 sums to 0 + 1 + 3 + 4 + 2 = 10, so `d`, then `g`, then `e`.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn an_image_in_the_prompt_stands_where_its_placeholder_was() {
     use rlx_ir::{Graph, GraphExt, Op, Shape};
@@ -2008,7 +2008,7 @@ fn an_image_in_the_prompt_stands_where_its_placeholder_was() {
 /// position 6 (`[6,6,6]`: `d`), then 7 (`g`). The image's further rows
 /// (`kinds.image.rows`, 1 each) reach the prefill at its six positions: 63
 /// + 6, so `g` first.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn an_image_in_the_prompt_takes_its_multimodal_rope_positions() {
     use rlx_ir::{Graph, GraphExt, Op, Shape};
@@ -2185,7 +2185,7 @@ fn an_image_in_the_prompt_takes_its_multimodal_rope_positions() {
 /// voice's offset), and by a decoder that writes codec tokens first (next
 /// id = the sum so far + 1: after `a`, `b c e a`; less the offset 1, within
 /// a 4-code book, codes 0 1 3; a stage halves them).
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn synthesize_speaks_by_stages_and_by_a_codec_decoder() {
     use rlx_ir::{Graph, GraphExt, Op, Shape};
@@ -2298,7 +2298,7 @@ fn synthesize_speaks_by_stages_and_by_a_codec_decoder() {
 /// weights bind, for a param the base holds and for one it references.
 /// `x = [1, 1]` through `x·W` with `W = I` gives `[1, 1]`; the update
 /// `2 · [0, 1]ᵀ·[1, 0]` adds 2 at row 1, column 0: `[3, 1]`.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn an_adapter_package_merges_its_updates_into_its_base() {
     use rlx_ir::{Graph, Shape};
@@ -2361,7 +2361,7 @@ fn an_adapter_package_merges_its_updates_into_its_base() {
 /// A package's f32 matmul weights quantized into it (GGUF Q8_0): the graph
 /// reads them through `DequantMatMul`, the package holds a quarter-and-a-bit
 /// of the bytes, and the output stays within Q8_0's error.
-#[cfg(all(feature = "model-io", feature = "cpu"))]
+#[cfg(all(feature = "rlxp", feature = "cpu"))]
 #[test]
 fn a_package_quantizes_its_matmul_weights_into_itself() {
     use rlx_ir::{Graph, Shape};

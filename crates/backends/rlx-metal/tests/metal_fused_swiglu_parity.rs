@@ -14,7 +14,11 @@ use rlx_runtime::{Device, Session};
 
 #[test]
 fn metal_fused_swiglu_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }

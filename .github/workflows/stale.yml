@@ -1,0 +1,39 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Inactive issues: labelled `stale` after 7 days without activity, closed 23
+# days later (1 month of inactivity in total). Any comment or update removes
+# the label and restarts the clock. Pull requests are left alone.
+#
+# Run by hand: Actions → Stale issues → Run workflow.
+
+name: Stale issues
+
+on:
+  schedule:
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          days-before-issue-stale: 7
+          days-before-issue-close: 23
+          stale-issue-label: stale
+          stale-issue-message: >
+            This issue has had no activity for 7 days and is now marked stale.
+            It will be closed in 23 days unless there is new activity.
+          close-issue-message: >
+            Closed after 1 month without activity. Comment if this is still
+            relevant and it can be reopened.
+          close-issue-reason: not_planned
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          operations-per-run: 100

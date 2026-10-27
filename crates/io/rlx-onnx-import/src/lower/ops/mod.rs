@@ -2021,6 +2021,26 @@ fn apply_import_shape_fix(
         .iter()
         .map(|d| d.unwrap_static() as i64)
         .collect();
+    // A fix that changes the element count is not a reshape: it declares that
+    // the ONNX metadata was wrong about this node's size, which no view of the
+    // computed tensor can honour. KittenTTS's sine-generator chain asks for this
+    // (`[1, 1, 300, 9]` → `[1, 55200, 9]`) and replaces that chain with its own
+    // nodes, so these relabels are dead and pruned before compile. Lower them to
+    // a custom op with no kernel rather than a count-changing `Reshape`: dead,
+    // it costs nothing; live, the backend refuses to compile it instead of
+    // reading past the input buffer. (Before reshape checked element counts this
+    // was a `Reshape` that quietly did exactly that.)
+    if cur.num_elements() != fixed.num_elements() {
+        return m.add_node(
+            Op::Custom {
+                name: format!("onnx_import.shape_relabel:{node_name}"),
+                num_inputs: 1,
+                attrs: Vec::new(),
+            },
+            vec![id],
+            fixed,
+        );
+    }
     m.reshape_(id, dims)
 }
 

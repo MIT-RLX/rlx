@@ -43,7 +43,7 @@ pub fn native_f64(op: &Op) -> bool {
             | Op::Gather { .. }
             | Op::KvAppend { .. }
             | Op::Reduce {
-                op: ReduceOp::Sum,
+                op: ReduceOp::Sum | ReduceOp::Mean,
                 ..
             }
             | Op::RmsNorm { .. }
@@ -51,7 +51,108 @@ pub fn native_f64(op: &Op) -> bool {
             | Op::Softmax { .. }
             | Op::Rope { .. }
             | Op::Attention { .. }
+            | Op::SoftmaxCrossEntropyWithLogits
+            | Op::SoftmaxCrossEntropyBackward
+            | Op::ReluBackward
     )
+}
+
+/// Class indices: f32-encoded labels, or the F64 they were widened to.
+fn labels(t: &CpuTensorRef<'_>) -> Result<Vec<usize>, String> {
+    match t.dtype() {
+        rlx_ir::DType::F64 => Ok(t
+            .expect_f64("labels")?
+            .iter()
+            .map(|&v| v as usize)
+            .collect()),
+        _ => Ok(t
+            .expect_f32("labels")?
+            .iter()
+            .map(|&v| v as usize)
+            .collect()),
+    }
+}
+
+/// `(max, Σ exp(z − max))` of one row.
+fn row_softmax(z: &[f64]) -> (f64, f64) {
+    let m = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    (m, z.iter().map(|v| (v - m).exp()).sum())
+}
+
+/// `loss[n] = logsumexp(z[n]) − z[n, label[n]]`. Inputs `[logits, labels]`.
+struct SceF64;
+impl CpuKernel for SceF64 {
+    fn name(&self) -> &str {
+        "core.sce_with_logits_f64"
+    }
+    fn execute(
+        &self,
+        inputs: &[CpuTensorRef<'_>],
+        output: CpuTensorMut<'_>,
+        _attrs: &[u8],
+    ) -> Result<(), String> {
+        let z = inputs[0].expect_f64("sce logits")?;
+        let lab = labels(&inputs[1])?;
+        let c = *dims(inputs[0].shape()).last().unwrap_or(&1);
+        let out = output.expect_f64_mut("sce out")?;
+        for (r, o) in out.iter_mut().enumerate() {
+            let row = &z[r * c..(r + 1) * c];
+            let (m, s) = row_softmax(row);
+            *o = m + s.ln() - row.get(lab[r]).copied().unwrap_or(0.0);
+        }
+        Ok(())
+    }
+}
+
+/// `dz = (softmax(z) − one_hot(labels)) · d_loss`. Inputs `[logits, labels, d_loss]`.
+struct SceBackwardF64;
+impl CpuKernel for SceBackwardF64 {
+    fn name(&self) -> &str {
+        "core.sce_backward_f64"
+    }
+    fn execute(
+        &self,
+        inputs: &[CpuTensorRef<'_>],
+        output: CpuTensorMut<'_>,
+        _attrs: &[u8],
+    ) -> Result<(), String> {
+        let z = inputs[0].expect_f64("sce logits")?;
+        let lab = labels(&inputs[1])?;
+        let dl = inputs[2].expect_f64("sce d_loss")?;
+        let c = *dims(inputs[0].shape()).last().unwrap_or(&1);
+        let out = output.expect_f64_mut("sce dz")?;
+        for r in 0..dl.len() {
+            let row = &z[r * c..(r + 1) * c];
+            let (m, s) = row_softmax(row);
+            for k in 0..c {
+                let p = (row[k] - m).exp() / s;
+                out[r * c + k] = (p - f64::from(k == lab[r])) * dl[r];
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `dx = dy where x > 0 else 0`. Inputs `[x, dy]`.
+struct ReluBackwardF64;
+impl CpuKernel for ReluBackwardF64 {
+    fn name(&self) -> &str {
+        "core.relu_backward_f64"
+    }
+    fn execute(
+        &self,
+        inputs: &[CpuTensorRef<'_>],
+        output: CpuTensorMut<'_>,
+        _attrs: &[u8],
+    ) -> Result<(), String> {
+        let x = inputs[0].expect_f64("relu x")?;
+        let dy = inputs[1].expect_f64("relu dy")?;
+        let out = output.expect_f64_mut("relu dx")?;
+        for ((o, &x), &d) in out.iter_mut().zip(x).zip(dy) {
+            *o = if x > 0.0 { d } else { 0.0 };
+        }
+        Ok(())
+    }
 }
 
 /// An f32 op attribute (eps, scale, softcap) as the f64 it was written as.
@@ -108,6 +209,9 @@ pub(crate) fn kernel_for(op: &Op, in_shapes: &[&Shape]) -> Option<std::sync::Arc
             },
             softcap: attr(attn_logit_softcap.unwrap_or(0.0)),
         }),
+        Op::SoftmaxCrossEntropyWithLogits => Arc::new(SceF64),
+        Op::SoftmaxCrossEntropyBackward => Arc::new(SceBackwardF64),
+        Op::ReluBackward => Arc::new(ReluBackwardF64),
         _ => return None,
     })
 }

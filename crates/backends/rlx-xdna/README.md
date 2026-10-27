@@ -58,13 +58,16 @@ Point the env at them:
 ```sh
 export XILINX_XRT=…/xrt LD_LIBRARY_PATH=$XILINX_XRT/lib:$LD_LIBRARY_PATH
 
-# rlx's OWN C-ABI shim over XRT's C++ API — build it once. This is *not*
+# rlx's OWN C-ABI shim over XRT's C++ API. Leave RLX_XDNA_SHIM unset and rlx
+# builds it on first use (`$CXX`/`c++` against the detected XRT; needs the XRT
+# headers, e.g. `libxrt-dev`) into ~/.cache/rlx-xdna. To build it yourself — or
+# with RLX_XDNA_NO_SHIM_BUILD=1 — point RLX_XDNA_SHIM at it. This is *not*
 # XRT's libxrt_driver_xdna.so; pointing RLX_XDNA_SHIM at that dlopens fine and
 # then fails with `undefined symbol: rlx_xdna_io_open`.
-g++ -O2 -fPIC -shared -std=c++17 -I$XILINX_XRT/include \
-    -o librlx_xdna_shim.so crates/backends/rlx-xdna/csrc/xrt_gemm_shim.cpp \
-    -L$XILINX_XRT/lib -Wl,-rpath,$XILINX_XRT/lib -lxrt_coreutil
-export RLX_XDNA_SHIM=$PWD/librlx_xdna_shim.so
+#   g++ -O2 -fPIC -shared -std=c++17 -I$XILINX_XRT/include \
+#       -o librlx_xdna_shim.so crates/backends/rlx-xdna/csrc/xrt_gemm_shim.cpp \
+#       -L$XILINX_XRT/lib -Wl,-rpath,$XILINX_XRT/lib -lxrt_coreutil
+#   export RLX_XDNA_SHIM=$PWD/librlx_xdna_shim.so
 
 # `aiecc` must be the NATIVE ELF (~212 MB), not the `aiecc.py` wrapper. A pip
 # `mlir_aie` install puts it at <site-packages>/mlir_aie/bin/aiecc, and Peano at
@@ -74,6 +77,12 @@ export AIECC=…/mlir_aie/bin/aiecc PEANO=…/llvm-aie
 # since bin/aiecc there isn't at <mlir_aie>/bin:
 export RLX_XDNA_AIE_INCLUDE=…/site-packages/mlir_aie/include
 ```
+
+The AIE dialect syntax changed in mlir-aie 1.4.0 (`aie.dma_bd` keyword form)
+and 1.4.3 (`!aie.objectfifosubview` removed). rlx reads the installed version
+from the wheel's `mlir_aie-*.dist-info` and rewrites its emitted MLIR to match;
+a source build without dist-info is inferred from the `aiecc` CLI. Override
+with `RLX_XDNA_AIE_DIALECT=<version>` (e.g. `1.3`, `1.4.4`).
 
 Sanity-check the two bundled parity suites (each result is compared to the CPU
 backend and prints `all NPU graph ops match CPU ✓`):

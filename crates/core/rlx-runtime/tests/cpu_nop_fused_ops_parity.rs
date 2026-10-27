@@ -268,7 +268,7 @@ fn every_risky_kind_has_a_numerical_case_or_a_stated_reason() {
         }
     };
     push(rlx_cpu::supported_ops::SUPPORTED_OPS);
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
     push(rlx_metal::supported_ops::SUPPORTED_OPS);
     #[cfg(feature = "gpu")]
     push(rlx_wgpu::supported_ops::SUPPORTED_OPS);

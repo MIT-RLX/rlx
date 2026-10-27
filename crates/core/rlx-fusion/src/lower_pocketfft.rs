@@ -935,6 +935,13 @@ mod tests {
         let kinds: Vec<OpKind> = out.nodes().iter().map(|n| n.op.kind()).collect();
         assert!(!kinds.contains(&OpKind::FftPocketFft));
         assert_eq!(kinds.iter().filter(|k| **k == OpKind::Fft).count(), 1);
-        assert!(kinds.contains(&OpKind::Fma));
+        // SciPy's build contracts `a*b + c` only where its compiler does
+        // (Apple clang); the lowering mirrors that, so `Fma` appears on Apple
+        // targets and `mul` + `add` elsewhere.
+        assert_eq!(
+            kinds.contains(&OpKind::Fma),
+            Contraction::Platform.fused(),
+            "Fma presence must follow the platform contraction rule"
+        );
     }
 }

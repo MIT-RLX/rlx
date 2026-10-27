@@ -811,3 +811,121 @@ fn dgesdd_matches_scipy_svd_on_openblas_haswell() {
     assert!(checked >= 40, "{checked}");
     assert!(bad.is_empty(), "{checked} checked: {bad:?}");
 }
+
+/// `tools/openblas_ref_dsyevd.py`'s input `(n, kind)`: kinds 0-7 as the dsyevr fixture,
+/// 8 diagonal, 9 block-diagonal with blocks of 20 and 40 — column-major.
+fn dsyevd_matrix(n: usize, kind: usize) -> Vec<f64> {
+    match kind {
+        8 => {
+            let u = stream(0x9d1a + n as u64, n);
+            let mut a = vec![0.0f64; n * n];
+            for i in 0..n {
+                a[i + i * n] = u[i] * 3.0;
+            }
+            a
+        }
+        9 => {
+            let mut a = vec![0.0f64; n * n];
+            let (mut start, mut s) = (0usize, 0usize);
+            while start < n {
+                let b = [20usize, 40][s % 2].min(n - start);
+                s += 1;
+                let u = stream(0x5b10 + (n + start) as u64, b * b);
+                for i in 0..b {
+                    for j in 0..b {
+                        a[(start + i) + (start + j) * n] = (u[i * b + j] + u[j * b + i]) * 0.5;
+                    }
+                }
+                start += b;
+            }
+            a
+        }
+        _ => dsyevr_matrix(n, kind),
+    }
+}
+
+#[test]
+fn dsyevd_matches_numpy_eigh_and_dstevd_on_openblas_haswell() {
+    let text = include_str!("fixtures/openblas_haswell_dsyevd.txt");
+    let (mut bad_w, mut bad_v, mut bad_trd, mut bad_stw, mut bad_stz, mut checked) =
+        (vec![], vec![], vec![], vec![], vec![], 0);
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split(" | ").collect();
+        let h: Vec<usize> = parts[0].split(' ').map(|v| v.parse().unwrap()).collect();
+        let (n, kind) = (h[0], h[1]);
+        let f = |k: usize| parts[k].split(' ').collect::<Vec<&str>>();
+        let a0 = dsyevd_matrix(n, kind);
+        match rlx_linux_ref::dsyevd_lower(n, &a0, n) {
+            Ok((w, v)) => {
+                if !same(&f(1), &w) {
+                    bad_w.push((n, kind));
+                }
+                if !same(&f(2), &v) {
+                    bad_v.push((n, kind));
+                }
+            }
+            Err(info) => bad_w.push((n, 1000 + info as usize)),
+        }
+        // DSTEDC alone (scipy's dstevd), on this matrix's tridiagonal form as the
+        // fixture made it: scipy's dsytrd, whose default lwork = max(1, n)
+        let mut a = a0.clone();
+        let (d, e, _) = rlx_linux_ref::dsytrd_lower(n, &mut a, n, n.max(1) as i64);
+        if !(same(&f(3), &d) && same(&f(4), &e[..n - 1])) {
+            bad_trd.push((n, kind));
+            continue;
+        }
+        match rlx_linux_ref::dstevd_v(&d, &e[..n - 1]) {
+            Ok((w, z)) => {
+                if !same(&f(5), &w) {
+                    bad_stw.push((n, kind));
+                }
+                if !same(&f(6), &z) {
+                    bad_stz.push((n, kind));
+                }
+            }
+            Err(info) => bad_stw.push((n, 1000 + info as usize)),
+        }
+        checked += 1;
+    }
+    assert!(
+        bad_w.is_empty()
+            && bad_v.is_empty()
+            && bad_trd.is_empty()
+            && bad_stw.is_empty()
+            && bad_stz.is_empty(),
+        "{checked} cases: eigh w {bad_w:?}\nv {bad_v:?}\ndsytrd {bad_trd:?}\ndstevd w {bad_stw:?}\nz {bad_stz:?}"
+    );
+}
+
+/// Past `DSYEVR_MAX_N` the reduction's trailing update is plain-order (no reference
+/// to match bit for bit): the decomposition must still be right.
+#[test]
+fn dsyevd_beyond_the_modelled_size_is_an_eigendecomposition() {
+    let n = 700;
+    let u = stream(0x7a11, n * n);
+    let mut a = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            a[i + j * n] = (u[i * n + j] + u[j * n + i]) * 0.5;
+        }
+    }
+    let (w, v) = rlx_linux_ref::dsyevd_lower(n, &a, n).unwrap();
+    assert!(w.windows(2).all(|p| p[0] <= p[1]), "ascending");
+    let (mut res, mut orth) = (0.0f64, 0.0f64);
+    for j in 0..n {
+        for i in 0..n {
+            let av: f64 = (0..n).map(|k| a[i + k * n] * v[k + j * n]).sum();
+            res = res.max((av - w[j] * v[i + j * n]).abs());
+        }
+    }
+    for j in (0..n).step_by(37) {
+        for k in (0..n).step_by(41) {
+            let d: f64 = (0..n).map(|r| v[r + j * n] * v[r + k * n]).sum();
+            orth = orth.max((d - if j == k { 1.0 } else { 0.0 }).abs());
+        }
+    }
+    assert!(
+        res < 1e-11 && orth < 1e-12,
+        "residual {res:e}, orthogonality {orth:e}"
+    );
+}

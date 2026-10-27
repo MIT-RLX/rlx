@@ -23,6 +23,8 @@
 pub mod op_scan;
 
 pub mod demo;
+pub mod launch;
+pub mod nodes;
 pub mod scaffold;
 
 pub use rlx_runtime::check::{

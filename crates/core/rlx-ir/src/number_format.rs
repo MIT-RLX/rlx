@@ -66,6 +66,8 @@ impl FloatFormat {
     pub const F16: Self = Self::ieee(5, 10, 65504.0);
     /// bfloat16.
     pub const BF16: Self = Self::ieee(8, 7, 3.389_531_4e38);
+    /// TensorFloat-32 (e8m10).
+    pub const TF32: Self = Self::ieee(8, 10, 3.401_162_1e38);
 
     /// An IEEE-style format (bias `2^(exp_bits-1) - 1`) with an explicit maximum.
     pub const fn ieee(exp_bits: u8, man_bits: u8, max_normal: f32) -> Self {
@@ -284,6 +286,9 @@ impl FloatFormat {
         let named = match s.as_str() {
             "f16" | "half" | "fp16" => Some(Self::F16),
             "bf16" => Some(Self::BF16),
+            // TensorFloat-32: f32's 8-bit exponent, 10 mantissa bits — what
+            // NVIDIA tensor cores (and ROCm XF32) round matmul operands to.
+            "tf32" => Some(Self::TF32),
             "f8" | "fp8" | "e4m3" | "f8e4m3" => Some(Self::from_scaled(ScaledFormat::F8E4M3)),
             "bf8" | "e5m2" | "f8e5m2" => Some(Self::ieee(5, 2, 57344.0)),
             "f6" | "fp6" | "e2m3" => Some(Self::from_scaled(ScaledFormat::F6E2M3)),
@@ -323,6 +328,7 @@ impl fmt::Display for FloatFormat {
         let candidates = [
             "f16".to_string(),
             "bf16".to_string(),
+            "tf32".to_string(),
             format!("f{n}e{e}m{m}"),
             format!("f{n}e{e}m{m}fnuz"),
             format!("f{n}m{m}e{e}"),
@@ -587,6 +593,21 @@ fn pow2_f64(n: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tf32_is_e8m10_and_round_trips() {
+        let t = FloatFormat::parse("tf32").unwrap();
+        assert_eq!((t.exp_bits, t.man_bits, t.bias), (8, 10, 127));
+        assert_eq!(
+            FloatFormat::parse("f19m10e8"),
+            Some(t),
+            "generic spelling agrees"
+        );
+        assert_eq!(t.to_string(), "tf32");
+        // 1 + 2⁻¹² is below tf32's 10-bit mantissa step; 1 + 2⁻¹⁰ is not.
+        assert_eq!(t.round(1.0 + 2f32.powi(-12)), 1.0);
+        assert_eq!(t.round(1.0 + 2f32.powi(-10)), 1.0 + 2f32.powi(-10));
+    }
+
     use super::*;
 
     #[test]

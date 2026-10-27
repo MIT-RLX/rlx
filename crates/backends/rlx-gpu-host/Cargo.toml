@@ -19,7 +19,7 @@ rlx-cpu = { workspace = true, features = ["splat"] }
 rlx-ir = { workspace = true }
 # Dependency-free shape arithmetic for the on-device indexing plans.
 rlx-gpu-dispatch = { workspace = true }
-rlx-mlx-io = { workspace = true }
+rlx-mlx-io = { workspace = true, default-features = false }  # dequant kernels only
 # SPD host-fallback builds a one-op CPU graph and plans its arena.
 rlx-compile = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }

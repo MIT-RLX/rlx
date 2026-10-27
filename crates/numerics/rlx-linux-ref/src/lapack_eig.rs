@@ -256,7 +256,23 @@ fn dsytrd_lower(
                 &mut a[ia(i + nb, i + nb)..],
                 lda,
             );
-            assert!(ok, "dsyr2k past one GEMM_P block is not modelled");
+            if !ok {
+                // Past one GEMM_P block (rows > 512) OpenBLAS's multi-block order is
+                // not modelled: the same rank-2k update in plain order — correct, and
+                // what keeps DSYEVD fast at any n, but not bit-identical to the reference
+                // there (exact up to DSYEVR_MAX_N).
+                let c0 = ia(i + nb, i + nb);
+                for sc in 0..rows {
+                    for r in sc..rows {
+                        let mut acc = 0.0f64;
+                        for l in 0..nb {
+                            acc += v[r + l * lda] * work[nb + sc + l * ldwork]
+                                + work[nb + r + l * ldwork] * v[sc + l * lda];
+                        }
+                        a[c0 + r + sc * lda] -= acc;
+                    }
+                }
+            }
             for j in i..i + nb {
                 a[ia(j + 1, j)] = e[j - 1];
                 d[j - 1] = a[ia(j, j)];
@@ -289,7 +305,7 @@ pub fn dsytrd_lower_pub(
 }
 
 /// `DLANSY('M', 'L', n, A)`.
-fn dlansy_max_lower(n: usize, a: &[f64], lda: usize) -> f64 {
+pub(crate) fn dlansy_max_lower(n: usize, a: &[f64], lda: usize) -> f64 {
     let mut value = 0.0f64;
     for j in 0..n {
         for i in j..n {
@@ -302,7 +318,7 @@ fn dlansy_max_lower(n: usize, a: &[f64], lda: usize) -> f64 {
     value
 }
 
-/// The largest `n` [`dsyevr_lower`] models: above it the trailing `dsyr2k` of
+/// The largest `n` [`dsyevr_lower`] / [`crate::dsyevd_lower`] reproduce exactly: above it the trailing `dsyr2k` of
 /// `DSYTRD` spans more than one `GEMM_P` block (`n − 28 > 512`), not modelled.
 /// (The fixtures check `n ≤ 300`.)
 pub const DSYEVR_MAX_N: usize = 540;

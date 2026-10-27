@@ -163,7 +163,7 @@ fn cpu_honours_both_pairings() {
     check(Device::Cpu, RopeStyle::GptJ);
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_honours_both_pairings() {
     let _gpu = common::serialize_gpu();
@@ -179,7 +179,7 @@ fn wgpu_honours_both_pairings() {
     check(Device::Gpu, RopeStyle::GptJ);
 }
 
-#[cfg(feature = "coreml")]
+#[cfg(all(feature = "coreml", target_vendor = "apple"))]
 #[test]
 fn coreml_honours_both_pairings() {
     let _gpu = common::serialize_gpu();

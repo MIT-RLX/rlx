@@ -403,13 +403,14 @@ pub enum Thunk {
     },
     /// f64 contiguous reduction along a single axis range. Layout
     /// `[outer, reduced, inner]` in memory; output is `[outer, inner]`.
-    /// Sum only for now (Mean composes via 1/N multiply post-pass).
+    /// Sum, or Mean when `mean` (the sum divided by `reduced`).
     ReduceSumF64 {
         src: usize,
         dst: usize,
         outer: u32,
         reduced: u32,
         inner: u32,
+        mean: bool,
     },
     /// f64 plain copy (Reshape / Cast at the same dtype). Mirrors `Copy`
     /// but at 8 bytes per element.

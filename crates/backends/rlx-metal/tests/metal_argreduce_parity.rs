@@ -34,7 +34,11 @@ fn build(outer: usize, reduced: usize, inner: usize, is_max: bool) -> Graph {
 
 #[test]
 fn metal_argreduce_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -63,7 +67,11 @@ fn metal_argreduce_matches_cpu() {
 
 #[test]
 fn metal_argreduce_first_best_tiebreak() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         return;
     }
     // Ties must resolve to the lowest index on both backends.

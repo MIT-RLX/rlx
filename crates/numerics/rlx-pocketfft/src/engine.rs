@@ -234,7 +234,10 @@ pub struct Options {
 }
 
 impl Options {
-    /// `scipy.fft` / `torch.fft` (CPU) on macOS arm64, measured bit-identical.
+    /// `scipy.fft` / `torch.fft` (CPU) on macOS arm64, measured bit-identical
+    /// — with the `libm` feature: `AppleSinCos` twiddles call Apple's
+    /// `__sincos_stret`; without it they are the pure-Rust `sin`/`cos`, the
+    /// same as [`Twiddles::Separate`].
     pub const SCIPY_MACOS_ARM64: Options = Options {
         contraction: Contraction::Clang,
         twiddles: Twiddles::AppleSinCos,
@@ -246,27 +249,15 @@ impl Options {
     };
 }
 
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct SinCos {
-    sin: f64,
-    cos: f64,
-}
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn __sincos_stret(x: f64) -> SinCos;
-}
-
 /// `(cos a, sin a)`.
 #[inline(never)]
 fn cos_sin(a: f64, merged: bool) -> (f64, f64) {
-    #[cfg(target_os = "macos")]
+    // Apple's merged `__sincos_stret` (the macOS scipy twiddles) with
+    // rlx-libm's `libm` feature; the Rust ports otherwise.
     if merged {
-        // SAFETY: a pure libm function of a double.
-        let r = unsafe { __sincos_stret(a) };
-        return (r.cos, r.sin);
+        let (s, c) = rlx_libm::reference::sincos(a);
+        return (c, s);
     }
-    let _ = merged;
     (
         rlx_libm::reference::cos(std::hint::black_box(a)),
         rlx_libm::reference::sin(std::hint::black_box(a)),

@@ -20,7 +20,7 @@ rlx-compile = { workspace = true }
 rlx-fusion = { workspace = true }
 rlx-cpu = { workspace = true, features = ["splat"] }
 rlx-gguf = { workspace = true }
-rlx-mlx-io = { workspace = true }
+rlx-mlx-io = { workspace = true, default-features = false }  # dequant kernels only
 
 # libloading dlopens libtpu.so at runtime so the crate compiles + tests
 # cleanly on Mac/Windows hosts that don't have it installed.

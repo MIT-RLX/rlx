@@ -177,7 +177,7 @@ pub fn eval_single_op_f32(
     // Fast path: Kitten discrete wgpu packs ~1000 Binary/Activation HostOps per
     // infer. Building a mini-graph + plan_memory + compile_thunks each time was
     // the dominant cost (~17s hello). Direct kernels keep numerics identical.
-    if let Some(y) = eval_elementwise_fast(op, n, inputs) {
+    if let Some(y) = eval_elementwise_fast(op, out_shape, n, inputs) {
         return y;
     }
     // wgpu (and HostOp packed staging) store every tensor as f32-uniform,
@@ -232,8 +232,38 @@ pub fn eval_single_op_f32(
     arena.slice_mut(out)[..n].to_vec()
 }
 
+/// How element `i` of an `n`-element output reads an operand of `src_len`
+/// values declared as `src`: index `(i / rep) % len`.
+///
+/// A plain `i % src_len` is right only when the operand is a trailing slice of
+/// the output. A per-channel `[1,C,1]` against `[N,C,T]` needs the divisor, or
+/// the channel walks with time — which is what wgpu's host-op replay (every
+/// elementwise op on discrete NVIDIA) did to each per-channel operand. `None`
+/// when no single
+/// `(rep, len)` describes the broadcast; the caller then takes the
+/// thunk path, which broadcasts by shape.
+fn operand_index(
+    out: &rlx_ir::Shape,
+    src: &rlx_ir::Shape,
+    src_len: usize,
+    n: usize,
+) -> Option<(usize, usize)> {
+    if src_len == n {
+        return Some((1, n));
+    }
+    if src_len <= 1 {
+        return Some((1, 1));
+    }
+    if !out.is_static() || !src.is_static() {
+        return None;
+    }
+    let (rep, len) = rlx_unfuse::simple_broadcast(out, src)?;
+    (len as usize == src_len).then_some((rep as usize, len as usize))
+}
+
 fn eval_elementwise_fast(
     op: &Op,
+    out_shape: &rlx_ir::Shape,
     n: usize,
     inputs: &[(rlx_ir::Shape, &[f32])],
 ) -> Option<Vec<f32>> {
@@ -265,8 +295,10 @@ fn eval_elementwise_fast(
                         y[i] = region_binary_scalar(*bop, a[i], bv);
                     }
                 } else {
+                    let (ar, al) = operand_index(out_shape, &inputs[0].0, a_n, n)?;
+                    let (br, bl) = operand_index(out_shape, &inputs[1].0, b_n, n)?;
                     for i in 0..n {
-                        y[i] = region_binary_scalar(*bop, a[i % a_n], b[i % b_n]);
+                        y[i] = region_binary_scalar(*bop, a[(i / ar) % al], b[(i / br) % bl]);
                     }
                 }
             } else if a_n == n && b_n == n {
@@ -284,9 +316,10 @@ fn eval_elementwise_fast(
                     *out = region_binary_scalar(*bop, a[i], bv);
                 });
             } else {
-                // General broadcast via modulus (equal-rank trailing).
+                let (ar, al) = operand_index(out_shape, &inputs[0].0, a_n, n)?;
+                let (br, bl) = operand_index(out_shape, &inputs[1].0, b_n, n)?;
                 y.par_iter_mut().enumerate().for_each(|(i, out)| {
-                    *out = region_binary_scalar(*bop, a[i % a_n], b[i % b_n]);
+                    *out = region_binary_scalar(*bop, a[(i / ar) % al], b[(i / br) % bl]);
                 });
             }
             Some(y)
@@ -307,15 +340,15 @@ fn eval_elementwise_fast(
             let c = inputs[0].1;
             let t = inputs[1].1;
             let f = inputs[2].1;
-            let cn = c.len().max(1);
-            let tn = t.len().max(1);
-            let fn_ = f.len().max(1);
+            let (cr, cl) = operand_index(out_shape, &inputs[0].0, c.len().max(1), n)?;
+            let (tr, tl) = operand_index(out_shape, &inputs[1].0, t.len().max(1), n)?;
+            let (fr, fl) = operand_index(out_shape, &inputs[2].0, f.len().max(1), n)?;
             let mut y = vec![0f32; n];
             y.par_iter_mut().enumerate().for_each(|(i, out)| {
-                *out = if c[i % cn] != 0.0 {
-                    t[i % tn]
+                *out = if c[(i / cr) % cl] != 0.0 {
+                    t[(i / tr) % tl]
                 } else {
-                    f[i % fn_]
+                    f[(i / fr) % fl]
                 };
             });
             Some(y)
@@ -324,12 +357,12 @@ fn eval_elementwise_fast(
             let a = inputs[0].1;
             let b = inputs[1].1;
             let c = inputs[2].1;
-            let an = a.len().max(1);
-            let bn = b.len().max(1);
-            let cn = c.len().max(1);
+            let (ar, al) = operand_index(out_shape, &inputs[0].0, a.len().max(1), n)?;
+            let (br, bl) = operand_index(out_shape, &inputs[1].0, b.len().max(1), n)?;
+            let (cr, cl) = operand_index(out_shape, &inputs[2].0, c.len().max(1), n)?;
             let mut y = vec![0f32; n];
             y.par_iter_mut().enumerate().for_each(|(i, out)| {
-                *out = a[i % an].mul_add(b[i % bn], c[i % cn]);
+                *out = a[(i / ar) % al].mul_add(b[(i / br) % bl], c[(i / cr) % cl]);
             });
             Some(y)
         }
@@ -473,4 +506,104 @@ macro_rules! rlx_maybe_unroll_scans {
     ($graph:expr, $max_length:expr) => {
         $crate::thunk::maybe_unroll_scans($graph, $max_length)
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eval_single_op_f32;
+    use rlx_ir::op::BinaryOp;
+    use rlx_ir::{DType, Op, Shape};
+
+    /// Broadcast by coordinates: right-align `src` under `out` and read index 0
+    /// on every size-1 axis. Independent of the `(rep, len)` arithmetic.
+    fn read(out: &[usize], src: &[usize], vals: &[f32], i: usize) -> f32 {
+        let pad = out.len() - src.len();
+        let (mut rem, mut idx, mut stride) = (i, 0, 1);
+        for ax in (0..out.len()).rev() {
+            let c = rem % out[ax];
+            rem /= out[ax];
+            if ax >= pad && src[ax - pad] != 1 {
+                idx += c * stride;
+                stride *= src[ax - pad];
+            }
+        }
+        vals[idx]
+    }
+
+    fn vals(n: usize, seed: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i as f32 + 1.0) * seed).sin() * 2.0)
+            .collect()
+    }
+
+    fn eval(op: Op, out: &[usize], ins: &[(&[usize], &[f32])]) -> Vec<f32> {
+        let shapes: Vec<Shape> = ins.iter().map(|(d, _)| Shape::new(d, DType::F32)).collect();
+        let refs: Vec<(Shape, &[f32])> = shapes
+            .iter()
+            .cloned()
+            .zip(ins.iter().map(|(_, v)| *v))
+            .collect();
+        eval_single_op_f32(&op, &Shape::new(out, DType::F32), &refs)
+    }
+
+    fn assert_bits(what: &str, got: &[f32], want: impl Fn(usize) -> f32) {
+        for (i, g) in got.iter().enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                want(i).to_bits(),
+                "{what}: element {i}: {g} vs {}",
+                want(i)
+            );
+        }
+    }
+
+    /// Per-channel, trailing, scalar and non-contiguous operands, below and
+    /// above the 4096-element serial/parallel split.
+    #[test]
+    fn host_binary_broadcasts_by_shape_not_by_modulus() {
+        for (out, src) in [
+            (vec![2, 3, 4], vec![1, 3, 1]),
+            (vec![2, 3, 4], vec![3, 1]),
+            (vec![2, 3, 4], vec![3, 4]),
+            (vec![2, 3, 4], vec![1]),
+            (vec![2, 3, 4], vec![2, 1, 4]),
+            (vec![4, 8, 3, 50], vec![1, 8, 1, 1]),
+            (vec![4, 8, 3, 50], vec![4, 8, 1, 1]),
+        ] {
+            let n: usize = out.iter().product();
+            let x = vals(n, 0.37);
+            let b = vals(src.iter().product(), 1.3);
+            for (swap, op) in [(false, BinaryOp::Sub), (true, BinaryOp::Div)] {
+                let got = if swap {
+                    eval(Op::Binary(op), &out, &[(&src, &b), (&out, &x)])
+                } else {
+                    eval(Op::Binary(op), &out, &[(&out, &x), (&src, &b)])
+                };
+                assert_bits(&format!("{op:?} {out:?} with {src:?}"), &got, |i| {
+                    let (xv, bv) = (x[i], read(&out, &src, &b, i));
+                    if swap { bv / xv } else { xv - bv }
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn host_where_and_fma_broadcast_by_shape() {
+        let out = [2usize, 3, 4];
+        let ch = [1usize, 3, 1];
+        let x = vals(24, 0.37);
+        let y = vals(24, 0.71);
+        let c = vec![1.0f32, 0.0, 1.0];
+        let k = vals(3, 1.9);
+        let got = eval(Op::Where, &out, &[(&ch, &c), (&out, &x), (&out, &y)]);
+        assert_bits("where", &got, |i| {
+            if read(&out, &ch, &c, i) != 0.0 {
+                x[i]
+            } else {
+                y[i]
+            }
+        });
+        let got = eval(Op::Fma, &out, &[(&out, &x), (&ch, &k), (&out, &y)]);
+        assert_bits("fma", &got, |i| x[i].mul_add(read(&out, &ch, &k, i), y[i]));
+    }
 }

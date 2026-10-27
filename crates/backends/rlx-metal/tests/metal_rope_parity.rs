@@ -39,7 +39,11 @@ fn build_rope_styled(b: usize, s: usize, h: usize, d: usize, style: rlx_ir::Rope
 
 #[test]
 fn metal_rope_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -84,7 +88,11 @@ fn metal_rope_matches_cpu() {
 /// a result distinct from NeoX. Mirrors rlx-mlx `rope_gptj_interleaved_*`.
 #[test]
 fn metal_rope_gptj_interleaved_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -138,7 +146,11 @@ fn metal_rope_gptj_interleaved_matches_cpu() {
 /// Metal.
 #[test]
 fn metal_rope_ragged_per_token_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -233,7 +245,11 @@ fn build_rope_partial(b: usize, s: usize, h: usize, d: usize, n_rot: usize) -> G
 
 #[test]
 fn metal_partial_rope_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }

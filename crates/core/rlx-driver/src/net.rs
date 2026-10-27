@@ -87,10 +87,36 @@ fn read_frame<R: Read>(r: &mut R) -> io::Result<(u8, u32, u32, Vec<u8>)> {
     Ok((kind, a, b, payload))
 }
 
+/// How long a dial to a peer keeps trying: `RLX_CONNECT_WAIT` seconds, `0`
+/// (`None`) for as long as it takes (a persistent node waiting for the next
+/// job's rank 0); 10 s by default.
+fn env_connect_wait() -> Option<Duration> {
+    match rlx_ir::env::read("RLX_CONNECT_WAIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
+        Some(s) if s <= 0.0 => None,
+        Some(s) => Some(Duration::from_secs_f64(s)),
+        None => Some(Duration::from_secs(10)),
+    }
+}
+
+/// The longest one connection attempt may take. A peer whose SYNs go
+/// unanswered (a Wi-Fi stall, a dropped route) otherwise blocks a plain
+/// `connect` for over a minute each try, and a "10 s" budget became a mesh
+/// that hung for half an hour.
+const CONNECT_ATTEMPT: Duration = Duration::from_secs(2);
+
 fn connect_retry(addr: SocketAddr) -> io::Result<TcpStream> {
+    let deadline = env_connect_wait().map(|w| Instant::now() + w);
     let mut last: Option<io::Error> = None;
-    for _ in 0..400 {
-        match TcpStream::connect(addr) {
+    loop {
+        let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        if left.is_some_and(|l| l.is_zero()) {
+            break;
+        }
+        let attempt = left.map_or(CONNECT_ATTEMPT, |l| l.min(CONNECT_ATTEMPT));
+        match TcpStream::connect_timeout(&addr, attempt.max(Duration::from_millis(10))) {
             Ok(s) => return Ok(s),
             Err(e) => {
                 last = Some(e);
@@ -98,7 +124,8 @@ fn connect_retry(addr: SocketAddr) -> io::Result<TcpStream> {
             }
         }
     }
-    Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "connect retry exhausted")))
+    let e = last.unwrap_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "no attempt made"));
+    Err(io::Error::new(e.kind(), format!("connect to {addr}: {e}")))
 }
 
 struct NetInner {
@@ -117,6 +144,43 @@ struct NetInner {
     getresp: Mutex<HashMap<u32, VecDeque<Vec<u8>>>>,
     getresp_cv: Condvar,
     shutdown: AtomicBool,
+    /// Per peer: its connection closed (process died, host went away). A
+    /// receive waiting on a lost peer fails instead of blocking forever.
+    lost: Vec<AtomicBool>,
+    /// Per peer: which of its connections is the current one. A reader whose
+    /// connection was replaced (a later HELLO from the same rank) ends
+    /// without marking the peer lost.
+    conn_gen: Vec<std::sync::atomic::AtomicU64>,
+    /// Upper bound on one receive (`RLX_COLLECTIVE_TIMEOUT` seconds).
+    recv_timeout: Option<Duration>,
+}
+
+/// `RLX_COLLECTIVE_TIMEOUT` (seconds), read once per transport.
+/// `RLX_MESH_REVERSE="0-3,0-4"`: pairs of ranks whose connection the
+/// higher rank opens — the lower one cannot reach it (an iPad accepts no
+/// connection over its USB-C link, but can open one). Every rank of the
+/// mesh must be given the same list.
+fn env_mesh_reverse() -> Vec<(u32, u32)> {
+    rlx_ir::env::read("RLX_MESH_REVERSE")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .filter_map(|p| {
+                    let (a, b) = p.trim().split_once('-')?;
+                    let (a, b) = (a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?);
+                    Some((a.min(b), a.max(b)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn env_recv_timeout() -> Option<Duration> {
+    rlx_ir::env::read("RLX_COLLECTIVE_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
 }
 
 impl NetInner {
@@ -141,16 +205,77 @@ impl NetInner {
         }
     }
 
-    fn recv_inbox(&self, from: u32, tag: u32) -> Vec<u8> {
+    /// Blocking receive. Queued data is always delivered first; after that a
+    /// lost peer, or `recv_timeout` passing, is an error that names the rank —
+    /// so a dead node stops the job with a reason instead of hanging it.
+    fn recv_inbox(&self, from: u32, tag: u32) -> Result<Vec<u8>, CollectiveError> {
+        if from >= self.world {
+            return Err(CollectiveError::TransportError {
+                reason: format!("rank {from} out of range for WORLD={}", self.world),
+            });
+        }
+        let deadline = self.recv_timeout.map(|t| Instant::now() + t);
         let mut guard = self.inbox.lock().unwrap();
         loop {
             if let Some(q) = guard.get_mut(&(from, tag))
                 && let Some(v) = q.pop_front()
             {
-                return v;
+                return Ok(v);
             }
-            guard = self.inbox_cv.wait(guard).unwrap();
+            if from != self.rank && self.writers[from as usize].lock().unwrap().is_none() {
+                return Err(CollectiveError::TransportError {
+                    reason: format!(
+                        "rank {} has no connection to rank {from} (a star topology links \
+                         workers only to rank 0)",
+                        self.rank
+                    ),
+                });
+            }
+            if self.is_lost(from) {
+                return Err(CollectiveError::TransportError {
+                    reason: format!(
+                        "rank {from} disconnected (process exited or host unreachable) \
+                         while rank {} waited on tag {tag}",
+                        self.rank
+                    ),
+                });
+            }
+            match deadline {
+                None => guard = self.inbox_cv.wait(guard).unwrap(),
+                Some(d) => {
+                    let now = Instant::now();
+                    if now >= d {
+                        return Err(CollectiveError::TransportError {
+                            reason: format!(
+                                "rank {} waited {}s for rank {from} (tag {tag}) — \
+                                 RLX_COLLECTIVE_TIMEOUT",
+                                self.rank,
+                                self.recv_timeout.unwrap_or_default().as_secs()
+                            ),
+                        });
+                    }
+                    guard = self.inbox_cv.wait_timeout(guard, d - now).unwrap().0;
+                }
+            }
         }
+    }
+
+    fn is_lost(&self, peer: u32) -> bool {
+        self.lost
+            .get(peer as usize)
+            .is_some_and(|l| l.load(Ordering::SeqCst))
+    }
+
+    /// A reader saw `peer`'s connection end: wake every waiter so receives
+    /// on that peer fail now.
+    fn mark_lost(&self, peer: u32) {
+        if let Some(l) = self.lost.get(peer as usize) {
+            l.store(true, Ordering::SeqCst);
+        }
+        // Take the lock so a waiter between its check and `wait` sees this.
+        drop(self.inbox.lock().unwrap());
+        self.inbox_cv.notify_all();
+        self.getresp_cv.notify_all();
     }
 
     /// Like [`Self::recv_inbox`] but returns `None` if nothing matching
@@ -256,13 +381,23 @@ impl NetInner {
     }
 }
 
-fn reader_loop(mut stream: TcpStream, inner: Arc<NetInner>) {
+/// Read `peer`'s frames until its connection closes. `mine` is this
+/// connection's generation ([`NetInner::conn_gen`]), taken when it was
+/// accepted, not when this thread starts.
+fn reader_loop(mut stream: TcpStream, inner: Arc<NetInner>, peer: u32, mine: u64) {
+    let current = |inner: &NetInner| inner.conn_gen[peer as usize].load(Ordering::SeqCst);
     // Exits when read_frame errors (peer closed or we were shut down).
     while let Ok((kind, a, b, payload)) = read_frame(&mut stream) {
+        if current(&inner) != mine {
+            break;
+        }
         inner.dispatch(kind, a, b, payload);
         if inner.shutdown.load(Ordering::Relaxed) {
             break;
         }
+    }
+    if !inner.shutdown.load(Ordering::Relaxed) && current(&inner) == mine {
+        inner.mark_lost(peer);
     }
 }
 
@@ -291,6 +426,19 @@ impl NetTransport {
         peers: Vec<SocketAddr>,
         heap_size: usize,
     ) -> io::Result<Self> {
+        Self::from_listener_reversed(rank, world, listener, peers, heap_size, &[])
+    }
+
+    /// [`NetTransport::from_listener`], with the connection of each pair in
+    /// `reversed` (`(lower, higher)` ranks) opened by its higher rank.
+    pub fn from_listener_reversed(
+        rank: u32,
+        world: u32,
+        listener: TcpListener,
+        peers: Vec<SocketAddr>,
+        heap_size: usize,
+        reversed: &[(u32, u32)],
+    ) -> io::Result<Self> {
         assert_eq!(
             peers.len(),
             world as usize,
@@ -309,37 +457,82 @@ impl NetTransport {
             getresp: Mutex::new(HashMap::new()),
             getresp_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
+            lost: (0..world).map(|_| AtomicBool::new(false)).collect(),
+            conn_gen: (0..world)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            recv_timeout: env_recv_timeout(),
         });
         let mut readers = Vec::new();
 
-        // Connect to every higher-ranked peer.
-        for p in (rank + 1)..world {
+        // Connect to every higher-ranked peer, and to the lower ones of
+        // reversed pairs; accept from the rest. A peer's listener is bound
+        // before it dials anyone, so the order cannot deadlock.
+        let flipped = |a: u32, b: u32| reversed.contains(&(a.min(b), a.max(b)));
+        let dial: Vec<u32> = (0..world)
+            .filter(|&p| p != rank && ((p > rank) != flipped(rank, p)))
+            .collect();
+        let mut expect: std::collections::BTreeSet<u32> = (0..world)
+            .filter(|&p| p != rank && !dial.contains(&p))
+            .collect();
+        for p in dial {
             let stream = connect_retry(peers[p as usize])?;
             stream.set_nodelay(true).ok();
             let mut wr = stream.try_clone()?;
             write_frame(&mut wr, HELLO, rank, 0, &[])?;
             let rd = stream.try_clone()?;
             let inner2 = inner.clone();
-            readers.push(thread::spawn(move || reader_loop(rd, inner2)));
+            readers.push(thread::spawn(move || reader_loop(rd, inner2, p, 0)));
             *inner.writers[p as usize].lock().unwrap() = Some(wr);
         }
 
-        // Accept exactly `rank` connections from lower-ranked peers.
-        for _ in 0..rank {
-            let (stream, _addr) = listener.accept()?;
+        // Accept the rest, each announcing its rank, until every one has: a
+        // count of connections is not enough. A persistent worker from the
+        // run before, still dialing until it is stopped, announces a rank
+        // that its new process announces again — counted twice, it took the
+        // place of rank 0's connection, which then sat unaccepted while rank
+        // 0 waited at the first barrier. A rank announced again replaces its
+        // earlier connection (that process is the one being replaced), and a
+        // connection that is not a HELLO from an expected rank is dropped.
+        let wanted: std::collections::BTreeSet<u32> = expect.clone();
+        while !expect.is_empty() {
+            let (stream, addr) = listener.accept()?;
             stream.set_nodelay(true).ok();
             let mut rd = stream.try_clone()?;
-            let (kind, peer, _b, _payload) = read_frame(&mut rd)?;
-            if kind != HELLO || peer >= world {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("expected HELLO with valid rank, got kind={kind} rank={peer}"),
-                ));
+            // A connection that never says hello (a port probe) cannot hold
+            // up the mesh.
+            rd.set_read_timeout(Some(Duration::from_secs(10))).ok();
+            let peer = match read_frame(&mut rd) {
+                Ok((HELLO, peer, _, _)) if wanted.contains(&peer) => peer,
+                Ok((kind, peer, _, _)) => {
+                    eprintln!(
+                        "[rlx-driver] rank {rank}: dropped a connection from {addr}: kind {kind}, rank {peer}"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[rlx-driver] rank {rank}: dropped a connection from {addr}: {e}");
+                    continue;
+                }
+            };
+            rd.set_read_timeout(None).ok();
+            if !expect.remove(&peer) {
+                eprintln!(
+                    "[rlx-driver] rank {rank}: rank {peer} connected again from {addr}; the earlier connection is dropped"
+                );
             }
             let wr = stream.try_clone()?;
+            let (old, gen_) = {
+                let mut w = inner.writers[peer as usize].lock().unwrap();
+                let g = inner.conn_gen[peer as usize].fetch_add(1, Ordering::SeqCst) + 1;
+                inner.lost[peer as usize].store(false, Ordering::SeqCst);
+                (w.replace(wr), g)
+            };
+            if let Some(old) = old {
+                let _ = old.shutdown(Shutdown::Both);
+            }
             let inner2 = inner.clone();
-            readers.push(thread::spawn(move || reader_loop(rd, inner2)));
-            *inner.writers[peer as usize].lock().unwrap() = Some(wr);
+            readers.push(thread::spawn(move || reader_loop(rd, inner2, peer, gen_)));
         }
 
         Ok(Self {
@@ -362,6 +555,11 @@ impl NetTransport {
             getresp: Mutex::new(HashMap::new()),
             getresp_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
+            lost: (0..world).map(|_| AtomicBool::new(false)).collect(),
+            conn_gen: (0..world)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            recv_timeout: env_recv_timeout(),
         })
     }
 
@@ -390,7 +588,7 @@ impl NetTransport {
             }
             let wr = stream.try_clone()?;
             let inner2 = inner.clone();
-            readers.push(thread::spawn(move || reader_loop(rd, inner2)));
+            readers.push(thread::spawn(move || reader_loop(rd, inner2, peer, 0)));
             *inner.writers[peer as usize].lock().unwrap() = Some(wr);
         }
         Ok(Self {
@@ -416,7 +614,7 @@ impl NetTransport {
         write_frame(&mut wr, HELLO, rank, 0, &[])?;
         let rd = stream.try_clone()?;
         let inner2 = inner.clone();
-        let readers = vec![thread::spawn(move || reader_loop(rd, inner2))];
+        let readers = vec![thread::spawn(move || reader_loop(rd, inner2, 0, 0))];
         *inner.writers[0].lock().unwrap() = Some(wr);
         Ok(Self {
             inner,
@@ -467,7 +665,7 @@ impl Transport for NetTransport {
         self.inner.send_frame(to, SEND, self.inner.rank, tag, bytes)
     }
     fn recv_bytes(&self, from: u32, tag: u32) -> Result<Vec<u8>, CollectiveError> {
-        Ok(self.inner.recv_inbox(from, tag))
+        self.inner.recv_inbox(from, tag)
     }
     fn recv_bytes_timeout(
         &self,
@@ -551,17 +749,45 @@ pub const DEFAULT_HEAP_BYTES: usize = 64 * 1024 * 1024;
 pub struct TcpTransport;
 
 impl TcpTransport {
-    /// Bind this rank's listener at `peers[rank]` and establish the full
-    /// mesh. Every rank must pass the same `peers` list.
+    /// Bind this rank's listener at `peers[rank]`'s port, on every local
+    /// address, and establish the full mesh. The ranks' lists agree on every
+    /// port; a peer may name this rank by another of its addresses (an iPad
+    /// over its USB-C link rather than Wi-Fi), so the listener cannot be
+    /// bound to the one address this rank's own list gives — it was, and a
+    /// rank on its USB-C link refused every connection.
     pub fn bind(
         rank: u32,
         world: u32,
         peers: Vec<SocketAddr>,
         heap_size: usize,
     ) -> io::Result<NetTransport> {
-        let listener = TcpListener::bind(peers[rank as usize])?;
-        NetTransport::from_listener(rank, world, listener, peers, heap_size)
+        let listener = listen_any(peers[rank as usize])?;
+        NetTransport::from_listener_reversed(
+            rank,
+            world,
+            listener,
+            peers,
+            heap_size,
+            &env_mesh_reverse(),
+        )
     }
+}
+
+/// A listener on `at`'s port on every local address — `[::]`, dual-stack,
+/// except on Windows, whose IPv6 sockets take no IPv4 — else at `at` itself.
+fn listen_any(at: SocketAddr) -> io::Result<TcpListener> {
+    let v4 = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        at.port(),
+    );
+    let v6 = SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        at.port(),
+    );
+    let first = if cfg!(windows) { v4 } else { v6 };
+    TcpListener::bind(first)
+        .or_else(|_| TcpListener::bind(v4))
+        .or_else(|_| TcpListener::bind(at))
 }
 
 /// Thunderbolt transport. Same wire protocol as [`TcpTransport`] today
@@ -601,12 +827,162 @@ impl ThunderboltTransport {
 
 #[cfg(test)]
 mod tests {
+    /// A dial to an address that never answers gives up within its
+    /// budget: one blocked `connect` took over a minute a try.
+    #[test]
+    fn a_dial_that_gets_no_answer_ends_within_its_budget() {
+        rlx_ir::env::set("RLX_CONNECT_WAIT", "1");
+        let t = std::time::Instant::now();
+        // TEST-NET-1 (RFC 5737): routed nowhere.
+        let r = super::connect_retry("192.0.2.1:9".parse().unwrap());
+        rlx_ir::env::remove("RLX_CONNECT_WAIT");
+        assert!(r.is_err());
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(4),
+            "took {:?}",
+            t.elapsed()
+        );
+    }
+
+    /// A mesh whose pairs (0,2) and (1,2) are opened by rank 2 carries
+    /// messages both ways on every link, like the usual one.
+    #[test]
+    fn a_reversed_pair_is_dialed_by_its_higher_rank() {
+        let listeners: Vec<TcpListener> = (0..3)
+            .map(|_| TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap())
+            .collect();
+        let peers: Vec<SocketAddr> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        let handles: Vec<_> = listeners
+            .into_iter()
+            .enumerate()
+            .map(|(r, l)| {
+                let peers = peers.clone();
+                std::thread::spawn(move || {
+                    let t = NetTransport::from_listener_reversed(
+                        r as u32,
+                        3,
+                        l,
+                        peers,
+                        64,
+                        &[(0, 2), (1, 2)],
+                    )
+                    .unwrap();
+                    for p in 0..3u32 {
+                        if p != r as u32 {
+                            t.send_bytes(p, 7, &[r as u8]).unwrap();
+                        }
+                    }
+                    let mut got: Vec<u8> = (0..3u32)
+                        .filter(|&p| p != r as u32)
+                        .map(|p| t.recv_bytes(p, 7).unwrap()[0])
+                        .collect();
+                    got.sort();
+                    got
+                })
+            })
+            .collect();
+        let got: Vec<Vec<u8>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(got, vec![vec![1, 2], vec![0, 2], vec![0, 1]]);
+    }
+
+    /// A stale process's HELLO (a persistent worker from the run before,
+    /// still dialing) and a bare port probe, queued at a rank's listener
+    /// before the real ranks connect, neither take a real rank's place: the
+    /// mesh forms, every pair carries messages, and the replaced connection
+    /// closing marks no one lost. Counted by connections, the stale HELLO
+    /// left rank 0's connection unaccepted and the first barrier hung.
+    #[test]
+    fn a_stale_hello_does_not_take_a_ranks_place() {
+        let listeners: Vec<TcpListener> = (0..3)
+            .map(|_| TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap())
+            .collect();
+        let peers: Vec<SocketAddr> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        // A probe that says nothing and goes, then an old "rank 1".
+        drop(TcpStream::connect(peers[2]).unwrap());
+        let mut stale = TcpStream::connect(peers[2]).unwrap();
+        write_frame(&mut stale, HELLO, 1, 0, &[]).unwrap();
+        let mut stale = Some(stale);
+        let handles: Vec<_> = listeners
+            .into_iter()
+            .enumerate()
+            .map(|(r, l)| {
+                let peers = peers.clone();
+                let stale = if r == 2 { stale.take() } else { None };
+                std::thread::spawn(move || {
+                    let t = NetTransport::from_listener(r as u32, 3, l, peers, 64).unwrap();
+                    // The old process goes away once the mesh is up.
+                    if let Some(s) = stale {
+                        drop(s);
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    t.send_bytes((r as u32 + 1) % 3, 7, &[r as u8]).unwrap();
+                    t.send_bytes((r as u32 + 2) % 3, 7, &[r as u8]).unwrap();
+                    let mut got: Vec<u8> = (0..3u32)
+                        .filter(|&p| p != r as u32)
+                        .map(|p| t.recv_bytes(p, 7).unwrap()[0])
+                        .collect();
+                    got.sort();
+                    // Rank 2 then waits on rank 1 for a reply sent only after
+                    // the stale connection closed: a rank marked lost would
+                    // fail it.
+                    match r {
+                        1 => {
+                            t.recv_bytes(2, 8).unwrap();
+                            std::thread::sleep(Duration::from_millis(100));
+                            t.send_bytes(2, 9, &[1]).unwrap();
+                        }
+                        2 => {
+                            t.send_bytes(1, 8, &[2]).unwrap();
+                            assert_eq!(t.recv_bytes(1, 9).unwrap(), vec![1]);
+                        }
+                        _ => {}
+                    }
+                    got
+                })
+            })
+            .collect();
+        let got: Vec<Vec<u8>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(got, vec![vec![1, 2], vec![0, 2], vec![0, 1]]);
+    }
+
     use super::*;
     use crate::collective::{ReduceKind, all_reduce};
     use crate::transport::ProcessGroup;
 
     /// Pre-bind `n` loopback listeners and run `body(rank, transport)`
     /// on a thread per rank. Returns once every rank's body returns.
+    /// A peer that exits mid-job fails the receive waiting on it (with its
+    /// rank) instead of hanging; data it sent before exiting still arrives.
+    #[test]
+    fn receive_from_a_dead_peer_errors_instead_of_hanging() {
+        let listeners: Vec<TcpListener> = (0..2)
+            .map(|_| TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap())
+            .collect();
+        let addrs: Vec<SocketAddr> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        let mut it = listeners.into_iter();
+        let (l0, l1) = (it.next().unwrap(), it.next().unwrap());
+        let a1 = addrs.clone();
+        let peer = thread::spawn(move || {
+            let t = NetTransport::from_listener(1, 2, l1, a1, 1024).unwrap();
+            t.send_bytes(0, 7, b"last words").unwrap();
+            // `t` drops here: the process "dies".
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let t = NetTransport::from_listener(0, 2, l0, addrs, 1024).unwrap();
+            let first = t.recv_bytes(1, 7);
+            let second = t.recv_bytes(1, 7);
+            tx.send((first, second)).unwrap();
+        });
+        peer.join().unwrap();
+        let (first, second) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("receive on a dead peer hung");
+        assert_eq!(first.unwrap(), b"last words");
+        let err = second.expect_err("dead peer must error").to_string();
+        assert!(err.contains("rank 1"), "error should name the rank: {err}");
+    }
+
     fn run_net<F>(n: u32, heap: usize, body: F)
     where
         F: Fn(u32, Arc<NetTransport>) + Send + Sync + 'static,

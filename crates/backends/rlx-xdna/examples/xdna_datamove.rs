@@ -18,10 +18,8 @@ use rlx_xdna::compile::{OverlaySpec, compile_overlay};
 use rlx_xdna::npu_gemm::NpuRun3;
 
 fn compile(name: &str, mlir: String) -> Option<Vec<u32>> {
-    let (aiecc, peano) = (
-        std::env::var("AIECC").unwrap(),
-        std::env::var("PEANO").unwrap(),
-    );
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let (aiecc, peano) = (tc.aiecc_str(), tc.peano_str());
     let tmp = format!("/tmp/rlx_dm_{name}");
     std::fs::create_dir_all(&tmp).ok();
     let mp = format!("{tmp}/aie.mlir");

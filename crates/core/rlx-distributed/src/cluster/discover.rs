@@ -144,7 +144,12 @@ pub fn discover_ssh(d: &DiscoverSection, remote_bin: &str) -> Result<Discovered>
     let mut out = Vec::new();
     let mut failed = Vec::new();
     for host in &d.ssh_hosts {
-        let addr = format!("{host}:{}", d.port);
+        // A bare IPv6 literal needs brackets before the `:port`.
+        let addr = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]:{}", d.port)
+        } else {
+            format!("{host}:{}", d.port)
+        };
         match probe_remote(host, remote_bin, &addr, &ckpt) {
             Ok(caps) => {
                 let device = d.device.clone().unwrap_or_else(|| {

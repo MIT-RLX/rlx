@@ -658,7 +658,7 @@ fn kernel_sources_are_reachable() {
     assert!(!Q_MATMUL_CU.is_empty());
     assert!(!Q_CONV2D_CU.is_empty());
     assert!(!INDEXING_ND_CU.is_empty());
-    assert_eq!(KERNEL_COUNT, 79);
+    assert_eq!(KERNEL_COUNT, 82);
 }
 
 #[test]
@@ -769,4 +769,82 @@ fn dequant_matmul_mxfp4x2_matches_reference() {
         "MxFp4x2 DequantMatMul mismatch: got {:?} want {expected:?}",
         out[0]
     );
+}
+
+/// The Q8_0 decode GEMV at a decode shape (`k` = 1024, enough rows for many
+/// blocks): every output within a few f32 ulps of an f64 reference, and with
+/// two activation rows (a speculative verify step's few-row kernel) each row
+/// exactly what the one-row kernel gives for it.
+#[test]
+fn dequant_matmul_gguf_q8_0_gemv_matches_reference_and_one_row() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
+        return;
+    }
+    let (n, k) = (96usize, 1024usize);
+    // Q8_0: per 32 weights an f16 scale, then 32 int8.
+    let mut packed = Vec::new();
+    let mut w = vec![0f64; n * k];
+    let mut s = 0x9e37_79b9u32;
+    for blk in 0..n * k / 32 {
+        // Scales 2^-6 … 2^-3, exact in f16.
+        let e = 9 + (blk % 4) as u16;
+        let d = f64::powi(2.0, e as i32 - 15);
+        packed.extend_from_slice(&(e << 10).to_le_bytes());
+        for t in 0..32 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let q = (s >> 24) as u8;
+            packed.push(q);
+            w[blk * 32 + t] = d * (q as i8) as f64;
+        }
+    }
+    let rows: Vec<Vec<f32>> = (0..2)
+        .map(|r| {
+            (0..k)
+                .map(|i| (((i * 7 + r * 13) % 101) as f32 - 50.0) / 37.0)
+                .collect()
+        })
+        .collect();
+    let run = |m: usize, x: &[f32]| -> Vec<f32> {
+        let mut g = Graph::new("dq_gguf_q8_0_gemv");
+        let x_in = g.input("x", Shape::new(&[m, k], DType::F32));
+        let w_param = g.param("w_q", Shape::new(&[packed.len()], DType::U8));
+        let y = g.add_node(
+            rlx_ir::Op::DequantMatMul {
+                scheme: QuantScheme::GgufQ8_0,
+            },
+            vec![x_in, w_param],
+            Shape::new(&[m, n], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        let mut exe = RocmExecutable::compile(g);
+        exe.set_param_bytes("w_q", &packed);
+        exe.run(&[("x", x)]).remove(0)
+    };
+    let one: Vec<Vec<f32>> = rows.iter().map(|x| run(1, x)).collect();
+    for (x, got) in rows.iter().zip(&one) {
+        for j in 0..n {
+            let want: f64 = (0..k).map(|i| x[i] as f64 * w[j * k + i]).sum();
+            let tol = 4.0
+                * f32::EPSILON as f64
+                * (0..k)
+                    .map(|i| (x[i] as f64 * w[j * k + i]).abs())
+                    .sum::<f64>();
+            assert!(
+                (got[j] as f64 - want).abs() <= tol.max(1e-6),
+                "row {j}: {} vs {want}",
+                got[j]
+            );
+        }
+    }
+    let both = run(2, &[rows[0].clone(), rows[1].clone()].concat());
+    for r in 0..2 {
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&both[r * n..(r + 1) * n]),
+            bits(&one[r]),
+            "row {r} of the two-row GEMV"
+        );
+    }
 }

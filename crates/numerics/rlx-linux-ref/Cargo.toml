@@ -21,3 +21,7 @@ rlx-libm = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+# Platform C libm for rlx-libm's `reference` (macOS-exact NumPy/SciPy); off = pure Rust.
+libm = ["rlx-libm/libm"]

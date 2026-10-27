@@ -19,11 +19,21 @@ publish = false
 [lib]
 name = "pyrlx"
 crate-type = ["cdylib", "rlib"]
+# No Rust tests live here (they are the pytest suite, `just test-pyrlx`). An
+# empty test binary still links libpython, and on a host without python3-dev
+# that one link error aborted the whole `cargo test --workspace` build — zero
+# tests ran on the Linux rig.
+test = false
+doctest = false
 
 [features]
 # Backend selection mirrors rlx-runtime. Default = whatever's
 # always available everywhere (cpu).
-default = ["cpu", "gguf-convert", "training", "text", "models"]
+# `extension-module` (also what maturin passes) keeps every cargo build from
+# linking libpython: the symbols resolve when Python imports the module. The
+# macOS half of the same fix is build.rs's `-undefined dynamic_lookup`.
+default = ["cpu", "gguf-convert", "training", "text", "models", "extension-module"]
+extension-module = ["pyo3/extension-module"]
 
 cpu             = ["rlx-runtime/cpu"]
 gguf-convert    = ["rlx-gguf-convert/safetensors", "rlx-bind/gguf-convert"]

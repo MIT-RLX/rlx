@@ -24,8 +24,9 @@ fn main() {
     let chunk: usize = env("CHUNK", "2048").parse().unwrap();
     let bf16 = env("BF16", "0") == "1";
     let ty = if bf16 { Ty::Bf16 } else { Ty::F32 };
-    let aiecc = std::env::var("AIECC").expect("set AIECC");
-    let peano = std::env::var("PEANO").expect("set PEANO");
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let aiecc = tc.aiecc_str();
+    let peano = tc.peano_str();
 
     // Domain-restricted ops (log/sqrt/rsqrt/recip) get positive inputs; the rest
     // get a signed spread so the negative branches (sign/floor/elu/…) are tested.

@@ -23,20 +23,16 @@ pub fn run_custom_host(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     name: &str,
-    in_specs: &[(u32, Shape)],
+    in_specs: &[(usize, Shape)],
     out_byte_off: usize,
     out_shape: &Shape,
     attrs: &[u8],
 ) {
-    let specs: Vec<(usize, Shape)> = in_specs
-        .iter()
-        .map(|(off, sh)| (*off as usize, sh.clone()))
-        .collect();
     let mut a = WgpuArena {
         arena,
         device,
         queue,
         size_bytes: 0,
     };
-    rlx_gpu_host::run_custom_host_bytes(&mut a, name, &specs, out_byte_off, out_shape, attrs);
+    rlx_gpu_host::run_custom_host_bytes(&mut a, name, in_specs, out_byte_off, out_shape, attrs);
 }

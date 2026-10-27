@@ -672,6 +672,67 @@ impl ProcessGroup {
         self.ring_all_gather(data, n, me)
     }
 
+    /// The reduce-scatter half of [`Self::all_reduce`] on its own: every rank
+    /// ends owning the fully reduced (and, for `Mean`, finalized) slice
+    /// `data[range]` of the returned range; the rest of `data` is partial.
+    /// [`Self::all_gather_owned`] completes it into a full all-reduce. Splitting
+    /// the two lets an optimizer update only its own slice in between
+    /// (ZeRO-1 optimizer-state sharding) for the same bytes on the wire.
+    /// Every rank must pass the same length.
+    pub fn reduce_scatter_owned(
+        &self,
+        data: &mut [f32],
+        op: ReduceKind,
+    ) -> Result<std::ops::Range<usize>, CollectiveError> {
+        let n = self.world_size() as usize;
+        let me = self.rank() as usize;
+        if n <= 1 {
+            for v in data.iter_mut() {
+                *v = finalize(op, *v, 1);
+            }
+            return Ok(0..data.len());
+        }
+        let next = ((me + 1) % n) as u32;
+        let prev = ((me + n - 1) % n) as u32;
+        let len = data.len();
+        for step in 0..n - 1 {
+            let (ss, se) = ring_chunk(len, n, (me + n - step) % n);
+            let (rs, re) = ring_chunk(len, n, (me + n - step - 1) % n);
+            self.send_f32_tagged(next, TAG_ALL_REDUCE, &data[ss..se])?;
+            let incoming = self.recv_f32_tagged(prev, TAG_ALL_REDUCE)?;
+            expect_len(incoming.len(), re - rs)?;
+            for (d, v) in data[rs..re].iter_mut().zip(incoming) {
+                *d = combine(op, *d, v);
+            }
+        }
+        let (os, oe) = ring_chunk(len, n, (me + 1) % n);
+        for v in data[os..oe].iter_mut() {
+            *v = finalize(op, *v, n as u32);
+        }
+        Ok(os..oe)
+    }
+
+    /// The slice of a `len`-element buffer this rank owns after
+    /// [`Self::reduce_scatter_owned`] — computable without communicating.
+    pub fn owned_range(&self, len: usize) -> std::ops::Range<usize> {
+        let n = self.world_size() as usize;
+        if n <= 1 {
+            return 0..len;
+        }
+        let (os, oe) = ring_chunk(len, n, (self.rank() as usize + 1) % n);
+        os..oe
+    }
+
+    /// The all-gather half: each rank contributes its [`Self::owned_range`]
+    /// slice of `data` and every rank ends with the whole buffer.
+    pub fn all_gather_owned(&self, data: &mut [f32]) -> Result<(), CollectiveError> {
+        let n = self.world_size() as usize;
+        if n <= 1 {
+            return Ok(());
+        }
+        self.ring_all_gather(data, n, self.rank() as usize)
+    }
+
     /// The all-gather half shared by both rings: once each rank owns its finalized
     /// chunk `(me+1)%n`, walk the chunks around the ring so every rank ends with
     /// the whole vector. f32 payload — the values are already reduced.
@@ -1336,6 +1397,26 @@ mod tests {
                 "rank {}",
                 g.rank()
             );
+        });
+    }
+
+    #[test]
+    fn reduce_scatter_then_all_gather_is_all_reduce() {
+        // 7 elements over 3 ranks: uneven chunks. Each rank updates ONLY its
+        // owned slice between the halves (the ZeRO-1 shape).
+        run_ranks(3, |g| {
+            let r = g.rank() as f32;
+            let mut d: Vec<f32> = (0..7).map(|i| i as f32 + 10.0 * r).collect();
+            let own = g.reduce_scatter_owned(&mut d, ReduceKind::Sum).unwrap();
+            assert_eq!(own, g.owned_range(7));
+            for i in own.clone() {
+                // Σ_r (i + 10r) = 3i + 30
+                assert_eq!(d[i], 3.0 * i as f32 + 30.0, "rank {} elem {i}", g.rank());
+                d[i] += 1.0;
+            }
+            g.all_gather_owned(&mut d).unwrap();
+            let want: Vec<f32> = (0..7).map(|i| 3.0 * i as f32 + 31.0).collect();
+            assert_eq!(d, want, "rank {}", g.rank());
         });
     }
 

@@ -28,7 +28,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -343,11 +343,7 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub fn connect(addr: &str, opts: &RpcOptions) -> Result<Self> {
-        let sa = addr
-            .to_socket_addrs()
-            .with_context(|| format!("resolving {addr}"))?
-            .next()
-            .with_context(|| format!("{addr} resolves to nothing"))?;
+        let sa = rlx_driver::resolve_addr(addr).with_context(|| format!("resolving {addr}"))?;
         let mut last = None;
         for _ in 0..opts.connect_attempts.max(1) {
             match TcpStream::connect_timeout(&sa, opts.timeout.min(Duration::from_secs(10))) {

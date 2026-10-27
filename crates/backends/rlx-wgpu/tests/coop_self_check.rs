@@ -54,6 +54,7 @@ fn every_buildable_coop_kernel_passes_its_self_check() {
                 widen: true,
                 f32acc: true,
             },
+            CoopKernel::F16Vk32,
         ]
     };
     let mut checked = 0;

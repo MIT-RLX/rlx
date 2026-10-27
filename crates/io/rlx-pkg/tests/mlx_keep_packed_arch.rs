@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! keep-packed + arch config embeds Llama prefill graph (not parallel dequant).
 
+#![cfg(feature = "convert")]
 use std::collections::HashMap;
 use std::fs;
 

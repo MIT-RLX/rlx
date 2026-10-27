@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+
 //! An eval-mode BatchNorm written out elementwise after a convolution —
 //! `conv → +b → (x − mean) / √(var + ε) · γ + β` — segfaulted CoreML inside
 //! `libBNNS` while it initialised the program (LEAF's tokenizer at

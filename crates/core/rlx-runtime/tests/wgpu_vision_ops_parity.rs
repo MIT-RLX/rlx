@@ -145,7 +145,12 @@ fn resize_nearest2x_wgpu_matches_cpu() {
     // A WGSL kernel, not a host step: WebGPU in wasm cannot run host steps
     // (a VAE decoder's upsamples stopped it there).
     let exe = Session::new(Device::Gpu).compile(resize_graph(1, 3, 8, 8));
-    assert_eq!(exe.host_execution_summary(), None);
+    // Native Vulkan/DX12 adapters host structure ops, resize included, by
+    // policy (`wgpu_prefer_structure_host`); a native process can run host
+    // steps, so the kernel requirement applies everywhere else.
+    if !rlx_wgpu::device::coop_discrete_backend() {
+        assert_eq!(exe.host_execution_summary(), None);
+    }
     for &(n, c, h, w) in &[(1, 3, 8, 8), (2, 16, 12, 10), (1, 8, 32, 32)] {
         assert_close(
             &format!("resize wgpu [{n},{c},{h},{w}]"),

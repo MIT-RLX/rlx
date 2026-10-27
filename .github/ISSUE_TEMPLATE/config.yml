@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Known issues and fixes
+    url: https://github.com/MIT-RLX/rlx/blob/main/docs/known-issues.md
+    about: Search here for your error message first — most setup problems are listed with the fix.

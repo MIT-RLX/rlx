@@ -19,7 +19,7 @@ struct Params {
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1) var<uniform>              params: Params;
 
-const INF: f32 = 3.4028235e+38;
+const INF: f32 = 0x1.fffffep+127f;
 
 @compute @workgroup_size(64)
 fn umap_knn(

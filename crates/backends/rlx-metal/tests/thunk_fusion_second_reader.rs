@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![cfg(target_os = "macos")]
+
 //! A thunk fusion may not drop a producer whose value is read again later.
 //!
 //! Metal's thunk-level fusions (`fuse_gdn_gated_norm`, `fuse_l2_norm`) collapse

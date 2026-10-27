@@ -25,7 +25,7 @@ rlx-ir = { workspace = true }
 rlx-opt = { workspace = true }
 # Host-side GGUF / MLX dequant fallback for the off-path quant schemes.
 rlx-gguf = { workspace = true }
-rlx-mlx-io = { workspace = true }
+rlx-mlx-io = { workspace = true, default-features = false }  # dequant kernels only
 prost = "0.13"
 half = "2"
 bytemuck = { version = "1", features = ["derive"] }

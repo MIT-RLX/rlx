@@ -86,11 +86,79 @@ pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
 
 /// Launch `dequant_gguf` into arena scratch, then `C = X @ W^T` via hipBLAS.
 /// Whether the fused `m == 1` GEMV covers this scheme — mirrors rlx-cuda's
-/// `gguf_fused_gemv_m1_supported`. Q4_K only for now (scheme id 0), which is the
-/// bulk of a K-quant checkpoint; everything else keeps the dequant-to-scratch
-/// path.
+/// `gguf_fused_gemv_m1_supported`: Q8_0, Q4_K, Q5_K and Q6_K (the element-strided
+/// `gguf_gemv_elem`; Q4_K's block-strided kernel with `RLX_GGUF_GEMV_ELEM=0`).
+/// Everything else keeps the dequant-to-scratch path.
 pub fn gguf_fused_gemv_m1_supported(scheme_id: u32, m: usize, k: usize) -> bool {
-    m == 1 && scheme_id == 0 && k.is_multiple_of(256)
+    m == 1
+        && match scheme_id {
+            0 => k.is_multiple_of(256),
+            1 | 2 => gguf_gemv_elem_enabled() && k.is_multiple_of(256),
+            20 => k.is_multiple_of(32),
+            _ => false,
+        }
+}
+
+/// Whether the few-row GEMV covers `m` rows (2–4, a speculative verify
+/// step's) of this scheme — mirrors rlx-cuda's `gguf_gemv_rows_supported`.
+pub fn gguf_gemv_rows_supported(scheme_id: u32, m: usize, k: usize) -> bool {
+    (2..=4).contains(&m)
+        && match scheme_id {
+            20 => k.is_multiple_of(32),
+            1 => k.is_multiple_of(256),
+            0 | 2 => gguf_gemv_elem_enabled() && k.is_multiple_of(256),
+            _ => false,
+        }
+}
+
+/// The element-strided GEMV for `m` (2–4) rows: each weight chunk decoded
+/// once for every row, each row's output the `m == 1` kernel's.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn run_dequant_matmul_gguf_gemv_rows(
+    ctx: &Arc<RocmContext>,
+    stream: crate::hip::HipStream,
+    buffer: &HipBuffer<f32>,
+    m: usize,
+    n: usize,
+    k: usize,
+    scheme_id: u32,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    out_byte_off: usize,
+) {
+    use core::ffi::c_void;
+    let mut dev = buffer.ptr;
+    let (m_u, n_u, k_u) = (m as u64, n as u64, k as u64);
+    let x_u = (x_byte_off / 4) as u64;
+    let w_u = w_byte_off as u64;
+    let out_u = (out_byte_off / 4) as u64;
+    let mut params: [*mut c_void; 8] = [
+        &mut dev as *mut _ as *mut c_void,
+        &m_u as *const _ as *mut c_void,
+        &n_u as *const _ as *mut c_void,
+        &k_u as *const _ as *mut c_void,
+        &x_u as *const _ as *mut c_void,
+        &w_u as *const _ as *mut c_void,
+        &out_u as *const _ as *mut c_void,
+        &scheme_id as *const _ as *mut c_void,
+    ];
+    unsafe {
+        crate::kernels::dequant_matmul_gguf_gemv_rows_kernel(ctx)
+            .launch_checked(
+                stream,
+                ((n as u32).div_ceil(8), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut params,
+            )
+            .expect("rlx-rocm: GGUF few-row GEMV launch failed");
+    }
+}
+
+/// The element-strided decode GEMV: on unless `RLX_GGUF_GEMV_ELEM=0`.
+fn gguf_gemv_elem_enabled() -> bool {
+    rlx_ir::env::var("RLX_GGUF_GEMV_ELEM").as_deref() != Some("0")
 }
 
 /// Fused GGUF Q4_K GEMV: one CTA per output row, reading the packed weight
@@ -104,31 +172,55 @@ pub fn run_dequant_matmul_gguf_gemv_m1(
     buffer: &HipBuffer<f32>,
     n: usize,
     k: usize,
+    scheme_id: u32,
     x_byte_off: usize,
     w_byte_off: usize,
     out_byte_off: usize,
 ) {
     use core::ffi::c_void;
-    let kernel = crate::kernels::dequant_matmul_gguf_q4k_gemv_kernel(ctx);
+    let elem = scheme_id != 0 || gguf_gemv_elem_enabled();
     let mut dev = buffer.ptr;
     let n_u = n as u64;
     let k_u = k as u64;
     let x_u = (x_byte_off / 4) as u64;
     let w_u = w_byte_off as u64;
     let out_u = (out_byte_off / 4) as u64;
-    let mut params: [*mut c_void; 6] = [
+    let mut params: [*mut c_void; 7] = [
         &mut dev as *mut _ as *mut c_void,
         &n_u as *const _ as *mut c_void,
         &k_u as *const _ as *mut c_void,
         &x_u as *const _ as *mut c_void,
         &w_u as *const _ as *mut c_void,
         &out_u as *const _ as *mut c_void,
+        &scheme_id as *const _ as *mut c_void,
     ];
-    // One block per output row; 128 threads split the k/256 super-blocks.
+    // `elem`: 8 rows of 32 threads per block, splitting each row's elements.
+    // Otherwise one block per row, 128 threads splitting its k/256 super-blocks.
+    let (kernel, nparams, grid, block) = if elem {
+        (
+            crate::kernels::dequant_matmul_gguf_gemv_elem_kernel(ctx),
+            7,
+            (n as u32).div_ceil(8),
+            256,
+        )
+    } else {
+        (
+            crate::kernels::dequant_matmul_gguf_q4k_gemv_kernel(ctx),
+            6,
+            n as u32,
+            128,
+        )
+    };
     unsafe {
         kernel
-            .launch_checked(stream, (n as u32, 1, 1), (128, 1, 1), 0, &mut params)
-            .expect("rlx-rocm: dequant_matmul_gguf_q4k_gemv launch failed");
+            .launch_checked(
+                stream,
+                (grid, 1, 1),
+                (block, 1, 1),
+                0,
+                &mut params[..nparams],
+            )
+            .expect("rlx-rocm: fused GGUF GEMV launch failed");
     }
 }
 

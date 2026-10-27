@@ -565,6 +565,17 @@ impl CoremlExecutable {
             };
             slot.lowered = Some(lowered);
             slot.pkg_dir = Some(dir);
+            let mut model = model;
+            // RLX_COREML_PLAN=1: where CoreML places this model's ops
+            // (MLComputePlan; RLX_COREML_PLAN_OPS=1 breaks it down per op).
+            if rlx_ir::env::var("RLX_COREML_PLAN").as_deref() == Some("1") {
+                match model.compute_plan() {
+                    Some([cpu, gpu, ane, other]) => eprintln!(
+                        "[coreml-plan] slot {i}: {cpu} ops on cpu, {gpu} on gpu, {ane} on ane, {other} unplaced"
+                    ),
+                    None => eprintln!("[coreml-plan] slot {i}: MLComputePlan unavailable"),
+                }
+            }
             slot.model = Some(model);
         }
         Ok(())

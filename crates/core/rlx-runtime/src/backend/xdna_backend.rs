@@ -133,7 +133,8 @@ impl Backend for XdnaBackend {
         } else {
             build_op_exec(&graph)
         };
-        built.unwrap_or_else(|e| panic!("XdnaBackend: {e}"))
+        let exe = built.unwrap_or_else(|e| panic!("XdnaBackend: {e}"));
+        IntBoundary::wrap(exe, &graph)
     }
 
     fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
@@ -332,6 +333,97 @@ fn decode_constant_f32(data: &[u8], dtype: rlx_ir::DType) -> Result<Vec<f32>, St
     })
 }
 
+/// The `run()` convention for integer tensors at the graph boundary.
+///
+/// Inside the NPU path an I32 tensor rides as its bits in an f32 cell
+/// (`emit_cast`'s fptosi/sitofp write and read raw bits). The `run()` contract
+/// — what the CPU backend implements in `read_as_f32` / `write_f32_as` — is
+/// *numeric*: an I32 value 3 crosses as `3.0`. Without this the same graph
+/// returned `3.0` on CPU and `4.2e-45` (the bits of 3) on the NPU, which is
+/// how `xdna_graph`'s `cast_f2i` came to fail once the CPU backend switched to
+/// native integer storage.
+struct IntBoundary {
+    inner: Box<dyn ExecutableGraph>,
+    int_inputs: Vec<String>,
+    int_outputs: Vec<usize>,
+}
+
+impl IntBoundary {
+    fn wrap(inner: Box<dyn ExecutableGraph>, graph: &Graph) -> Box<dyn ExecutableGraph> {
+        // Only `Cast` reads or writes the bits form; every other NPU op that
+        // touches an index (ArgMax, Gather) uses f32-encoded *values*, so an I32
+        // tensor is converted only where a Cast is on the other side of it.
+        let is_cast = |id: rlx_ir::NodeId| matches!(graph.node(id).op, Op::Cast { .. });
+        let int_inputs: Vec<String> = graph
+            .nodes()
+            .iter()
+            .filter(|n| n.shape.dtype() == rlx_ir::DType::I32)
+            .filter(|n| {
+                let users: Vec<_> = graph
+                    .nodes()
+                    .iter()
+                    .filter(|u| u.inputs.contains(&n.id))
+                    .collect();
+                !users.is_empty() && users.iter().all(|u| is_cast(u.id))
+            })
+            .filter_map(|n| match &n.op {
+                Op::Input { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let int_outputs: Vec<usize> = graph
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| graph.node(**id).shape.dtype() == rlx_ir::DType::I32 && is_cast(**id))
+            .map(|(i, _)| i)
+            .collect();
+        if int_inputs.is_empty() && int_outputs.is_empty() {
+            return inner;
+        }
+        Box::new(IntBoundary {
+            inner,
+            int_inputs,
+            int_outputs,
+        })
+    }
+}
+
+impl ExecutableGraph for IntBoundary {
+    fn set_param(&mut self, name: &str, data: &[f32]) {
+        self.inner.set_param(name, data);
+    }
+    fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
+        self.inner.set_param_typed(name, data, dtype);
+    }
+    fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        let converted: Vec<(String, Vec<f32>)> = inputs
+            .iter()
+            .filter(|(n, _)| self.int_inputs.iter().any(|i| i == n))
+            .map(|(n, v)| {
+                let bits = v.iter().map(|x| f32::from_bits(*x as i32 as u32)).collect();
+                (n.to_string(), bits)
+            })
+            .collect();
+        let feeds: Vec<(&str, &[f32])> = inputs
+            .iter()
+            .map(|(n, v)| match converted.iter().find(|(c, _)| c == n) {
+                Some((c, bits)) => (c.as_str(), bits.as_slice()),
+                None => (*n, *v),
+            })
+            .collect();
+        let mut outs = self.inner.run(&feeds);
+        for &i in &self.int_outputs {
+            if let Some(o) = outs.get_mut(i) {
+                for x in o.iter_mut() {
+                    *x = x.to_bits() as i32 as f32;
+                }
+            }
+        }
+        outs
+    }
+}
+
 fn build_op_exec(graph: &Graph) -> Result<Box<dyn ExecutableGraph>, String> {
     let node_id = graph
         .nodes()
@@ -352,8 +444,7 @@ fn build_op_exec(graph: &Graph) -> Result<Box<dyn ExecutableGraph>, String> {
 /// them in order. Scoped to the `build_node_exec`-supported ops (no matmul in-chain
 /// yet — a MatMul graph takes the single-op microkernel path).
 fn build_chain(graph: &Graph, bf16: bool) -> Result<XdnaChainExec, String> {
-    std::env::var("AIECC").map_err(|_| "chain needs AIECC in env".to_string())?;
-    std::env::var("PEANO").map_err(|_| "chain needs PEANO in env".to_string())?;
+    rlx_xdna::toolchain::toolchain()?;
     let mut steps: Vec<ChainStep> = Vec::new();
     for (idx, node) in graph.nodes().iter().enumerate() {
         if matches!(
@@ -540,9 +631,8 @@ impl ExecutableGraph for XdnaChainExec {
 /// intermediate produced by an earlier node in a [`XdnaChainExec`]). Needs
 /// `AIECC` + `PEANO`.
 fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGraph>, String> {
-    let aiecc = std::env::var("AIECC")
-        .map_err(|_| "set AIECC (native mlir-aie) for on-demand NPU op compile".to_string())?;
-    let peano = std::env::var("PEANO").map_err(|_| "set PEANO (llvm-aie dir)".to_string())?;
+    let tc = rlx_xdna::toolchain::toolchain()?;
+    let (aiecc, peano) = (tc.aiecc_str(), tc.peano_str());
 
     let node = &graph.nodes()[node_id];
     let in_id = *node.inputs.first().ok_or("op has no input")?;
@@ -1948,25 +2038,21 @@ struct MatmulSetup {
 }
 
 fn matmul_node_setup(graph: &Graph, mm: &rlx_ir::graph::Node) -> Result<MatmulSetup, String> {
-    let aiecc =
-        std::env::var("AIECC").map_err(|_| "microkernel matmul needs AIECC in env".to_string())?;
-    let peano =
-        std::env::var("PEANO").map_err(|_| "microkernel matmul needs PEANO in env".to_string())?;
-    // The mlir_aie include tree that holds BOTH `aie_kernels/aie2/mm.cc` (the vendor
-    // microkernel source) and `aie_api/` (its headers). `RLX_XDNA_AIE_INCLUDE`
-    // overrides it — required when aiecc doesn't sit at `<mlir_aie>/bin/aiecc` (e.g. a
-    // pip `mlir_aie` package puts the real include under site-packages, not next to
-    // the `bin/aiecc` shim). Falls back to `<aiecc>/../../include`.
-    let include = rlx_ir::env::var("RLX_XDNA_AIE_INCLUDE").map_or_else(
-        || {
-            std::path::Path::new(&aiecc)
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|p| format!("{}/include", p.display()))
-                .ok_or_else(|| "cannot derive mlir_aie include dir from AIECC path".to_string())
-        },
-        Ok,
-    )?;
+    let tc = rlx_xdna::toolchain::toolchain()?;
+    let (aiecc, peano) = (tc.aiecc_str(), tc.peano_str());
+    // The mlir_aie include tree holding BOTH `aie_kernels/aie2/mm.cc` (the vendor
+    // microkernel source) and `aie_api/` (its headers): `RLX_XDNA_AIE_INCLUDE`,
+    // else found next to the discovered package (`toolchain`).
+    let include = tc
+        .include
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            format!(
+                "no mlir_aie include tree (aie_kernels/) next to {aiecc}; set \
+                 RLX_XDNA_AIE_INCLUDE to <site-packages>/mlir_aie/include"
+            )
+        })?;
 
     if mm.inputs.len() != 2 {
         return Err("matmul must have exactly 2 inputs".into());

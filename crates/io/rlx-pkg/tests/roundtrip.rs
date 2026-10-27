@@ -4,12 +4,22 @@
 
 //! Flat / directory / ZIP package round-trips.
 
+#![cfg(feature = "write")]
 use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_pkg::{
     BakeWeight, ContainerKind, Package, Placement, TensorShard, WriteOptions, package_from_bake,
 };
 use std::collections::BTreeMap;
+
+/// `tempfile::tempdir()`, under `/tmp` on WASI (where `std::env::temp_dir` panics).
+fn scratch() -> tempfile::TempDir {
+    if cfg!(target_os = "wasi") {
+        tempfile::tempdir_in("/tmp").unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    }
+}
 
 fn tiny_graph() -> Graph {
     let s = Shape::new(&[4], DType::F32);
@@ -33,7 +43,7 @@ fn weight_f32() -> BakeWeight {
 
 #[test]
 fn roundtrip_flat_pack_default() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scratch();
     let out = dir.path().join("model.rlxp");
     let g = tiny_graph();
     let weights = vec![weight_f32()];
@@ -69,7 +79,7 @@ fn roundtrip_flat_pack_default() {
 
 #[test]
 fn flat_smaller_than_zip_no_dup() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scratch();
     let g = tiny_graph();
     // Larger weight to make overhead differences visible.
     let mut data = Vec::new();
@@ -116,7 +126,7 @@ fn flat_smaller_than_zip_no_dup() {
 
 #[test]
 fn roundtrip_directory_pack() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scratch();
     let out = dir.path().join("model_pkg");
     let g = tiny_graph();
     let weights = vec![weight_f32()];
@@ -155,7 +165,7 @@ fn roundtrip_directory_pack() {
 
 #[test]
 fn roundtrip_zip_pack() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scratch();
     let out = dir.path().join("model.zip");
     let g = tiny_graph();
     let weights = vec![weight_f32()];
@@ -178,7 +188,7 @@ fn roundtrip_zip_pack() {
 fn hybrid_hot_warm_cold() {
     use rlx_pkg::{PackedWeight, StorageTier, write_package};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scratch();
     let out = dir.path().join("hybrid.rlxp");
     let g = tiny_graph();
 
@@ -262,7 +272,7 @@ fn hybrid_hot_warm_cold() {
 fn verify_checksums_and_bincode_toc() {
     use rlx_pkg::{PackedWeight, verify_package, write_package};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scratch();
     let out = dir.path().join("chk.rlxp");
     let g = tiny_graph();
     let hot = PackedWeight::hot(
@@ -298,7 +308,7 @@ fn verify_checksums_and_bincode_toc() {
 fn weight_only_and_zip_hybrid() {
     use rlx_pkg::{PackedWeight, StorageTier, write_package};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scratch();
     let out = dir.path().join("wo.zip");
     let g = tiny_graph();
     let mut warm_raw = vec![0u8; 32 * 1024];
@@ -337,7 +347,7 @@ fn weight_only_and_zip_hybrid() {
 /// open.
 #[test]
 fn graphs_are_rlxmodel_text_and_bincode_packages_still_open() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scratch();
     let out = dir.path().join("pkg");
     let g = tiny_graph();
     let opts = WriteOptions {
@@ -369,7 +379,7 @@ fn graphs_are_rlxmodel_text_and_bincode_packages_still_open() {
 /// with the model's name and version, in every container.
 #[test]
 fn a_package_holds_a_module_with_its_model_block() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scratch();
     let mut second = tiny_graph();
     second.name = "decode".into();
     for (container, file) in [

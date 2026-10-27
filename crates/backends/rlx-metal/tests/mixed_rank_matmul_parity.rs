@@ -13,6 +13,8 @@
 //! bank and `X` a batch of covariances: the first product is the safe direction
 //! and the second is not, so half of the expression was right.
 
+#![cfg(target_os = "macos")]
+
 use rlx_ir::{DType, Graph, GraphExt, Shape};
 use rlx_runtime::{Device, Session};
 
@@ -45,7 +47,11 @@ fn compare(build: impl Fn() -> Graph, inputs: &[(&str, &[f32])]) -> f32 {
 
 #[test]
 fn rank2_lhs_times_rank3_rhs() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_metal::is_available(),
+    ) {
         return;
     }
     let w = noise(M * N, 1);
@@ -71,7 +77,11 @@ fn rank2_lhs_times_rank3_rhs() {
 fn rank3_lhs_times_rank2_rhs_is_unaffected() {
     // The direction the flatten path *is* correct for — kept so a repair of the
     // broken direction cannot quietly break the working one.
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_metal::is_available(),
+    ) {
         return;
     }
     let x = noise(B * N * N, 3);
@@ -95,7 +105,11 @@ fn rank3_lhs_times_rank2_rhs_is_unaffected() {
 
 #[test]
 fn the_full_congruence_that_surfaced_it() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_metal::is_available(),
+    ) {
         return;
     }
     let w = noise(N * M, 5);

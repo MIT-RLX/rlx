@@ -15,6 +15,8 @@ pub mod asm_check;
 pub mod attention_bwd;
 pub mod autotune;
 pub mod blas;
+/// Accurate vectorized f32 exp / log / tanh (the `rlx-fastmath` crate).
+pub use rlx_fastmath as fastmath;
 pub mod calibrate;
 pub mod config;
 pub mod conv3d_bwd;

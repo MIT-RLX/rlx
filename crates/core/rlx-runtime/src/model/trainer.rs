@@ -195,11 +195,27 @@ fn merged(meta: &Value, options: &Value) -> Value {
     Value::Object(out)
 }
 
+/// The output `name` addresses: its node's name, the graph's name for that
+/// output, or `#i` (the i-th output) — so an unnamed output is reachable too.
 fn output_named(g: &Graph, name: &str) -> Result<NodeId> {
+    if let Some(i) = name.strip_prefix('#').and_then(|i| i.parse::<usize>().ok()) {
+        return g.outputs.get(i).copied().with_context(|| {
+            format!(
+                "the function has {} output(s), not '{name}'",
+                g.outputs.len()
+            )
+        });
+    }
     g.outputs
         .iter()
         .copied()
         .find(|&o| g.node(o).name.as_deref() == Some(name))
+        .or_else(|| {
+            g.output_names()
+                .iter()
+                .find(|(_, n)| n == name)
+                .and_then(|(i, _)| g.outputs.get(*i).copied())
+        })
         .with_context(|| format!("the function has no output '{name}'"))
 }
 
@@ -296,6 +312,37 @@ fn with_float_inputs(g: &Graph) -> Result<Graph> {
     Ok(out)
 }
 
+/// Package function `function` with its symbols sized by `dims` (every one
+/// must be), its integer inputs taken as f32 — a static graph any trainer or
+/// executor takes.
+pub(super) fn specialize_function(
+    pkg: &mut Opened,
+    function: &str,
+    dims: Option<&Map<String, Value>>,
+) -> Result<Graph> {
+    let mut graph = pkg.take_graph(function)?;
+    if let Some(dims) = dims {
+        let mut bind = rlx_ir::DimBinding::new();
+        for (name, size) in dims {
+            let sym = pkg
+                .dims
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, s)| *s)
+                .with_context(|| format!("the package has no dim '{name}'"))?;
+            bind.set(
+                sym,
+                size.as_u64().context("a dim's size is a whole number")? as usize,
+            );
+        }
+        graph = rlx_ir::dynamic::specialize(&graph, &bind);
+    }
+    if graph.has_dynamic_dims() {
+        bail!("'{function}' still has unsized dims: give them in `dims`");
+    }
+    with_float_inputs(&graph)
+}
+
 /// `g`'s scalar loss as its only output, as `loss` says.
 fn with_loss(mut g: Graph, loss: &Value) -> Result<Graph> {
     let f32s = |d: &[usize]| Shape::new(d, DType::F32);
@@ -378,27 +425,8 @@ pub fn prepare(path: &str, options: &Value) -> Result<Prepared> {
         .get("function")
         .and_then(Value::as_str)
         .context("the trainer names its `function`")?;
-    let mut graph = pkg.take_graph(function)?;
-    if let Some(dims) = o.get("dims").and_then(Value::as_object) {
-        let mut bind = rlx_ir::DimBinding::new();
-        for (name, size) in dims {
-            let sym = pkg
-                .dims
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, s)| *s)
-                .with_context(|| format!("the package has no dim '{name}'"))?;
-            bind.set(
-                sym,
-                size.as_u64().context("a dim's size is a whole number")? as usize,
-            );
-        }
-        graph = rlx_ir::dynamic::specialize(&graph, &bind);
-    }
-    if graph.has_dynamic_dims() {
-        bail!("'{function}' still has unsized dims: give them in `dims`");
-    }
-    let mut graph = with_float_inputs(&graph)?;
+    let mut graph =
+        specialize_function(&mut pkg, function, o.get("dims").and_then(Value::as_object))?;
 
     let train = o
         .get("train")

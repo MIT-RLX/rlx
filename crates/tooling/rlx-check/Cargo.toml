@@ -27,12 +27,21 @@ rlx-runtime = { workspace = true }
 # serialize: serde derives on Graph/Op/Shape so the CLI can load a graph from JSON.
 rlx-ir      = { workspace = true, features = ["serialize"] }
 serde_json  = "1"
+# `cargo rlx dist` cluster files.
+serde       = { version = "1", features = ["derive"] }
+# `cargo rlx nodes`: nodes advertised over Bonjour/Avahi (pure-Rust mDNS).
+rlx-driver  = { workspace = true, features = ["mdns"] }
+toml        = "0.8"
+# `cargo rlx setup xdna` (toolchain install plan + discovery); feature `xdna`.
+rlx-xdna    = { workspace = true, optional = true }
 
 [dev-dependencies]
 # End-to-end test of the `#[rlx_model(check)]` self-check hook.
 rlx-macros = { workspace = true }
 
 [features]
+# `cargo rlx dist` hosts linked over Bluetooth LE (`via = "ble"`).
+ble = ["rlx-driver/ble"]
 # Source-scanning gates over the whole op set (needs rlx-ir's sample_ops).
 op-gates = ["rlx-ir/test-support"]
 default = []
@@ -45,6 +54,11 @@ cuda   = ["rlx-runtime/cuda"]
 rocm   = ["rlx-runtime/rocm"]
 tpu    = ["rlx-runtime/tpu"]
 coreml = ["rlx-runtime/coreml"]
+# Further backends `cargo rlx doctor` can report on (it sees only what is built in).
+vulkan = ["rlx-runtime/vulkan"]
+oneapi = ["rlx-runtime/oneapi"]
+xdna   = ["rlx-runtime/xdna", "dep:rlx-xdna"]
+egpu   = ["rlx-runtime/egpu"]
 
 [lints]
 workspace = true

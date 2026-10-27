@@ -104,7 +104,7 @@ fn div_rn(a: f32, b: f32) -> f32 {
 }
 
 fn is_nan(v: f32) -> bool { return v != v; }
-fn is_inf(v: f32) -> bool { return abs(v) > 3.4028235e38; }
+fn is_inf(v: f32) -> bool { return abs(v) > 0x1.fffffep+127f; }
 fn is_finite(v: f32) -> bool { return !is_nan(v) && !is_inf(v); }
 // `seed` is any runtime value: a NaN bit pattern built from constants alone is
 // a const-expression, which Tint (Chrome/Dawn WebGPU) rejects outright.
@@ -227,7 +227,7 @@ fn encode_lowp(fmt: u32, x_in: f32) -> u32 {
     }
     let n_codes = 1u << code_width(fmt);
     var best = 0u;
-    var best_err = 3.4028235e38;
+    var best_err = 0x1.fffffep+127f;
     var best_lsb = 1u;
     for (var c = 0u; c < n_codes; c = c + 1u) {
         let v = decode_lowp(fmt, c);

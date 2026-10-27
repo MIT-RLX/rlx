@@ -83,7 +83,11 @@ fn run_sample(device: Device, b: usize, v: usize, k: usize, p: f32, t: f32, seed
 
 #[test]
 fn metal_argmax_and_sample_match_cpu() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }

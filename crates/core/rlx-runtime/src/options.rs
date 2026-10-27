@@ -106,6 +106,36 @@ pub struct CompileOptions {
     /// `RLX_SIMPLIFY_TRANSPOSES`). Off by default: bit-exact, but no measured
     /// speedup yet (see the pass docs).
     pub simplify_transposes: bool,
+    /// What a `Cast` to `f16` / `bf16` inside the graph does
+    /// (`RLX_HALF_CASTS=widen|round`). CPU and GPU backends execute half
+    /// graphs in f32, so by default ([`HalfCasts::Widen`]) such a cast keeps
+    /// the full f32 value; [`HalfCasts::Round`] rounds it to the half format
+    /// first, so the graph computes what it says. For whole-graph low
+    /// precision use [`Self::number_format`].
+    pub half_casts: HalfCasts,
+}
+
+/// See [`CompileOptions::half_casts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HalfCasts {
+    /// The cast is widened with the rest of the graph: no rounding (the
+    /// behavior before this option existed).
+    #[default]
+    Widen,
+    /// The value is rounded to the cast's format (nearest-even, saturating),
+    /// then carried in f32.
+    Round,
+}
+
+impl std::str::FromStr for HalfCasts {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "widen" | "f32" | "off" | "0" => Ok(Self::Widen),
+            "round" | "on" | "1" => Ok(Self::Round),
+            o => Err(format!("RLX_HALF_CASTS={o}: expected widen or round")),
+        }
+    }
 }
 
 impl Default for CompileOptions {
@@ -144,6 +174,7 @@ impl CompileOptions {
             disable_conv_bias_act_fusion: false,
             no_io_peaks_output: false,
             simplify_transposes: false,
+            half_casts: HalfCasts::Widen,
         }
     }
 
@@ -182,6 +213,13 @@ impl CompileOptions {
         }
         if env_registry::flag("RLX_NO_IO_PEAKS_OUTPUT") {
             self.no_io_peaks_output = true;
+        }
+        if let Some(v) = env_registry::var("RLX_HALF_CASTS") {
+            match v.parse::<HalfCasts>() {
+                Ok(h) => self.half_casts = h,
+                // Like RLX_NUMBER_FORMAT: a typo must not silently do nothing.
+                Err(e) => panic!("{e}"),
+            }
         }
         if let Some(spec) = env_registry::var("RLX_NUMBER_FORMAT") {
             match spec.parse::<rlx_ir::NumberFormat>() {

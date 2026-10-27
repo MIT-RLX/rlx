@@ -1988,7 +1988,7 @@ pub(crate) fn sort_pairs(n: usize, m: usize, w: &mut [f64], z: &mut [f64], ldz: 
 
 /// `DLAEV2(A, B, C) → (RT1, RT2, CS1, SN1)`: the eigen-decomposition of
 /// `[[a, b], [b, c]]`.
-fn dlaev2(a: f64, b: f64, c: f64) -> (f64, f64, f64, f64) {
+pub(crate) fn dlaev2(a: f64, b: f64, c: f64) -> (f64, f64, f64, f64) {
     let sm = a + c;
     let df = a - c;
     let adf = df.abs();

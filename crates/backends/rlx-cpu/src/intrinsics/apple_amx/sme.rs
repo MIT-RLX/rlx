@@ -75,6 +75,12 @@ core::arch::global_asm!(
     .globl _rlx_sme_fmopa_panel
 _rlx_sme_fmopa_panel:
     // x0=a_packed  x1=b_packed  x2=c_out  x3=k  x4=n_tiles
+    // smstart/smstop zero every SIMD&FP register, and d8-d15 are
+    // callee-saved (AAPCS64): keep the caller's across streaming mode.
+    stp     d8, d9, [sp, #-64]!
+    stp     d10, d11, [sp, #16]
+    stp     d12, d13, [sp, #32]
+    stp     d14, d15, [sp, #48]
     smstart
     ptrue   p0.b
     lsl     x13, x4, #7            // c row stride bytes = n_tiles*32*4
@@ -123,6 +129,10 @@ _rlx_sme_fmopa_panel:
     add     x5, x5, #1
     b       1b
 4:  smstop
+    ldp     d10, d11, [sp, #16]
+    ldp     d12, d13, [sp, #32]
+    ldp     d14, d15, [sp, #48]
+    ldp     d8, d9, [sp], #64
     ret
 "#
 );
@@ -138,11 +148,16 @@ pub fn is_available() -> bool {
 /// ([`is_available`]) **and** `RLX_CPU_SME=1`. Opt-in is deliberate: this does
 /// not beat Accelerate for dense f32, and the fastest path per backend wins.
 pub fn dispatch_enabled() -> bool {
-    is_available()
-        && matches!(
-            rlx_ir::env::var("RLX_CPU_SME").as_deref(),
-            Some("1") | Some("on") | Some("true")
-        )
+    // Opt-in (`RLX_CPU_SME=1`) next to a vendor BLAS; the default in
+    // `pure-rust` builds, where the alternative is the NEON `gemm` crate
+    // (`RLX_CPU_SME=0` turns it off there).
+    let v = rlx_ir::env::var("RLX_CPU_SME");
+    let on = match v.as_deref() {
+        Some("1") | Some("on") | Some("true") => true,
+        Some(_) => false,
+        None => cfg!(feature = "pure-rust"),
+    };
+    is_available() && on
 }
 
 /// Whether the int8 **W8A8** SME path should be used in the quant executor.
@@ -174,43 +189,253 @@ pub fn worth_sme(m: usize, k: usize, n: usize) -> bool {
     m >= 16 && k >= 64 && n >= 32 && m.saturating_mul(n) >= 2048
 }
 
-/// Pack a 32-wide `A` row-panel: `dst[p*32 + i] = A[m0+i, p]`, rows `≥mt` zeroed.
+/// Threads for the f32 SME GEMM: `RLX_CPU_SME_THREADS`, else the pool size.
+pub fn sme_workers() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let pool = crate::pool::num_threads().max(1);
+        rlx_ir::env::var("RLX_CPU_SME_THREADS")
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(pool, |n| n.clamp(1, pool))
+    })
+}
+
+/// A strided read-only matrix view: element `(r, c)` is `ptr[r * rs + c * cs]`.
+#[derive(Clone, Copy)]
+pub struct StridedMat {
+    pub ptr: *const f32,
+    pub rs: usize,
+    pub cs: usize,
+}
+// SAFETY: read-only views shared by the panel workers.
+unsafe impl Send for StridedMat {}
+unsafe impl Sync for StridedMat {}
+
+impl StridedMat {
+    #[inline(always)]
+    unsafe fn at(&self, r: usize, c: usize) -> f32 {
+        unsafe { *self.ptr.add(r * self.rs + c * self.cs) }
+    }
+}
+
+/// Pack a 32-wide `A` row-panel: `dst[p*32 + i] = A[m0+i, p]`, rows `≥mt`
+/// zeroed. Reads along whichever of A's axes is contiguous.
 #[inline]
-fn pack_a_panel(a: &[f32], m0: usize, mt: usize, k: usize, dst: &mut [f32]) {
-    for p in 0..k {
-        let d = &mut dst[p * BLK..p * BLK + BLK];
-        for (i, slot) in d.iter_mut().enumerate().take(BLK) {
-            *slot = if i < mt { a[(m0 + i) * k + p] } else { 0.0 };
+unsafe fn pack_a_panel(a: StridedMat, m0: usize, mt: usize, k: usize, dst: &mut [f32]) {
+    if mt < BLK {
+        dst.iter_mut().for_each(|v| *v = 0.0);
+    }
+    if a.cs == 1 {
+        // 64-column blocks: the strided (32-float) writes of one block stay
+        // in L1 instead of streaming the whole k×32 panel per row.
+        const PB: usize = 64;
+        let mut p0 = 0;
+        while p0 < k {
+            let pe = (p0 + PB).min(k);
+            for i in 0..mt {
+                let row =
+                    unsafe { std::slice::from_raw_parts(a.ptr.add((m0 + i) * a.rs + p0), pe - p0) };
+                for (pp, &v) in row.iter().enumerate() {
+                    dst[(p0 + pp) * BLK + i] = v;
+                }
+            }
+            p0 = pe;
+        }
+    } else {
+        for p in 0..k {
+            for i in 0..mt {
+                dst[p * BLK + i] = unsafe { a.at(m0 + i, p) };
+            }
         }
     }
 }
 
 /// `C[m,n] = A[m,k] · B[k,n]`, all row-major f32, on the SME unit (overwrites
-/// `C`). Caller must ensure [`is_available`]. Pre-packs B once, blocks the
-/// output into 32×32 tiles, and spreads row-panels across Rayon workers.
+/// `C`). Caller must ensure [`is_available`].
 pub fn sme_sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(b.len(), k * n);
     debug_assert_eq!(c.len(), m * n);
+    // SAFETY: the slices cover the dense extents.
+    unsafe {
+        sme_sgemm_strided(
+            m,
+            k,
+            n,
+            StridedMat {
+                ptr: a.as_ptr(),
+                rs: k,
+                cs: 1,
+            },
+            StridedMat {
+                ptr: b.as_ptr(),
+                rs: n,
+                cs: 1,
+            },
+            c.as_mut_ptr(),
+            n,
+            1.0,
+            0.0,
+        )
+    }
+}
+
+/// `C = alpha·A·B + beta·C` with strided A / B (any transpose) and row stride
+/// `ldc` for C, on the SME unit (`beta == 0` does not read C). Pre-packs B
+/// once straight from its strides, blocks the output into 32×32 tiles and
+/// spreads 32-row panels across workers. Each output accumulates k in order
+/// (one fused multiply-add per step), so it equals a sequential `mul_add`
+/// loop. Caller must ensure [`is_available`].
+///
+/// # Safety
+/// `a`, `b` cover `m×k` / `k×n` through their strides; `c` covers
+/// `(m-1)·ldc + n` floats and does not alias them.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn sme_sgemm_strided(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: StridedMat,
+    b: StridedMat,
+    c: *mut f32,
+    ldc: usize,
+    alpha: f32,
+    beta: f32,
+) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    let packed = unsafe { pack_b(k, n, b) };
+    unsafe { sme_sgemm_packed(m, a, &packed, c, ldc, alpha, beta) };
+}
+
+/// A `k × n` right-hand operand packed for the SME kernel once, for products
+/// that share it ([`sme_sgemm_packed`]): attention reuses one packed Kᵀ / V
+/// across all its query blocks.
+pub struct PackedB {
+    k: usize,
+    n: usize,
+    n_tiles: usize,
+    data: Vec<f32>,
+}
+
+impl PackedB {
+    pub fn k(&self) -> usize {
+        self.k
+    }
+    pub fn n(&self) -> usize {
+        self.n
+    }
+}
+
+/// Pack `B` (`k × n`, strided) for [`sme_sgemm_packed`].
+///
+/// # Safety
+/// `b` covers `k×n` through its strides.
+pub unsafe fn pack_b(k: usize, n: usize, b: StridedMat) -> PackedB {
+    let n_tiles = n.div_ceil(BLK);
+    // b_pack_all[tn*k*32 + p*32 + j] = B[p, tn*32 + j], zero-padded,
+    // one 32-column tile per task (the tiles are disjoint).
+    let mut b_pack_all = vec![0f32; n_tiles * k * BLK];
+    let pack_tile = |tn: usize, tile: &mut [f32]| {
+        let n0 = tn * BLK;
+        let nt = BLK.min(n - n0);
+        if b.cs == 1 {
+            for p in 0..k {
+                let src = unsafe { std::slice::from_raw_parts(b.ptr.add(p * b.rs + n0), nt) };
+                tile[p * BLK..p * BLK + nt].copy_from_slice(src);
+            }
+        } else if b.rs == 1 {
+            // transposed B (`x · Wᵀ`): column j of B is contiguous; 64-row
+            // blocks keep the strided writes in L1
+            const PB: usize = 64;
+            let mut p0 = 0;
+            while p0 < k {
+                let pe = (p0 + PB).min(k);
+                for j in 0..nt {
+                    let col = unsafe {
+                        std::slice::from_raw_parts(b.ptr.add((n0 + j) * b.cs + p0), pe - p0)
+                    };
+                    for (pp, &v) in col.iter().enumerate() {
+                        tile[(p0 + pp) * BLK + j] = v;
+                    }
+                }
+                p0 = pe;
+            }
+        } else {
+            for p in 0..k {
+                for j in 0..nt {
+                    tile[p * BLK + j] = unsafe { b.at(p, n0 + j) };
+                }
+            }
+        }
+    };
+    if n_tiles > 1 && k * n >= 1 << 16 {
+        let bp = b_pack_all.as_mut_ptr() as usize;
+        crate::pool::par_for(n_tiles, 1, &|off, cnt| {
+            for tn in off..off + cnt {
+                // SAFETY: tile `tn` is the disjoint range [tn·k·32, (tn+1)·k·32).
+                let tile = unsafe {
+                    std::slice::from_raw_parts_mut((bp as *mut f32).add(tn * k * BLK), k * BLK)
+                };
+                pack_tile(tn, tile);
+            }
+        });
+    } else {
+        for (tn, tile) in b_pack_all.chunks_exact_mut(k * BLK).enumerate() {
+            pack_tile(tn, tile);
+        }
+    }
+    PackedB {
+        k,
+        n,
+        n_tiles,
+        data: b_pack_all,
+    }
+}
+
+/// `C = alpha·A·B + beta·C` with `B` pre-packed ([`pack_b`]); `A` strided
+/// (`m × B.k`), `C` row stride `ldc` (`beta == 0` does not read C). Same
+/// arithmetic as [`sme_sgemm_strided`].
+///
+/// # Safety
+/// `a` covers `m×k`; `c` covers `(m-1)·ldc + n` floats, not aliasing `a`.
+pub unsafe fn sme_sgemm_packed(
+    m: usize,
+    a: StridedMat,
+    packed: &PackedB,
+    c: *mut f32,
+    ldc: usize,
+    alpha: f32,
+    beta: f32,
+) {
+    unsafe { sme_sgemm_packed_with(sme_workers(), m, a, packed, c, ldc, alpha, beta) }
+}
+
+/// [`sme_sgemm_packed`] on at most `max_workers` threads (1: the caller's
+/// thread only — for callers that already parallelize across products).
+///
+/// # Safety
+/// As [`sme_sgemm_packed`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn sme_sgemm_packed_with(
+    max_workers: usize,
+    m: usize,
+    a: StridedMat,
+    packed: &PackedB,
+    c: *mut f32,
+    ldc: usize,
+    alpha: f32,
+    beta: f32,
+) {
+    let (k, n, n_tiles) = (packed.k, packed.n, packed.n_tiles);
     if m == 0 || n == 0 {
         return;
     }
     let m_tiles = m.div_ceil(BLK);
-    let n_tiles = n.div_ceil(BLK);
+    let b_pack_all = &packed.data;
 
-    // Pre-pack B: b_pack_all[tn*k*32 + p*32 + j] = B[p, tn*32 + j], zero-padded.
-    let mut b_pack_all = vec![0f32; n_tiles * k * BLK];
-    for tn in 0..n_tiles {
-        let n0 = tn * BLK;
-        let nt = BLK.min(n - n0);
-        let base = tn * k * BLK;
-        for p in 0..k {
-            let src = &b[p * n + n0..p * n + n0 + nt];
-            b_pack_all[base + p * BLK..base + p * BLK + nt].copy_from_slice(src);
-        }
-    }
-
-    let c_ptr = c.as_mut_ptr() as usize;
+    let c_ptr = c as usize;
     let scratch_cols = n_tiles * BLK;
     // One 32-row panel per call — the panel kernel does all n-tiles in a single
     // streaming session, writing a padded 32×scratch_cols scratch we then copy
@@ -219,7 +444,7 @@ pub fn sme_sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
     let run_panel = |tm: usize, a_pack: &mut [f32], c_scratch: &mut [f32]| {
         let m0 = tm * BLK;
         let mt = BLK.min(m - m0);
-        pack_a_panel(a, m0, mt, k, a_pack);
+        unsafe { pack_a_panel(a, m0, mt, k, a_pack) };
         // SAFETY: is_available() guarantees the SME2 geometry; a_pack=k*32,
         // b_pack_all=n_tiles*k*32, c_scratch=32*scratch_cols.
         unsafe {
@@ -231,21 +456,38 @@ pub fn sme_sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
                 n_tiles,
             );
         }
-        // SAFETY: disjoint C rows [m0, m0+mt); first `n` scratch cols are valid.
-        let c = unsafe { std::slice::from_raw_parts_mut(c_ptr as *mut f32, m * n) };
         for i in 0..mt {
-            c[(m0 + i) * n..(m0 + i) * n + n]
-                .copy_from_slice(&c_scratch[i * scratch_cols..i * scratch_cols + n]);
+            // SAFETY: disjoint C rows [m0, m0+mt); first `n` scratch cols are valid.
+            let row = unsafe {
+                std::slice::from_raw_parts_mut((c_ptr as *mut f32).add((m0 + i) * ldc), n)
+            };
+            let src = &c_scratch[i * scratch_cols..i * scratch_cols + n];
+            if alpha == 1.0 && beta == 0.0 {
+                row.copy_from_slice(src);
+            } else if beta == 0.0 {
+                for (d, &v) in row.iter_mut().zip(src) {
+                    *d = alpha * v;
+                }
+            } else {
+                for (d, &v) in row.iter_mut().zip(src) {
+                    *d = alpha * v + beta * *d;
+                }
+            }
         }
     };
 
-    let threads = crate::pool::num_threads();
-    if threads > 1 && m_tiles > 1 {
-        crate::pool::par_for(m_tiles, 1, &|off, cnt| {
+    // The cores of a cluster share one SME unit, so fewer workers than cores
+    // may win; `RLX_CPU_SME_THREADS` sets it (default: the whole pool, as
+    // before — not re-tuned: timings on a loaded machine were inconclusive).
+    let workers = max_workers.max(1).min(m_tiles);
+    if workers > 1 {
+        crate::pool::par_for(workers, 1, &|off, cnt| {
             let mut a_pack = vec![0f32; k * BLK];
             let mut c_scratch = vec![0f32; BLK * scratch_cols];
-            for tm in off..off + cnt {
-                run_panel(tm, &mut a_pack, &mut c_scratch);
+            for w in off..off + cnt {
+                for tm in (w..m_tiles).step_by(workers) {
+                    run_panel(tm, &mut a_pack, &mut c_scratch);
+                }
             }
         });
     } else {
@@ -291,6 +533,12 @@ core::arch::global_asm!(
     .globl _rlx_sme_smopa_32x32_i8
 _rlx_sme_smopa_32x32_i8:
     // x0=a_packed(i8)  x1=b_packed(i8)  x2=c_out(i32)  x3=k_groups
+    // smstart/smstop zero every SIMD&FP register, and d8-d15 are
+    // callee-saved (AAPCS64): keep the caller's across streaming mode.
+    stp     d8, d9, [sp, #-64]!
+    stp     d10, d11, [sp, #16]
+    stp     d12, d13, [sp, #32]
+    stp     d14, d15, [sp, #48]
     smstart
     zero    {{za}}
     ptrue   p0.b
@@ -325,6 +573,10 @@ _rlx_sme_smopa_32x32_i8:
     cmp     w12, #16
     b.lt    3b
     smstop
+    ldp     d10, d11, [sp, #16]
+    ldp     d12, d13, [sp, #32]
+    ldp     d14, d15, [sp, #48]
+    ldp     d8, d9, [sp], #64
     ret
 "#
 );
@@ -832,6 +1084,12 @@ core::arch::global_asm!(
     .globl _rlx_sme_bfmopa_32x32
 _rlx_sme_bfmopa_32x32:
     // x0=a_packed(bf16)  x1=b_packed(bf16)  x2=c_out(f32)  x3=k_groups
+    // smstart/smstop zero every SIMD&FP register, and d8-d15 are
+    // callee-saved (AAPCS64): keep the caller's across streaming mode.
+    stp     d8, d9, [sp, #-64]!
+    stp     d10, d11, [sp, #16]
+    stp     d12, d13, [sp, #32]
+    stp     d14, d15, [sp, #48]
     smstart
     zero    {{za}}
     ptrue   p0.b
@@ -866,6 +1124,10 @@ _rlx_sme_bfmopa_32x32:
     cmp     w12, #16
     b.lt    3b
     smstop
+    ldp     d10, d11, [sp, #16]
+    ldp     d12, d13, [sp, #32]
+    ldp     d14, d15, [sp, #48]
+    ldp     d8, d9, [sp], #64
     ret
 "#
 );
@@ -1053,6 +1315,41 @@ mod tests {
                 ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
             })
             .collect()
+    }
+
+    /// FMOPA is one fused multiply-add per element per k step, in k order:
+    /// the kernel must equal a sequential `mul_add` loop bit for bit (odd and
+    /// even k, edge tiles, several tiles).
+    #[test]
+    fn sme_is_sequential_fma_bit_exact() {
+        if !is_available() {
+            return;
+        }
+        for (m, k, n) in [
+            (16, 64, 32),
+            (33, 65, 31),
+            (64, 128, 96),
+            (100, 257, 70),
+            (48, 1280, 64),
+        ] {
+            let a = fill(m * k, 0x51 + (m * k) as u64);
+            let b = fill(k * n, 0x77 + (k * n) as u64);
+            let mut c = vec![0f32; m * n];
+            sme_sgemm(&a, &b, &mut c, m, k, n);
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0f32;
+                    for p in 0..k {
+                        acc = a[i * k + p].mul_add(b[p * n + j], acc);
+                    }
+                    assert_eq!(
+                        acc.to_bits(),
+                        c[i * n + j].to_bits(),
+                        "{m}x{k}x{n} [{i},{j}]"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

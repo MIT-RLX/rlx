@@ -263,7 +263,11 @@ fn narrow_down_the_crashing_shape() {
     if main_child() {
         return;
     }
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("metal not available — skipped");
         return;
     }

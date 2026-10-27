@@ -33,8 +33,11 @@ fn fnv(v: &[f64]) -> u64 {
 /// `-ffp-contract={on,off}` on macOS arm64 (`tools/contraction_ref.cpp`), n = 1..=600.
 #[test]
 fn contraction_options_match_cpp_builds() {
-    #[cfg(not(target_os = "macos"))]
-    return; // the fixtures carry Apple's merged sincos twiddles
+    // The fixtures carry Apple's merged sincos twiddles: macOS with
+    // rlx-libm's `libm` feature (`--features libm`) only.
+    if !cfg!(all(target_os = "macos", feature = "libm")) {
+        return;
+    }
     for (file, contraction) in [
         ("on", engine::Contraction::Clang),
         ("off", engine::Contraction::None),

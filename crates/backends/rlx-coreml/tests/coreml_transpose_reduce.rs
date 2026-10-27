@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+
 //! CoreML's CPU engine (BNNS) mis-executes `transpose → reduce → transpose`: it
 //! segfaults, or silently returns wrong sums (reproduced with coremltools and no
 //! rlx code, macOS 26.6.2). rlx-autodiff emits that chain for bias gradients, so

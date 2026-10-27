@@ -690,7 +690,21 @@ pub(super) fn lower_resize(
     let out_s_final = resize_output_shape(m, ctx, node, x0)
         .or_else(|_| resolve_shape(&node.output_meta[0], ctx.opts))
         .unwrap_or_else(|_| m.shape(x0).clone());
-    let x = ensure_nchw_4d(m, x0);
+    // A rank-3 Resize is viewed as `[N, C, 1, L]` in its ONNX axis order —
+    // never through `ensure_nchw_4d`'s BLC guess. The guess goes by dimension
+    // sizes, and Resize does not need one: its scales name the axes. KittenTTS's
+    // `/decoder/decode.3/upsample` is `[1, 1090, 512] → [1, 1090, 1024]` (1090
+    // channels, time doubled); the guess read it as BLC, transposed it to
+    // `[1, 512, 1, 1090]`, and upsampled the wrong axis, while `out_s` below
+    // kept ONNX order. Nothing transposes back on the way out, so a guessed
+    // transpose could only ever produce a mis-shaped result.
+    let x = if m.shape(x0).rank() == 3 {
+        let s = m.shape(x0).clone();
+        let d = |i: usize| s.dim(i).unwrap_static() as i64;
+        m.reshape_(x0, vec![d(0), d(1), 1, d(2)])
+    } else {
+        ensure_nchw_4d(m, x0)
+    };
     let in_s = m.shape(x).clone();
     let out_s = ncl_to_nchw_shape(&out_s_final);
     let mode = node

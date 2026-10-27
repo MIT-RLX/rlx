@@ -136,9 +136,21 @@ fn qkv_split_with_aliased_sinks_matches_cpu() {
 /// but stops covering anything, so say so out loud.
 #[test]
 fn sinks_share_a_slot() {
+    // Where the backend runs Narrow/Concat/… on the host (discrete Vulkan/DX12,
+    // `RLX_WGPU_FORCE_HOST`), the planner pins their slots and the narrows
+    // never alias: the bug this file guards cannot occur there.
+    if rlx_wgpu::buffer::hosts_structural_ops() {
+        eprintln!(
+            "structural ops are hosted on this adapter: the qkv sinks cannot alias, skipping"
+        );
+        return;
+    }
     let g = build(2, 16, 64, 4);
-    // The exact planner the backend uses (`buffer::plan_f32_uniform`).
-    let plan = rlx_compile::memory::plan_memory_f32_uniform(&g, 16);
+    // The backend's own entry point, not `rlx_compile`'s planner: it first
+    // tells the planner whether structural ops are hosted, a process-wide
+    // setting. Calling the planner directly read whatever an earlier test in
+    // this binary had left there, so the result depended on test order.
+    let plan = rlx_wgpu::buffer::plan_f32_uniform(&g, 16);
     let narrows: Vec<NodeId> = g
         .nodes()
         .iter()

@@ -346,6 +346,11 @@ pub struct WgpuExecutable {
     coop_f16_vk_wide_b: HashSet<String>,
     /// Wide f32 bind groups for CoopF16Vk steps (schedule index → bg).
     coop_f16_vk_wide_bind_groups: HashMap<usize, wgpu::BindGroup>,
+    /// A's element offset in the f16 window a CoopF16Vk matmul step binds
+    /// (schedule index → offset), written into `MatmulParams::_pad0`. The f32
+    /// `a_off` is relative to the f32 arena window and is still what the wide
+    /// f32 fallback reads; the two windows do not share an origin.
+    coop_f16_vk_a_off: HashMap<usize, u32>,
     /// CoopF16Vk activation operands mirrored on the host each `run()` (f32+f16).
     coop_f16_host_activations: Vec<(NodeId, Activation, String)>,
     /// Last `set_param` f32 payload per name (for host activation mirrors).
@@ -475,6 +480,7 @@ impl WgpuExecutable {
         self.coop_f16_vk = fresh.coop_f16_vk;
         self.coop_f16_b_param = fresh.coop_f16_b_param;
         self.coop_f16_vk_wide_bind_groups = fresh.coop_f16_vk_wide_bind_groups;
+        self.coop_f16_vk_a_off = fresh.coop_f16_vk_a_off;
         self.coop_f16_host_activations = fresh.coop_f16_host_activations;
 
         // Replay pending param uploads against the new arena.
@@ -550,6 +556,7 @@ impl WgpuExecutable {
             coop_f16_b_param: HashMap::new(),
             coop_f16_vk_wide_b: HashSet::new(),
             coop_f16_vk_wide_bind_groups: HashMap::new(),
+            coop_f16_vk_a_off: HashMap::new(),
             coop_f16_host_activations: Vec::new(),
             stashed_params: HashMap::new(),
             readback_staging: None,
@@ -1009,10 +1016,19 @@ fn dispatch_wide_f32_matmul(
     }
 }
 
-fn coop_f16_vk_bind_group(exe: &WgpuExecutable, gpu_bi: usize, use_wide: bool) -> &wgpu::BindGroup {
+/// The bind group for a CoopF16Vk step. The wide-f32 fallback's groups are
+/// keyed by SCHEDULE index (that is what compile has when it inserts them), not
+/// by `gpu_bi`, which host steps do not advance: looking them up by `gpu_bi`
+/// picked another step's group after any host op, and wgpu rejected it.
+fn coop_f16_vk_bind_group(
+    exe: &WgpuExecutable,
+    step_i: usize,
+    gpu_bi: usize,
+    use_wide: bool,
+) -> &wgpu::BindGroup {
     if use_wide {
         exe.coop_f16_vk_wide_bind_groups
-            .get(&gpu_bi)
+            .get(&step_i)
             .unwrap_or(&exe.bind_groups[gpu_bi])
     } else {
         &exe.bind_groups[gpu_bi]
@@ -1054,6 +1070,46 @@ fn require_equal_shapes(graph: &Graph, ids: &[NodeId], op_name: &str) {
 pub(crate) fn arena_binds_whole_at_zero(dev: &wgpu::Device, arena: &Arena) -> bool {
     arena_whole_arena_bind(arena, dev.limits().max_storage_buffer_binding_size)
         .is_some_and(|(base, _)| base == 0)
+}
+
+/// Can one bind window hold the activations `act_ids` together with staged
+/// copies of whichever of `maybe_parked` live in the separate weight buffer?
+///
+/// A generic op reads a parked weight by copying it into the arena's scratch
+/// tail and widening its bind window to cover the copy. When the activations
+/// sit far from that tail — any arena larger than the storage-binding limit
+/// (2 GiB on NVIDIA) — no single window reaches both, and the op would read its
+/// weight from outside the binding. Callers host the op instead.
+pub(crate) fn parked_operands_reachable(
+    dev: &wgpu::Device,
+    arena: &Arena,
+    act_ids: &[NodeId],
+    maybe_parked: &[NodeId],
+) -> bool {
+    let max_binding = dev.limits().max_storage_buffer_binding_size;
+    if arena.is_sharded() || arena_whole_arena_bind(arena, max_binding).is_some() {
+        return true;
+    }
+    let staged: u64 = maybe_parked
+        .iter()
+        .filter(|&&id| crate::buffer::is_weight_off(arena.offset(id)))
+        .map(|&id| (arena.len_of(id) as u64).div_ceil(256) * 256)
+        .sum();
+    if staged == 0 {
+        return true;
+    }
+    let scratch = arena.scratch_off as u64;
+    let mut lo = scratch;
+    let mut hi = scratch + staged;
+    for &id in act_ids {
+        let off = arena.offset(id);
+        if crate::buffer::is_weight_off(off) {
+            continue;
+        }
+        lo = lo.min(off as u64);
+        hi = hi.max(off as u64 + arena.len_of(id) as u64);
+    }
+    (hi - (lo / 256) * 256) <= max_binding
 }
 
 fn arena_whole_arena_bind(arena: &Arena, max_binding: u64) -> Option<(u64, u64)> {
@@ -1100,7 +1156,12 @@ fn arena_clamp_bind_window(arena: &Arena, base: &mut u64, size: &mut u64) {
         //
         // Unsharded arenas clamp benignly (the caller over-requested against the
         // single buffer's tail), so the report is gated on `is_sharded`.
-        if arena.is_sharded() {
+        // A whole-stripe window on the LAST stripe over-requests by design: that
+        // stripe is shorter, and the clamp only drops addresses past the end
+        // of the arena, where nothing lives. Kitten under a 2 GiB cap printed
+        // this warning for exactly that.
+        let cuts_live_bytes = base.saturating_add(cap) < arena.size as u64;
+        if arena.is_sharded() && cuts_live_bytes {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1713,8 +1774,7 @@ fn arena_ensure_scratch_in_window(scratch: &mut u64, base: u64, size: u64) {
 fn arena_ensure_scratch_for_window(arena: &Arena, scratch: &mut u64, base: u64, size: u64) {
     if arena.is_sharded() {
         let stage = arena.shard_stage_off(base as usize) as u64;
-        let reserve = crate::buffer::shard_stage_reserve() as u64;
-        let stage_end = stage.saturating_add(reserve);
+        let stage_end = arena.shard_stage_end(base as usize) as u64;
         // Keep an already-bumping cursor inside this stripe's reserve. Resetting
         // to `stage` on every call made the second staged tensor (e.g. LN beta)
         // overwrite the first (gamma) — F5 FusedResidualLN then read gamma=0
@@ -1782,19 +1842,6 @@ fn arena_off_for_window(
     }
 }
 
-/// f16 shadow buffer window matching an f32 arena bind `[arena_base, arena_base+arena_size)`.
-fn f16_shadow_bind_range(arena_base: u64, arena_size: u64, f16_buf_bytes: u64) -> (u64, u64) {
-    const ALIGN: u64 = 256;
-    let mut base = (arena_base / 2 / ALIGN) * ALIGN;
-    let mut size = (arena_size / 2).div_ceil(ALIGN) * ALIGN;
-    size = size.max(256).min(f16_buf_bytes);
-    if base.saturating_add(size) > f16_buf_bytes {
-        base = f16_buf_bytes.saturating_sub(size);
-        base = (base / ALIGN) * ALIGN;
-    }
-    (base, size)
-}
-
 /// Window into `f16_buffer` for matmul weight reads (`params.b_off` is in
 /// f16-element indices, matching the f32 arena word index).
 fn f16_weight_bind_range(
@@ -1843,6 +1890,35 @@ fn f16_weight_bind_range(
     (base, size, rebased)
 }
 
+/// Window into `f16_buffer` covering every `(first_elem, len)` range a
+/// CoopF16Vk kernel reads — A and B both live in the f16 shadow, at their f32
+/// arena word index. Returns `(base_bytes, size_bytes, base_elem)`; each range
+/// is read at `first_elem - base_elem` inside the window.
+///
+/// The kernels used to get B's offset rebased into a window sized for B alone
+/// and A's offset relative to the *f32* arena window, so A was read from the
+/// wrong place (often outside the binding) unless both windows started at 0:
+/// a 32×16×32 product came out ~100× off on an RTX 3080 Ti.
+pub(crate) fn coop_f16_vk_window(
+    dev: &wgpu::Device,
+    f16_buf_bytes: u64,
+    ranges: &[(u64, u64)],
+) -> (u64, u64, u32) {
+    const ALIGN: u64 = 256;
+    let lo = ranges.iter().map(|r| r.0).min().unwrap_or(0) * 2;
+    let hi = ranges.iter().map(|r| r.0 + r.1).max().unwrap_or(0) * 2;
+    let base = (lo / ALIGN) * ALIGN;
+    let size = (hi - base).max(1).div_ceil(ALIGN) * ALIGN;
+    let size = size.min(f16_buf_bytes - base);
+    let max_binding = dev.limits().max_storage_buffer_binding_size;
+    assert!(
+        size <= max_binding && base + size >= hi.min(f16_buf_bytes),
+        "rlx-wgpu CoopF16Vk: operands span {} bytes of the f16 shadow (> {max_binding})",
+        hi - base
+    );
+    (base, size, (base / 2) as u32)
+}
+
 const ARENA_STAGE_CAP: u64 = crate::buffer::SHARD_STAGE_RESERVE as u64;
 
 /// Output spatial positions computed per thread by `conv2d.wgsl` (register
@@ -1885,8 +1961,14 @@ fn arena_off_in_window_or_stage(
             *size = s.min(max_binding).max(256);
             arena_ensure_scratch_for_window(arena, scratch, *base, *size);
             let stage_begin = arena.shard_stage_off(*base as usize) as u64;
-            let stage_end = stage_begin.saturating_add(stage_cap);
+            let stage_end = arena.shard_stage_end(*base as usize) as u64;
             let aligned = len.div_ceil(256) * 256;
+            assert!(
+                aligned <= stage_end - stage_begin,
+                "rlx-wgpu: cannot stage {len} bytes for weight node {id:?}: the stripe's \
+                 stage reserve is {} bytes",
+                stage_end - stage_begin
+            );
             // Bump-allocate inside the reserve; wrap if this op's stages fill it.
             if scratch.saturating_add(aligned) > stage_end {
                 *scratch = stage_begin;
@@ -1941,6 +2023,17 @@ fn arena_off_in_window_or_stage(
                 *base = (*base / ALIGN) * ALIGN;
             }
             arena_clamp_bind_window(arena, base, size);
+        } else {
+            // The staged copy cannot share a binding with this op's window: the
+            // offset returned would point outside the binding and the shader
+            // would read zeros. Callers check `parked_operands_reachable` and
+            // host the op first; reaching here means one did not.
+            panic!(
+                "rlx-wgpu: staged weight {id:?} at {dst} is out of reach of bind window \
+                 [{}, {}) (max binding {max_binding}); host the op instead",
+                *base,
+                *base + *size
+            );
         }
         return ((dst.saturating_sub(*base)) / 4) as u32;
     }
@@ -2351,6 +2444,19 @@ fn derive_matmul_compute_default(
         && coop_f32_metal_aligned
         && b_is_param
         && (forced || (matches!(backend, Some(wgpu::Backend::Metal)) && !(any_bf16 && b_is_param)));
+    // Metal, pure f32, any K/N, B a Param OR an activation: unaligned shapes go
+    // to `matmul_coop_f32_edge` (zero-padded staging), aligned ones to the
+    // kernel above — `kernels::matmul_coop_f32_kernel_for` decides. Without
+    // this, attention (`[S,dh]·[dh,S]`, B an activation, dh=25) and any
+    // d_model not a multiple of 32 fell to the scalar tiled kernel.
+    // `RLX_WGPU_NO_COOP_F32_EDGE=1` restores the param-and-aligned-only gate.
+    let metal_coop_any = !disabled
+        && has_coop
+        && !any_low
+        && matches!(backend, Some(wgpu::Backend::Metal))
+        && !rlx_ir::env::flag("RLX_WGPU_NO_COOP_F32_EDGE")
+        && (coop_f32_metal_aligned || crate::kernels::matmul_coop_f32_edge_kernel(dev).is_some());
+    let metal_coop = metal_coop || metal_coop_any;
     let vulkan_coop = !disabled
         && has_coop
         && coop_f32_portable_aligned
@@ -2986,11 +3092,9 @@ fn maybe_push_coop_f16_vk_casts(
     bind_groups: &mut Vec<wgpu::BindGroup>,
     mm_cast: &Option<&'static Kernel>,
     compute_precision: MatmulCompute,
-    a_off_f32: u32,
     m: u32,
     k: u32,
     batch: u32,
-    b_off_f32: u32,
     n: u32,
 ) {
     if compute_precision != MatmulCompute::CoopF16Vk {
@@ -3012,7 +3116,7 @@ fn maybe_push_coop_f16_vk_casts(
             uniforms,
             bind_groups,
             mm_cast,
-            a_off_f32,
+            (arena.offset(a_id) / 4) as u32,
             a_elems,
         );
     }
@@ -3031,7 +3135,7 @@ fn maybe_push_coop_f16_vk_casts(
             uniforms,
             bind_groups,
             mm_cast,
-            b_off_f32,
+            (arena.offset(b_id) / 4) as u32,
             b_elems,
         );
     }
@@ -3047,23 +3151,25 @@ fn build_matmul_qkv_coop_f16_vk_bind_group(
     k: u32,
     n: u32,
     b_off: u32,
-) -> (wgpu::BindGroup, u32) {
+    a_f16: (u64, u64),
+) -> (wgpu::BindGroup, u32, u32) {
     let f16_buf = arena
         .f16_buffer
         .as_ref()
         .expect("CoopF16Vk QKV requires SHADER_F16 f16 shadow arena");
-    let (f16_res, rebased_b) = {
-        let (base, size, rebased) =
-            f16_weight_bind_range(device, f16_buf.size(), b_off, k, n, 1, 0);
-        (
-            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: f16_buf,
-                offset: base,
-                size: NonZeroU64::new(size),
-            }),
-            rebased,
-        )
-    };
+    // A and B both come from the f16 shadow: one window covering both.
+    let (base, size, base_elem) = coop_f16_vk_window(
+        device,
+        f16_buf.size(),
+        &[a_f16, (b_off as u64, k as u64 * n as u64)],
+    );
+    let f16_res = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer: f16_buf,
+        offset: base,
+        size: NonZeroU64::new(size),
+    });
+    let rebased_b = b_off - base_elem;
+    let rebased_a = a_f16.0 as u32 - base_elem;
     (
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rlx-wgpu matmul_qkv_coop_f16_vk bg"),
@@ -3091,6 +3197,7 @@ fn build_matmul_qkv_coop_f16_vk_bind_group(
             ],
         }),
         rebased_b,
+        rebased_a,
     )
 }
 /// Append a CastF32ToF16 pre-pass: mirrors `arena[off..off+len]` (f32) into
@@ -3116,10 +3223,15 @@ fn push_cast_f32_to_f16_step(
         Some(b) => b,
         None => return,
     };
+    // `src_off` is the global f32 word index; the f16 shadow mirrors it at the
+    // same element index, but its window is aligned on its own, so the write
+    // offset is rebased separately.
+    let (f16_base, f16_size, f16_base_elem) =
+        coop_f16_vk_window(device, f16_buf.size(), &[(src_off as u64, len as u64)]);
     let p = CastF32ToF16Params {
-        src_off: src_off.saturating_sub((arena_base / 4) as u32),
+        src_off: src_off - (arena_base / 4) as u32,
         len,
-        _p0: 0,
+        dst_off: src_off - f16_base_elem,
         _p1: 0,
     };
     let u = device.create_buffer(&wgpu::BufferDescriptor {
@@ -3131,7 +3243,6 @@ fn push_cast_f32_to_f16_step(
     // Write params at compile (kernel doesn't depend on active extent).
     let dev = wgpu_device().expect("rlx-wgpu: device gone");
     dev.queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
-    let (f16_base, f16_size) = f16_shadow_bind_range(arena_base, arena_size, f16_buf.size());
     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("rlx-wgpu cast_f32_to_f16 bg"),
         layout: &kernel.bgl,
@@ -3174,7 +3285,7 @@ fn build_matmul_bind_group(
     mm_bf16w: &'static Kernel,
     mm_f16c: &Option<&'static Kernel>,
     mm_coop: &Option<&'static Kernel>,
-    mm_coop_f32: &Option<&'static Kernel>,
+    _mm_coop_f32: &Option<&'static Kernel>,
     arena: &Arena,
     arena_base: u64,
     arena_size: u64,
@@ -3186,6 +3297,8 @@ fn build_matmul_bind_group(
     batch: u32,
     b_off: u32,
     b_batch_stride: u32,
+    a_f16: (u64, u64),
+    a_off_f16: &mut u32,
 ) -> (wgpu::BindGroup, u32) {
     // PACKED-BF16 weight: 3-binding layout (arena rw for A/C, params, packed
     // bf16 weight buffer bound WHOLE at offset 0 so `b_off` stays the global
@@ -3237,10 +3350,20 @@ fn build_matmul_bind_group(
         )
     };
     if compute_precision == MatmulCompute::CoopF16Vk
-        && let (Some(coop_vk), Some(_f16_buf)) =
+        && let (Some(coop_vk), Some(f16_buf)) =
             (matmul_coop_f16_vulkan_kernel(device), &arena.f16_buffer)
     {
-        let (f16_res, rebased_b) = f16_bind(b_off);
+        // A and B both come from the f16 shadow: one window covering both.
+        let b_span = (batch.max(1) as u64 - 1) * b_batch_stride as u64 + k as u64 * n as u64;
+        let (f16_base, f16_size, base_elem) =
+            coop_f16_vk_window(device, f16_buf.size(), &[a_f16, (b_off as u64, b_span)]);
+        *a_off_f16 = a_f16.0 as u32 - base_elem;
+        let rebased_b = b_off - base_elem;
+        let f16_res = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: f16_buf,
+            offset: f16_base,
+            size: NonZeroU64::new(f16_size),
+        });
         return (
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rlx-wgpu matmul_coop_f16_vulkan bg"),
@@ -3267,9 +3390,10 @@ fn build_matmul_bind_group(
             rebased_b,
         );
     }
-    if b_is_param
-        && compute_precision == MatmulCompute::CoopF32
-        && let Some(coop_f32) = mm_coop_f32
+    // CoopF32 reads A and B from the f32 arena, so B need not be a Param. The
+    // kernel (aligned vs edge) must match the one `run` dispatches.
+    if compute_precision == MatmulCompute::CoopF32
+        && let Some(coop_f32) = crate::kernels::matmul_coop_f32_kernel_for(device, k, n)
     {
         // 2-binding layout — both A and B come from the f32 arena
         // (no f16 shadow buffer needed for the pure-f32 path).

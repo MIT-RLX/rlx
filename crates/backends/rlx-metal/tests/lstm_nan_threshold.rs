@@ -71,7 +71,11 @@ fn run(device: Device, s: usize, h: usize) -> Vec<f32> {
 
 #[test]
 fn report_the_hidden_width_where_native_lstm_breaks() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("metal not available — skipped");
         return;
     }
@@ -174,7 +178,11 @@ fn report_the_hidden_width_where_native_lstm_breaks() {
 }
 #[test]
 fn is_the_bad_output_written_as_zero_or_not_written_at_all() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("metal not available — skipped");
         return;
     }

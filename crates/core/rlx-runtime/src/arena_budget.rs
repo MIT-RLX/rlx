@@ -38,6 +38,10 @@ pub fn device_arena_limit(device: Device) -> Option<u64> {
         // truncates inside the kernel signature no matter how wide the host
         // field is. `rlx-rocm`'s compile step asserts on this.
         Device::Rocm => Some(u32::MAX as u64),
+        // On a 32-bit target (the browser) `rlx-wgpu` marks weight-buffer
+        // offsets with bit 31 of a `usize` (`WEIGHT_BUF_TAG`), so an arena
+        // offset at or past 2 GiB would read as a weight offset.
+        Device::Gpu if cfg!(target_pointer_width = "32") => Some(i32::MAX as u64),
         // A single storage-buffer binding is capped at 4 GiB by the underlying
         // APIs; `rlx-wgpu` shards above that, and Vulkan inherits the same rule.
         Device::Gpu | Device::Vulkan => Some(u32::MAX as u64),

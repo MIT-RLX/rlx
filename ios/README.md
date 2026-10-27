@@ -108,6 +108,26 @@ cd ios/Demo && xcodegen generate    # brew install xcodegen
 open RlxDemo.xcodeproj
 ```
 
+To put the node on attached iPhones and iPads for `cargo rlx dist`, one
+command builds it and installs it on all of them:
+
+```sh
+ios/deploy-node.sh                   # every attached iOS device
+ios/deploy-node.sh "Yellow iPad"     # or just these
+BLE=1 ios/deploy-node.sh             # + mesh links over Bluetooth LE
+ios/deploy-node.sh --no-framework    # app only, the Rust side unchanged
+```
+
+It builds the node with Metal / ANE and `mode = "model"` for devices only
+(`build-xcframework.sh --device-only`: one Rust build where the iOS default
+does three, two of them simulators). It builds the app once for any iOS
+device and installs that one build on each device, keeping the app build
+incremental in `target/ios-app`. The Xcode project is regenerated when
+`project.yml` is newer. Signing uses `DEVELOPMENT_TEAM`, then the team the
+last build used (kept in `~/.config/rlx/ios-team`, so a `cargo clean`
+doesn't lose it). With one team on the Mac it needs neither; with several, it
+lists them and asks.
+
 Start the desktop coordinator, then tap **Join mesh**:
 
 ```sh
@@ -144,6 +164,27 @@ Bundle IDs are `com.mit.rlx.nodedemo` plus `.tv`, `.watch` and `.vision`. The
 simulator shares the host network stack, so `127.0.0.1` reaches a coordinator
 running on the Mac.
 
+On a device attached to the Mac, `devicectl` does the same. Put `--` before
+the app's arguments, or `devicectl` reads `-exitwhendone` as its own `-t`:
+
+```sh
+xcrun devicectl device process launch --console --terminate-existing \
+    --device 'Yellow iPad' com.mit.rlx.nodedemo -- \
+    -rank 3 -world 4 -peers <mac>:29500,…,<ipad>:29503 \
+    -device metal -mode model -autojoin YES -exitwhendone YES
+```
+
+Other launch arguments:
+- `-mode model` serves a `dist_node MODE=model` job (build with `--model`).
+- `-exitwhendone YES` quits the app when its job ends, with exit code 0 or 1,
+  so a launcher sees the rank finish.
+- `-nodename` sets the Bonjour name. iOS 16+ reports a generic device name to
+  apps without a special entitlement.
+
+The app prints its Wi-Fi address, its status changes and the node's phases
+on stderr. `cargo rlx dist` with an `ios_device` host builds this command
+for you (see docs/distributed.md).
+
 ### Linking notes
 
 A static archive carries no link directives, so an app target must name what
@@ -164,7 +205,7 @@ needed for a node to see the rest of a LAN mesh:
 | Key | Where | Why |
 |---|---|---|
 | `NSLocalNetworkUsageDescription` | Info.plist | **Required for any LAN peer traffic**, including plain TCP to a `host:port`. Without it the first connection triggers a permission prompt and, if denied or absent, connects to nothing. |
-| `NSBonjourServices` | Info.plist | Only if you use mDNS discovery (`mdns` feature). List the service type, e.g. `_rlx-coord._udp`. |
+| `NSBonjourServices` | Info.plist | For Bonjour: `_rlx-node._tcp` (the app advertising itself, `RlxAdvertiser`), `_rlx-rdv._tcp` / `_rlx-coord._udp` (mDNS discovery). Publishing through `NetService` needs no multicast entitlement, but the first publish raises the local-network prompt. |
 | `com.apple.developer.networking.multicast` | Entitlements | Only for the **UDP broadcast discovery** path (empty `peers`). Apple grants this by request; until then, use a static peer list or unicast rendezvous. |
 | `WKApplication` | Info.plist (watchOS) | Marks a single-target watch app — one with no companion iOS app. |
 

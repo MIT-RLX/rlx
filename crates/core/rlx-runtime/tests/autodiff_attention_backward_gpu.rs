@@ -133,8 +133,7 @@ fn cpu_reference_bwd_grads_finite() {
 #[test]
 fn wgpu_attention_backward_matches_cpu() {
     let _gpu = common::serialize_gpu();
-    if !rlx_wgpu::is_available() {
-        eprintln!("skip wgpu_attention_backward_matches_cpu: no adapter");
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
         return;
     }
     let (q, k, v, dy) = synthetic_inputs();
@@ -212,4 +211,86 @@ fn rocm_attention_backward_matches_cpu() {
     assert_grads_close("dq", &dq_cpu, &outs[0], 1e-3);
     assert_grads_close("dk", &dk_cpu, &outs[1], 1e-3);
     assert_grads_close("dv", &dv_cpu, &outs[2], 1e-3);
+}
+
+/// Through autodiff, attention's dY is computed earlier in the same graph,
+/// not fed. Metal's `[B, H, S, D]` path runs the CPU reference, which read
+/// the arena before the GPU had written dY, so dQ, dK and dV all came back
+/// zero. Every device's gradients must match the CPU's.
+#[test]
+fn attention_gradients_through_a_computed_dy_match_the_cpu() {
+    use rlx_ir::GraphExt;
+    use rlx_ir::op::ReduceOp;
+    use rlx_runtime::{Device, Session};
+    let (h, s, dh) = (2usize, 16usize, 32usize);
+    let n = h * s * dh;
+    let rnd = |seed: u64| -> Vec<f32> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            })
+            .collect()
+    };
+    let shape = Shape::new(&[1, h, s, dh], DType::F32);
+    for mask_kind in [MaskKind::None, MaskKind::Causal] {
+        let mut g = Graph::new("attn_through_dy");
+        let q = g.param("q", shape.clone());
+        let k = g.param("k", shape.clone());
+        let v = g.param("v", shape.clone());
+        let a = g.add_node(
+            Op::Attention {
+                num_heads: h,
+                head_dim: dh,
+                v_head_dim: None,
+                mask_kind,
+                score_scale: None,
+                attn_logit_softcap: None,
+            },
+            vec![q, k, v],
+            shape.clone(),
+        );
+        // dY = c · d_output: computed on the device before the backward.
+        let c = g.input("c", shape.clone());
+        let p = g.mul(a, c);
+        let loss = g.reduce(
+            p,
+            ReduceOp::Sum,
+            vec![0, 1, 2, 3],
+            false,
+            Shape::scalar(DType::F32),
+        );
+        g.set_outputs(vec![loss]);
+        let bwd = rlx_autodiff::grad_with_loss(&g, &[q, k, v]);
+        let run = |d: Device| {
+            let mut cg = Session::new(d).compile(bwd.clone());
+            cg.set_param("q", &rnd(1));
+            cg.set_param("k", &rnd(2));
+            cg.set_param("v", &rnd(3));
+            cg.run(&[("c", &rnd(9)), ("d_output", &[1.0])])
+        };
+        let want = run(Device::Cpu);
+        for d in rlx_runtime::available_devices() {
+            if d == Device::Cpu || !rlx_runtime::devices_for(&bwd).contains(&d) {
+                continue;
+            }
+            let got = run(d);
+            for (i, name) in ["dq", "dk", "dv"].iter().enumerate() {
+                let (gw, ww) = (&got[i + 1], &want[i + 1]);
+                let scale = ww.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
+                let err = gw
+                    .iter()
+                    .zip(ww)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max);
+                assert!(
+                    err <= 1e-4 * scale.max(1.0),
+                    "{d:?} {mask_kind:?} {name}: max |Δ| {err} (CPU scale {scale})"
+                );
+            }
+        }
+    }
 }

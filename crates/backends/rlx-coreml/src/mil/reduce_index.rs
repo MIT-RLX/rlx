@@ -18,7 +18,7 @@ use crate::{CoremlError, Result};
 use rlx_ir::op::{Activation, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::*;
 
@@ -38,12 +38,12 @@ impl<'a> LowerCtx<'a> {
         let vals_ty = named_value_type(&values, &shape)?;
         let idx_ty = named_value_type(&indices, &shape.clone().with_dtype(DType::I32))?;
 
-        let mut inputs = HashMap::new();
+        let mut inputs = BTreeMap::new();
         inputs.insert("x".to_string(), bind_name(&x));
         inputs.insert("k".to_string(), bind_value(scalar_i32(k as i32)));
         inputs.insert("axis".to_string(), bind_value(scalar_i32(axis)));
         inputs.insert("ascending".to_string(), bind_value(scalar_bool(false)));
-        let mut attributes = HashMap::new();
+        let mut attributes = BTreeMap::new();
         attributes.insert("name".to_string(), scalar_str(out_name));
         self.operations.push(proto::Operation {
             r#type: "topk".to_string(),

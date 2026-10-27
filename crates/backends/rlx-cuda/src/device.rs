@@ -311,3 +311,31 @@ pub fn cuda_dnn_workspace() -> Option<Arc<Mutex<CudaSlice<u8>>>> {
 pub fn device_name() -> Option<String> {
     cuda_context().map(|_| "cuda-0".to_string())
 }
+
+/// CUDA version the installed driver supports, `(major, minor)` — e.g.
+/// `(13, 1)`. `None` without a working driver. The crate's symbol floor is
+/// 12.3 (`cuda-12030` in Cargo.toml); `cargo rlx doctor` flags anything older.
+pub fn driver_version() -> Option<(u32, u32)> {
+    use cudarc::driver::sys;
+    cuda_context()?;
+    let mut v: std::ffi::c_int = 0;
+    // SAFETY: plain out-parameter query; the driver is initialised above.
+    let r = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        sys::cuDriverGetVersion(&mut v)
+    }))
+    .ok()?;
+    (r == sys::CUresult::CUDA_SUCCESS).then_some(((v / 1000) as u32, ((v % 1000) / 10) as u32))
+}
+
+/// Version of the NVRTC library kernels are JIT-compiled with. `None` when
+/// libnvrtc cannot be loaded (cudarc's dynamic loader panics; caught here).
+pub fn nvrtc_version() -> Option<(u32, u32)> {
+    use cudarc::nvrtc::sys;
+    let (mut major, mut minor): (std::ffi::c_int, std::ffi::c_int) = (0, 0);
+    // SAFETY: two out-parameters, no other state.
+    let r = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        sys::nvrtcVersion(&mut major, &mut minor)
+    }))
+    .ok()?;
+    (r == sys::nvrtcResult::NVRTC_SUCCESS).then_some((major as u32, minor as u32))
+}

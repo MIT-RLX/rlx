@@ -8,7 +8,7 @@
 //! whose [`NativeBnnsFullyConnected::new`] / [`NativeBnnsFullyConnected::apply`]
 //! always return `None` (no-ops for cross-compile / non-Apple hosts).
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "pure-rust")))]
 mod imp {
     use core::ffi::c_void;
     use core::ptr::NonNull;
@@ -205,14 +205,14 @@ mod imp {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "pure-rust")))]
 pub use imp::NativeBnnsFullyConnected;
 
 /// Stub BNNS fully-connected layer (non-macOS): construction and apply are no-ops.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", not(feature = "pure-rust"))))]
 pub struct NativeBnnsFullyConnected;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", not(feature = "pure-rust"))))]
 impl NativeBnnsFullyConnected {
     /// Always `None` — BNNS is unavailable off macOS.
     pub fn new(
@@ -231,7 +231,7 @@ impl NativeBnnsFullyConnected {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_os = "macos", not(feature = "pure-rust")))]
 mod tests {
     use super::*;
 

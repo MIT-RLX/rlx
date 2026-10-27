@@ -110,13 +110,27 @@ unsafe fn fill(buf: *mut c_char, cap: usize, s: &str) -> c_int {
     (n - 1) as c_int
 }
 
+/// What a node joins to do (`mode`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Job {
+    Infer,
+    Train,
+    TrainServe,
+    #[cfg(feature = "model")]
+    Model,
+}
+
 /// Join a mesh as worker `rank` of `world`.
 ///
 /// * `peers` — comma-separated `host:port` list indexed by rank. Pass an empty
 ///   string to find the coordinator by UDP broadcast instead.
 /// * `device` — `"auto"` or a backend name (`"cpu"`, `"metal"`, `"gpu"`, …).
-/// * `mode` — `"infer"` to serve a shipped inference stage, or `"train"` to
-///   join a data-parallel training run. `""` means `"infer"`.
+/// * `mode` — `"infer"` to serve a shipped inference stage, `"train"` to join
+///   a data-parallel training run, `"trainserve"` to be a `dist_node
+///   MODE=trainserve` worker (a cluster-options `TrainSpec`, e.g. from
+///   `rlx-vision-bench --coordinate --cluster`), or `"model"` (feature `model`) to serve
+///   whatever a `dist_node MODE=model` coordinator ships — a package
+///   function's pipeline stage or its training. `""` means `"infer"`.
 ///
 /// Returns [`RLX_NODE_OK`] once the serving thread is spawned — *not* once the
 /// mesh is joined. Poll [`rlx_node_status`] for that.
@@ -146,11 +160,21 @@ pub unsafe extern "C" fn rlx_node_start(
         set_error("peers/device/mode must be valid UTF-8 C strings");
         return RLX_NODE_ERR_ARG;
     };
-    let training = match mode.as_str() {
-        "" | "infer" => false,
-        "train" => true,
+    let job = match mode.as_str() {
+        "" | "infer" => Job::Infer,
+        "train" => Job::Train,
+        "trainserve" => Job::TrainServe,
+        #[cfg(feature = "model")]
+        "model" => Job::Model,
         other => {
-            set_error(format!("unknown mode [{other}]; expected infer or train"));
+            set_error(format!(
+                "unknown mode [{other}]; expected infer, train, trainserve{}",
+                if cfg!(feature = "model") {
+                    " or model"
+                } else {
+                    ""
+                }
+            ));
             return RLX_NODE_ERR_MODE;
         }
     };
@@ -178,6 +202,8 @@ pub unsafe extern "C" fn rlx_node_start(
     // will not route inbound to a handset), so a lone address — or discovery,
     // where the coordinator announces itself — means star. A full per-rank
     // list means the caller wants a mesh and believes every rank is reachable.
+    #[cfg(feature = "model")]
+    let model_device = device.clone();
     let base = NodeConfig::new(rank as u32, world as u32).device(device);
     let cfg = if addrs.is_empty() {
         base.star().discover(29600, 29500)
@@ -196,24 +222,73 @@ pub unsafe extern "C" fn rlx_node_start(
     let ctl = NodeControl::unbounded();
     let stop = ctl.stop_handle();
     let (tx, rx) = mpsc::channel();
+    // `PERSIST=1` (mode `model`): serve one job after another, keeping the
+    // stage for a next job with the same plan, until [`rlx_node_stop`].
+    #[cfg(feature = "model")]
+    let persist = job == Job::Model && std::env::var("PERSIST").is_ok_and(|v| v != "0");
+    #[cfg(feature = "model")]
+    let stopped = stop.clone();
 
     if let Err(e) = std::thread::Builder::new()
         .name("rlx-node".into())
         .spawn(move || {
+            #[cfg(feature = "model")]
+            if persist {
+                let _ = tx.send(serve_models(&cfg, &model_device, &stopped));
+                return;
+            }
             let msg = match cfg.connect() {
                 Err(e) => format!("error: connect failed: {e}"),
-                Ok(group) if training => match serve_trainer_here(&group, uri_resolver, false) {
-                    Ok(r) => format!(
-                        "ok: rank {} trained on {} ({}), {} sample(s), loss {:.4}->{:.4}",
-                        r.rank,
-                        r.metrics.device.name(),
-                        r.platform,
-                        r.metrics.samples,
-                        r.metrics.first_loss,
-                        r.metrics.last_loss
-                    ),
-                    Err(e) => format!("error: {e}"),
-                },
+                Ok(group) if job == Job::TrainServe => {
+                    eprintln!(
+                        "rlx-node: rank {}/{} connected; waiting for a training job",
+                        group.rank(),
+                        group.world_size()
+                    );
+                    match rlx_runtime::dist::trainserve_worker(&group, true) {
+                        Ok(m) => format!(
+                            "ok: rank {} trained {} sample(s) on {}: loss {:.4}->{:.4}, {} sync(s)",
+                            group.rank(),
+                            m.samples,
+                            m.device.name(),
+                            m.first_loss,
+                            m.last_loss,
+                            m.syncs
+                        ),
+                        Err(e) => format!("error: {e}"),
+                    }
+                }
+                #[cfg(feature = "model")]
+                Ok(group) if job == Job::Model => {
+                    use rlx_runtime::model::distributed as md;
+                    let dev = rlx_runtime::dist::resolve_device_pub(&model_device);
+                    // Phases on stderr: a phone's console is the only place a
+                    // stalled rank can say where it is.
+                    eprintln!(
+                        "rlx-node: rank {}/{} connected on {}",
+                        group.rank(),
+                        group.world_size(),
+                        dev.name()
+                    );
+                    match md::worker(&group, dev, true) {
+                        Ok(did) => format!("ok: rank {} {did}", group.rank()),
+                        Err(e) => format!("error: {e:#}"),
+                    }
+                }
+                Ok(group) if job == Job::Train => {
+                    match serve_trainer_here(&group, uri_resolver, false) {
+                        Ok(r) => format!(
+                            "ok: rank {} trained on {} ({}), {} sample(s), loss {:.4}->{:.4}",
+                            r.rank,
+                            r.metrics.device.name(),
+                            r.platform,
+                            r.metrics.samples,
+                            r.metrics.first_loss,
+                            r.metrics.last_loss
+                        ),
+                        Err(e) => format!("error: {e}"),
+                    }
+                }
                 Ok(group) => match serve_worker(&group, uri_resolver) {
                     Ok(r) => format!(
                         "ok: rank {} on {} ({}), {} activation(s)",
@@ -238,6 +313,46 @@ pub unsafe extern "C" fn rlx_node_start(
         last: None,
     });
     RLX_NODE_OK
+}
+
+/// A model worker that outlives its jobs: connect, serve one, connect again.
+/// Rank 0 comes and goes, so a dial to it waits however long; a job that
+/// ends early (rank 0 gone mid-run) just ends that mesh.
+#[cfg(feature = "model")]
+fn serve_models(cfg: &NodeConfig, device: &str, stop: &NodeStopHandle) -> String {
+    use rlx_runtime::model::distributed as md;
+    rlx_runtime::env::set("RLX_CONNECT_WAIT", "0");
+    let dev = rlx_runtime::dist::resolve_device_pub(device);
+    let mut done = 0usize;
+    for job in 1.. {
+        if stop.is_stopped() {
+            break;
+        }
+        eprintln!(
+            "rlx-node: persistent: waiting for job {job} on {}",
+            dev.name()
+        );
+        let group = match cfg.connect() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("rlx-node: connect failed: {e}; trying again");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+        let t = std::time::Instant::now();
+        match md::worker(&group, dev, true) {
+            Ok(did) => {
+                done += 1;
+                eprintln!(
+                    "rlx-node: persistent: job {job} done in {:.1}s: {did}",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            Err(e) => eprintln!("rlx-node: persistent: job {job} ended early: {e:#}"),
+        }
+    }
+    format!("ok: served {done} job(s)")
 }
 
 /// Write the node state into `buf`: `idle` | `running` | `stopping` |
@@ -304,6 +419,24 @@ pub extern "C" fn rlx_node_platform() -> *const c_char {
     static P: OnceLock<CString> = OnceLock::new();
     P.get_or_init(|| CString::new(rlx_runtime::dist::node::platform_tag()).unwrap_or_default())
         .as_ptr()
+}
+
+/// Write what this node advertises (`_rlx-node._tcp` TXT records, the same
+/// ones a desktop node publishes) into `buf` as `key=value` lines:
+/// `platform`, `devices` (comma list), `version`, and `mem_gb` where the
+/// library can read it. A shell publishes them through its own Bonjour API.
+/// Returns the length written, or a negative error code.
+///
+/// # Safety
+/// `buf` must be writable for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rlx_node_advert(buf: *mut c_char, cap: usize) -> c_int {
+    let mut props = rlx_runtime::dist::node::advert_props();
+    props
+        .entry("version".into())
+        .or_insert_with(|| env!("CARGO_PKG_VERSION").into());
+    let lines: Vec<String> = props.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    unsafe { fill(buf, cap, &lines.join("\n")) }
 }
 
 #[cfg(test)]
@@ -406,6 +539,23 @@ mod tests {
     fn stop_is_safe_with_no_node() {
         let _lock = ffi_lock();
         assert_eq!(rlx_node_stop(), RLX_NODE_OK);
+    }
+
+    #[test]
+    fn advert_lists_platform_devices_and_version() {
+        let mut buf = [0 as c_char; 512];
+        let n = unsafe { rlx_node_advert(buf.as_mut_ptr(), buf.len()) };
+        assert!(n > 0);
+        let s = unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        for key in ["platform=", "devices=", "version="] {
+            assert!(
+                s.lines().any(|l| l.starts_with(key)),
+                "{key} missing from {s:?}"
+            );
+        }
+        assert!(s.contains("cpu"), "the CPU is always a device: {s:?}");
     }
 
     #[test]

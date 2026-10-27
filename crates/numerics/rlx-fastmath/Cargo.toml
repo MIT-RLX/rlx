@@ -1,0 +1,14 @@
+[package]
+name = "rlx-fastmath"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Accurate vectorized f32 exp / log / tanh in pure Rust (NEON on aarch64): <= 1.33 ulp over every f32, faster than the platform libm"
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+
+[lints]
+workspace = true

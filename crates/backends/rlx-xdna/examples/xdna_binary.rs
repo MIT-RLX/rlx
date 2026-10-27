@@ -24,8 +24,9 @@ fn main() {
     let n: usize = env("N", "1048576").parse().unwrap();
     let chunk: usize = env("CHUNK", "2048").parse().unwrap();
     let iters: usize = env("ITERS", "50").parse().unwrap();
-    let aiecc = std::env::var("AIECC").expect("set AIECC");
-    let peano = std::env::var("PEANO").expect("set PEANO");
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let aiecc = tc.aiecc_str();
+    let peano = tc.peano_str();
 
     // Deterministic operands. `b` is 1..=7 so div/mod are well-defined and the
     // shift amounts stay in range.

@@ -32,7 +32,9 @@ rlx-ir = { workspace = true, features = ["serialize"] }
 rlx-compile = { workspace = true }
 rlx-fusion = { workspace = true }
 rlx-gguf = { workspace = true }
-rlx-pkg = { workspace = true }
+# libzstd for warm/cold tiers: real compression levels when baking (rlx-pkg's
+# pure-Rust encoder only has its fastest level).
+rlx-pkg = { workspace = true, features = ["zstd-native"] }
 rlx-mlx-io = { workspace = true }
 rlx-dduf = { workspace = true }
 rlx-onnx-import = { workspace = true, optional = true }

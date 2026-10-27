@@ -943,6 +943,10 @@ pub(super) struct PackageWeights {
     /// can (`with_param_sharing_scope`): the package, and an adapter merged
     /// into it. Empty: no sharing.
     pub(super) scope: String,
+    /// Opened checkpoint files, kept across reads: a GGUF's header (with a
+    /// tokenizer's ~150k-entry vocabulary) took ~0.6 s to parse, and a fresh
+    /// cache per read reparsed it for each of a model's hundreds of params.
+    read_cache: std::sync::Mutex<crate::dist::WeightCache>,
 }
 
 impl PackageWeights {
@@ -954,6 +958,7 @@ impl PackageWeights {
             lora: HashMap::new(),
             lean: false,
             scope: String::new(),
+            read_cache: Default::default(),
         }
     }
 
@@ -1008,6 +1013,7 @@ impl PackageWeights {
             lora: HashMap::new(),
             lean: false,
             scope: format!("rlxp:{}", package.display()),
+            read_cache: Default::default(),
         })
     }
 
@@ -1016,9 +1022,49 @@ impl PackageWeights {
         if let Some((bytes, dt)) = self.embedded.get(name) {
             return Ok(crate::backend::widen_bytes_to_f32(bytes, *dt));
         }
-        let mut cache = crate::dist::WeightCache::new();
+        let mut cache = self.read_cache.lock().unwrap_or_else(|e| e.into_inner());
         self.read(&mut cache, name, dims)
             .map_err(|e| anyhow::anyhow!("no weights for '{name}': {e}"))
+    }
+
+    /// One param's bytes in the dtype the graph declares it (`dtype`): packed
+    /// blocks (U8/I8, GGUF K-quants behind a `DequantMatMul`) as stored,
+    /// float params widened or narrowed to `dtype`. What [`Self::bind`] hands
+    /// a backend, for a caller that ships it elsewhere (a cluster stage).
+    #[cfg(feature = "training")]
+    pub(super) fn typed(
+        &self,
+        name: &str,
+        dtype: rlx_ir::DType,
+        dims: &[usize],
+    ) -> Result<Vec<u8>> {
+        use rlx_ir::DType;
+        if let Some((bytes, dt)) = self.embedded.get(name) {
+            let mut b = bytes.clone();
+            if let Some(delta) = self.lora.get(name) {
+                let mut wide = crate::backend::widen_bytes_to_f32(bytes, *dt);
+                wide.iter_mut().zip(delta).for_each(|(w, d)| *w += d);
+                b = crate::backend::narrow_f32_to_bytes(&wide, *dt);
+            }
+            if *dt != dtype && dt.is_float() && dtype.is_float() {
+                let wide = crate::backend::widen_bytes_to_f32(&b, *dt);
+                return Ok(crate::backend::narrow_f32_to_bytes(&wide, dtype));
+            }
+            return Ok(b);
+        }
+        let mut cache = self.read_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let r = if matches!(dtype, DType::U8 | DType::I8) {
+            self.read_bytes(&mut cache, name)
+        } else if matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+            self.read(&mut cache, name, dims)
+                .map(|v| crate::backend::narrow_f32_to_bytes(&v, dtype))
+        } else {
+            bail!(
+                "param '{name}' is {}: only f32/f16/bf16 and packed blocks ship",
+                dtype_name(dtype)
+            );
+        };
+        r.map_err(|e| anyhow::anyhow!("no weights for '{name}': {e}"))
     }
 
     /// Check every referenced file that names its `sha256` against it (open
@@ -1515,6 +1561,8 @@ pub const FEATURES: &[&str] = &[
     "generate.state_update",
     "generate.state_kinds",
     "generate.logits",
+    "generate.draft_logits",
+    "generate.verify",
     "generate.prefill",
     "generate.max_context",
     "generate.batch",

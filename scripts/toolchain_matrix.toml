@@ -1,0 +1,332 @@
+# Toolchain version matrix — run by scripts/toolchain_matrix.py (`just toolchain-matrix`).
+#
+# One [[run]] per (device, component version, rig). `env` selects the version
+# (each version lives in its own venv / toolkit dir, side by side). `pass` is
+# text the command must print, in addition to exiting 0. `workdir` is the rig's
+# synced copy of this repo. Add a version by installing it next to the others
+# and adding a run; `--update` records the result in tested_toolchains.tsv.
+
+# ── XDNA: mlir-aie releases (each in its own venv on the amd rig) ──────────
+# Each release is paired with the llvm-aie (Peano) build its
+# utils/peano-requirements.txt pins (1.3.4+). 1.3.0-1.3.3 pin nothing; they use
+# the nearest surviving nightly (builds before 2026-06-11 are no longer published).
+# 1.2.x and older have no native aiecc (only aiecc.py) — known issue RLX-XDNA-009.
+# 1.3.0, 1.3.1 and 1.3.3 fail with every published Peano (registers; f0x literals
+# 1.3.3 emits) — kept here so a new Peano that fixes them shows up; RLX-XDNA-011.
+[[run]]
+device = "xdna"
+component = "mlir-aie"
+version = "1.3.0"
+peano = "21.0.0.2026061101"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/aie-venvs/1.3.0/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/peano-venvs/21.0.0.2026061101/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-root/usr"
+LD_LIBRARY_PATH = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+RLX_XDNA_ALLOW_KNOWN_BAD = "1"   # measured despite RLX-XDNA-011
+
+[[run]]
+device = "xdna"
+component = "mlir-aie"
+version = "1.3.1"
+peano = "21.0.0.2026061101"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/aie-venvs/1.3.1/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/peano-venvs/21.0.0.2026061101/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-root/usr"
+LD_LIBRARY_PATH = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+RLX_XDNA_ALLOW_KNOWN_BAD = "1"   # measured despite RLX-XDNA-011
+
+[[run]]
+device = "xdna"
+component = "mlir-aie"
+version = "1.3.2"
+peano = "21.0.0.2026061101"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/aie-venvs/1.3.2/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/peano-venvs/21.0.0.2026061101/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-root/usr"
+LD_LIBRARY_PATH = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+
+[[run]]
+device = "xdna"
+component = "mlir-aie"
+version = "1.3.3"
+peano = "21.0.0.2026062601"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/aie-venvs/1.3.3/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/peano-venvs/21.0.0.2026062601/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-root/usr"
+LD_LIBRARY_PATH = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+RLX_XDNA_ALLOW_KNOWN_BAD = "1"   # measured despite RLX-XDNA-011
+
+[[run]]
+device = "xdna"
+component = "mlir-aie"
+version = "1.3.4"
+peano = "21.0.0.2026062301"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/mlir-aie/ironenv/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/peano-venvs/21.0.0.2026062301/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-root/usr"
+LD_LIBRARY_PATH = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+
+[[run]]
+device = "xdna"
+component = "mlir-aie"
+version = "1.4.0"
+peano = "21.0.0.2026072001"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/aie-venvs/1.4.0/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/mlir-aie/ironenv/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-root/usr"
+LD_LIBRARY_PATH = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+
+[[run]]
+device = "xdna"
+component = "mlir-aie"
+version = "1.4.1"
+peano = "21.0.0.2026080301"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/aie-venvs/1.4.1/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/peano-venvs/21.0.0.2026080301/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-root/usr"
+LD_LIBRARY_PATH = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+
+[[run]]
+device = "xdna"
+component = "mlir-aie"
+version = "1.4.2"
+peano = "21.0.0.2026080301"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/aie-venvs/1.4.2/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/peano-venvs/21.0.0.2026080301/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-root/usr"
+LD_LIBRARY_PATH = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+
+[[run]]
+device = "xdna"
+component = "mlir-aie"
+version = "1.4.3"
+peano = "22.0.0.2026090701"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/aie-venvs/1.4.3/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/peano-venvs/22.0.0.2026090701/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-root/usr"
+LD_LIBRARY_PATH = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+
+[[run]]
+device = "xdna"
+component = "mlir-aie"
+version = "1.4.4"
+peano = "22.0.0.2026092101"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/aie144/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/peano-venvs/22.0.0.2026092101/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-root/usr"
+LD_LIBRARY_PATH = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+
+# ── XDNA: XRT releases (each unpacked rootless: `dpkg-deb -x` into ~/xrt-<ver>) ──
+# 2.21.75 = Ubuntu 26.04 archive (~/xrt-root); 2.25.0 = ppa:amd-team/xrt
+# (2.25.0-4~resolute1, what the #9-#12 reporter runs). Each run builds its own
+# rlx XRT shim against that version's headers (RLX_XDNA_SHIM unset).
+[[run]]
+device = "xdna"
+component = "xrt"
+version = "2.21.75"
+notes = "with mlir-aie 1.4.4"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/aie144/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/peano-venvs/22.0.0.2026092101/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-root/usr"
+RLX_XDNA_XRT_LIB = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+LD_LIBRARY_PATH = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+
+[[run]]
+device = "xdna"
+component = "xrt"
+version = "2.21.75"
+notes = "with mlir-aie 1.3.4"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/mlir-aie/ironenv/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/peano-venvs/21.0.0.2026062301/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-root/usr"
+RLX_XDNA_XRT_LIB = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+LD_LIBRARY_PATH = "~/xrt-root/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+
+[[run]]
+device = "xdna"
+component = "xrt"
+version = "2.25.0"
+notes = "with mlir-aie 1.4.4"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/aie144/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/peano-venvs/22.0.0.2026092101/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-2.25/usr"
+RLX_XDNA_XRT_LIB = "~/xrt-2.25/usr/lib/x86_64-linux-gnu"
+LD_LIBRARY_PATH = "~/xrt-2.25/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+
+[[run]]
+device = "xdna"
+component = "xrt"
+version = "2.25.0"
+notes = "with mlir-aie 1.3.4"
+hardware = "Ryzen 9 8945HS npu1 fw 1.5.5.391"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-runtime --features xdna --example xdna_graph"
+pass = "all NPU graph ops match CPU"
+timeout_s = 2400
+[run.env]
+AIECC = "~/mlir-aie/ironenv/lib/python3.14/site-packages/mlir_aie/bin/aiecc"
+PEANO = "~/peano-venvs/21.0.0.2026062301/lib/python3.14/site-packages/llvm-aie"
+XILINX_XRT = "~/xrt-2.25/usr"
+RLX_XDNA_XRT_LIB = "~/xrt-2.25/usr/lib/x86_64-linux-gnu"
+LD_LIBRARY_PATH = "~/xrt-2.25/usr/lib/x86_64-linux-gnu"
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+XDG_CACHE_HOME = "~/rlx-doctor-cache"
+
+# ── ROCm and Vulkan on the 780M (amd rig) ──────────────────────────────────
+[[run]]
+device = "rocm"
+component = "rocm"
+version = "7.1"
+hardware = "Radeon 780M (gfx1103)"
+host = "amd"
+workdir = "~/rlx-doctor"
+command = "cargo run --offline --release -q -p rlx-check --bin cargo-rlx --features rocm,vulkan -- doctor --device rocm,vulkan"
+pass = "ready: ROCm, Vulkan"
+timeout_s = 2400
+[run.env]
+CARGO_TARGET_DIR = "~/rlx-doctor-target"
+
+# ── CUDA on the msi rig ────────────────────────────────────────────────────
+[[run]]
+device = "cuda"
+component = "nvrtc"
+version = "13.1"
+hardware = "RTX 3080 Ti Laptop (sm_86)"
+host = "msi"
+workdir = "/tmp/rlxdoctor"
+command = "cargo run --release -q -p rlx-check --bin cargo-rlx --features cuda -- doctor --device cuda"
+pass = "ready: CUDA"
+timeout_s = 2400
+[run.env]
+CARGO_HOME = "~/rlx-scratch/cargo-home"
+CARGO_TARGET_DIR = "~/rlx-scratch/target-doctor"
+LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
+
+# ── Upstream projects whose new releases have broken us before ─────────────
+[[upstream]]
+device = "xdna"
+component = "mlir-aie"
+github = "Xilinx/mlir-aie"
+
+[[upstream]]
+device = "xdna"
+component = "xrt"
+github = "Xilinx/XRT"

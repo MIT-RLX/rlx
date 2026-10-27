@@ -8,13 +8,25 @@ authors.workspace      = true
 license.workspace      = true
 keywords = ["libm", "glibc", "math", "parity"]
 categories = ["science", "mathematics"]
-readme                 = "README.md"
 repository.workspace   = true
 documentation.workspace = true
 
 [lib]
 name = "rlx_libm"
 path = "src/lib.rs"
+
+[dependencies]
+# Exact (integer) fma for inputs outside `fma_emulated`'s proven range.
+libm_crate = { package = "libm", version = "0.2" }
+
+[features]
+# wasm32: define the `fma` symbol with `fma_emulated`, replacing the slow
+# software fma behind every `f64::mul_add` in the binary.
+wasm-fma = []
+# The platform's C libm (Apple's libSystem) for `reference` on Apple
+# targets, so ports agree bit for bit with NumPy / SciPy / torch running on
+# macOS. Off: the pure-Rust ports (glibc's algorithms) everywhere.
+libm = []
 
 [lints]
 workspace = true

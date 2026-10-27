@@ -275,6 +275,11 @@ test:
         JOBS=$(( CPUS < 4 ? CPUS : 4 ))
         cargo test --release -j "$JOBS"
     else
+        # One test target that fails to compile aborts the whole workspace
+        # run, `--no-fail-fast` or not — on the Linux rig that was seven
+        # ungated Apple-only tests plus pyrlx's libpython link, and zero tests
+        # ran. Build every target first so the report names all of them.
+        cargo build --release --tests --keep-going -j "$CPUS"
         cargo test --release -j "$CPUS" -- --test-threads="$CPUS"
     fi
     # A workspace `cargo test` builds every crate with its DEFAULT features, so
@@ -663,6 +668,24 @@ check-readme:
 #   just known-failures update /tmp/kf.jsonl --issue owner/repo#N
 known-failures *args:
     python3 scripts/known-failures.py {{args}}
+
+# Toolchain version matrix (scripts/toolchain_matrix.toml): every supported
+# external toolchain version, each on its rig in a fresh TMPDIR.
+#   just toolchain-matrix                 # run all, print a table
+#   just toolchain-matrix --only xdna     # one device or component
+#   just toolchain-matrix --update        # record results in tested_toolchains.tsv
+toolchain-matrix *args:
+    python3 scripts/toolchain_matrix.py {{args}}
+
+# Exit 1 when an upstream toolchain (mlir-aie, XRT, …) has a release newer than
+# anything the matrix has tested — run it nightly / before a release.
+toolchain-upstream:
+    python3 scripts/toolchain_matrix.py --upstream
+
+# Regenerate docs/known-issues.md from rlx-runtime's known-issue table
+# (`doctor/known_issues.rs`); a unit test fails while it is stale.
+gen-known-issues:
+    cargo run -q -p rlx-check --bin cargo-rlx -- doctor --known --markdown > docs/known-issues.md
 
 # Regenerate docs/rlx-env-vars.md from the env registry (+ leftover mentions).
 gen-rlx-env-vars:

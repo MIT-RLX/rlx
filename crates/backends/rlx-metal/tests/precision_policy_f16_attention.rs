@@ -89,7 +89,11 @@ fn check(label: &str, got: &[f32], want: &[f32]) {
 
 #[test]
 fn attention_under_low_precision_policies_matches_f32() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -204,7 +208,11 @@ where
 /// a case whenever the pass learns a new op.
 #[test]
 fn amp_sweep_over_the_transformer_path() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -279,7 +287,11 @@ fn amp_sweep_over_the_transformer_path() {
 /// diagnostic at all. A backend that cannot execute something must say so.
 #[test]
 fn bf16_compute_is_refused_not_silently_wrong() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }

@@ -69,6 +69,24 @@ fn wgpu_resident_training_tracks_cpu_step_by_step() {
         eprintln!("skip: wgpu unavailable");
         return;
     }
+    tracks_cpu_step_by_step();
+}
+
+/// The same run with every elementwise op routed to the host, which is what
+/// discrete NVIDIA Vulkan does by default. Two bugs lived only on this path,
+/// so it was invisible on Metal-backed wgpu: the handle feeds were skipped when
+/// the schedule ended on a host step, and the host mirror flushed a dead
+/// tenant's tail over the live `b'` (`b` never moved).
+#[test]
+fn wgpu_resident_training_on_the_host_routed_path() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, is_available(Device::Gpu)) {
+        return;
+    }
+    let _host = rlx_ir::env::scoped("RLX_WGPU_FORCE_HOST", "1");
+    tracks_cpu_step_by_step();
+}
+
+fn tracks_cpu_step_by_step() {
     let spec = AdamSpec {
         lr: 0.05,
         weight_decay: 0.01,

@@ -20,7 +20,7 @@ pub fn is_ingraph_qmatmul_kernel(name: &str) -> bool {
 }
 
 pub fn ingraph_enabled() -> bool {
-    if let Some(v) = rlx_ir::env::var("KITTEN_RLX_QMATMUL_INGRAPH") {
+    if let Ok(v) = std::env::var("KITTEN_RLX_QMATMUL_INGRAPH") {
         if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no") {
             return false;
         }
@@ -41,7 +41,7 @@ pub fn ingraph_gpu_enabled() -> bool {
 
 pub fn gpu_min_flops() -> usize {
     rlx_ir::env::var("RLX_METAL_ONNX_QMATMUL_MIN_FLOPS")
-        .or_else(|| rlx_ir::env::var("KITTEN_RLX_QMATMUL_GPU_MIN_FLOPS"))
+        .or_else(|| std::env::var("KITTEN_RLX_QMATMUL_GPU_MIN_FLOPS").ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(2_097_152)
 }

@@ -32,7 +32,7 @@ rlx-ir = { workspace = true }
 rlx-opt = { workspace = true }
 # Host GGUF / MLX dequant for DequantMatMul (runtime feature only).
 rlx-gguf = { workspace = true, optional = true }
-rlx-mlx-io = { workspace = true, optional = true }
+rlx-mlx-io = { workspace = true, optional = true, default-features = false }  # dequant kernels only
 
 [build-dependencies]
 cc = "1"

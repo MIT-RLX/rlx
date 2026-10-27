@@ -948,6 +948,18 @@ kernel_cache!(
     "dequant_matmul_gguf_g8_gemv"
 );
 kernel_cache!(
+    DEQUANT_MATMUL_GGUF_GEMV_ELEM,
+    dequant_matmul_gguf_gemv_elem_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_gemv_elem"
+);
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF_GEMV_ROWS,
+    dequant_matmul_gguf_gemv_rows_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_gemv_rows"
+);
+kernel_cache!(
     DEQUANT_MATMUL_GGUF_Q4K_GEMV,
     dequant_matmul_gguf_q4k_gemv_kernel,
     DEQUANT_MATMUL_GGUF_CU,

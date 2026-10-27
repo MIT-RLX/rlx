@@ -147,3 +147,15 @@ pub fn skip_unless_available(device: Device, label: &str) -> bool {
 pub fn skip_unless(device: Device) -> bool {
     skip_unless_available(device, &format!("{device:?}"))
 }
+
+/// [`skip_unless_available`] for a test that runs on whichever of `devices`
+/// is present: skips only when none is, and under `RLX_REQUIRE_DEVICE` fails
+/// when any of them is compiled in.
+pub fn skip_unless_any(devices: &[Device]) -> bool {
+    let label: Vec<String> = devices.iter().map(|d| format!("{d:?}")).collect();
+    rlx_ir::env::skip_unless_device(
+        &label.join(" or "),
+        devices.iter().any(|d| rlx_runtime::feature_compiled(*d)),
+        devices.iter().any(|d| rlx_runtime::is_available(*d)),
+    )
+}

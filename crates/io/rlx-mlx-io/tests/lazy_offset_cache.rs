@@ -7,6 +7,7 @@
 //! a dense F32 tensor and a quantized (affine) Linear — i.e. the offset-cache
 //! arithmetic is correct.
 
+#![cfg(feature = "io")]
 use std::collections::HashMap;
 use std::fs;
 

@@ -16,4 +16,4 @@ pub use rlx_gpu_kernels::rocm::MATMUL_MFMA_CU;
 /// via hipRTC) and real-INT8 `q_matmul` / `q_conv2d`, plus the on-device ONNX
 /// ND indexing set (`gather_nd_f32` / `gather_elements_f32` /
 /// `scatter_elements_f32` / `scatter_nd_reduce_f32` / `copy_sanitize_f32`).
-pub const KERNEL_COUNT: usize = 79;
+pub const KERNEL_COUNT: usize = 82;

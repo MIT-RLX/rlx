@@ -283,8 +283,7 @@ fn fk_prologue_session_pipeline_keeps_region() {
 #[test]
 fn fk_prologue_chain_matches_primitives_on_wgpu() {
     let _gpu = common::serialize_gpu();
-    if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
-        eprintln!("skip fk_prologue_chain_matches_primitives_on_wgpu (unavailable)");
+    if common::skip_unless_any(&[Device::Vulkan, Device::WebGpu]) {
         return;
     }
     let device = if is_available(Device::Vulkan) {
@@ -427,8 +426,7 @@ fn fk_batch_single_launch_matches_primitives_on_metal() {
 #[test]
 fn fk_batch_region_matches_primitives_on_wgpu() {
     let _gpu = common::serialize_gpu();
-    if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
-        eprintln!("skip fk_batch_region_matches_primitives_on_wgpu (unavailable)");
+    if common::skip_unless_any(&[Device::Vulkan, Device::WebGpu]) {
         return;
     }
     use rlx_fusion::fk_fusion::FuseBatchPreprocess;
@@ -458,8 +456,7 @@ fn fk_batch_region_matches_primitives_on_wgpu() {
 #[test]
 fn fk_batch_single_launch_matches_primitives_on_wgpu() {
     let _gpu = common::serialize_gpu();
-    if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
-        eprintln!("skip fk_batch_single_launch_matches_primitives_on_wgpu (unavailable)");
+    if common::skip_unless_any(&[Device::Vulkan, Device::WebGpu]) {
         return;
     }
     with_fk_batch_single_kernel(|| {
@@ -818,8 +815,7 @@ fn fk_batch_region_matches_primitives_on_tpu() {
 #[test]
 fn fk_batch_session_pipeline_keeps_native_region_wgpu() {
     let _gpu = common::serialize_gpu();
-    if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
-        eprintln!("skip fk_batch_session_pipeline_keeps_native_region_wgpu (unavailable)");
+    if common::skip_unless_any(&[Device::Vulkan, Device::WebGpu]) {
         return;
     }
     let device = if is_available(Device::Vulkan) {
@@ -893,8 +889,7 @@ fn fk_prologue_resize_on_input_one_matches_cpu() {
 #[test]
 fn fk_prologue_resize_on_input_one_matches_cpu_wgpu() {
     let _gpu = common::serialize_gpu();
-    if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
-        eprintln!("skip fk_prologue_resize_on_input_one_matches_cpu_wgpu (unavailable)");
+    if common::skip_unless_any(&[Device::Vulkan, Device::WebGpu]) {
         return;
     }
     let device = if is_available(Device::Vulkan) {

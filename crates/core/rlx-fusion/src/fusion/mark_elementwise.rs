@@ -105,21 +105,22 @@ impl Pass for MarkElementwiseRegions {
                 continue;
             }
             // Each input must either match the output element count
-            // exactly OR be a trailing-shape broadcast (its element
-            // count divides the output's). The kernel reads
+            // exactly OR be a trailing-shape broadcast. The kernel reads
             // `arena[input_offs[i] + (gid % input_modulus[i])]` for
             // broadcast inputs; non-broadcast inputs leave the modulus
             // at 0 to skip the modulo.
+            //
+            // "Its element count divides the output's" is NOT enough: a
+            // per-channel `[1,C,1,1]` against `[N,C,H,W]` divides too, and
+            // `gid % C` then walks the channel with the innermost axis —
+            // a batch-norm scale fused this way was wrong in 70 of 120
+            // elements on CPU and wgpu alike. Mid-shape broadcasts stay out
+            // of the region (LegalizeBroadcast materialises them later).
             let out_shape = &node.shape;
-            let out_elems = out_shape.num_elements();
-            let shape_ok = node.inputs.iter().all(|id| {
-                let in_elems = graph.shape(*id).num_elements();
-                match (in_elems, out_elems) {
-                    (Some(i), Some(o)) if i == o => true,
-                    (Some(i), Some(o)) if i > 0 && o % i == 0 => true,
-                    _ => false,
-                }
-            });
+            let shape_ok = node
+                .inputs
+                .iter()
+                .all(|id| region_indexable(graph.shape(*id), out_shape));
             if !shape_ok {
                 continue;
             }
@@ -425,6 +426,36 @@ impl Pass for MarkElementwiseRegions {
 
         rw.finish_reporting(&graph.outputs)
     }
+}
+
+/// Whether a region kernel can read `src` at output element `gid` as
+/// `src[gid]` (same element count) or `src[gid % len(src)]` (scalar, or a
+/// trailing slice of `out` once `src`'s leading 1s are dropped). Any other
+/// broadcast — a 1 inside `src`'s non-leading dims — is not a modulus.
+fn region_indexable(src: &Shape, out: &Shape) -> bool {
+    let (Some(i), Some(o)) = (src.num_elements(), out.num_elements()) else {
+        return false;
+    };
+    if i == o || i == 1 {
+        return true;
+    }
+    if i == 0 || o % i != 0 {
+        return false;
+    }
+    let s = src.dims();
+    let lead = s.iter().take_while(|d| matches!(d, Dim::Static(1))).count();
+    let s = &s[lead..];
+    let t = out.dims();
+    if s.len() > t.len() {
+        return false;
+    }
+    s.iter()
+        .zip(&t[t.len() - s.len()..])
+        .all(|(a, b)| match (a, b) {
+            (Dim::Static(a), Dim::Static(b)) => a == b,
+            (Dim::Dynamic(a), Dim::Dynamic(b)) => a == b,
+            _ => false,
+        })
 }
 
 // ── PLAN L2 fallback: UnfuseElementwiseRegions ───────────────────────

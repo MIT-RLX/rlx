@@ -26,3 +26,12 @@ workspace = true
 
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
+
+[features]
+# Platform C libm for rlx-libm's `reference` (macOS-exact NumPy/SciPy); off = pure Rust.
+libm = ["rlx-libm/libm"]
+
+# The test fixtures are SciPy on macOS arm64: tests compute with its libm.
+# (Library builds default to the pure-Rust ports; see rlx-libm `libm`.)
+[dev-dependencies]
+rlx-libm = { workspace = true, features = ["libm"] }

@@ -215,6 +215,6 @@ fn copy_sanitize(@builtin(global_invocation_id) gid: vec3<u32>,
 
     var v: f32 = arena[params.dst_off + i];
     if (do_copy && i < params.src_len) { v = arena[params.data_off + i]; }
-    if (do_sanitize && !(abs(v) <= 3.4028235e38)) { v = 0.0; }
+    if (do_sanitize && !(abs(v) <= 0x1.fffffep+127f)) { v = 0.0; }
     arena[params.dst_off + i] = v;
 }

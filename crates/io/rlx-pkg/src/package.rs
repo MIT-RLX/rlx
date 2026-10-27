@@ -6,7 +6,8 @@
 //!
 //! # Load path
 //!
-//! 1. [`Package::open`] — mmap file / shards, parse TOC (JSON or bincode)
+//! 1. [`Package::open`] — mmap file / shards (read them where there is no mmap:
+//!    wasm32), parse TOC (JSON or bincode); or [`Package::from_bytes`]
 //! 2. [`Package::advise_hot_willneed`] — optional `madvise(WILLNEED)` on hot ranges
 //! 3. [`Package::graph`] — deserialize MIR; fill **hot** stripped Constants
 //! 4. [`Package::bind_warm_and_cold`] — optional late bind of compressed weights
@@ -43,20 +44,53 @@ pub enum MaterializeMode {
     None,
 }
 
+/// A package file's bytes: memory-mapped, or owned where there is no mmap
+/// (wasm32) or the bytes came from elsewhere ([`Package::from_bytes`]).
+#[derive(Debug)]
+pub enum Bytes {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for Bytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(m) => m,
+            Self::Owned(v) => v,
+        }
+    }
+}
+
+impl Bytes {
+    /// Map `path`; read it whole if this platform cannot map files.
+    fn of_file(path: &Path) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: read-only map of a local package file for the Package lifetime.
+        match unsafe { Mmap::map(&file) } {
+            Ok(m) => Ok(Self::Mapped(m)),
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(Self::Owned(
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+            )),
+            Err(e) => Err(e).with_context(|| format!("mmap {}", path.display())),
+        }
+    }
+}
+
 /// Where package members are served from.
 #[derive(Debug)]
 pub enum MemberSource {
-    /// Flat `RLXPFLAT` single-file mmap.
-    Flat { path: PathBuf, map: Mmap },
-    /// Unpacked directory tree with per-shard mmaps.
+    /// Flat `RLXPFLAT` single file (`path` is empty for [`Package::from_bytes`]).
+    Flat { path: PathBuf, map: Bytes },
+    /// Unpacked directory tree with per-shard maps.
     Dir {
         root: PathBuf,
-        shard_maps: BTreeMap<String, Mmap>,
+        shard_maps: BTreeMap<String, Bytes>,
     },
-    /// ZIP64 STORE archive.
+    /// ZIP64 STORE archive (`path` is empty for [`Package::from_bytes`]).
     Zip {
         path: PathBuf,
-        map: Mmap,
+        map: Bytes,
         ranges: BTreeMap<String, MemberRange>,
     },
 }
@@ -82,19 +116,27 @@ impl Package {
         if path.is_dir() {
             return Self::open_dir(path);
         }
-        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        // SAFETY: read-only map of a local package file for the Package lifetime.
-        let map =
-            unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?;
+        Self::open_bytes(path, Bytes::of_file(path)?)
+    }
+
+    /// Open a flat or ZIP package held in memory — fetched in a browser, say,
+    /// where there is no filesystem to open it from.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        Self::open_bytes(Path::new(""), Bytes::Owned(bytes))
+    }
+
+    fn open_bytes(path: &Path, map: Bytes) -> Result<Self> {
         if flat::is_flat_magic(&map) {
             Self::open_flat(path, map)
         } else if map.len() >= 4 && &map[..2] == b"PK" {
             Self::open_zip_mapped(path, map)
         } else {
-            bail!(
-                "{} is not a flat RLXPFLAT, ZIP, or package directory",
-                path.display()
-            )
+            let what = if path.as_os_str().is_empty() {
+                "these bytes are".into()
+            } else {
+                format!("{} is", path.display())
+            };
+            bail!("{what} not a flat RLXPFLAT, ZIP, or package directory")
         }
     }
 
@@ -129,7 +171,7 @@ impl Package {
         }
     }
 
-    fn open_flat(path: &Path, map: Mmap) -> Result<Self> {
+    fn open_flat(path: &Path, map: Bytes) -> Result<Self> {
         let view = FlatView::parse(&map)?;
         let weights = Some(view.weights_index());
         let placement = view.placement()?;
@@ -170,11 +212,7 @@ impl Package {
                 if shard_maps.contains_key(&t.shard) {
                     continue;
                 }
-                let p = dir.join(&t.shard);
-                let f = File::open(&p).with_context(|| format!("open shard {}", p.display()))?;
-                // SAFETY: read-only map of a package shard for the Package lifetime.
-                let map = unsafe { Mmap::map(&f) }
-                    .with_context(|| format!("mmap shard {}", p.display()))?;
+                let map = Bytes::of_file(&dir.join(&t.shard))?;
                 shard_maps.insert(t.shard.clone(), map);
             }
         }
@@ -192,8 +230,8 @@ impl Package {
         ))
     }
 
-    fn open_zip_mapped(path: &Path, map: Mmap) -> Result<Self> {
-        let ranges = store_zip::resolve_store_ranges(path)?;
+    fn open_zip_mapped(path: &Path, map: Bytes) -> Result<Self> {
+        let ranges = store_zip::resolve_store_ranges_in(std::io::Cursor::new(&map[..]), "package")?;
         let manifest_bytes = store_zip::read_member_from_map(&map, &ranges, "rlx.json")
             .context("rlx.json in package")?;
         let manifest: Manifest =
@@ -359,21 +397,30 @@ impl Package {
                 return;
             }
             match &self.source {
-                MemberSource::Flat { map, .. } => {
+                MemberSource::Flat {
+                    map: Bytes::Mapped(map),
+                    ..
+                } => {
                     let abs = (self.flat_data_start + offset) as usize;
                     let _ = map.advise_range(memmap2::Advice::WillNeed, abs, len);
                 }
                 MemberSource::Dir { shard_maps, .. } => {
-                    if let Some(map) = shard_maps.get(shard) {
+                    if let Some(Bytes::Mapped(map)) = shard_maps.get(shard) {
                         let _ = map.advise_range(memmap2::Advice::WillNeed, offset as usize, len);
                     }
                 }
-                MemberSource::Zip { map, ranges, .. } => {
+                MemberSource::Zip {
+                    map: Bytes::Mapped(map),
+                    ranges,
+                    ..
+                } => {
                     if let Some(r) = ranges.get(shard) {
                         let abs = r.data_offset as usize + offset as usize;
                         let _ = map.advise_range(memmap2::Advice::WillNeed, abs, len);
                     }
                 }
+                // owned bytes are already resident
+                _ => {}
             }
         }
         #[cfg(not(unix))]

@@ -14,12 +14,18 @@
 //! there the single-row kernels (`sdpa_decode_m1`, the split-K partials) once
 //! had no bias branch and attended to every key, unmasked.
 
+#![cfg(target_os = "macos")]
+
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 
 fn case(b: usize, nh: usize, hd: usize, sq: usize, sk: usize) -> Option<f32> {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_metal::is_available(),
+    ) {
         eprintln!("skip: metal unavailable");
         return None;
     }

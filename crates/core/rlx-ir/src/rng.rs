@@ -500,15 +500,15 @@ impl BnnsAesCtr128 {
 /// The native activation does not accept a caller-owned random generator.
 /// Holding this value prevents another RLX native sampler from interleaving
 /// draws after the stream has been initialized.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "pure-rust")))]
 pub struct NativeBnnsGumbelMax {
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "pure-rust")))]
 static NATIVE_BNNS_GUMBEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "pure-rust")))]
 impl NativeBnnsGumbelMax {
     /// Initialize the native BNNS stream and retain exclusive RLX access.
     pub fn new(seed: u64) -> Option<Self> {
@@ -530,10 +530,10 @@ impl NativeBnnsGumbelMax {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", not(feature = "pure-rust"))))]
 pub struct NativeBnnsGumbelMax;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", not(feature = "pure-rust"))))]
 impl NativeBnnsGumbelMax {
     pub fn new(_seed: u64) -> Option<Self> {
         None
@@ -544,7 +544,7 @@ impl NativeBnnsGumbelMax {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "pure-rust")))]
 fn native_bnns_gumbel_max_argmax_impl(logits: &[f32], alpha: f32, beta: f32) -> Option<usize> {
     #[repr(C, align(64))]
     #[derive(Clone, Copy)]
@@ -1255,7 +1255,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "pure-rust")))]
     #[test]
     fn native_bnns_gumbel_replays_seeded_stream() {
         let logits = [0.0f32; 256];
@@ -1268,7 +1268,7 @@ mod tests {
         assert_eq!(draw(), draw());
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "pure-rust")))]
     mod apple_bnns_parity {
         use super::*;
 

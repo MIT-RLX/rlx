@@ -51,12 +51,27 @@ fn softmax(
     let out_base = params.out_off + row * params.inner;
 
     // ── Pass 1: row max (parallel tree, exact). ──
-    var m: f32 = -3.40282347e38; // -f32::MAX (identity for max)
+    // Rows of <= 8*64 elements are held in registers: one read of the input
+    // and one `exp` per element instead of three reads and two `exp`s. Same
+    // per-thread order and the same Kahan merges, so the bits are unchanged.
+    let cached = params.inner <= 512u;
+    var v: array<f32, 8>;
+    var m: f32 = -0x1.fffffep+127f; // -f32::MAX (identity for max)
     var i: u32 = tid;
-    loop {
-        if (i >= params.inner) { break; }
-        m = max(m, arena[in_base + i]);
-        i = i + 64u;
+    if (cached) {
+        for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+            let ij = tid + j * 64u;
+            if (ij < params.inner) {
+                v[j] = arena[in_base + ij];
+                m = max(m, v[j]);
+            }
+        }
+    } else {
+        loop {
+            if (i >= params.inner) { break; }
+            m = max(m, arena[in_base + i]);
+            i = i + 64u;
+        }
     }
     scratch[tid] = m;
     workgroupBarrier();
@@ -67,15 +82,28 @@ fn softmax(
     // ── Pass 2: Σ exp(x − max), Kahan-compensated. ──
     var s: f32 = 0.0;
     var c: f32 = 0.0;
-    i = tid;
-    loop {
-        if (i >= params.inner) { break; }
-        let e = exp(arena[in_base + i] - row_max);
-        let y = e - c;
-        let t = s + y;
-        c = (t - s) - y;
-        s = t;
-        i = i + 64u;
+    if (cached) {
+        for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+            if (tid + j * 64u < params.inner) {
+                let e = exp(v[j] - row_max);
+                v[j] = e;
+                let y = e - c;
+                let t = s + y;
+                c = (t - s) - y;
+                s = t;
+            }
+        }
+    } else {
+        i = tid;
+        loop {
+            if (i >= params.inner) { break; }
+            let e = exp(arena[in_base + i] - row_max);
+            let y = e - c;
+            let t = s + y;
+            c = (t - s) - y;
+            s = t;
+            i = i + 64u;
+        }
     }
     scratch[tid] = s;
     workgroupBarrier();
@@ -96,10 +124,19 @@ fn softmax(
     let inv_s = 1.0 / scratch[0];
 
     // ── Pass 3: write normalized (recompute exp; keeps peak memory low). ──
-    i = tid;
-    loop {
-        if (i >= params.inner) { break; }
-        arena[out_base + i] = exp(arena[in_base + i] - row_max) * inv_s;
-        i = i + 64u;
+    if (cached) {
+        for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+            let ij = tid + j * 64u;
+            if (ij < params.inner) {
+                arena[out_base + ij] = v[j] * inv_s;
+            }
+        }
+    } else {
+        i = tid;
+        loop {
+            if (i >= params.inner) { break; }
+            arena[out_base + i] = exp(arena[in_base + i] - row_max) * inv_s;
+            i = i + 64u;
+        }
     }
 }

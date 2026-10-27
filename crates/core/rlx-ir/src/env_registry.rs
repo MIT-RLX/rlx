@@ -112,6 +112,51 @@ pub fn is_registered(name: &str) -> bool {
     lookup(name).is_some()
 }
 
+/// The registered name (or alias) nearest to `name` by edit distance, when it
+/// is close enough to be a plausible typo: at most a quarter of the name's
+/// length, and at least one edit. Feeds the unknown-variable warning and
+/// `cargo rlx doctor`.
+pub fn suggest(name: &str) -> Option<&'static str> {
+    let budget = (name.len() / 4).max(1);
+    REGISTRY
+        .iter()
+        .flat_map(|e| std::iter::once(e.name).chain(e.aliases.iter().copied()))
+        .map(|cand| (levenshtein(name, cand), cand))
+        .filter(|(d, _)| *d <= budget)
+        .min_by_key(|(d, c)| (*d, c.len()))
+        .map(|(_, c)| c)
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != *cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// `RLX_*` variables set in `vars` that the registry does not know — read by
+/// nothing, so most likely typos — each with [`suggest`]'s nearest name.
+pub fn unknown_vars(vars: impl IntoIterator<Item = String>) -> Vec<(String, Option<&'static str>)> {
+    let mut out: Vec<(String, Option<&'static str>)> = vars
+        .into_iter()
+        .filter(|k| k.starts_with("RLX_") && !is_registered(k))
+        .map(|k| {
+            let s = suggest(&k);
+            (k, s)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// Canonical name for `name` (identity if already canonical / unknown).
 pub fn canonical_name(name: &str) -> &str {
     match lookup(name) {
@@ -169,9 +214,256 @@ pub(crate) fn resolve(name: &str, raw: impl Fn(&str) -> Option<String>) -> Optio
     }
     if let EnvStability::Deprecated { replace_with } = e.stability {
         maybe_warn_deprecated(name, e);
-        return raw(replace_with);
+        return raw(replace_with).or_else(|| layered(replace_with, &raw).map(|(v, _)| v));
+    }
+    layered(e.name, &raw).map(|(v, _)| v)
+}
+
+/// List variables that switch on a whole family at once. `RLX_DISABLE=cse,sccp`
+/// sets `RLX_DISABLE_CSE` and `RLX_DISABLE_SCCP`; `RLX_TRACE=metal,gguf` sets
+/// `RLX_METAL_TRACE` and `RLX_GGUF_TRACE`; `RLX_DEBUG` likewise for `*_DEBUG`.
+/// Tokens are case-insensitive. The long names keep working unchanged.
+pub const FAMILIES: &[(&str, &str, &str)] = &[
+    ("RLX_DISABLE", "RLX_DISABLE_", ""), // env-lint: ignore
+    ("RLX_TRACE", "RLX_", "_TRACE"),
+    ("RLX_DEBUG", "RLX_", "_DEBUG"),
+];
+
+/// Built-in `RLX_PROFILE` bundles: `(name, what it is for, settings)`. Each
+/// setting sits below anything set explicitly. Only switches whose effect the
+/// registry documents belong here; a profile that guesses is worse than none.
+pub const PROFILES: &[(&str, &str, &[(&str, &str)])] = &[
+    (
+        "debug",
+        "runtime logging, the dispatch report, static NaN lint, deprecation notices",
+        &[
+            ("RLX_VERBOSE", "1"),
+            ("RLX_DISPATCH_REPORT", "1"),
+            ("RLX_LINT_NUMERICS", "1"),
+            ("RLX_ENV_DEPRECATIONS", "1"),
+        ],
+    ),
+    (
+        "nans",
+        "localize the first NaN/Inf at runtime (slow), plus the static lint",
+        &[("RLX_DEBUG_NANS", "1"), ("RLX_LINT_NUMERICS", "1")],
+    ),
+    (
+        "parity",
+        "tightest numerics on CUDA, ROCm and Metal, for cross-backend comparison",
+        &[
+            ("RLX_CUDA_PARITY", "1"),
+            ("RLX_CUDA_MATMUL_PRECISE", "1"),
+            ("RLX_ROCM_PARITY", "1"),
+            ("RLX_METAL_PRECISE", "1"),
+            ("RLX_METAL_SGEMM_PRECISE", "1"),
+        ],
+    ),
+    (
+        "deterministic",
+        "reproducible collective reductions (set on every rank)",
+        &[("RLX_DETERMINISTIC_REDUCE", "1")],
+    ),
+    (
+        "ci",
+        "a missing GPU fails tests instead of skipping; memory-plan self-check",
+        &[("RLX_REQUIRE_DEVICE", "1"), ("RLX_MEM_VERIFY", "1")],
+    ),
+];
+
+/// Where a value that was not set explicitly came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Layer {
+    /// A list variable (`RLX_DISABLE`, `RLX_TRACE`, `RLX_DEBUG`).
+    Family(&'static str),
+    /// The top level of the `RLX_CONFIG` file.
+    Config(String),
+    /// A profile named in `RLX_PROFILE` (built-in or from the config file).
+    Profile(String),
+}
+
+impl std::fmt::Display for Layer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Layer::Family(list) => write!(f, "{list}"),
+            Layer::Config(path) => write!(f, "RLX_CONFIG {path}"),
+            Layer::Profile(p) => write!(f, "RLX_PROFILE {p}"),
+        }
+    }
+}
+
+/// The value of registered `name` from the layers below explicit settings —
+/// families, then the config file, then profiles (the last one listed wins) —
+/// and which layer supplied it.
+pub fn layered(name: &str, raw: &impl Fn(&str) -> Option<String>) -> Option<(String, Layer)> {
+    for &(list, prefix, suffix) in FAMILIES {
+        let Some(token) = name
+            .strip_prefix(prefix)
+            .and_then(|r| r.strip_suffix(suffix))
+            .filter(|t| !t.is_empty() && name != list)
+        else {
+            continue;
+        };
+        if raw(list).is_some_and(|l| l.split(',').any(|t| t.trim().eq_ignore_ascii_case(token))) {
+            return Some(("1".into(), Layer::Family(list)));
+        }
+    }
+    let config = raw("RLX_CONFIG").map(|p| (load_config(&p), p));
+    if let Some((cfg, path)) = &config
+        && let Some(v) = cfg.top.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    {
+        return Some((v.clone(), Layer::Config(path.clone())));
+    }
+    let profiles = raw("RLX_PROFILE")?;
+    for p in profiles
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .rev()
+    {
+        let from_file = config
+            .as_ref()
+            .and_then(|(cfg, _)| cfg.profiles.iter().find(|(n, _)| n == p))
+            .and_then(|(_, kv)| kv.iter().find(|(k, _)| k == name))
+            .map(|(_, v)| v.clone());
+        let builtin = || {
+            PROFILES
+                .iter()
+                .find(|(n, _, _)| *n == p)
+                .and_then(|(_, _, kv)| kv.iter().find(|(k, _)| *k == name))
+                .map(|(_, v)| v.to_string())
+        };
+        if let Some(v) = from_file.or_else(builtin) {
+            return Some((v, Layer::Profile(p.to_string())));
+        }
     }
     None
+}
+
+/// Every registered variable the layers set, with its value and source — what
+/// `cargo rlx doctor` shows. Explicit settings are not included.
+pub fn layered_values(raw: &impl Fn(&str) -> Option<String>) -> Vec<(&'static str, String, Layer)> {
+    REGISTRY
+        .iter()
+        .filter(|e| raw(e.name).is_none())
+        .filter_map(|e| layered(e.name, raw).map(|(v, l)| (e.name, v, l)))
+        .collect()
+}
+
+/// A parsed `RLX_CONFIG` file. The format is a TOML subset:
+///
+/// ```toml
+/// # applied whenever RLX_CONFIG points here
+/// RLX_DISPATCH_REPORT = 1
+/// LINT_NUMERICS = true          # the RLX_ prefix is optional
+///
+/// [profile.bench]               # selected with RLX_PROFILE=bench
+/// RLX_CUDA_TMA = true
+/// RLX_METAL_SDPA_TUNE_CACHE = "/tmp/sdpa.cache"
+/// ```
+///
+/// `true`/`false` become `1`/`0`; quotes are stripped. Unknown keys and
+/// malformed lines are reported once on stderr and skipped.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConfigFile {
+    pub top: Vec<(String, String)>,
+    pub profiles: Vec<(String, Vec<(String, String)>)>,
+    /// One message per skipped line.
+    pub problems: Vec<String>,
+}
+
+pub fn parse_config(text: &str) -> ConfigFile {
+    let mut cfg = ConfigFile::default();
+    let mut section: Option<usize> = None;
+    for (i, line) in text.lines().enumerate() {
+        let line = strip_comment(line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(head) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            match head.trim().strip_prefix("profile.") {
+                Some(name) if !name.is_empty() => {
+                    cfg.profiles.push((name.to_string(), Vec::new()));
+                    section = Some(cfg.profiles.len() - 1);
+                }
+                _ => cfg.problems.push(format!(
+                    "line {}: unknown section [{head}] (only [profile.NAME])",
+                    i + 1
+                )),
+            }
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            cfg.problems
+                .push(format!("line {}: expected KEY = value", i + 1));
+            continue;
+        };
+        let key = env::normalize_key(k.trim());
+        if !is_registered(&key) {
+            let hint = suggest(&key)
+                .map(|s| format!("; did you mean {s}?"))
+                .unwrap_or_default();
+            cfg.problems.push(format!(
+                "line {}: {key} is not a variable rlx reads{hint}",
+                i + 1
+            ));
+            continue;
+        }
+        let v = v.trim();
+        let v = v
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(v);
+        let v = match v {
+            "true" => "1",
+            "false" => "0",
+            v => v,
+        };
+        let target = match section {
+            Some(s) => &mut cfg.profiles[s].1,
+            None => &mut cfg.top,
+        };
+        target.push((canonical_name(&key).to_string(), v.to_string()));
+    }
+    cfg
+}
+
+/// `#` starts a comment outside double quotes.
+fn strip_comment(line: &str) -> &str {
+    let mut quoted = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '#' if !quoted => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Parse `path` once per process; problems (and an unreadable file) are
+/// reported on stderr the first time.
+fn load_config(path: &str) -> std::sync::Arc<ConfigFile> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    static FILES: OnceLock<Mutex<HashMap<String, Arc<ConfigFile>>>> = OnceLock::new();
+    let files = FILES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = files.lock().unwrap_or_else(|e| e.into_inner());
+    g.entry(path.to_string())
+        .or_insert_with(|| {
+            let cfg = match std::fs::read_to_string(path) {
+                Ok(text) => parse_config(&text),
+                Err(e) => ConfigFile {
+                    problems: vec![format!("cannot read: {e}")],
+                    ..ConfigFile::default()
+                },
+            };
+            for p in &cfg.problems {
+                eprintln!("rlx: RLX_CONFIG {path}: {p}");
+            }
+            Arc::new(cfg)
+        })
+        .clone()
 }
 
 /// [`env::var`]: it resolves aliases and deprecations itself.
@@ -332,6 +624,114 @@ pub fn public_catalog_docs() -> &'static [EnvVarDoc] {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    fn reader(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| m.get(k).cloned()
+    }
+
+    #[test]
+    fn family_lists_switch_on_their_members() {
+        let raw = reader(&[("RLX_DISABLE", "cse, sccp"), ("RLX_TRACE", "gguf")]);
+        assert_eq!(
+            super::resolve("RLX_DISABLE_CSE", &raw).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            super::resolve("RLX_DISABLE_SCCP", &raw).as_deref(),
+            Some("1")
+        );
+        assert_eq!(super::resolve("RLX_GGUF_TRACE", &raw).as_deref(), Some("1"));
+        assert_eq!(super::resolve("RLX_METAL_TRACE", &raw), None);
+        assert_eq!(super::resolve("RLX_DISABLE_MPS", &raw), None);
+        // An explicit value beats the family.
+        let raw = reader(&[("RLX_DISABLE", "cse"), ("RLX_DISABLE_CSE", "0")]);
+        assert_eq!(
+            super::resolve("RLX_DISABLE_CSE", &raw).as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn profiles_layer_below_explicit_values_and_later_ones_win() {
+        let raw = reader(&[("RLX_PROFILE", "debug")]);
+        assert_eq!(
+            super::resolve("RLX_DISPATCH_REPORT", &raw).as_deref(),
+            Some("1")
+        );
+        let raw = reader(&[("RLX_PROFILE", "debug"), ("RLX_DISPATCH_REPORT", "0")]);
+        assert_eq!(
+            super::resolve("RLX_DISPATCH_REPORT", &raw).as_deref(),
+            Some("0")
+        );
+        let raw = reader(&[("RLX_PROFILE", "debug,nans")]);
+        assert_eq!(super::resolve("RLX_DEBUG_NANS", &raw).as_deref(), Some("1"));
+        assert_eq!(super::resolve("RLX_VERBOSE", &raw).as_deref(), Some("1"));
+        let layered = super::layered_values(&raw);
+        assert!(layered.iter().any(
+            |(n, _, l)| *n == "RLX_LINT_NUMERICS" && *l == super::Layer::Profile("nans".into())
+        ));
+    }
+
+    /// Every profile setting must name a registered variable, or the profile
+    /// silently sets nothing.
+    #[test]
+    fn every_profile_setting_is_registered() {
+        for (p, _, kv) in super::PROFILES {
+            for (k, _) in *kv {
+                assert!(
+                    super::is_registered(k),
+                    "profile {p}: {k} is not registered"
+                );
+            }
+        }
+        for (list, _, _) in super::FAMILIES {
+            assert!(super::is_registered(list), "{list} is not registered");
+        }
+    }
+
+    #[test]
+    fn config_file_parses_top_level_profiles_and_reports_problems() {
+        let cfg = super::parse_config(
+            "# comment\n\
+             RLX_DISPATCH_REPORT = true\n\
+             LINT_NUMERICS = 1   # prefix optional\n\
+             RLX_DISPACH_REPORT = 1\n\
+             [profile.bench]\n\
+             RLX_METAL_SDPA_TUNE_CACHE = \"/tmp/a#b\"\n\
+             [weird]\n\
+             nonsense\n",
+        );
+        assert_eq!(
+            cfg.top,
+            vec![
+                ("RLX_DISPATCH_REPORT".to_string(), "1".to_string()),
+                ("RLX_LINT_NUMERICS".to_string(), "1".to_string()),
+            ]
+        );
+        assert_eq!(cfg.profiles.len(), 1);
+        assert_eq!(cfg.profiles[0].0, "bench");
+        assert_eq!(cfg.profiles[0].1[0].1, "/tmp/a#b");
+        assert_eq!(cfg.problems.len(), 3, "{:?}", cfg.problems);
+        assert!(cfg.problems[0].contains("did you mean RLX_DISPATCH_REPORT"));
+    }
+
+    #[test]
+    fn typos_get_the_nearest_registered_name() {
+        const TYPO: &str = "RLX_DISPATCH_REPOT"; // env-lint: ignore
+        const SHORT_TYPO: &str = "RLX_VERBSE"; // env-lint: ignore
+        const FAR: &str = "RLX_ZZZZZZZZZZZZZZZZZZZZ"; // env-lint: ignore
+        assert_eq!(super::suggest(TYPO), Some("RLX_DISPATCH_REPORT"));
+        assert_eq!(super::suggest(FAR), None);
+        assert_eq!(super::levenshtein("kitten", "sitting"), 3);
+        let unknown = super::unknown_vars(["RLX_VERBOSE", SHORT_TYPO, "PATH"].map(String::from));
+        assert_eq!(unknown, vec![(SHORT_TYPO.to_string(), Some("RLX_VERBOSE"))]);
+    }
+
     use super::*;
 
     #[test]

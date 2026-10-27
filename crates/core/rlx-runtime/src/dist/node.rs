@@ -204,6 +204,62 @@ impl NodeCaps {
     }
 }
 
+/// What this process advertises as a node: the devices it can run (as built
+/// and detected), its platform, memory when known, and version.
+pub fn advert_props() -> std::collections::BTreeMap<String, String> {
+    let devices: Vec<String> = crate::available_devices()
+        .into_iter()
+        .map(|d| d.as_arg().to_string())
+        .collect();
+    let mut props = std::collections::BTreeMap::from([
+        ("platform".to_string(), platform_tag().to_string()),
+        ("devices".to_string(), devices.join(",")),
+    ]);
+    if let Some(gb) = memory_gb() {
+        props.insert("mem_gb".into(), format!("{gb:.0}"));
+    }
+    props
+}
+
+/// Physical memory in GB: `/proc/meminfo` (Linux, Android) or `hw.memsize`
+/// (macOS). `None` elsewhere — an iOS app cannot spawn `sysctl`, and its
+/// shell knows the figure (`ProcessInfo.physicalMemory`) anyway.
+fn memory_gb() -> Option<f64> {
+    if let Ok(m) = std::fs::read_to_string("/proc/meminfo") {
+        let kb: f64 = m
+            .lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        return Some(kb / (1u64 << 20) as f64);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        let b: f64 = String::from_utf8(out.stdout).ok()?.trim().parse().ok()?;
+        return Some(b / (1u64 << 30) as f64);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Advertise this process as `_rlx-node._tcp` named `name`, taking shard
+/// traffic on `port`, until the returned value is dropped — the backends are
+/// this binary's own, so what it advertises is what it can run.
+#[cfg(feature = "mdns")]
+pub fn advertise_here(name: &str, port: u16) -> std::io::Result<rlx_driver::mdns::Advertisement> {
+    rlx_driver::mdns::advertise_node(&rlx_driver::mdns::NodeAdvert {
+        name: name.to_string(),
+        port,
+        props: advert_props(),
+    })
+}
+
 /// Compile-time platform tag. Not a capability — just an identifier, so a
 /// coordinator log says *which* kind of node answered.
 ///
@@ -428,12 +484,44 @@ impl NodeConfig {
 
     /// Build the transport and join the mesh.
     pub fn connect(&self) -> std::io::Result<Arc<ProcessGroup>> {
+        // `RLX_BLE_SERVE=<name>`: also accept this rank's mesh connections
+        // over Bluetooth LE, advertised as `name`. A peer's bridge
+        // (`rlx_driver::ble::bridge`) carries them here from localhost.
+        // Once per process: a persistent node connects for every job, and
+        // the advertisement it started first keeps serving them all.
+        #[cfg(all(
+            feature = "ble",
+            not(target_os = "windows"),
+            not(target_arch = "wasm32")
+        ))]
+        static BLE_SERVED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        #[cfg(all(
+            feature = "ble",
+            not(target_os = "windows"),
+            not(target_arch = "wasm32")
+        ))]
+        if let Ok(name) = rlx_ir::env::read("RLX_BLE_SERVE")
+            && !name.is_empty()
+            && let PeerSource::Static(v) = &self.peers
+            && let Some(own) = v.get(self.rank as usize)
+            && !BLE_SERVED.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let port = rlx_driver::resolve_addr(own)?.port();
+            if let Err(e) = rlx_driver::ble::serve(&name, port) {
+                eprintln!("rlx-node: BLE unavailable, staying on the network: {e}");
+            }
+        }
         let mut node = Node::new(self.rank, self.world).topology(self.topology);
         if let Some(n) = self.heap_bytes {
             node = node.heap_bytes(n);
         }
         node = match &self.peers {
-            PeerSource::Static(v) => node.peers(v.iter().map(String::as_str))?,
+            PeerSource::Static(v) => node.peers(
+                v.iter()
+                    .map(|a| rlx_driver::resolve_addr(a))
+                    .collect::<std::io::Result<Vec<_>>>()?,
+            )?,
             PeerSource::Discover {
                 disc_port,
                 data_base,

@@ -37,7 +37,11 @@ fn ints(v: &[u8]) -> Vec<i32> {
 
 #[test]
 fn metal_fft_q_matches_cpu_exactly() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }

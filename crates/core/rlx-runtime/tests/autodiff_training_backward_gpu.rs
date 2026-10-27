@@ -247,8 +247,7 @@ fn cpu_rms_norm_backward_input_matches_finite_difference() {
 #[test]
 fn wgpu_rms_norm_backward_input_matches_cpu() {
     let _gpu = common::serialize_gpu();
-    if !rlx_wgpu::is_available() {
-        eprintln!("skip wgpu_rms_norm_backward_input_matches_cpu: no adapter");
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
         return;
     }
     let (x, gamma, beta, dy) = rms_norm_inputs();
@@ -418,8 +417,7 @@ fn build_rope_bwd_graph_packed() -> Graph {
 #[test]
 fn wgpu_rope_backward_matches_cpu() {
     let _gpu = common::serialize_gpu();
-    if !rlx_wgpu::is_available() {
-        eprintln!("skip wgpu_rope_backward_matches_cpu: no adapter");
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
         return;
     }
     let (dy, cos, sin) = rope_inputs();
@@ -496,8 +494,7 @@ fn metal_rope_backward_matches_cpu() {
 fn wgpu_rope_backward_packed_table_matches_cpu() {
     let _gpu = common::serialize_gpu();
     use rlx_runtime::{CompileOptions, Session};
-    if !rlx_wgpu::is_available() {
-        eprintln!("skip: no adapter");
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
         return;
     }
     let (dy, cos, sin) = rope_inputs_packed();
@@ -601,8 +598,7 @@ fn cumsum_inputs() -> Vec<f32> {
 #[test]
 fn wgpu_cumsum_backward_matches_cpu() {
     let _gpu = common::serialize_gpu();
-    if !rlx_wgpu::is_available() {
-        eprintln!("skip wgpu_cumsum_backward_matches_cpu: no adapter");
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
         return;
     }
     let dy = cumsum_inputs();
@@ -700,8 +696,7 @@ fn gather_inputs() -> (Vec<f32>, Vec<f32>) {
 #[test]
 fn wgpu_gather_backward_matches_cpu() {
     let _gpu = common::serialize_gpu();
-    if !rlx_wgpu::is_available() {
-        eprintln!("skip wgpu_gather_backward_matches_cpu: no adapter");
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
         return;
     }
     let (dy, indices) = gather_inputs();

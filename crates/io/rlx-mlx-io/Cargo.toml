@@ -12,17 +12,26 @@ readme                 = "README.md"
 repository.workspace   = true
 documentation.workspace = true
 
+[features]
+# Reading weights from disk / the HF cache: the loaders (`load_path*`, `.npz`/
+# `.npy`, safetensors), `collect_packed_linears`, the llama-like graph builders.
+# Without it the crate is the quant math alone — `MlxConfig`, the affine / mxfp
+# dequant kernels, RoPE tables — which is all a backend (rlx-cpu, rlx-metal, …)
+# uses.
+default = ["io"]
+io = ["dep:memmap2", "dep:libc", "dep:npyz", "dep:zip", "dep:safetensors"]
+
 [dependencies]
 anyhow = "1"
 half = { version = "2", features = ["bytemuck"] }
-memmap2 = "0.9"
+memmap2 = { version = "0.9", optional = true }
 rayon = "1.10"
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 # `npz` is read with zip 9 directly: npyz's `npz` feature pulls zip 0.6 and
 # with it zstd 0.11 (RUSTSEC-2026-0391/0403).
-npyz = { version = "0.8", features = ["half"] }
-zip = { version = "9", default-features = false, features = ["deflate"] }
-safetensors = "0.7"
+npyz = { version = "0.8", features = ["half"], optional = true }
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
+safetensors = { version = "0.7", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rlx-ir = { workspace = true }
@@ -31,6 +40,10 @@ rlx-ir = { workspace = true }
 tempfile = "3"
 # Path-only: run packed Linear via Session (published manifest strips this).
 rlx-runtime = { path = "../../core/rlx-runtime", default-features = false, features = ["cpu"] }
+
+[[example]]
+name = "mlx_dequant_dump"
+required-features = ["io"]
 
 [lints]
 workspace = true

@@ -109,6 +109,7 @@ pub fn get_or_build_pipeline(device: &wgpu::Device, k: &dyn WgpuGpuKernel) -> Ar
 /// binding so params carry a tight `array<u32>` with no 16-byte stride padding.
 fn build_custom_kernel(device: &wgpu::Device, wgsl: &str, entry_point: &str) -> Kernel {
     let label = "rlx-wgpu custom gpu";
+    crate::kernels::dump_wgsl(label, wgsl);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(wgsl.into()),

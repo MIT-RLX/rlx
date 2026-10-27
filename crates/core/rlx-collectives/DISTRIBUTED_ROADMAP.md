@@ -118,9 +118,11 @@ benchmarked if the machines are bridged (offered separately).
 | Quantized-on-device stage (`WEIGHTS_FMT=q8`) | ✅ Q8_0-packed GGUF → `U8` param → `DequantMatMul` across the mesh (Metal + CPU), matches dequant reference |
 | aarch64 / Raspberry Pi (cross-compile + QEMU) | ✅ BLAS-optional `rlx-cpu`; `./rig.sh cross-pi` / `test-pi` |
 | Per-region multi-backend placement | ✅ `MODE=multidev` (region→device, host transfer at boundary) |
-| 1F1B / interleaved pipeline scheduler + bubble model | ⏳ planner treats PP as ideal; needs micro-batch schedule |
-| ZeRO/FSDP optimizer-state sharding | ⏳ design only |
-| MPI-shaped launcher / `rsmpi` interop | ⏳ `dist_node` + UDP discovery is the minimal launcher |
+| Micro-batched streaming pipeline (inference) + speed-weighted layer split | ✅ `dist::pipeline_run`/`serve_stage_stream`, `planner::split_layers`/`recommend_inference`, `MODE=pipestream` (2.65× over one batch, 7 devices) |
+| 1F1B / interleaved pipeline scheduler for **training** | ⏳ |
+| ZeRO-1 optimizer-state sharding | ✅ `TrainOptions::zero` (reduce-scatter → slice update → all-gather); ZeRO-2/3 / FSDP ⏳ |
+| Multi-host launcher | ✅ `cargo rlx dist` (ssh, per-device ranks, sync/build, retries, fail-fast); `rsmpi` interop ⏳ |
+| Rendezvous over TCP/UDP + zero-config, QUIC/UDP data transport | ✅ `RENDEZVOUS=tcp|udp|auto`, `TRANSPORT=quic` |
 | NIXL (KV/activation transfer for disaggregated inference) | ⏳ design only — NVIDIA lib, not testable here |
 | WideEP MoE (dispatch/combine, `all_to_all_v`, EPLB + replicas + migrate) | ✅ host collectives in `rlx-collectives::{moe_ep,eplb}`; NCCL `all_reduce`/`all_to_all` seam ✅ (`rlx-cuda` `--features nccl`); device `moe_*` still host |
 | NCCL/RCCL device-resident collectives | ✅ CUDA scaffold (`distributed.rs` + collective_host hook); ⏳ multi-GPU validate; ⏳ RCCL |

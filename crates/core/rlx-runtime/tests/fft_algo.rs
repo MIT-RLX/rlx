@@ -141,9 +141,15 @@ fn parallel_rows_and_no_fma_option() {
             assert_eq!(bits(&got[r]), bits(&want), "{algo:?} row {r}");
         }
     }
-    // the options are live: Native, fused and unfused pocketfft round differently
+    // the options are live: Native, fused and unfused pocketfft round differently.
+    // `Clang` contraction fuses on every target; `SCIPY` fuses only where SciPy's
+    // own compiler does (Apple), so on Linux it IS the unfused build.
     let native = run_f64(&rows[..1], false, FftNorm::Backward, FftAlgo::Native);
-    let fused = run_f64(&rows[..1], false, FftNorm::Backward, FftAlgo::SCIPY);
+    let always_fused = FftAlgo::PocketFft {
+        contraction: FftContraction::Clang,
+        twiddles: FftTwiddles::Platform,
+    };
+    let fused = run_f64(&rows[..1], false, FftNorm::Backward, always_fused);
     let unfused = run_f64(
         &rows[..1],
         false,

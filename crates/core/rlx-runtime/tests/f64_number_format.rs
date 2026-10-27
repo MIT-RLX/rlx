@@ -384,3 +384,79 @@ fn double_single_runs_the_block_on_every_backend() {
         "double-single off the f64 reference: {bad:?}"
     );
 }
+
+#[test]
+fn f64_mean_reduction_runs_natively_on_the_cpu() {
+    // A mean whose f32 sum loses digits: f32 spacing at 1e8 is 8, so
+    // 1e8 + 4 + 4 + 4 stays 1e8 in f32 (mean 2.5e7) but is 1e8 + 12 in f64
+    // (mean 25000003, which narrows to 25000004 ≠ 2.5e7).
+    let mut g = Graph::new("f64_mean");
+    let x = g.input("x", sh(&[2, 4]));
+    let m = g.add_node(
+        Op::Reduce {
+            op: rlx_ir::op::ReduceOp::Mean,
+            axes: vec![1],
+            keep_dim: false,
+        },
+        vec![x],
+        sh(&[2]),
+    );
+    g.set_outputs(vec![m]);
+    let opts = CompileOptions {
+        number_format: Some(NumberFormat::F64),
+        ..Default::default()
+    };
+    let mut c = Session::new(Device::Cpu).compile_with(g, &opts);
+    let xs = [1e8f32, 4.0, 4.0, 4.0, 2.0, 4.0, 6.0, 8.0];
+    let out = c.run(&[("x", &xs[..])]).remove(0);
+    assert_eq!(out, vec![25_000_004.0, 5.0]);
+    assert_ne!(out[0], 2.5e7, "an f32 sum would give 2.5e7");
+}
+
+#[test]
+fn softmax_cross_entropy_in_double_single_matches_f64() {
+    // Logits spread over a wide range so the f32 log seed alone is visibly
+    // short of f64; one Newton step must close the gap.
+    let (n, c) = (3usize, 5usize);
+    let z: Vec<f32> = (0..n * c)
+        .map(|i| ((i * 37 % 11) as f32 - 5.0) * 1.7)
+        .collect();
+    let labels = [2.0f32, 0.0, 4.0];
+    let dl = [1.0f32, 0.5, 2.0];
+    let mut g = Graph::new("sce_df");
+    let zi = g.input("z", sh(&[n, c]));
+    let yi = g.input("y", sh(&[n]));
+    let di = g.input("dl", sh(&[n]));
+    let l = g.add_node(Op::SoftmaxCrossEntropyWithLogits, vec![zi, yi], sh(&[n]));
+    let dz = g.add_node(
+        Op::SoftmaxCrossEntropyBackward,
+        vec![zi, yi, di],
+        sh(&[n, c]),
+    );
+    g.set_outputs(vec![l, dz]);
+    let opts = CompileOptions {
+        number_format: Some(NumberFormat::F64x2),
+        ..Default::default()
+    };
+    let mut cg = Session::new(Device::Cpu).compile_with(g, &opts);
+    let out = cg.run(&[("z", &z[..]), ("y", &labels[..]), ("dl", &dl[..])]);
+    // f64 host reference.
+    for r in 0..n {
+        let row: Vec<f64> = z[r * c..(r + 1) * c].iter().map(|&v| v as f64).collect();
+        let m = row.iter().cloned().fold(f64::MIN, f64::max);
+        let s: f64 = row.iter().map(|v| (v - m).exp()).sum();
+        let lab = labels[r] as usize;
+        let loss = m + s.ln() - row[lab];
+        assert!(
+            ((out[0][r] as f64) - loss).abs() <= 1e-6 * loss.abs().max(1.0),
+            "loss row {r}: {} vs {loss}",
+            out[0][r]
+        );
+        for k in 0..c {
+            let p = (row[k] - m).exp() / s;
+            let want = (p - f64::from(k == lab)) * dl[r] as f64;
+            let got = out[1][r * c + k] as f64;
+            assert!((got - want).abs() <= 1e-6, "dz[{r},{k}]: {got} vs {want}");
+        }
+    }
+}

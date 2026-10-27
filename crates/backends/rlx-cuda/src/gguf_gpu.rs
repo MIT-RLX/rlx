@@ -30,7 +30,7 @@ fn slab_bytes_for(scheme: rlx_ir::quant::QuantScheme, k: usize, n: usize) -> usi
 pub fn gguf_fused_m1_env_disabled() -> bool {
     matches!(
         rlx_ir::env::var("RLX_CUDA_GGUF_FUSED_M1")
-            .or_else(|| rlx_ir::env::var("ORPHEUS_CUDA_GGUF_FUSED_M1"))
+            .or_else(|| std::env::var("ORPHEUS_CUDA_GGUF_FUSED_M1").ok())
             .as_deref(),
         Some("0") | Some("false") | Some("off")
     )
@@ -55,9 +55,10 @@ pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
             // 4 GiB) that would push the arena past 16 GiB VRAM and OOM.
             // When `RLX_CUDA_GGUF_FUSED_M1=0`, keep planning scratch so the
             // dequant+matmul fallback stays on-device (or host if scratch is 0).
-            if m == 1
-                && !fused_disabled
-                && gguf_fused_gemv_m1_supported(crate::gguf_host::gguf_scheme_id(*scheme), m, k)
+            let scheme_id = crate::gguf_host::gguf_scheme_id(*scheme);
+            if !fused_disabled
+                && (gguf_fused_gemv_m1_supported(scheme_id, m, k)
+                    || gguf_gemv_rows_supported(scheme_id, m, k))
             {
                 continue;
             }
@@ -106,8 +107,75 @@ pub fn gguf_fused_gemv_m1_supported(scheme_id: u32, m: usize, k: usize) -> bool 
         25 => k.is_multiple_of(128),
         // G8_0 (Pestle token_embd / lm_head): 32-elem blocks
         28 => k.is_multiple_of(32),
+        // Q8_0: 32-elem blocks; Q5_K: 256 (`gguf_gemv_elem` only)
+        20 => k.is_multiple_of(32),
+        1 => gguf_gemv_elem_enabled() && k.is_multiple_of(256),
         _ => false,
     }
+}
+
+/// Most activation rows [`run_dequant_matmul_gguf_gemv_rows`] takes.
+pub const GGUF_GEMV_MAX_ROWS: usize = 4;
+
+/// Whether the few-row GEMV covers `m` rows of this scheme (a speculative
+/// verify step's 2–4 tokens): the element-strided kernel's schemes.
+pub fn gguf_gemv_rows_supported(scheme_id: u32, m: usize, k: usize) -> bool {
+    (2..=GGUF_GEMV_MAX_ROWS).contains(&m)
+        && match scheme_id {
+            20 => k.is_multiple_of(32),
+            1 => k.is_multiple_of(256),
+            0 | 2 => gguf_gemv_elem_enabled() && k.is_multiple_of(256),
+            _ => false,
+        }
+}
+
+/// The element-strided GEMV for `m` (2–4) rows: each weight chunk decoded
+/// once for every row, each row's output the `m == 1` kernel's.
+#[allow(clippy::too_many_arguments)]
+pub fn run_dequant_matmul_gguf_gemv_rows(
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    buffer: &mut CudaSlice<f32>,
+    m: usize,
+    n: usize,
+    k: usize,
+    scheme_id: u32,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    out_byte_off: usize,
+) {
+    debug_assert!(gguf_gemv_rows_supported(scheme_id, m, k));
+    let kernel = crate::kernels::dequant_matmul_gguf_gemv_rows_kernel(ctx);
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(8), 1, 1),
+        block_dim: (256u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (m_u, n_u, k_u) = (m as u64, n as u64, k as u64);
+    let x_u = (x_byte_off / 4) as u64;
+    let w_u = w_byte_off as u64;
+    let out_u = (out_byte_off / 4) as u64;
+    let mut launcher = stream.launch_builder(&kernel.function);
+    launcher
+        .arg(&mut *buffer)
+        .arg(&m_u)
+        .arg(&n_u)
+        .arg(&k_u)
+        .arg(&x_u)
+        .arg(&w_u)
+        .arg(&out_u)
+        .arg(&scheme_id);
+    unsafe {
+        launcher
+            .launch(cfg)
+            .expect("rlx-cuda: dequant_matmul_gguf_gemv_rows launch failed");
+    }
+}
+
+/// The element-strided decode GEMV for Q4_K / Q6_K (Q8_0 always uses it):
+/// on unless `RLX_GGUF_GEMV_ELEM=0`.
+pub fn gguf_gemv_elem_enabled() -> bool {
+    rlx_ir::env::var("RLX_GGUF_GEMV_ELEM").as_deref() != Some("0")
 }
 
 /// Launch fused GGUF GEMV (`m == 1`) — one thread per output column for
@@ -263,6 +331,39 @@ pub fn run_dequant_matmul_gguf_gemv_m1(
             launcher
                 .launch(cfg)
                 .expect("rlx-cuda: dequant_matmul_gguf_q4k_gemv launch failed");
+        }
+        return;
+    }
+
+    // Q8_0 / Q4_K / Q5_K / Q6_K: one block per row, threads striding its elements
+    // (all busy at any k). `RLX_GGUF_GEMV_ELEM=0` keeps the one-thread-per-row
+    // scalar kernel for Q4_K / Q6_K.
+    if scheme_id == 20 || scheme_id == 1 || gguf_gemv_elem_enabled() {
+        let kernel = crate::kernels::dequant_matmul_gguf_gemv_elem_kernel(ctx);
+        // 8 rows of 32 threads per block.
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(8), 1, 1),
+            block_dim: (256u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_u = n as u64;
+        let k_u = k as u64;
+        let x_u = x_off as u64;
+        let w_u = w_byte_off as u64;
+        let out_u = out_off as u64;
+        let mut launcher = stream.launch_builder(&kernel.function);
+        launcher
+            .arg(&mut *buffer)
+            .arg(&n_u)
+            .arg(&k_u)
+            .arg(&x_u)
+            .arg(&w_u)
+            .arg(&out_u)
+            .arg(&scheme_id);
+        unsafe {
+            launcher
+                .launch(cfg)
+                .expect("rlx-cuda: dequant_matmul_gguf_gemv_elem launch failed");
         }
         return;
     }

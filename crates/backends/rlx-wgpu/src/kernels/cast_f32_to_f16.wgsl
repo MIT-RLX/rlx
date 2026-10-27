@@ -11,9 +11,11 @@ enable f16;
 // downcast of arena[off..off+len].
 
 struct Params {
-    src_off: u32,   // f32-element offset (also f16-element offset; packed densely)
+    src_off: u32,   // f32-element offset into the bound f32 arena window
     len: u32,       // element count
-    _p0: u32, _p1: u32,
+    dst_off: u32,   // f16-element offset into the bound f16 window (aligned
+                    // on its own, so not `src_off`)
+    _p1: u32,
 };
 
 // Bind ordering matches `build_kernel_3`: 0=f16(rw), 1=uniform, 2=f32 arena(rw).
@@ -26,5 +28,5 @@ fn cast_f32_to_f16(@builtin(global_invocation_id) gid: vec3<u32>,
                    @builtin(num_workgroups) ngs: vec3<u32>) {
     let i = gid.x + gid.y * ngs.x * 64u;
     if (i >= params.len) { return; }
-    arena_f16[params.src_off + i] = f16(arena[params.src_off + i]);
+    arena_f16[params.dst_off + i] = f16(arena[params.src_off + i]);
 }

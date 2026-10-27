@@ -24,6 +24,10 @@ struct NodeView: View {
     @State private var mode: RlxNode.Mode = .infer
     @State private var status = "idle"
     @State private var failure: String?
+    /// `onAppear` can fire more than once; launch arguments apply once.
+    @State private var launched = false
+    /// Bonjour record for this device (`_rlx-node._tcp`) while the app is open.
+    private static let advertiser = RlxAdvertiser()
 
     /// The node serves on a native thread; this only polls it.
     private let tick = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
@@ -63,6 +67,7 @@ struct NodeView: View {
                     Picker("Mode", selection: $mode) {
                         Text("Inference").tag(RlxNode.Mode.infer)
                         Text("Training").tag(RlxNode.Mode.train)
+                        Text("Any model").tag(RlxNode.Mode.model)
                     }
                     // `.segmented` is iOS/macOS/visionOS only. A TV picks with
                     // focus and a watch with the crown, and the default style
@@ -70,7 +75,7 @@ struct NodeView: View {
                     #if !os(tvOS) && !os(watchOS)
                     .pickerStyle(.segmented)
                     #endif
-                    if mode == .train {
+                    if mode != .infer {
                         Text("A training rank cannot leave partway — the gradient reduce is a barrier, so backgrounding the app stalls every other rank.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -98,7 +103,21 @@ struct NodeView: View {
         #if !os(visionOS)
         .navigationViewStyle(.stack)
         #endif
-        .onReceive(tick) { _ in status = RlxNode.status }
+        .onReceive(tick) { _ in
+            let now = RlxNode.status
+            if now != status {
+                // Status changes on stderr, so a launcher streaming the console
+                // (`devicectl … --console`) sees the rank's progress.
+                FileHandle.standardError.write("rlx-demo: status \(now)\n".data(using: .utf8)!)
+            }
+            status = now
+            // `-exitwhendone YES`: a launched rank ends with its job, so the
+            // launcher sees it finish (and how).
+            if UserDefaults.standard.bool(forKey: "exitwhendone"),
+               now.hasPrefix("ok:") || now.hasPrefix("error:") {
+                exit(now.hasPrefix("ok:") ? 0 : 1)
+            }
+        }
         .onAppear { applyLaunchArguments() }
     }
 
@@ -142,13 +161,45 @@ struct NodeView: View {
     ///     -rank 1 -world 2 -peers 127.0.0.1:29500 -autojoin YES
     /// ```
     private func applyLaunchArguments() {
+        guard !launched else { return }
+        launched = true
         let d = UserDefaults.standard
+        // `-logfile YES`: stderr — this view's lines and the Rust node's —
+        // goes to Documents/rlx-node.log, headed by the launcher's `-jobid`.
+        // A launcher reads it with `devicectl device copy from`, so the app
+        // can stay open after a job: `--console` would tie the app's life to
+        // the devicectl session (it forwards every signal to the app).
+        if d.bool(forKey: "logfile"),
+           let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            let path = dir.appendingPathComponent("rlx-node.log").path
+            FileManager.default.createFile(
+                atPath: path,
+                contents: "rlx-demo: job \(d.string(forKey: "jobid") ?? "-")\n".data(using: .utf8))
+            if freopen(path, "a", stderr) != nil {
+                setvbuf(stderr, nil, _IONBF, 0)
+            }
+        }
+        // Say on the LAN that this device can be a rank — `cargo rlx nodes`
+        // lists it, and a cluster file host `addr = "mdns"` finds it by name.
+        // iOS 16+ reports a generic device name without a special
+        // entitlement, so `-nodename` sets the one a cluster file uses.
+        let nodeName = d.string(forKey: "nodename") ?? Self.deviceName()
+        let advertisedRank = Int32(d.string(forKey: "rank") ?? rank) ?? 1
+        Self.advertiser.onChange = { st in
+            FileHandle.standardError.write("rlx-demo: bonjour \(st)\n".data(using: .utf8)!)
+        }
+        Self.advertiser.start(name: nodeName, port: 29500 + advertisedRank)
+        FileHandle.standardError.write(
+            "rlx-demo: advertising \(nodeName) as _rlx-node._tcp \(RlxNode.advert)\n".data(using: .utf8)!)
         if let v = d.string(forKey: "rank") { rank = v }
         if let v = d.string(forKey: "world") { world = v }
         if let v = d.string(forKey: "peers") { peers = v }
         if let v = d.string(forKey: "device") { device = v }
-        if d.string(forKey: "mode") == "train" { mode = .train }
+        if let m = d.string(forKey: "mode").flatMap(RlxNode.Mode.init(rawValue:)) { mode = m }
         if d.bool(forKey: "discover") { useDiscovery = true }
+        // The other ranks dial this address, so say it where a launcher sees it.
+        FileHandle.standardError.write(
+            "rlx-demo: lan address \(Self.lanAddress() ?? "none")\n".data(using: .utf8)!)
         FileHandle.standardError.write(
             "rlx-demo: launch args rank=\(rank) world=\(world) peers=\(peers) mode=\(mode.rawValue) autojoin=\(d.bool(forKey: "autojoin"))\n"
                 .data(using: .utf8)!)
@@ -178,6 +229,34 @@ struct NodeView: View {
         FileHandle.standardError.write(
             "rlx-demo: start -> status=\(status) failure=\(failure ?? "none")\n"
                 .data(using: .utf8)!)
+    }
+}
+
+extension NodeView {
+    static func deviceName() -> String {
+        #if os(watchOS)
+        return "watch"
+        #else
+        return UIDevice.current.name
+        #endif
+    }
+
+    /// This device's IPv4 address on Wi-Fi (`en0`), if it has one.
+    static func lanAddress() -> String? {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return nil }
+        defer { freeifaddrs(head) }
+        for p in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let a = p.pointee
+            guard let sa = a.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET),
+                  String(cString: a.ifa_name) == "en0" else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count),
+                           nil, 0, NI_NUMERICHOST) == 0 {
+                return String(cString: host)
+            }
+        }
+        return nil
     }
 }
 

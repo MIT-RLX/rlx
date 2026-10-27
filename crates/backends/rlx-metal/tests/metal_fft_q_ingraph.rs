@@ -42,7 +42,11 @@ fn build(n: usize, inverse: bool, scale: FftQScale) -> Graph {
 
 #[test]
 fn metal_fft_q_matches_cpu_and_the_kernel() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }

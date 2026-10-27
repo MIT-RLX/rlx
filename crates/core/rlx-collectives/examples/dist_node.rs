@@ -29,7 +29,11 @@
 //!   RANK   this process's rank in 0..WORLD            (default 0)
 //!   WORLD  number of ranks                            (default 1)
 //!   PEERS  comma-separated host:port, one per rank    (default loopback pair)
-//!   MODE   infer | train | both | bench | pipeline | topology | placement |
+//!   RENDEZVOUS  tcp://host:port | udp://host:port — learn every address from
+//!          rank 0 instead of PEERS; workers may use RANK=auto and omit WORLD
+//!   TRANSPORT  tcp | quic — collectives over TCP (default) or QUIC/UDP
+//!          (build with --features iroh)
+//!   MODE   infer | train | both | bench | pipeline | pipestream | topology | placement |
 //!          multidev | parity | federated | coordinator | worker | autofleet |
 //!          benchfleet   (default both)
 //!          benchfleet = each rank benches its own device (inference GFLOP/s +
@@ -45,6 +49,17 @@
 //!                      Knobs: FLEET_MODE, FLEET_HOST (default 127.0.0.1),
 //!                      FLEET_PORT (default 29600), FLEET_TF32 (default 0 =
 //!                      precise f32 for CUDA; 1 = fast TF32 tensor cores).
+//!          model = train / run any .rlxp package function across the mesh
+//!                  (PKG, TASK=info|infer|generate|train, FUNCTION, DIMS, …;
+//!                  see run_model); rank 0 holds the package, workers serve
+//!          dtypes = per-device compute dtype table (f32/f16/bf16 matmul
+//!                   GFLOP/s + error vs f64; ≡cpu marks bit-identical results)
+//!          pipestream = micro-batched pipeline inference planned from the live
+//!                       mesh (layers split by measured GFLOP/s, micro-batch
+//!                       count + activation width from the link); PS_LAYERS,
+//!                       PS_D, PS_TOKENS, PS_MICRO, PS_WIRE (plan | auto |
+//!                       f32 | bf16 | f16), PS_FORMAT (compute number format) (plan|auto|f32|bf16|f16),
+//!                       PS_FORMAT (compute number format)
 //!          parity = cross-backend divergence diagnostic on this node (CPU oracle
 //!                   vs every local backend) — flags round-off vs kernel-bug drift
 //!          federated = bounded-staleness federated averaging (LATE_MS makes
@@ -400,17 +415,49 @@ fn main() {
     });
     let (rank, world) = (node.rank(), node.world());
     let mode = env("MODE", "both");
+    // MODE=advertise: no job — say on the LAN that this machine can be a rank
+    // (`_rlx-node._tcp`, Bonjour/Avahi) with this binary's backends, until
+    // killed. `cargo rlx nodes` lists it; a cluster file names it by NAME.
+    if mode == "advertise" {
+        let name = env("NAME", &env("LABEL", "rlx-node"));
+        let port: u16 = env("PORT", "29500").parse().expect("PORT");
+        let _ad = rlx_runtime::dist::node::advertise_here(&name, port)
+            .unwrap_or_else(|e| panic!("advertise: {e}"));
+        eprintln!(
+            "advertising {name:?} on port {port}: {:?} — Ctrl-C to stop",
+            rlx_runtime::dist::node::advert_props()
+        );
+        loop {
+            std::thread::park();
+        }
+    }
     let steps: usize = env("STEPS", "200").parse().expect("STEPS");
     let accum: usize = env("ACCUM", "1").parse::<usize>().expect("ACCUM").max(1);
-    let label = env("LABEL", &format!("rank{rank}"));
+    // RANK=auto (rendezvous): the coordinator assigns the rank at connect.
+    let auto = rank == rlx_driver::RANK_UNASSIGNED;
+    let shown = |v: u32| if auto { "?".to_string() } else { v.to_string() };
+    let mut label = env("LABEL", &format!("rank{}", shown(rank)));
     let device = resolve_device(&env("DEVICE", "cpu"), &label);
     eprintln!(
-        "[{label}] rank {rank}/{world}  device={}  mode={mode}",
+        "[{label}] rank {}/{}  device={}  mode={mode}",
+        shown(rank),
+        if auto && world == 0 {
+            "?".to_string()
+        } else {
+            world.to_string()
+        },
         device_label(device)
     );
     print_inventory(&label);
 
     register(); // install in-graph collective op (idempotent)
+
+    // `PERSIST=1` (MODE=model, a worker rank): stay up between jobs, serving
+    // one after another and keeping the stage — compiled, weights and all —
+    // for a next job with the same plan.
+    if mode == "model" && !auto && rank != 0 && env("PERSIST", "0") != "0" {
+        run_persistent(&label, device);
+    }
 
     // Join the mesh — the builder handles mesh vs. star (DIAL_OUT), peer
     // discovery, and Arc wrapping.
@@ -419,6 +466,16 @@ fn main() {
         std::process::exit(1);
     });
     register_group(GID, group.clone());
+    if auto {
+        if std::env::var("LABEL").is_err() {
+            label = format!("rank{}", group.rank());
+        }
+        eprintln!(
+            "[{label}] rendezvous assigned rank {}/{}",
+            group.rank(),
+            group.world_size()
+        );
+    }
 
     group.barrier().expect("initial barrier");
     eprintln!("[{label}] mesh connected ✓");
@@ -438,6 +495,21 @@ fn main() {
     if mode == "topology" {
         run_topology(&group, &label, device);
         group.barrier().expect("post-topology barrier");
+    }
+
+    if mode == "dtypes" {
+        run_dtypes(&label);
+        group.barrier().expect("post-dtypes barrier");
+    }
+
+    if mode == "model" {
+        ok &= run_model(&group, &label, device);
+        group.barrier().expect("post-model barrier");
+    }
+
+    if mode == "pipestream" {
+        ok &= run_pipestream(&group, &label, device);
+        group.barrier().expect("post-pipestream barrier");
     }
 
     if mode == "benchfleet" {
@@ -867,6 +939,20 @@ fn run_train_worker(group: &Arc<ProcessGroup>, label: &str) -> bool {
             ""
         },
     );
+    // Cluster options → the ProcessGroup-driven loop, which plans the work,
+    // receives its data slice and reduces on its own (no closure, no pull).
+    if spec.options.is_some() {
+        return match dist::run_train_group(&spec, group, dist::uri_resolver, true) {
+            Ok((m, _)) => {
+                report_train_worker(label, &m);
+                true
+            }
+            Err(e) => {
+                eprintln!("[{label}] TRAIN-WORKER run_train_group: {e}");
+                false
+            }
+        };
+    }
     // No shared filesystem? Pull our data shard from the master and rewrite the
     // spec to the received local files.
     if spec.push_data {
@@ -890,13 +976,7 @@ fn run_train_worker(group: &Arc<ProcessGroup>, label: &str) -> bool {
     }
     match out {
         Ok((m, _final_params)) => {
-            let inv: Vec<&str> = m.inventory.iter().map(|d| device_label(*d)).collect();
-            let used: Vec<&str> = m.lanes.iter().map(|d| device_label(*d)).collect();
-            eprintln!(
-                "[{label}] TRAIN-WORKER done — {} samples, compute {:.2}s / comm {:.2}s, \
-                 loss {:.4}→{:.4}  | trained across {used:?} of node inventory {inv:?}",
-                m.samples, m.compute_s, m.comm_s, m.first_loss, m.last_loss,
-            );
+            report_train_worker(label, &m);
             true
         }
         Err(e) => {
@@ -904,6 +984,24 @@ fn run_train_worker(group: &Arc<ProcessGroup>, label: &str) -> bool {
             false
         }
     }
+}
+
+fn report_train_worker(label: &str, m: &dist::TrainMetrics) {
+    let inv: Vec<&str> = m.inventory.iter().map(|d| device_label(*d)).collect();
+    let used: Vec<&str> = m.lanes.iter().map(|d| device_label(*d)).collect();
+    eprintln!(
+        "[{label}] TRAIN-WORKER done — {} samples, compute {:.2}s / comm {:.2}s / upload {:.2}s, \
+         {} syncs × {} micro-step(s), loss {:.4}→{:.4}  | trained across {used:?} of node \
+         inventory {inv:?}",
+        m.samples,
+        m.compute_s,
+        m.comm_s,
+        m.upload_s,
+        m.syncs,
+        m.micro_steps,
+        m.first_loss,
+        m.last_loss,
+    );
 }
 
 // ── Distributed FFT ─────────────────────────────────────────────────────────
@@ -1968,6 +2066,1223 @@ fn run_benchfleet(group: &Arc<ProcessGroup>, label: &str, device: Device) -> boo
 /// topology and a capacity-weighted, link-aware plan. This is the flexibility
 /// payoff — CPU, GPU and accelerators of different speeds sharing one job,
 /// with work split proportional to each node's measured capability.
+/// One matmul `[m,k]×[k,n]` computed as `dt` (Cast in, Cast out; f32 = none).
+fn dtype_matmul_graph(m: usize, k: usize, n: usize, dt: DType) -> Graph {
+    use rlx_ir::op::Op;
+    let f = |d: &[usize], t: DType| Shape::new(d, t);
+    let mut g = Graph::new("dtype_probe");
+    let a = g.input("a", f(&[m, k], DType::F32));
+    let b = g.input("b", f(&[k, n], DType::F32));
+    let out = if dt == DType::F32 {
+        g.matmul(a, b, f(&[m, n], DType::F32))
+    } else {
+        let ah = g.add_node(Op::Cast { to: dt }, vec![a], f(&[m, k], dt));
+        let bh = g.add_node(Op::Cast { to: dt }, vec![b], f(&[k, n], dt));
+        let c = g.matmul(ah, bh, f(&[m, n], dt));
+        g.add_node(Op::Cast { to: DType::F32 }, vec![c], f(&[m, n], DType::F32))
+    };
+    g.set_outputs(vec![out]);
+    g
+}
+
+/// `MODE=dtypes`: what each local device does with each compute dtype. For
+/// every device × {f32, f16, bf16} × matmul shape (a training step, squares, a
+/// decode GEMV) it prints GFLOP/s and the error against an f64 host reference
+/// (max |Δ| / max |ref|), plus whether the result is bit-identical to the CPU
+/// backend's. CUDA's f32 row reflects TF32 unless RLX_CUDA_NO_TF32=1 is set.
+fn run_dtypes(label: &str) {
+    let shapes: [(usize, usize, usize, &str); 5] = [
+        (64, 784, 256, "train-mlp"),
+        (256, 256, 256, "sq-256"),
+        (1024, 1024, 1024, "sq-1024"),
+        (2048, 2048, 2048, "sq-2048"),
+        (1, 4096, 4096, "decode-gemv"),
+    ];
+    let rnd = |n: usize, seed: u64| -> Vec<f32> {
+        let mut st = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                (st >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+            })
+            .collect()
+    };
+    let tf32 = if std::env::var("RLX_CUDA_NO_TF32").is_ok() {
+        "off"
+    } else {
+        "default"
+    };
+    eprintln!(
+        "[{label}] DTYPES (CUDA TF32 {tf32}) — GFLOP/s · error vs f64 · ≡cpu = bit-identical to the CPU backend"
+    );
+    let devices: Vec<Device> = ALL_DEVICES
+        .iter()
+        .copied()
+        .filter(|&d| is_available(d) && !matches!(d, Device::Xdna | Device::Ane))
+        .collect();
+    // Accumulation order: rows of [1e8, 1, -1e8, 0] · ones. In strict k order
+    // (fused multiply-adds, one running sum) 1e8 + 1 rounds back to 1e8 and
+    // the row sums to 0; a pairwise/split-k sum gives 1.
+    let (om, ok_, on) = (64usize, 4usize, 64usize);
+    let oa: Vec<f32> = (0..om).flat_map(|_| [1e8f32, 1.0, -1e8, 0.0]).collect();
+    let ob = vec![1.0f32; ok_ * on];
+    // Does a Cast to f16 / bf16 actually round? 1 + 2⁻¹² is not representable
+    // in either (f16 keeps 10 mantissa bits, bf16 7).
+    let probe = 1.0f32 + 2f32.powi(-12);
+    for &dev in &devices {
+        let order = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut c = Session::new(dev).compile(dtype_matmul_graph(om, ok_, on, DType::F32));
+            c.run(&[("a", oa.as_slice()), ("b", ob.as_slice())])
+                .remove(0)[0]
+        }));
+        let rounds = |dt: DType| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                use rlx_ir::op::Op;
+                let mut g = Graph::new("cast_probe");
+                let x = g.input("x", Shape::new(&[4], DType::F32));
+                let h = g.add_node(Op::Cast { to: dt }, vec![x], Shape::new(&[4], dt));
+                let y = g.add_node(
+                    Op::Cast { to: DType::F32 },
+                    vec![h],
+                    Shape::new(&[4], DType::F32),
+                );
+                g.set_outputs(vec![y]);
+                let mut c = Session::new(dev).compile(g);
+                c.run(&[("x", &[probe; 4][..])]).remove(0)[0]
+            }))
+            .map(|v| {
+                if v == probe {
+                    "kept f32 bits".to_string()
+                } else {
+                    format!("rounded to {v}")
+                }
+            })
+            .unwrap_or_else(|_| "n/a".into())
+        };
+        eprintln!(
+            "[{label}]   {:<7} gemm order: {}  ·  cast→f16→f32: {}  ·  cast→bf16→f32: {}",
+            device_label(dev),
+            match order {
+                Ok(0.0) => "strict k-order FMA chain".to_string(),
+                Ok(v) => format!("reordered (got {v})"),
+                Err(_) => "n/a".into(),
+            },
+            rounds(DType::F16),
+            rounds(DType::BF16),
+        );
+    }
+    for &(m, k, n, name) in &shapes {
+        let a = rnd(m * k, 1);
+        let b = rnd(k * n, 2);
+        // f64 reference (skip the largest: O(n³) on one host core).
+        let reference: Option<Vec<f64>> = (m * k * n <= 1 << 30).then(|| {
+            let mut c = vec![0f64; m * n];
+            for i in 0..m {
+                for p in 0..k {
+                    let av = a[i * k + p] as f64;
+                    let row = &b[p * n..(p + 1) * n];
+                    for (cj, &bv) in c[i * n..(i + 1) * n].iter_mut().zip(row) {
+                        *cj += av * bv as f64;
+                    }
+                }
+            }
+            c
+        });
+        let mut cpu_out: Option<Vec<f32>> = None;
+        for dt in [DType::F32, DType::F16, DType::BF16] {
+            for &dev in &devices {
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut c = Session::new(dev).compile(dtype_matmul_graph(m, k, n, dt));
+                    let feed = [("a", a.as_slice()), ("b", b.as_slice())];
+                    let out = c.run(&feed).remove(0);
+                    let flops = 2.0 * (m * k * n) as f64;
+                    let reps = ((2e9 / flops) as usize).clamp(3, 200);
+                    let mut ts = Vec::with_capacity(reps);
+                    let mut last = Vec::new();
+                    for _ in 0..reps {
+                        let t = Instant::now();
+                        last = c.run(&feed).remove(0);
+                        ts.push(t.elapsed().as_secs_f64());
+                    }
+                    if std::env::var("DTYPES_FIRST_VS_LAST").is_ok() && last != out {
+                        let d = out
+                            .iter()
+                            .zip(&last)
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0f32, f32::max);
+                        eprintln!(
+                            "[{label}]     {} {dt:?}: first run differs from later runs by {d:.2e}",
+                            device_label(dev)
+                        );
+                    }
+                    (last, flops / median(ts) / 1e9)
+                }));
+                let dname = format!("{dt:?}").to_lowercase();
+                match run {
+                    Ok((out, gf)) => {
+                        let err = reference.as_ref().map(|r| {
+                            let scale = r.iter().fold(0f64, |x, v| x.max(v.abs())).max(1e-30);
+                            out.iter()
+                                .zip(r)
+                                .map(|(&o, &rv)| (o as f64 - rv).abs())
+                                .fold(0f64, f64::max)
+                                / scale
+                        });
+                        if dev == Device::Cpu && dt == DType::F32 {
+                            cpu_out = Some(out.clone());
+                        }
+                        let same = dt == DType::F32
+                            && dev != Device::Cpu
+                            && cpu_out.as_ref().is_some_and(|c| c == &out);
+                        eprintln!(
+                            "[{label}]   {name:<11} {dname:<4} {:<7} {gf:>8.1} GFLOP/s  err {}{}",
+                            device_label(dev),
+                            err.map_or("   n/a  ".into(), |e| format!("{e:.2e}")),
+                            if same { "  ≡cpu" } else { "" }
+                        );
+                    }
+                    Err(_) => eprintln!(
+                        "[{label}]   {name:<11} {dname:<4} {:<7}      n/a (not supported)",
+                        device_label(dev)
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// `MODE=model`: train or run any `.rlxp` package function across the mesh.
+/// Rank 0 holds the package (and dataset) and sends the workers everything;
+/// the workers know nothing about the model. Rank 0's env:
+///
+///   PKG=<model.rlxp>  TASK=info|infer|generate|train  FUNCTION=<name>
+///   DIMS="seq=64,batch=1"            the function's symbols, sized
+///   SPEEDS="43,27,30"                pin the split (default: measured)
+///   infer:    INPUTS=<x.safetensors> (else zeros), REQUESTS=3, VERIFY=1,
+///             WIRE=auto|f32|bf16|f16, NUMBER_FORMAT=…
+///   generate: PROMPT="1,2,3" or PROMPT="text" (the package's tokenizer)
+///             NEW=16  (one token input, logits out); SPECULATE=1 runs a
+///             package's verify step (the token and its MTP draft a pass)
+///   train:    DATA=<data.safetensors> (a tensor per input, samples first)
+///             or DATA=<text.txt> (next-token windows, every STRIDE=1 tokens),
+///             TRAIN=all | lora:<glob>[,<glob>…][:rank] | params:<glob>,…
+///             LOSS='{"cross_entropy":{"logits":"logits","labels":"labels"}}'
+///             LR, EPOCHS, OUT=<trained.rlxp>, plus the cluster options
+///             ACCUM, GRAD_WIRE, BALANCE, LOCAL_STEPS, ZERO, CHECKPOINT,
+///             TRAIN_FORMAT (a number format), HALF_CASTS
+///
+/// Stages are split by each rank's measured speed (fp32 GEMM GFLOP/s).
+/// A worker that outlives its jobs: connect, take part in one job exactly as
+/// a one-job process would (the same barriers rank 0 waits at), leave the
+/// mesh, and connect again for the next. A job that fails — rank 0 gone
+/// mid-run — just ends that mesh. `PIDFILE` gets this process's id, for a
+/// launcher checking whether it is still up.
+fn run_persistent(label: &str, device: Device) -> ! {
+    // Rank 0 comes and goes: wait for it however long (a reversed pair dials it).
+    rlx_ir::env::set("RLX_CONNECT_WAIT", "0");
+    if let Ok(path) = std::env::var("PIDFILE") {
+        std::fs::write(&path, format!("{}\n", std::process::id()))
+            .unwrap_or_else(|e| eprintln!("[{label}] PIDFILE {path}: {e}"));
+    }
+    let mut job = 0;
+    loop {
+        job += 1;
+        eprintln!("[{label}] persistent: waiting for job {job}");
+        // A fresh config each job: connecting consumes it.
+        let group = match Node::from_env().and_then(|n| n.connect().map_err(|e| e.to_string())) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[{label}] connect failed: {e}; trying again");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+        register_group(GID, group.clone());
+        let t = std::time::Instant::now();
+        let ok =
+            group.barrier().is_ok() && run_model(&group, label, device) && group.barrier().is_ok();
+        unregister_group(GID);
+        let ok = ok && group.barrier().is_ok();
+        eprintln!(
+            "[{label}] persistent: job {job} {} in {:.1}s",
+            if ok { "done" } else { "ended early" },
+            t.elapsed().as_secs_f64()
+        );
+    }
+}
+
+fn run_model(group: &Arc<ProcessGroup>, label: &str, device: Device) -> bool {
+    use rlx_runtime::model::distributed as md;
+    // Every rank: its speed, so rank 0 can split by it.
+    let (speeds, links) = md::exchange_speeds_links(group, device).expect("speed exchange");
+    if group.rank() == 0 {
+        eprintln!("[{label}] MODEL speeds (GFLOP/s) by rank: {speeds:.0?}");
+    }
+    if group.rank() == 0 && std::env::var("TOPOLOGY").is_ok_and(|v| v != "0") {
+        let ms = |v: f64| format!("{:.1}", 1e3 * v);
+        for (a, row) in links.latency.iter().enumerate() {
+            let cells: Vec<String> = row
+                .iter()
+                .zip(&links.bandwidth[a])
+                .map(|(l, b)| {
+                    if *b >= 1e6 {
+                        format!("{}ms/{:.0}MB/s", ms(*l), b / 1e6)
+                    } else if *b > 0.0 {
+                        format!("{}ms/{:.1}KB/s", ms(*l), b / 1e3)
+                    } else {
+                        "-".into()
+                    }
+                })
+                .collect();
+            eprintln!("[{label}] LINK from rank {a}: {}", cells.join("  "));
+        }
+    }
+    // `SPEEDS=43,27,30` (rank 0) pins the split instead of the measured speeds.
+    let speeds: Vec<f64> = match std::env::var("SPEEDS") {
+        Ok(s) if group.rank() == 0 => s.split(',').filter_map(|v| v.trim().parse().ok()).collect(),
+        _ => speeds,
+    };
+    if group.rank() != 0 {
+        return match md::serve(group, true) {
+            Ok(did) => {
+                eprintln!("[{label}] MODEL worker: {did}");
+                true
+            }
+            Err(e) => {
+                eprintln!("[{label}] MODEL worker failed: {e:#}");
+                if env("PERSIST", "0") != "0" {
+                    return false;
+                }
+                // Exit now: the other ranks see this rank's connection close
+                // and fail with its rank instead of waiting at a barrier.
+                std::process::exit(1);
+            }
+        };
+    }
+    rlx_text::install_model_tokenizer();
+    let result = (|| -> anyhow::Result<()> {
+        let pkg = std::env::var("PKG").map_err(|_| anyhow::anyhow!("set PKG=<model.rlxp>"))?;
+        let task = env("TASK", "info");
+        let (infos, syms) = md::describe(&pkg)?;
+        let function = std::env::var("FUNCTION")
+            .ok()
+            .or_else(|| infos.first().map(|f| f.name.clone()))
+            .ok_or_else(|| anyhow::anyhow!("the package has no functions"))?;
+        let dims = md::parse_dims(&env("DIMS", ""))?;
+        let dev = env("DEVICE", "auto");
+        // TASK=local: the package on this rank's device alone, through the
+        // runtime's own model API (packed / quantized weights included) — the
+        // single-node baseline a split is measured against.
+        if task == "local" {
+            let request = rlx_runtime::model::ModelRequest::new(
+                pkg.clone(),
+                serde_json::json!({"device": rlx_runtime::device_label(device).to_ascii_lowercase()}),
+            )?;
+            let t = Instant::now();
+            let mut model = rlx_runtime::model::open(&request)?;
+            let load = t.elapsed().as_secs_f64();
+            let prompt = env("PROMPT", "The capital of France is");
+            let new: usize = env("NEW", "32").parse().unwrap_or(32);
+            let opts = serde_json::json!({"max_tokens": new});
+            let _ = model.generate_text(&prompt, &serde_json::json!({"max_tokens": 2}))?; // warm-up
+            let t = Instant::now();
+            let text = model.generate_text(&prompt, &opts)?;
+            let dt = t.elapsed().as_secs_f64();
+            eprintln!(
+                "[{label}] MODEL local on {}: loaded in {load:.1}s; {new} token(s) in {dt:.2}s ({:.1} tok/s): {text:?}",
+                rlx_runtime::device_label(device),
+                new as f64 / dt
+            );
+            md::dismiss(group)?;
+            return Ok(());
+        }
+        if task == "info" {
+            eprintln!("[{label}] MODEL {pkg}: dims {syms:?}");
+            for f in &infos {
+                eprintln!(
+                    "[{label}]   {}: inputs {:?} → outputs {:?}, {} params ({:.1} MB)",
+                    f.name,
+                    f.inputs,
+                    f.outputs,
+                    f.params,
+                    f.param_bytes as f64 / 1e6
+                );
+            }
+            md::dismiss(group)?;
+            return Ok(());
+        }
+        if task == "train" {
+            let mut cluster = rlx_runtime::dist::TrainOptions::default();
+            let num = |k: &str, d: usize| env(k, &d.to_string()).parse().unwrap_or(d);
+            cluster.accum = num("ACCUM", 1);
+            cluster.local_steps = num("LOCAL_STEPS", 0);
+            cluster.balance = env("BALANCE", "0") != "0";
+            cluster.zero = env("ZERO", "0") != "0";
+            cluster.half_casts = env("HALF_CASTS", "0") != "0";
+            cluster.wire = env("GRAD_WIRE", "auto")
+                .parse()
+                .map_err(anyhow::Error::msg)?;
+            cluster.checkpoint_dir = std::env::var("CHECKPOINT").ok();
+            cluster.lr_scaling = env("LR_SCALING", "none")
+                .parse()
+                .map_err(anyhow::Error::msg)?;
+            cluster.warmup = std::env::var("WARMUP").ok().and_then(|v| v.parse().ok());
+            cluster.number_format = std::env::var("TRAIN_FORMAT").ok();
+            let train = match env("TRAIN", "all").as_str() {
+                "all" => serde_json::json!("all"),
+                t if t.starts_with("lora:") => {
+                    let mut parts = t["lora:".len()..].splitn(2, ':');
+                    let targets: Vec<&str> = parts.next().unwrap_or("").split(',').collect();
+                    let rank: u64 = parts.next().and_then(|r| r.parse().ok()).unwrap_or(8);
+                    serde_json::json!({"lora": {"targets": targets, "rank": rank}})
+                }
+                t if t.starts_with("params:") => {
+                    serde_json::json!({"params": t["params:".len()..].split(',').collect::<Vec<_>>()})
+                }
+                t => serde_json::from_str(t)?,
+            };
+            let loss: serde_json::Value = serde_json::from_str(&env(
+                "LOSS",
+                r#"{"cross_entropy":{"logits":"logits","labels":"labels"}}"#,
+            ))?;
+            let lr: f64 = env("LR", "1e-4").parse().unwrap_or(1e-4);
+            let opts = serde_json::json!({
+                "function": function, "dims": dims, "loss": loss, "train": train,
+                "optimizer": {"lr": lr},
+            });
+            let data = std::env::var("DATA")
+                .map_err(|_| anyhow::anyhow!("set DATA=<data.safetensors>"))?;
+            let epochs = num("EPOCHS", 1);
+            let job = if data.ends_with(".txt") {
+                let text = std::fs::read_to_string(&data)?;
+                let stride = num("STRIDE", 1);
+                md::train_job_text(&pkg, &opts, &text, stride, epochs, &dev, cluster)?
+            } else {
+                md::train_job(&pkg, &opts, &data, epochs, &dev, cluster)?
+            };
+            eprintln!(
+                "[{label}] MODEL train {pkg}::{function}: {} trained + {} frozen params, {} samples, batch {}",
+                job.spec.params.len(),
+                job.spec.frozen.len(),
+                job.samples,
+                job.spec.batch
+            );
+            let before = job.loss(&Default::default(), Device::Cpu);
+            // HELDOUT=<text.txt>: windows the job never trains on, scored
+            // before and after (mean of up to HELDOUT_BATCHES batches).
+            let heldout = match std::env::var("HELDOUT") {
+                Ok(p) => {
+                    let text = std::fs::read_to_string(&p)?;
+                    let ev = md::train_job_text(
+                        &pkg,
+                        &opts,
+                        &text,
+                        num("STRIDE", 1),
+                        1,
+                        "cpu",
+                        rlx_runtime::dist::TrainOptions::default(),
+                    )?;
+                    let nb = num("HELDOUT_BATCHES", 32);
+                    let l0 = ev.eval_loss(&Default::default(), Device::Cpu, nb);
+                    Some((ev, nb, l0))
+                }
+                Err(_) => None,
+            };
+            let t = Instant::now();
+            let (m, trained) = job.run(group, true)?;
+            let after = job.loss(&trained, Device::Cpu);
+            if let Some((ev, nb, l0)) = &heldout {
+                let l1 = ev.eval_loss(&trained, Device::Cpu, *nb);
+                eprintln!(
+                    "[{label}] MODEL held-out ({} windows): loss {l0:.4} → {l1:.4}, \
+                     perplexity {:.1} → {:.1}",
+                    nb.min(&ev.samples),
+                    l0.exp(),
+                    l1.exp()
+                );
+            }
+            eprintln!(
+                "[{label}] MODEL train done in {:.1}s: {} syncs ({} skipped, {} wire, {:.1} MB sent), \
+                 first-batch loss {before:.4} → {after:.4}",
+                t.elapsed().as_secs_f64(),
+                m.syncs,
+                m.skipped,
+                m.wire,
+                m.wire_bytes as f64 / 1e6
+            );
+            if let Ok(out) = std::env::var("OUT") {
+                job.save(&trained, std::path::Path::new(&out), &function)?;
+                eprintln!("[{label}] MODEL saved {out}");
+            }
+            return Ok(());
+        }
+        // infer / generate
+        let wire: rlx_runtime::dist::WireDtype =
+            env("WIRE", "auto").parse().map_err(anyhow::Error::msg)?;
+        // A stateful step (a `generate` entry with `state`, e.g. Qwen3.5's
+        // hybrid decode): each stage keeps its own layers' caches.
+        if task == "generate" {
+            let codec = md::package_codec(&pkg).ok();
+            let raw = env("PROMPT", "1");
+            let ids: Option<Vec<u32>> = raw.split(',').map(|t| t.trim().parse().ok()).collect();
+            let prompt: Vec<u32> = match (ids, &codec) {
+                (Some(ids), _) => ids,
+                (None, Some(c)) => c.encode(&raw)?,
+                (None, None) => anyhow::bail!("PROMPT is text and {pkg} has no tokenizer"),
+            };
+            let new: usize = env("NEW", "16").parse().unwrap_or(16);
+            // A pass reaches two rows past the last token.
+            if let Ok(entry) = md::decode_entry(&pkg, prompt.len() + new + 2)
+                && env("SPECULATE", "0") != "0"
+            {
+                let Some((verify, _)) = entry.verify.clone() else {
+                    anyhow::bail!(
+                        "SPECULATE=1: {pkg} has no verify step (export it with --variant mtp)"
+                    );
+                };
+                let t = Instant::now();
+                let mut job = md::InferJob::start_with_layout(
+                    group,
+                    &pkg,
+                    &verify,
+                    &entry.dims,
+                    &speeds,
+                    &dev,
+                    std::env::var("NUMBER_FORMAT").ok(),
+                    wire,
+                    &entry.state,
+                    &md::StepLayout {
+                        // ARGMAX=1: the last stage sends token ids, not logits.
+                        argmax: if env("ARGMAX", "0") != "0" {
+                            if true {
+                                vec![0, entry.draft.unwrap_or(1)]
+                            } else {
+                                vec![0]
+                            }
+                        } else {
+                            Vec::new()
+                        },
+                        vocab: entry.vocab,
+                        // TOPOLOGY=1: the workers in the order the links make fastest.
+                        links: (env("TOPOLOGY", "0") != "0").then(|| links.clone()),
+                    },
+                )?;
+                let sent = t.elapsed().as_secs_f64();
+                if let Some((t, base)) = job.estimate {
+                    eprintln!(
+                        "[{label}] MODEL layout: pipeline order {:?}, estimated {:.1} ms a step (rank order {:.1} ms)",
+                        job.order,
+                        1e3 * t,
+                        1e3 * base
+                    );
+                }
+                // TOPOLOGY=1: time every stage on throwaway passes and lay the
+                // step out again by the measured speeds (CALIBRATE=0: don't).
+                if env("TOPOLOGY", "0") != "0" && env("CALIBRATE", "1") != "0" {
+                    let t = Instant::now();
+                    // At most one request per token: a re-layout has to pay
+                    // for its weights' transfer over this job.
+                    let (measured, relaid) = job.calibrate_for(
+                        group,
+                        &entry.feeds_n(0, &[prompt[0], prompt[0]]),
+                        6,
+                        0.1,
+                        Some(prompt.len() + new),
+                    )?;
+                    let how = match (relaid, job.estimate) {
+                        (true, Some((next, now))) => format!(
+                            "re-laid out: pipeline order {:?}, estimated {:.1} ms a step (was {:.1} ms)",
+                            job.order,
+                            1e3 * next,
+                            1e3 * now
+                        ),
+                        _ => "layout kept".into(),
+                    };
+                    eprintln!(
+                        "[{label}] MODEL calibrated in {:.1}s: measured GFLOP/s by rank {measured:.1?}; {how}",
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+                eprintln!(
+                    "[{label}] MODEL {pkg}::{verify} (speculative, {} states, cache {}) split over {} rank(s) (stages sent in {:.1}s, {} kept from the last job)",
+                    entry.state.len(),
+                    entry.upper,
+                    group.world_size(),
+                    sent,
+                    job.kept
+                );
+                let t = Instant::now();
+                let (toks, st) =
+                    job.decode_verify(group, &prompt, new, entry.vocab, &entry.stop, |p, tok| {
+                        entry.feeds_n(p, tok)
+                    })?;
+                let dt = t.elapsed().as_secs_f64();
+                let (own, rest, n) = job.timing;
+                eprintln!(
+                    "[{label}] MODEL first pass {:.0} ms (kernels compiling), then per pass: rank 0's stage {:.1} ms, the rest of the pipeline {:.1} ms",
+                    1e3 * job.warmup,
+                    1e3 * own / n.max(1) as f64,
+                    1e3 * rest / n.max(1) as f64,
+                );
+                eprintln!(
+                    "[{label}] MODEL generated {} token(s) in {dt:.2}s over {} passes ({:.2} tokens/pass, {:.1} tokens/s incl. the prompt); drafts kept {}/{}: {toks:?}",
+                    toks.len(),
+                    st.passes,
+                    toks.len() as f64 / st.passes.max(1) as f64,
+                    toks.len() as f64 / dt,
+                    st.accepted,
+                    st.drafts
+                );
+                if let Some(c) = &codec {
+                    eprintln!(
+                        "[{label}] MODEL text: {:?}",
+                        c.decode(&[prompt.as_slice(), toks.as_slice()].concat())?
+                    );
+                }
+                job.finish(group)?;
+                if env("VERIFY", "0") != "0" {
+                    // Speculation keeps only the trunk's own picks: the same
+                    // tokens as one-token decoding.
+                    let (want, _) = md::decode_local(&pkg, &entry, Device::Cpu, &prompt, new)?;
+                    let same = toks.iter().zip(&want).take_while(|(a, b)| a == b).count();
+                    eprintln!(
+                        "[{label}] MODEL vs one CPU, unsplit, one token a step: tokens {}",
+                        if want == toks {
+                            "MATCH ✓".to_string()
+                        } else {
+                            format!("differ from token {same}")
+                        }
+                    );
+                }
+                return Ok(());
+            }
+            if let Ok(entry) = md::decode_entry(&pkg, prompt.len() + new) {
+                let t = Instant::now();
+                let mut job = md::InferJob::start_with_layout(
+                    group,
+                    &pkg,
+                    &entry.function,
+                    &entry.dims,
+                    &speeds,
+                    &dev,
+                    std::env::var("NUMBER_FORMAT").ok(),
+                    wire,
+                    &entry.state,
+                    &md::StepLayout {
+                        // ARGMAX=1: the last stage sends token ids, not logits.
+                        argmax: if env("ARGMAX", "0") != "0" {
+                            if false {
+                                vec![0, entry.draft.unwrap_or(1)]
+                            } else {
+                                vec![0]
+                            }
+                        } else {
+                            Vec::new()
+                        },
+                        vocab: entry.vocab,
+                        // TOPOLOGY=1: the workers in the order the links make fastest.
+                        links: (env("TOPOLOGY", "0") != "0").then(|| links.clone()),
+                    },
+                )?;
+                let sent = t.elapsed().as_secs_f64();
+                if let Some((t, base)) = job.estimate {
+                    eprintln!(
+                        "[{label}] MODEL layout: pipeline order {:?}, estimated {:.1} ms a step (rank order {:.1} ms)",
+                        job.order,
+                        1e3 * t,
+                        1e3 * base
+                    );
+                }
+                // TOPOLOGY=1: time every stage on throwaway passes and lay the
+                // step out again by the measured speeds (CALIBRATE=0: don't).
+                if env("TOPOLOGY", "0") != "0" && env("CALIBRATE", "1") != "0" {
+                    let t = Instant::now();
+                    let (measured, relaid) = job.calibrate_for(
+                        group,
+                        &entry.feeds(0, prompt[0]),
+                        6,
+                        0.1,
+                        Some(prompt.len() + new),
+                    )?;
+                    let how = match (relaid, job.estimate) {
+                        (true, Some((next, now))) => format!(
+                            "re-laid out: pipeline order {:?}, estimated {:.1} ms a step (was {:.1} ms)",
+                            job.order,
+                            1e3 * next,
+                            1e3 * now
+                        ),
+                        _ => "layout kept".into(),
+                    };
+                    eprintln!(
+                        "[{label}] MODEL calibrated in {:.1}s: measured GFLOP/s by rank {measured:.1?}; {how}",
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+                let shares: Vec<String> = job
+                    .shares
+                    .iter()
+                    .zip(&speeds)
+                    .map(|(s, g)| format!("{:.0}% @{g:.0}", s * 100.0))
+                    .collect();
+                eprintln!(
+                    "[{label}] MODEL {pkg}::{} (stateful, {} states, cache {}) split over {} rank(s) [{}] (stages sent in {:.1}s, {} kept from the last job)",
+                    entry.function,
+                    entry.state.len(),
+                    entry.upper,
+                    group.world_size(),
+                    shares.join(", "),
+                    sent,
+                    job.kept
+                );
+                let t = Instant::now();
+                let (toks, rows) =
+                    job.decode(group, &prompt, new, entry.vocab, &entry.stop, |p, tok| {
+                        entry.feeds(p, tok)
+                    })?;
+                let dt = t.elapsed().as_secs_f64();
+                let steps = prompt.len() + toks.len() - 1;
+                let (own, rest, n) = job.timing;
+                eprintln!(
+                    "[{label}] MODEL first step {:.0} ms (kernels compiling), then per step: rank 0's stage {:.1} ms, the rest of the pipeline (send → logits back) {:.1} ms = {:.1} steps/s",
+                    1e3 * job.warmup,
+                    1e3 * own / n.max(1) as f64,
+                    1e3 * rest / n.max(1) as f64,
+                    n as f64 / (own + rest).max(1e-9)
+                );
+                eprintln!(
+                    "[{label}] MODEL generated {} token(s) in {dt:.2}s ({:.1} steps/s over {steps} steps incl. the prompt): {toks:?}",
+                    toks.len(),
+                    steps as f64 / dt
+                );
+                if let Some(c) = &codec {
+                    eprintln!(
+                        "[{label}] MODEL text: {:?}",
+                        c.decode(&[prompt.as_slice(), toks.as_slice()].concat())?
+                    );
+                }
+                job.finish(group)?;
+                if env("VERIFY", "0") != "0" {
+                    let (want, wrows) = md::decode_local(&pkg, &entry, Device::Cpu, &prompt, new)?;
+                    // Rows are comparable while both decoded the same tokens.
+                    let same = toks.iter().zip(&want).take_while(|(a, b)| a == b).count();
+                    let mut worst = 0.0f32;
+                    // With ARGMAX the split's rows are token ids: only tokens compare.
+                    for (g, w) in rows
+                        .iter()
+                        .zip(&wrows)
+                        .take(same + 1)
+                        .filter(|(g, w)| g.len() == w.len())
+                    {
+                        let scale = w.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+                        let e = g
+                            .iter()
+                            .zip(w)
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0f32, f32::max);
+                        worst = worst.max(e / scale);
+                    }
+                    let verdict = if want == toks {
+                        "MATCH ✓".to_string()
+                    } else {
+                        // Where they part: the reference's margin between its
+                        // choice and the split's.
+                        let w = &wrows[same];
+                        let scale = w.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+                        let m = (w[want[same] as usize] - w[toks[same] as usize]) / scale;
+                        format!(
+                            "differ from token {same} (reference margin there {m:.2e}{})",
+                            if m <= 2.0 * worst { ", a near-tie" } else { "" }
+                        )
+                    };
+                    eprintln!(
+                        "[{label}] MODEL vs one CPU, unsplit: max rel logit err {worst:.2e} over {} step(s); tokens {verdict}",
+                        (same + 1).min(rows.len())
+                    );
+                }
+                return Ok(());
+            }
+        }
+        let t = Instant::now();
+        let mut job = md::InferJob::start(
+            group,
+            &pkg,
+            &function,
+            &dims,
+            &speeds,
+            &dev,
+            std::env::var("NUMBER_FORMAT").ok(),
+            wire,
+        )?;
+        let shares: Vec<String> = job
+            .shares
+            .iter()
+            .zip(&speeds)
+            .map(|(s, g)| format!("{:.0}% @{g:.0}", s * 100.0))
+            .collect();
+        eprintln!(
+            "[{label}] MODEL {pkg}::{function} split over {} rank(s) [{}] (stages sent in {:.1}s, {} kept from the last job)",
+            group.world_size(),
+            shares.join(", "),
+            t.elapsed().as_secs_f64(),
+            job.kept
+        );
+        if task == "generate" {
+            // Ids ("1,2,3"), or text through the package's tokenizer.
+            let raw = env("PROMPT", "1");
+            let ids: Option<Vec<u32>> = raw.split(',').map(|t| t.trim().parse().ok()).collect();
+            let codec = md::package_codec(&pkg).ok();
+            let prompt: Vec<u32> = match (ids, &codec) {
+                (Some(ids), _) => ids,
+                (None, Some(c)) => c.encode(&raw)?,
+                (None, None) => anyhow::bail!(
+                    "PROMPT is text and {pkg} has no tokenizer: pass token ids (PROMPT=1,2,3)"
+                ),
+            };
+            let new: usize = env("NEW", "16").parse().unwrap_or(16);
+            let t = Instant::now();
+            let toks = job.generate(group, &prompt, new)?;
+            let dt = t.elapsed().as_secs_f64();
+            eprintln!(
+                "[{label}] MODEL generated {} token(s) in {dt:.2}s ({:.1} tok/s): {toks:?}",
+                toks.len(),
+                toks.len() as f64 / dt
+            );
+            if let Some(c) = &codec {
+                eprintln!(
+                    "[{label}] MODEL text: {:?}",
+                    c.decode(&[prompt.as_slice(), toks.as_slice()].concat())?
+                );
+            }
+            if env("VERIFY", "0") != "0" {
+                let (name, d) = job
+                    .inputs
+                    .iter()
+                    .max_by_key(|(_, d)| d.iter().product::<usize>())
+                    .cloned()
+                    .unwrap();
+                let pos: Vec<String> = job
+                    .inputs
+                    .iter()
+                    .filter(|(n, _)| *n != name)
+                    .map(|(n, _)| n.clone())
+                    .collect();
+                let seq = *d.last().unwrap_or(&1);
+                let mut tokens = prompt.clone();
+                let mut want = Vec::new();
+                for _ in 0..toks.len() {
+                    let mut feed = vec![0f32; seq];
+                    for (f, &t) in feed.iter_mut().zip(&tokens) {
+                        *f = t as f32;
+                    }
+                    let last = [(tokens.len() - 1) as f32];
+                    let mut feeds: Vec<(&str, &[f32])> = vec![(&name, &feed)];
+                    for p in &pos {
+                        feeds.push((p.as_str(), &last));
+                    }
+                    let l = md::run_local(&pkg, &function, &dims, Device::Cpu, &feeds)?.remove(0);
+                    let row = md::next_token_row(&l, seq, tokens.len(), !pos.is_empty());
+                    let next = (0..row.len())
+                        .max_by(|&a, &b| row[a].total_cmp(&row[b]))
+                        .unwrap_or(0) as u32;
+                    tokens.push(next);
+                    want.push(next);
+                }
+                eprintln!(
+                    "[{label}] MODEL single-node CPU greedy: {want:?}  {}",
+                    if want == toks {
+                        "MATCH ✓"
+                    } else {
+                        "DIFFERS ✗"
+                    }
+                );
+                // Teacher-forced: at every step both sides see the SAME prefix
+                // (the split's own tokens), so a near-tie that flipped once
+                // does not make every later step differ. A token comparison
+                // cannot tell a near-tie from a bug; the logits can.
+                let (mut worst, mut flips, mut worst_flip_margin) = (0.0f32, 0usize, 0.0f32);
+                for i in 0..toks.len() {
+                    let ctx: Vec<u32> = prompt.iter().chain(&toks[..i]).copied().collect();
+                    let mut feed = vec![0f32; seq];
+                    for (f, &t) in feed.iter_mut().zip(&ctx) {
+                        *f = t as f32;
+                    }
+                    let last = [(ctx.len() - 1) as f32];
+                    let mut feeds: Vec<(&str, &[f32])> = vec![(&name, &feed)];
+                    for p in &pos {
+                        feeds.push((p.as_str(), &last));
+                    }
+                    let got_all = job.run(group, &feeds)?.remove(0);
+                    let want_all =
+                        md::run_local(&pkg, &function, &dims, Device::Cpu, &feeds)?.remove(0);
+                    let got = md::next_token_row(&got_all, seq, ctx.len(), !pos.is_empty());
+                    let want = md::next_token_row(&want_all, seq, ctx.len(), !pos.is_empty());
+                    let scale = want.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+                    let err = got
+                        .iter()
+                        .zip(want)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max)
+                        / scale;
+                    worst = worst.max(err);
+                    let top = |r: &[f32]| {
+                        (0..r.len())
+                            .max_by(|&a, &b| r[a].total_cmp(&r[b]))
+                            .unwrap_or(0)
+                    };
+                    let (g, w) = (top(got), top(want));
+                    if g != w {
+                        flips += 1;
+                        // How far apart the reference put the two choices.
+                        let m = (want[w] - want[g]) / scale;
+                        worst_flip_margin = worst_flip_margin.max(m);
+                    }
+                }
+                // A flip is a near-tie when the reference's own margin between
+                // the two tokens is no larger than the logit error itself.
+                let near_ties = flips == 0 || worst_flip_margin <= 2.0 * worst;
+                eprintln!(
+                    "[{label}] MODEL logits vs one CPU (teacher-forced, {} steps): max rel err {worst:.2e}; \
+                     top token differs at {flips} step(s){} — {}",
+                    toks.len(),
+                    if flips > 0 {
+                        format!(", reference margin there ≤ {worst_flip_margin:.2e}")
+                    } else {
+                        String::new()
+                    },
+                    if worst < 1e-2 && near_ties {
+                        "PASS ✓"
+                    } else {
+                        "FAIL ✗"
+                    }
+                );
+            }
+            job.finish(group)?;
+            return Ok(());
+        }
+        // infer: INPUTS file, else zeros.
+        let mut cache = rlx_runtime::dist::WeightCache::new();
+        let feeds: Vec<(String, Vec<f32>)> = job
+            .inputs
+            .iter()
+            .map(|(n, d)| {
+                let len: usize = d.iter().product();
+                let v = std::env::var("INPUTS")
+                    .ok()
+                    .and_then(|p| cache.f32(&format!("safetensors://{p}#{n}")).ok())
+                    .unwrap_or_else(|| vec![0.0; len]);
+                (n.clone(), v)
+            })
+            .collect();
+        let f: Vec<(&str, &[f32])> = feeds.iter().map(|(n, v)| (n.as_str(), &v[..])).collect();
+        let reqs: usize = env("REQUESTS", "3").parse().unwrap_or(3);
+        let mut times = Vec::new();
+        let mut outs = Vec::new();
+        for _ in 0..reqs.max(1) {
+            let t = Instant::now();
+            outs = job.run(group, &f)?;
+            times.push(t.elapsed().as_secs_f64());
+        }
+        for (n, o) in job.output_names.iter().zip(&outs) {
+            eprintln!(
+                "[{label}] MODEL output {n}: {} values, first {:?}",
+                o.len(),
+                &o[..o.len().min(4)]
+            );
+        }
+        eprintln!(
+            "[{label}] MODEL {} request(s), median {:.1} ms",
+            times.len(),
+            median(times.clone()) * 1e3
+        );
+        if env("VERIFY", "0") != "0" {
+            let local = md::run_local(&pkg, &function, &dims, Device::Cpu, &f)?;
+            let (mut num, mut den) = (0f64, 0f64);
+            for (a, b) in outs.iter().zip(&local) {
+                for (x, y) in a.iter().zip(b) {
+                    num = num.max((x - y).abs() as f64);
+                    den = den.max(y.abs() as f64);
+                }
+            }
+            eprintln!(
+                "[{label}] MODEL vs single-node CPU: max |Δ| / max |ref| = {:.2e}",
+                num / den.max(1e-30)
+            );
+        }
+        job.finish(group)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[{label}] MODEL failed: {e:#}");
+            // Don't leave workers waiting for a job that will not come.
+            let _ = rlx_runtime::model::distributed::dismiss(group);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Link latency (median barrier) and bandwidth (~1 MiB all-reduce), measured
+/// over the live mesh.
+fn measure_link(group: &ProcessGroup) -> Link {
+    for _ in 0..10 {
+        group.barrier().unwrap();
+    }
+    let mut bar = Vec::new();
+    for _ in 0..50 {
+        let t = Instant::now();
+        group.barrier().unwrap();
+        bar.push(t.elapsed().as_secs_f64());
+    }
+    let elems = 262_144usize; // 1 MiB
+    let mut buf = vec![1.0f32; elems];
+    group.barrier().unwrap();
+    let t = Instant::now();
+    for _ in 0..5 {
+        group.all_reduce(&mut buf, ReduceKind::Sum).unwrap();
+    }
+    let per = t.elapsed().as_secs_f64() / 5.0;
+    Link {
+        bandwidth_bytes_per_s: 2.0 * (elems * 4) as f64 / per,
+        latency_s: median(bar),
+    }
+}
+
+/// Layer `l`'s `[d, d]` weight: deterministic uniform ±√(6/d) (He-scaled for
+/// ReLU, so a deep stack neither explodes nor vanishes).
+fn ps_weight(l: usize, d: usize) -> Vec<f32> {
+    let a = (6.0 / d as f32).sqrt();
+    let mut st = (l as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (0..d * d)
+        .map(|_| {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            ((st >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * a
+        })
+        .collect()
+}
+
+/// Layers `range` of the pipestream MLP as one graph: `h [rows, d]` through
+/// `relu(h @ W_l)` per layer.
+fn ps_stage(rows: usize, d: usize, range: std::ops::Range<usize>) -> Graph {
+    let mut g = Graph::new("pipestream_stage");
+    let sh = Shape::new(&[rows, d], DType::F32);
+    let mut h = g.input("h", sh.clone());
+    for l in range {
+        let w = g.param(format!("W{l}"), Shape::new(&[d, d], DType::F32));
+        let mm = g.matmul(h, w, sh.clone());
+        h = g.activation(rlx_ir::op::Activation::Relu, mm, sh.clone());
+    }
+    g.set_outputs(vec![h]);
+    g
+}
+
+/// A compiled stage as a closure (identity when the stage owns no layers).
+fn ps_runner(
+    device: Device,
+    rows: usize,
+    d: usize,
+    range: std::ops::Range<usize>,
+) -> Box<dyn FnMut(&[f32]) -> Vec<f32>> {
+    if range.is_empty() {
+        return Box::new(|x: &[f32]| x.to_vec());
+    }
+    // PS_FORMAT: the number format every stage computes in (default f32).
+    let options = rlx_runtime::CompileOptions {
+        number_format: std::env::var("PS_FORMAT")
+            .ok()
+            .map(|f| f.parse().expect("PS_FORMAT")),
+        ..Default::default()
+    };
+    let mut c = Session::new(device).compile_with(ps_stage(rows, d, range.clone()), &options);
+    for l in range {
+        c.set_param(&format!("W{l}"), &ps_weight(l, d));
+    }
+    Box::new(move |x: &[f32]| c.run(&[("h", x)]).into_iter().next().unwrap())
+}
+
+/// `MODE=pipestream`: micro-batched pipeline inference planned from the live
+/// mesh. Each rank measures its GFLOP/s and the mesh measures its link; the
+/// planner splits `PS_LAYERS` layers by speed (`split_layers`) and picks the
+/// micro-batch count + activation width (`recommend_inference`). The forward of
+/// `PS_TOKENS × PS_D` activations then runs (a) as ONE batch with f32
+/// activations and (b) streamed as M micro-batches with the planned width;
+/// rank 0 times both and checks (b) against a single-node CPU reference.
+/// `PS_MICRO` / `PS_WIRE` (f32|bf16|f16) override the plan.
+fn run_pipestream(group: &Arc<ProcessGroup>, label: &str, device: Device) -> bool {
+    let rank = group.rank() as usize;
+    let n = group.world_size() as usize;
+    let layers: usize = env("PS_LAYERS", "24").parse().unwrap_or(24);
+    let d: usize = env("PS_D", "1024").parse().unwrap_or(1024);
+    let tokens: usize = env("PS_TOKENS", "512").parse().unwrap_or(512);
+
+    // Measure, exchange, plan (identical on every rank).
+    let gflops = device_throughput(device);
+    let link = measure_link(group);
+    let all = group.all_gather(&[gflops as f32]).expect("gflops exchange");
+    let devs: Vec<planner::Device> = all
+        .iter()
+        .map(|&g| planner::Device {
+            flops_per_s: g as f64 * 1e9,
+            mem_bytes: 0,
+        })
+        .collect();
+    let lf = vec![2.0 * tokens as f64 * (d * d) as f64; layers];
+    let lb = vec![(4 * d * d) as u64; layers];
+    let split = planner::split_layers(&lf, &lb, &devs).expect("split_layers");
+    let plan = planner::recommend_inference(
+        &devs,
+        link,
+        planner::InferenceWorkload {
+            params: (layers * d * d) as u64,
+            d_model: d as u32,
+            n_layers: layers as u32,
+            tokens: tokens as u64,
+        },
+        planner::Objective::Throughput,
+    );
+    // Rank 0 settles M and the wire (plan, or override) and tells everyone.
+    let mut cfg = [0.0f32; 2];
+    if rank == 0 {
+        let m: usize = env("PS_MICRO", "0").parse().unwrap_or(0);
+        let m = if m > 0 { m } else { plan.micro_batches.max(n) };
+        // M must divide the tokens so every micro-batch has the same shape.
+        let m = (1..=m)
+            .rev()
+            .find(|k| tokens.is_multiple_of(*k))
+            .unwrap_or(1);
+        // PS_WIRE: `plan` (default) = the planner's call; `auto` = per-message
+        // f16 / bf16; or a fixed f32 / bf16 / f16.
+        let wire = match env("PS_WIRE", "plan").as_str() {
+            "plan" if plan.half_activations => dist::WireDtype::Auto,
+            "plan" => dist::WireDtype::F32,
+            w => w.parse().unwrap_or(dist::WireDtype::F32),
+        };
+        cfg = [m as f32, wire as u8 as f32];
+    }
+    group.broadcast(0, &mut cfg).expect("pipestream config");
+    let micro = cfg[0] as usize;
+    let wire = match cfg[1] as u8 {
+        1 => dist::WireDtype::Bf16,
+        2 => dist::WireDtype::F16,
+        3 => dist::WireDtype::Auto,
+        _ => dist::WireDtype::F32,
+    };
+    let rows = tokens / micro;
+
+    let mine = split[rank].clone();
+    let mut whole = ps_runner(device, tokens, d, mine.clone());
+    let mut part = ps_runner(device, rows, d, mine.clone());
+    eprintln!(
+        "[{label}] PIPESTREAM rank {rank}: layers {mine:?} ({} of {layers}) on {} ≈{gflops:.0} GFLOP/s",
+        mine.len(),
+        device_label(device)
+    );
+
+    // Runs: (warm-up + 3 timed) × {one batch f32, M micro-batches + wire}.
+    let x: Vec<f32> = (0..tokens * d).map(|i| (i as f32 * 0.001).sin()).collect();
+    let chunks: Vec<Vec<f32>> = x.chunks(rows * d).map(<[f32]>::to_vec).collect();
+    let runs: [(usize, dist::WireDtype); 2] = [(1, dist::WireDtype::F32), (micro, wire)];
+    let mut times: Vec<Vec<f64>> = vec![Vec::new(); 2];
+    let mut streamed = Vec::new();
+    for (ri, &(m, w)) in runs.iter().enumerate() {
+        for rep in 0..4 {
+            group.barrier().expect("pipestream barrier");
+            let f: &mut dyn FnMut(&[f32]) -> Vec<f32> =
+                if m == 1 { &mut *whole } else { &mut *part };
+            if rank == 0 {
+                let input: Vec<Vec<f32>> = if m == 1 {
+                    vec![x.clone()]
+                } else {
+                    chunks.clone()
+                };
+                let t = Instant::now();
+                let out = dist::pipeline_run(group, f, &input, w).expect("pipeline_run");
+                if rep > 0 {
+                    times[ri].push(t.elapsed().as_secs_f64());
+                }
+                if ri == 1 {
+                    streamed = out.concat();
+                }
+            } else {
+                dist::serve_stage_stream(group, f, m, w).expect("serve_stage_stream");
+            }
+        }
+    }
+
+    if rank != 0 {
+        return true;
+    }
+    // Reference: every layer on one CPU in f32 (PS_FORMAT is the format under
+    // test; the reference stays exact).
+    let fmt = std::env::var("PS_FORMAT").ok();
+    // SAFETY: single-threaded at this point (every stage has finished).
+    unsafe { std::env::remove_var("PS_FORMAT") };
+    let mut full = ps_runner(Device::Cpu, tokens, d, 0..layers);
+    let reference = full(&x);
+    let scale = reference
+        .iter()
+        .fold(0.0f32, |a, v| a.max(v.abs()))
+        .max(1e-6);
+    let rel = max_abs_err(&streamed, &reference) / scale;
+    // bf16 activations round at every hop. Even an f32 wire drifts ~1e-3 over
+    // 24 wide layers: CUDA matmuls default to TF32 (RLX_CUDA_NO_TF32=1 for
+    // full f32 on that rank).
+    let wire_tol: f32 = match wire {
+        dist::WireDtype::F32 => 2e-3,
+        dist::WireDtype::F16 | dist::WireDtype::Auto => 5e-3,
+        dist::WireDtype::Bf16 => 3e-2,
+    };
+    // A narrow compute format sets its own error floor: ~2^-man_bits per layer.
+    let fmt_tol = fmt
+        .as_deref()
+        .and_then(|f| f.parse::<rlx_ir::NumberFormat>().ok())
+        .and_then(|nf| nf.activations().or(nf.weights()))
+        .map_or(0.0, |(f, _)| {
+            2f32.powi(-(f.man_bits as i32)) * layers as f32
+        });
+    let tol = wire_tol.max(fmt_tol);
+    let pass = rel < tol && streamed.len() == reference.len();
+    let (t1, tm) = (median(times[0].clone()), median(times[1].clone()));
+    let shares: Vec<String> = split
+        .iter()
+        .zip(&all)
+        .map(|(r, g)| format!("{} @{g:.0}", r.len()))
+        .collect();
+    eprintln!(
+        "[{label}] PIPESTREAM {layers}×[{d}²] MLP, {tokens} tokens, link α={:.2} ms β={:.1} MB/s\n\
+         [{label}]   split (layers @GFLOP/s): [{}]\n\
+         [{label}]   plan: {:?}, {} micro-batches, {} activations — {}\n\
+         [{label}]   one batch, f32:            {:>8.1} ms  {:>8.0} tok/s\n\
+         [{label}]   {:>2} micro-batches, {:<5}:   {:>8.1} ms  {:>8.0} tok/s  ({:.2}×)\n\
+         [{label}]   vs single-node CPU f32 reference (compute {}): max rel err {rel:.2e} (tol {tol:.0e})  {}",
+        link.latency_s * 1e3,
+        link.bandwidth_bytes_per_s / 1e6,
+        shares.join(", "),
+        plan.strategy,
+        plan.micro_batches,
+        if plan.half_activations {
+            "16-bit"
+        } else {
+            "f32"
+        },
+        plan.rationale,
+        t1 * 1e3,
+        tokens as f64 / t1,
+        micro,
+        format!("{wire:?}").to_lowercase(),
+        tm * 1e3,
+        tokens as f64 / tm,
+        t1 / tm,
+        fmt.as_deref().unwrap_or("f32"),
+        if pass { "PASS ✓" } else { "FAIL ✗" },
+    );
+    pass
+}
+
 fn run_topology(group: &Arc<ProcessGroup>, label: &str, device: Device) {
     let gflops = device_throughput(device);
     eprintln!(

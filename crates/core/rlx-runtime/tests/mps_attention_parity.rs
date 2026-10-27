@@ -111,11 +111,9 @@ fn cpu_vs_metal_attention_no_mask_unpadded() {
     let cpu_out = run_on(Device::Cpu, b, s, nh, dh, &qkv, &mask);
     // Force MPSGraph attention path so we exercise the lowering we're
     // trying to validate.
-    rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
-    rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
+    rlx_ir::env::set("RLX_MPSGRAPH_FORCE", "1");
     let mtl_out = run_on(Device::Metal, b, s, nh, dh, &qkv, &mask);
-    rlx_ir::env::unset("RLX_USE_MPSGRAPH");
-    rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
+    rlx_ir::env::unset("RLX_MPSGRAPH_FORCE");
 
     assert_eq!(cpu_out.len(), mtl_out.len());
     let diff = max_abs_diff(&cpu_out, &mtl_out);
@@ -142,11 +140,9 @@ fn cpu_vs_metal_attention_multi_head_unpadded() {
     let mask = vec![1.0f32; b * s];
 
     let cpu_out = run_on(Device::Cpu, b, s, nh, dh, &qkv, &mask);
-    rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
-    rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
+    rlx_ir::env::set("RLX_MPSGRAPH_FORCE", "1");
     let mtl_out = run_on(Device::Metal, b, s, nh, dh, &qkv, &mask);
-    rlx_ir::env::unset("RLX_USE_MPSGRAPH");
-    rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
+    rlx_ir::env::unset("RLX_MPSGRAPH_FORCE");
 
     let diff = max_abs_diff(&cpu_out, &mtl_out);
     eprintln!("[attn-parity NH=2 DH=4 unpadded] max abs diff = {diff:e}");
@@ -244,8 +240,7 @@ fn cpu_vs_metal_full_block_unpadded() {
         .unwrap();
 
     // Metal with MPSGraph
-    rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
-    rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
+    rlx_ir::env::set("RLX_MPSGRAPH_FORCE", "1");
     let session_mtl = Session::new(Device::Metal);
     let mut mtl = session_mtl.compile_with(g, &CompileOptions::default());
     mtl.set_param("qkv_w", &qkv_w_data);
@@ -255,8 +250,7 @@ fn cpu_vs_metal_full_block_unpadded() {
         .into_iter()
         .next()
         .unwrap();
-    rlx_ir::env::unset("RLX_USE_MPSGRAPH");
-    rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
+    rlx_ir::env::unset("RLX_MPSGRAPH_FORCE");
 
     let diff = max_abs_diff(&cpu_out, &mtl_out);
     let cpu_max = cpu_out.iter().map(|v| v.abs()).fold(0f32, f32::max);
@@ -291,16 +285,14 @@ fn bisect(
     }
     let cpu_out = cpu.run(inputs).into_iter().next().unwrap();
 
-    rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
-    rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
+    rlx_ir::env::set("RLX_MPSGRAPH_FORCE", "1");
     let session_mtl = Session::new(Device::Metal);
     let mut mtl = session_mtl.compile_with(g, &opts);
     for (n, d) in params {
         mtl.set_param(n, d);
     }
     let mtl_out = mtl.run(inputs).into_iter().next().unwrap();
-    rlx_ir::env::unset("RLX_USE_MPSGRAPH");
-    rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
+    rlx_ir::env::unset("RLX_MPSGRAPH_FORCE");
 
     let diff = max_abs_diff(&cpu_out, &mtl_out);
     let cpu_max = cpu_out.iter().map(|v| v.abs()).fold(1e-9, f32::max);
@@ -824,11 +816,9 @@ fn cpu_vs_metal_attention_with_padding() {
     let mask = vec![1.0f32, 1.0, 0.0, 0.0];
 
     let cpu_out = run_on(Device::Cpu, b, s, nh, dh, &qkv, &mask);
-    rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
-    rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
+    rlx_ir::env::set("RLX_MPSGRAPH_FORCE", "1");
     let mtl_out = run_on(Device::Metal, b, s, nh, dh, &qkv, &mask);
-    rlx_ir::env::unset("RLX_USE_MPSGRAPH");
-    rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
+    rlx_ir::env::unset("RLX_MPSGRAPH_FORCE");
 
     let diff = max_abs_diff(&cpu_out, &mtl_out);
     eprintln!("[attn-parity NH=2 DH=4 padded] max abs diff = {diff:e}");

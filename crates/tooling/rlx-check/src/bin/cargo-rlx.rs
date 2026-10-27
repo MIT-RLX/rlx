@@ -26,6 +26,10 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("check") => run_check(&args[1..]),
         Some("debug") => run_debug(&args[1..]),
+        Some("doctor") => run_doctor(&args[1..]),
+        Some("dist") => rlx_check::launch::main(&args[1..]),
+        Some("nodes") => rlx_check::nodes::main(&args[1..]),
+        Some("setup") => run_setup(&args[1..]),
         Some("new-op") => run_scaffold(&args[1..], Kind::Op),
         Some("new-model") => run_scaffold(&args[1..], Kind::Model),
         None | Some("-h") | Some("--help") | Some("help") => {
@@ -324,6 +328,269 @@ fn run_debug(args: &[String]) -> ExitCode {
     }
 }
 
+/// `cargo rlx doctor [--device a,b] [--no-run] [--json]`.
+fn run_doctor(args: &[String]) -> ExitCode {
+    use rlx_runtime::doctor::{DoctorOptions, EnvVarStatus, doctor};
+    let mut opts = DoctorOptions::default();
+    let mut as_json = false;
+    let mut as_report = false;
+    let mut known = false;
+    let mut markdown = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => as_json = true,
+            "--report" => as_report = true,
+            "--known" => known = true,
+            "--markdown" => markdown = true,
+            "--no-run" => opts.no_run = true,
+            "--device" | "-d" => {
+                i += 1;
+                let Some(list) = args.get(i) else {
+                    return usage_err("--device needs a comma-separated list");
+                };
+                let mut devs = Vec::new();
+                for name in list.split(',').map(str::trim) {
+                    match name.parse::<rlx_runtime::Device>() {
+                        Ok(d) => devs.push(d),
+                        Err(_) => return usage_err(&format!("unknown device '{name}'")),
+                    }
+                }
+                opts.devices = Some(devs);
+            }
+            "-h" | "--help" => {
+                print_help();
+                return ExitCode::SUCCESS;
+            }
+            other => return usage_err(&format!("unknown doctor flag '{other}'")),
+        }
+        i += 1;
+    }
+    if known {
+        use rlx_runtime::doctor::known_issues::{ISSUES, markdown as known_md};
+        if markdown {
+            print!("{}", known_md());
+        } else {
+            for k in ISSUES {
+                println!(
+                    "{}  [{}{}]  {}\n    symptom: {}\n    fix: {}\n",
+                    k.id,
+                    k.severity.label(),
+                    if k.detect.is_some() {
+                        ", detected"
+                    } else {
+                        ", build time"
+                    },
+                    k.title,
+                    k.symptom,
+                    k.fix
+                );
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    let report = doctor(&opts);
+    if as_report {
+        println!("{}", report.to_markdown());
+        return if report.healthy() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    if as_json {
+        let devices: Vec<serde_json::Value> = report
+            .devices
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "device": d.device.to_string(),
+                    "name": d.name,
+                    "feature": d.feature,
+                    "status": d.status.label(),
+                    "fix": d.fix,
+                    "detail": d.detail,
+                    "tested": d.tested,
+                    "toolchain_warning": d.toolchain_warning,
+                    "check": d.check.as_ref().map(|c| serde_json::json!({
+                        "passed": c.passed(),
+                        "rel_err": c.rel_err,
+                        "tolerance": c.tolerance,
+                        "millis": c.millis,
+                        "error": c.error,
+                    })),
+                })
+            })
+            .collect();
+        let env: Vec<serde_json::Value> = report
+            .env
+            .iter()
+            .map(|e| {
+                let (status, hint) = match &e.status {
+                    EnvVarStatus::Known { group } => ("known", Some(group.to_string())),
+                    EnvVarStatus::Deprecated { use_instead } => {
+                        ("deprecated", Some(use_instead.clone()))
+                    }
+                    EnvVarStatus::Unknown { did_you_mean } => {
+                        ("unknown", did_you_mean.map(str::to_string))
+                    }
+                };
+                serde_json::json!({ "name": e.name, "value": e.value, "status": status, "hint": hint })
+            })
+            .collect();
+        let out = serde_json::json!({
+            "version": report.version,
+            "os": report.os,
+            "arch": report.arch,
+            "healthy": report.healthy(),
+            "devices": devices,
+            "env": env,
+            "issues": report.issues.iter().map(|k| serde_json::json!({
+                "id": k.id, "severity": k.severity.label(), "title": k.title, "fix": k.fix,
+            })).collect::<Vec<_>>(),
+            "versions": report.versions.iter().map(|(k, (a, b, c))| (k.to_string(), format!("{a}.{b}.{c}"))).collect::<std::collections::BTreeMap<_, _>>(),
+            "implied": report.implied.iter().map(|(n, v, src)| serde_json::json!({
+                "name": n, "value": v, "source": src,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    } else {
+        println!("{report}");
+    }
+    if report.healthy() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// `cargo rlx setup <backend> …`.
+fn run_setup(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("xdna") => setup_xdna(&args[1..]),
+        Some(other) => usage_err(&format!(
+            "no setup for '{other}' yet (available: xdna). For other backends, \
+             `cargo rlx doctor` names what is missing and how to install it"
+        )),
+        None => usage_err("setup needs a backend, e.g. `cargo rlx setup xdna`"),
+    }
+}
+
+#[cfg(not(feature = "xdna"))]
+fn setup_xdna(_args: &[String]) -> ExitCode {
+    usage_err(
+        "this cargo-rlx was built without XDNA; reinstall with \
+         `cargo install --path crates/tooling/rlx-check --features xdna`",
+    )
+}
+
+#[cfg(feature = "xdna")]
+fn setup_xdna(args: &[String]) -> ExitCode {
+    use rlx_xdna::{setup, toolchain};
+    let mut version: Option<(u32, u32, u32)> = None;
+    let mut python: Option<String> = None;
+    let mut dry_run = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dry-run" | "-n" => dry_run = true,
+            "--version" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage_err("--version needs a release, e.g. 1.4.4");
+                };
+                let p: Vec<u32> = v.split('.').filter_map(|x| x.parse().ok()).collect();
+                if p.len() != 3 {
+                    return usage_err(&format!("'{v}' is not a release like 1.4.4"));
+                }
+                version = Some((p[0], p[1], p[2]));
+            }
+            "--python" => {
+                i += 1;
+                python = args.get(i).cloned();
+            }
+            "-h" | "--help" => {
+                print_help();
+                return ExitCode::SUCCESS;
+            }
+            other => return usage_err(&format!("unknown setup flag '{other}'")),
+        }
+        i += 1;
+    }
+    if let Err(e) = setup::platform_supported()
+        && !dry_run
+    {
+        return usage_err(&e);
+    }
+    let host = toolchain::Host::real();
+    let plan = match setup::plan(&host, version, python.as_deref()) {
+        Ok(p) => p,
+        Err(e) => return usage_err(&e),
+    };
+    let (a, b, c) = plan.version;
+    if let Ok(tc) = toolchain::resolve(&host)
+        && tc.version == Some(plan.version)
+        && tc.peano_mismatch().is_none()
+        && !dry_run
+    {
+        println!(
+            "mlir-aie {a}.{b}.{c} with its pinned Peano is already installed ({}).",
+            tc.aiecc.display()
+        );
+    } else {
+        println!(
+            "Installing mlir-aie {a}.{b}.{c} + Peano {} into {}",
+            plan.peano,
+            plan.dir.display()
+        );
+        for cmd in &plan.commands {
+            println!("  $ {}", cmd.join(" "));
+            if dry_run {
+                continue;
+            }
+            let ok = std::process::Command::new(&cmd[0])
+                .args(&cmd[1..])
+                .status()
+                .is_ok_and(|s| s.success());
+            if !ok {
+                eprintln!(
+                    "cargo-rlx: `{}` failed. Needs Python 3 with venv/pip and network access to \
+                     github.com; on Debian/Ubuntu `sudo apt install python3-venv`. Use --python \
+                     to pick another interpreter.",
+                    cmd.join(" ")
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+        if dry_run {
+            println!("(dry run — nothing was installed)");
+            return ExitCode::SUCCESS;
+        }
+    }
+    // What rlx now resolves (fresh, not the per-process cache).
+    match toolchain::resolve(&host) {
+        Ok(tc) => {
+            println!(
+                "toolchain: aiecc {} · Peano {}",
+                tc.aiecc.display(),
+                tc.peano_version.as_deref().unwrap_or("?")
+            );
+        }
+        Err(e) => {
+            eprintln!("cargo-rlx: installed, but rlx still cannot use it:\n{e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if !rlx_xdna::runtime_present() {
+        println!("\nThe XRT runtime is still missing (needs root). For this system:");
+        for line in setup::xrt_instructions(std::path::Path::new("/")) {
+            println!("  {line}");
+        }
+    }
+    println!("\nNext: `cargo rlx doctor --device xdna`");
+    ExitCode::SUCCESS
+}
+
 fn usage_err(msg: &str) -> ExitCode {
     eprintln!("cargo-rlx: {msg}");
     ExitCode::from(2)
@@ -334,6 +601,10 @@ fn print_help() {
         "cargo rlx — rlx developer tools\n\
          \n\
          SUBCOMMANDS:\n\
+         \x20   doctor      what runs on this host: every device, a check run, RLX_* env\n\
+         \x20   dist        launch one distributed job on every rank of a cluster file\n\
+         \x20   nodes       list nodes advertised on the LAN (Bonjour/Avahi), or advertise this one\n\
+         \x20   setup       install a backend's toolchain (no root): `cargo rlx setup xdna`\n\
          \x20   check       device-free static analysis of an rlx graph\n\
          \x20   debug       run a graph on a device vs CPU; classify, probe options, bisect\n\
          \x20   new-op      scaffold a custom op (OpExtension + lower/kernel)\n\
@@ -345,6 +616,21 @@ fn print_help() {
          \x20   --probe   rerun with one compile option changed at a time\n\
          \x20   --bisect  expose every op as an output; name the first that diverges\n\
          \x20   Backends need their feature: cargo install … --features metal,gpu\n\
+         \n\
+         DOCTOR:\n\
+         \x20   cargo rlx doctor [--device a,b] [--no-run] [--json | --report]\n\
+         \x20   cargo rlx doctor --known [--markdown]   every known issue and its fix\n\
+         \x20   --report  paste-ready Markdown for a GitHub issue (home dir redacted)\n\
+         \x20   Reports only the backends this binary was built with:\n\
+         \x20   cargo install … --features metal,gpu (or cuda, rocm, vulkan, xdna…)\n\
+         \x20   Exit code is non-zero when an available device fails its check run\n\
+         \x20   or an RLX_* variable is unknown.\n\
+         \n\
+         SETUP:\n\
+         \x20   cargo rlx setup xdna [--version 1.4.4] [--python python3] [--dry-run]\n\
+         \x20   Installs a matrix-tested mlir-aie and the Peano build it pins into\n\
+         \x20   ~/.local/share/rlx/toolchains (found automatically), then prints what\n\
+         \x20   still needs root (the XRT runtime) for this distro.\n\
          \n\
          SCAFFOLD:\n\
          \x20   cargo rlx new-op <Name>     [--stdout] [--force]\n\

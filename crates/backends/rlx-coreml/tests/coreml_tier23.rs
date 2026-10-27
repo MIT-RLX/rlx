@@ -10,7 +10,11 @@ use rlx_runtime::{Device, Session};
 
 #[test]
 fn ane_gru_native_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
+    if rlx_ir::env::skip_unless_device(
+        "ane",
+        cfg!(target_vendor = "apple"),
+        rlx_runtime::is_available(Device::Ane),
+    ) {
         eprintln!("skip: ANE unavailable");
         return;
     }
@@ -61,7 +65,11 @@ fn ane_gru_native_matches_cpu() {
 
 #[test]
 fn ane_sample_suffix_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
+    if rlx_ir::env::skip_unless_device(
+        "ane",
+        cfg!(target_vendor = "apple"),
+        rlx_runtime::is_available(Device::Ane),
+    ) {
         eprintln!("skip: ANE unavailable");
         return;
     }
@@ -80,7 +88,11 @@ fn ane_sample_suffix_matches_cpu() {
 
 #[test]
 fn ane_lstm_native_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
+    if rlx_ir::env::skip_unless_device(
+        "ane",
+        cfg!(target_vendor = "apple"),
+        rlx_runtime::is_available(Device::Ane),
+    ) {
         eprintln!("skip: ANE unavailable");
         return;
     }
@@ -127,7 +139,11 @@ fn ane_lstm_native_matches_cpu() {
 
 #[test]
 fn ane_rnn_native_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
+    if rlx_ir::env::skip_unless_device(
+        "ane",
+        cfg!(target_vendor = "apple"),
+        rlx_runtime::is_available(Device::Ane),
+    ) {
         eprintln!("skip: ANE unavailable");
         return;
     }
@@ -175,7 +191,11 @@ fn ane_rnn_native_matches_cpu() {
 
 #[test]
 fn ane_mamba2_native_matches_cpu() {
-    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
+    if rlx_ir::env::skip_unless_device(
+        "ane",
+        cfg!(target_vendor = "apple"),
+        rlx_runtime::is_available(Device::Ane),
+    ) {
         eprintln!("skip: ANE unavailable");
         return;
     }

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! `import-pt` packs a torch.save checkpoint into `.rlxp`.
 
+#![cfg(feature = "convert")]
 use std::io::Write;
 
 use rlx_pkg::{Package, PtImportOptions, pt_to_rlxp};

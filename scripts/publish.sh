@@ -80,18 +80,27 @@
 #   re-run with `--start-crate <name>` (or `--start-tier N`) to pick
 #   up where you stopped. Already-published crates aren't revisited.
 #
-# Dry-run limitations:
+# Dry run:
 #
-#   `cargo publish --dry-run` does a full local rebuild + dep
-#   resolution against crates.io. For NON-LEAF crates (tier ≥ 1)
-#   that fails until their leaf deps actually exist on crates.io at
-#   the new version. The script's --dry-run mode handles this by
-#   recording the resolution-failure crates separately at the end —
-#   metadata + packaging are still validated for them. The only
-#   pre-publish step that can fully dry-run is tier 0 (no RLX path
-#   deps). Run `scripts/publish.sh --list` to print the full tier
-#   order; `validate_publish_order` checks every `[dependencies]` path
-#   dep against that order before publishing.
+#   `--dry-run` changes nothing in the tree and uploads nothing. Its
+#   formatting gate only names the files a real run would format. It
+#   then runs ONE `cargo publish --workspace --dry-run --allow-dirty`
+#   (cargo ≥ 1.90): every publishable crate is packaged and rebuilt
+#   from its package, with the workspace crates' not-yet-published
+#   versions resolved locally, so non-leaf crates are verified too.
+#   (Older cargo falls back to one `cargo publish --dry-run` per crate,
+#   where a non-leaf crate's dep resolution fails until its leaves are
+#   on crates.io; those are listed apart.) The summary names any
+#   package over crates.io's 10 MB upload limit (a failure) and the
+#   crates whose version is already on crates.io: their changes ship
+#   only after a version bump.
+#
+#   A real publish checks package sizes first as well
+#   (`cargo package --workspace --no-verify`), so a crate over the
+#   limit stops the run before anything is uploaded, not halfway
+#   through the tiers. Run `scripts/publish.sh --list` to print the
+#   full tier order; `validate_publish_order` checks every
+#   `[dependencies]` path dep against that order before publishing.
 #
 # Environment:
 #
@@ -207,7 +216,13 @@ SKIPPED=(
 #     `path = "../../../rlx/…"` dev-dependency — and since Cargo resolves
 #     dev-dependencies at lock time regardless of features, that made a sibling
 #     `rlx` checkout mandatory just to load that workspace.
+# The first two tiers: leaf numerics with no rlx dependency, then the two
+# built on them (rlx-rng / rlx-numpy / rlx-special / rlx-pocketfft below, and
+# rlx-cpu, depend on rlx-libm and rlx-linux-ref). Comments go here, not inside
+# the array: `validate_publish_order` parses it as quoted lines only.
 TIERS=(
+    "rlx-libm rlx-fastmath"
+    "rlx-linux-ref rlx-spectral"
     "rlx-ir rlxsl rlx-gguf rlx-torch-ckpt rlx-nemo rlx-gpu-dispatch rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim rlx-hwprofile rlx-onnx-proto rlx-dduf rlx-hub rlx-fem rlx-rng rlx-program rlx-search rlx-numpy rlx-special rlx-pocketfft rlx-nnpack"
     "rlx-unfuse rlx-flow rlx-fusion rlx-driver rlx-mlx-io"
     "rlx-autodiff rlx-extend rlx-pkg"
@@ -703,12 +718,16 @@ if (( ! NO_GATE )); then
     # check, which still catches anything rustfmt itself cannot settle.
     bold "[1/3] cargo fmt"
     unformatted="$(cargo fmt --all -- --check -l 2>/dev/null || true)"
-    if [[ -n "$unformatted" ]]; then
+    if [[ -n "$unformatted" ]] && (( DRY_RUN )); then
+        # A dry run changes nothing: name what a real run would format.
+        yellow "  a real run would format:"
+        printf '    %s\n' $unformatted
+    elif [[ -n "$unformatted" ]]; then
         echo "  formatting:"
         printf '    %s\n' $unformatted
         cargo fmt --all
+        cargo fmt --all -- --check
     fi
-    cargo fmt --all -- --check
 
     bold "[2/3] cargo clippy --workspace --all-targets -- -D warnings"
     cargo clippy --workspace --all-targets -- -D warnings
@@ -942,6 +961,97 @@ sleep_with_countdown() {
     done
     printf "\r  %s — done.                  \n" "$label"
 }
+
+# ── Package sizes ───────────────────────────────────────────────
+# crates.io refuses an upload over 10 MB (10 MiB). Reads a `cargo package` /
+# `cargo publish` log ("Packaging <crate> v…" then "Packaged N files, … (X
+# compressed)") and prints `<crate> <bytes>` for every package over the limit;
+# returns 1 if there is one.
+UPLOAD_LIMIT=$(( 10 * 1024 * 1024 ))
+oversized_packages() {
+    python3 - "$1" "$UPLOAD_LIMIT" <<'PY'
+import re, sys
+log, limit = open(sys.argv[1], errors="replace").read(), int(sys.argv[2])
+units = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
+crate, over = None, False
+for line in log.splitlines():
+    m = re.match(r"\s*Packaging (\S+) v", line)
+    if m:
+        crate = m.group(1)
+        continue
+    m = re.search(r"\(([0-9.]+)(B|KiB|MiB|GiB) compressed\)", line)
+    if m and crate:
+        size = float(m.group(1)) * units[m.group(2)]
+        if size > limit:
+            print(f"{crate} {size / (1 << 20):.1f} MiB")
+            over = True
+        crate = None
+sys.exit(1 if over else 0)
+PY
+}
+
+# Crates the log reports as already on crates.io at their version.
+already_published_in_log() {
+    grep -oE 'crate [A-Za-z0-9_-]+@[0-9][^ ]* already exists on crates.io index' "$1" \
+        | awk '{print $2}' | sort -u
+}
+
+if (( ! DRY_RUN )); then
+    bold "Package sizes (cargo package --workspace --no-verify)"
+    size_log="$(mktemp)"
+    cargo package --workspace --no-verify --allow-dirty >"$size_log" 2>&1 || {
+        tail -20 "$size_log"; red "cargo package failed."; exit 1; }
+    if ! over="$(oversized_packages "$size_log")"; then
+        red "Over crates.io's 10 MB upload limit — nothing uploaded:"
+        printf '    %s\n' "$over"
+        red "Trim the package (\`exclude = [...]\` in its [package])."
+        exit 1
+    fi
+    rm -f "$size_log"
+    green "  every package is under the 10 MB limit."
+fi
+
+# ── Dry run: the whole workspace at once ────────────────────────
+if (( DRY_RUN )) && cargo publish --help 2>/dev/null | grep -q -- '--workspace'; then
+    args=(--workspace --dry-run --allow-dirty)
+    if (( NO_VERIFY )); then
+        args+=(--no-verify)
+    fi
+    bold ">> cargo publish ${args[*]}"
+    dry_log="$(mktemp)"
+    set +e
+    cargo publish "${args[@]}" 2>&1 | tee "$dry_log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    echo
+    bold "Dry-run summary:"
+    packaged="$(grep -cE '^\s+Packaged ' "$dry_log" || true)"
+    verified="$(grep -cE '^\s+Verifying ' "$dry_log" || true)"
+    failed=0
+    if (( rc != 0 )); then
+        red "  cargo publish --dry-run failed:"
+        grep -E '^error' -A4 "$dry_log" | head -20 | sed 's/^/    /'
+        failed=1
+    else
+        green "  packaged ${packaged}, rebuilt from the package ${verified}."
+    fi
+    if ! over="$(oversized_packages "$dry_log")"; then
+        red "  over crates.io's 10 MB upload limit:"
+        printf '    %s\n' "$over"
+        failed=1
+    fi
+    published="$(already_published_in_log "$dry_log")"
+    if [[ -n "$published" ]]; then
+        yellow "  already on crates.io at this version ($(echo "$published" | wc -l | tr -d ' ')) — their changes ship only after a version bump:"
+        echo "$published" | sed 's/^/    ○ /'
+    fi
+    rm -f "$dry_log"
+    if (( failed )); then
+        exit 1
+    fi
+    green "Dry run passed."
+    exit 0
+fi
 
 # ── Walk tiers ──────────────────────────────────────────────────
 DRY_RUN_PASS=()

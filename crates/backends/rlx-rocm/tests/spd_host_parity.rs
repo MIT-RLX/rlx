@@ -272,8 +272,8 @@ fn matrix_fn_batch_logm_diagonal() {
 /// assemble kernel (single + batched). Skips when HIP or hipSOLVER is unavailable.
 #[test]
 fn eigh_native_forward_reconstructs() {
-    if !rlx_rocm::is_available() || !rlx_rocm::eigh_native::is_available() {
-        eprintln!("[rlx-rocm spd] no ROCm/hipSOLVER — skipping eigh_native");
+    let available = rlx_rocm::is_available() && rlx_rocm::eigh_native::is_available();
+    if rlx_ir::env::skip_unless_device("rocm + hipSOLVER", true, available) {
         return;
     }
     let mk = |n: usize| -> Vec<f32> {

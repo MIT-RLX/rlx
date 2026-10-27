@@ -8,7 +8,7 @@
 // helpers. No `LowerCtx` state — split out of `mod.rs` to keep the
 // lowering dispatch readable.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use rlx_ir::op::BinaryOp;
 use rlx_ir::quant::QuantScheme;
@@ -332,7 +332,7 @@ pub(super) fn tensor_type_flex(shape: &Shape, flex_dims: &[bool]) -> Result<prot
         data_type: mil_data_type(shape.dtype())?,
         rank: shape.rank() as i64,
         dimensions: dims,
-        attributes: HashMap::new(),
+        attributes: BTreeMap::new(),
     })
 }
 
@@ -353,7 +353,7 @@ pub(super) fn tensor_type(shape: &Shape) -> Result<proto::TensorType> {
         data_type: mil_data_type(shape.dtype())?,
         rank: shape.rank() as i64,
         dimensions: dims,
-        attributes: HashMap::new(),
+        attributes: BTreeMap::new(),
     })
 }
 
@@ -405,11 +405,11 @@ pub(super) fn simple_op_flex(
     inputs: Vec<(&str, proto::Argument)>,
     flexible: bool,
 ) -> Result<proto::Operation> {
-    let mut input_map = HashMap::new();
+    let mut input_map = BTreeMap::new();
     for (k, v) in inputs {
         input_map.insert(k.to_string(), v);
     }
-    let mut attributes = HashMap::new();
+    let mut attributes = BTreeMap::new();
     attributes.insert("name".to_string(), scalar_str(out_name));
     let flex_mask: Vec<bool> = if flexible {
         out_shape
@@ -510,12 +510,12 @@ pub(super) fn make_const(
     } else {
         tensor_f32(shape, data)?
     };
-    let mut attributes = HashMap::new();
+    let mut attributes = BTreeMap::new();
     attributes.insert("name".to_string(), scalar_str(out_name));
     attributes.insert("val".to_string(), val);
     Ok(proto::Operation {
         r#type: "const".to_string(),
-        inputs: HashMap::new(),
+        inputs: BTreeMap::new(),
         outputs: vec![named_value_type(out_name, shape)?],
         blocks: vec![],
         attributes,
@@ -536,7 +536,7 @@ fn tensor_type_dt(dims: &[usize], dt: proto::DataType) -> proto::TensorType {
                 )),
             })
             .collect(),
-        attributes: HashMap::new(),
+        attributes: BTreeMap::new(),
     }
 }
 
@@ -573,12 +573,12 @@ pub(super) fn make_const_u1_packed(
             },
         )),
     };
-    let mut attributes = HashMap::new();
+    let mut attributes = BTreeMap::new();
     attributes.insert("name".to_string(), scalar_str(out_name));
     attributes.insert("val".to_string(), val);
     Ok(proto::Operation {
         r#type: "const".to_string(),
-        inputs: HashMap::new(),
+        inputs: BTreeMap::new(),
         outputs: vec![proto::NamedValueType {
             name: out_name.to_string(),
             r#type: Some(vt),
@@ -634,12 +634,12 @@ pub(super) fn make_const_float(
             };
             immediate(t, value_type(shape)?)
         };
-        let mut attributes = HashMap::new();
+        let mut attributes = BTreeMap::new();
         attributes.insert("name".to_string(), scalar_str(out_name));
         attributes.insert("val".to_string(), val);
         return Ok(proto::Operation {
             r#type: "const".to_string(),
-            inputs: HashMap::new(),
+            inputs: BTreeMap::new(),
             outputs: vec![named_value_type(out_name, shape)?],
             blocks: vec![],
             attributes,
@@ -2053,7 +2053,7 @@ pub(super) fn scalar_str(s: &str) -> proto::Value {
             data_type: proto::DataType::String as i32,
             rank: 0,
             dimensions: vec![],
-            attributes: HashMap::new(),
+            attributes: BTreeMap::new(),
         })),
     };
     immediate(t, vt)

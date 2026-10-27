@@ -1,0 +1,22 @@
+[package]
+name = "rlx-spectral"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Spectral front-ends in pure Rust, generic over precision (f32 / f64): FFT plans, windows, STFT framing, mel filterbanks, whisper log-mel, Kaldi / SeamlessM4T fbank"
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+# f32 log / exp for the log-mel stage
+rlx-fastmath = { workspace = true }
+# f64 sin / cos / ln for twiddles, windows and mel scales (pure Rust, < 1 ulp)
+libm = "0.2"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# benchmark baseline only
+rustfft = "6"

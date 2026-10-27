@@ -3685,28 +3685,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "onig"
-version = "6.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cc3cbf698f9438986c11a880c90a6d04b9de27575afd28bbf45b154b6c709e2"
-dependencies = [
- "bitflags 2.13.2",
- "libc",
- "once_cell",
- "onig_sys",
-]
-
-[[package]]
-name = "onig_sys"
-version = "69.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e68317604e77e53b85896388e1a803c1d21b74c899ec9e5e1112db90735edd7"
-dependencies = [
- "cc",
- "pkg-config",
-]
-
-[[package]]
 name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3849,7 +3827,7 @@ dependencies = [
  "seq-macro",
  "snap",
  "thrift",
- "twox-hash",
+ "twox-hash 1.6.3",
 ]
 
 [[package]]
@@ -4178,6 +4156,15 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "primal-check"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc0d895b311e3af9902528fbb8f928688abbd95872819320517cc24ca6b2bd08"
+dependencies = [
+ "num-integer",
 ]
 
 [[package]]
@@ -4912,22 +4899,28 @@ dependencies = [
 name = "rlx-check"
 version = "0.2.19"
 dependencies = [
+ "rlx-driver",
  "rlx-ir",
  "rlx-macros",
  "rlx-runtime",
+ "rlx-xdna",
+ "serde",
  "serde_json",
+ "toml 0.8.23",
 ]
 
 [[package]]
 name = "rlx-collectives"
 version = "0.2.19"
 dependencies = [
+ "anyhow",
  "rlx-autodiff",
  "rlx-cpu",
  "rlx-driver",
  "rlx-gguf",
  "rlx-ir",
  "rlx-runtime",
+ "rlx-text",
  "rlx-xdna",
  "serde",
  "serde_json",
@@ -4993,13 +4986,16 @@ dependencies = [
  "half",
  "libm",
  "rayon",
+ "rlx-fastmath",
  "rlx-gguf",
  "rlx-gpu-dispatch",
  "rlx-ir",
+ "rlx-libm",
  "rlx-linux-ref",
  "rlx-mlx-io",
  "rlx-opt",
  "rlx-pocketfft",
+ "rlx-unfuse",
  "rlxsl",
  "serde",
  "strum_macros",
@@ -5061,12 +5057,14 @@ dependencies = [
 name = "rlx-driver"
 version = "0.2.19"
 dependencies = [
+ "futures-executor",
  "half",
  "iroh",
  "mdns-sd",
  "mpi-rs",
  "rlx-ir",
  "tokio",
+ "webbluetooth",
 ]
 
 [[package]]
@@ -5085,6 +5083,10 @@ dependencies = [
  "rlx-flow",
  "rlx-ir",
 ]
+
+[[package]]
+name = "rlx-fastmath"
+version = "0.2.19"
 
 [[package]]
 name = "rlx-fdm"
@@ -5266,6 +5268,9 @@ dependencies = [
 [[package]]
 name = "rlx-libm"
 version = "0.2.19"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "rlx-linalg"
@@ -5542,6 +5547,7 @@ dependencies = [
  "rlx-ir",
  "rlx-mlx-io",
  "rlx-nemo",
+ "ruzstd",
  "safetensors",
  "serde",
  "serde_json",
@@ -5551,6 +5557,7 @@ dependencies = [
  "xxhash-rust",
  "zip",
  "zstd",
+ "zstd-rs",
 ]
 
 [[package]]
@@ -5703,6 +5710,15 @@ name = "rlx-special"
 version = "0.2.19"
 dependencies = [
  "rlx-libm",
+]
+
+[[package]]
+name = "rlx-spectral"
+version = "0.2.19"
+dependencies = [
+ "libm",
+ "rlx-fastmath",
+ "rustfft",
 ]
 
 [[package]]
@@ -5945,6 +5961,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfft"
+version = "6.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21db5f9893e91f41798c88680037dba611ca6674703c1a18601b01a72c8adb89"
+dependencies = [
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "primal-check",
+ "strength_reduce",
+ "transpose",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6037,6 +6067,15 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
+dependencies = [
+ "twox-hash 2.1.5",
+]
 
 [[package]]
 name = "ryu"
@@ -6466,6 +6505,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "strength_reduce"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe895eb47f22e2ddd4dabc02bce419d2e643c8e3b585c78158b349195bc24d82"
+
+[[package]]
 name = "string-interner"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6771,7 +6816,6 @@ dependencies = [
  "log",
  "macro_rules_attribute",
  "monostate",
- "onig",
  "paste",
  "rand 0.9.5",
  "rayon",
@@ -7074,6 +7118,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "transpose"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad61aed86bc3faea4300c7aee358b4c6d0c8d6ccc36524c96e4c92ccf26e77e"
+dependencies = [
+ "num-integer",
+ "strength_reduce",
+]
+
+[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7103,6 +7157,12 @@ dependencies = [
  "cfg-if",
  "static_assertions",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typed-path"
@@ -7551,6 +7611,93 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webbluetooth"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4502750f466fa28daf4f03fad699c1edba31f349f2b3fdba68c64d55225442bf"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-util",
+ "webbluetooth-android",
+ "webbluetooth-apple",
+ "webbluetooth-core",
+ "webbluetooth-linux",
+ "webbluetooth-wasm",
+ "webbluetooth-windows",
+]
+
+[[package]]
+name = "webbluetooth-android"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ccb46f769fb35848c067069aee646328dca379380df373d1a7f8c56dd8fa562"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-util",
+ "webbluetooth-core",
+]
+
+[[package]]
+name = "webbluetooth-apple"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d676f3300b258b33f8a0fe70215ca7ce16704ebb547df2fc0581acd51d888723"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-util",
+ "webbluetooth-core",
+]
+
+[[package]]
+name = "webbluetooth-core"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98eba583230172e2be2c3859bcc81888b8eea82741618ba54c58207b26e17998"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-util",
+]
+
+[[package]]
+name = "webbluetooth-linux"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2045179eec49db3137f26f62bcdb42d387d53515eb0be14a64bee7e8a4d2f667"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-util",
+ "webbluetooth-core",
+]
+
+[[package]]
+name = "webbluetooth-wasm"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ab6a6dd96032dcd1731e0d78647d85ec39c92fe6a4dfe37505cc23011b8f5b4"
+dependencies = [
+ "webbluetooth-core",
+]
+
+[[package]]
+name = "webbluetooth-windows"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abb6e09806062b2505cbae6c159a2489312ccd3fa5fc4411b49b1d64b677fbb4"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-util",
+ "webbluetooth-core",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8253,6 +8400,12 @@ checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
  "zstd-safe",
 ]
+
+[[package]]
+name = "zstd-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41514ccc30389f95bb9e6ab6d5634f17121c7b4fead6722a5fceec1c7891d78f"
 
 [[package]]
 name = "zstd-safe"

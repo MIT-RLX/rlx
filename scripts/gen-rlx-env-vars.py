@@ -48,6 +48,10 @@ ENV_CALL_RE = re.compile(
     r'rlx_ir::env_registry::|env_registry::)'
     r'(?:flag|flag_or|var|parse_or|var_os)\s*\(\s*"(?<![A-Z0-9_])(RLX_[A-Z][A-Z0-9_]*)"'
 )
+LITERAL_RE = re.compile(r'"(RLX_[A-Z][A-Z0-9_]*)"')
+# A line carrying this marker holds an `RLX_*` literal that is deliberately not
+# a variable (a test key, a typo fed to the did-you-mean check).
+IGNORE_MARKER = "env-lint: ignore"
 ENV_LINE_MARKERS = (
     "env::flag",
     "env::flag_or",
@@ -130,8 +134,16 @@ def collect_env_reads() -> dict[str, set[str]]:
             except OSError:
                 continue
             for line in text.splitlines():
-                if "RLX_" not in line:
+                if "RLX_" not in line or IGNORE_MARKER in line:
                     continue
+                if line.lstrip().startswith("//"):
+                    continue
+                # An exact `"RLX_…"` literal is an env-var name wherever it
+                # sits: reads go through `reg::flag`, local `on(..)` wrappers
+                # and named consts as often as through `env::flag`, and the
+                # marker list alone missed 30 live variables that way.
+                for m in LITERAL_RE.finditer(line):
+                    found[m.group(1)].add(rel)
                 if not any(m in line for m in ENV_LINE_MARKERS):
                     continue
                 for m in NAME_RE.finditer(line):
@@ -327,6 +339,35 @@ def summary_placeholders(entries: dict[str, dict]) -> list[str]:
     return sorted(out)
 
 
+SHIM_CALL_RE = re.compile(
+    r'(?:rlx_ir::env|crate::env|env_registry)::'
+    r'(?:var|read|flag|flag_or|parse_or|var_os|read_os|var_result|is_unset)'
+    r'\(\s*"([A-Z][A-Z0-9_]*)"'
+)
+
+
+def non_rlx_shim_reads() -> list[str]:
+    """`path:line name` for every env-shim call on a literal without `RLX_`."""
+    out: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(ROOT / "crates"):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for fn in filenames:
+            if not fn.endswith(".rs"):
+                continue
+            path = Path(dirpath) / fn
+            try:
+                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except OSError:
+                continue
+            for i, line in enumerate(lines, 1):
+                if IGNORE_MARKER in line or line.lstrip().startswith("//"):
+                    continue
+                for m in SHIM_CALL_RE.finditer(line):
+                    if not m.group(1).startswith("RLX_"):
+                        out.append(f"{path.relative_to(ROOT).as_posix()}:{i} {m.group(1)}")
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--check", action="store_true", help="exit 1 if doc/registry drift")
@@ -352,6 +393,21 @@ def main() -> int:
             print(f"  {n}", file=sys.stderr)
         if len(missing) > 40:
             print(f"  … +{len(missing) - 40} more", file=sys.stderr)
+        if args.check:
+            return 1
+
+    # The shim is for `RLX_*` names ONLY: it prefixes anything else with `RLX_`,
+    # so `rlx_ir::env::var("ROCM_PATH")` silently reads `RLX_ROCM_PATH`. Six
+    # such reads sat in the tree (MIOpen's DB lookup never saw `ROCM_PATH`).
+    foreign = non_rlx_shim_reads()
+    if foreign:
+        print(
+            f"env-shim reads of non-RLX names ({len(foreign)}) — the shim reads "
+            "RLX_<name> instead; use std::env::var for these:",
+            file=sys.stderr,
+        )
+        for line in foreign[:40]:
+            print(f"  {line}", file=sys.stderr)
         if args.check:
             return 1
 

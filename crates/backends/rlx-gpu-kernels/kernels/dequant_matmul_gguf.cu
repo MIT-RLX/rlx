@@ -5,7 +5,7 @@
 // Fused GGUF K-quant dequant + GEMV (decode, m == 1).
 // Mirrors rlx-vulkan/shaders/dequant_matmul.comp and rlx-cpu gguf_matmul_bt.
 //
-// Schemes: 0 = Q4_K (256 elems / 144 B), 2 = Q6_K (256 / 210 B),
+// Schemes: 0 = Q4_K (256 elems / 144 B), 2 = Q6_K (256 / 210 B), 20 = Q8_0,
 // 24 = Q1_0 (128 elems / 18 B) — Bonsai-27B decode path.
 
 // 64-bit weight-base index: packed 27B arenas exceed 4 GiB, so a u32
@@ -548,5 +548,286 @@ extern "C" __global__ void dequant_matmul_gguf_q4k_gemv_warp(
     }
     if (lane == 0u) {
         arena[out_off + j] = acc + comp;
+    }
+}
+
+// 8 bytes from tensor byte `rel` at any alignment: three word loads (not
+// eight `rd_byte`s), returned as two little-endian words.
+__device__ __forceinline__ void rd8(
+    const float* arena,
+    unsigned long long w_word,
+    unsigned long long rel,
+    unsigned int& lo,
+    unsigned int& hi
+) {
+    unsigned long long w = w_word + (rel >> 2ull);
+    unsigned int a = __float_as_uint(arena[w]);
+    unsigned int b = __float_as_uint(arena[w + 1ull]);
+    unsigned int sh = (unsigned int)(rel & 3ull) * 8u;
+    if (sh == 0u) {
+        lo = a;
+        hi = b;
+        return;
+    }
+    unsigned int c = __float_as_uint(arena[w + 2ull]);
+    lo = (a >> sh) | (b << (32u - sh));
+    hi = (b >> sh) | (c << (32u - sh));
+}
+
+// f16 at tensor byte `rel`, by bits: normals and zero exactly, the rest
+// through `rd_f16`. No `exp2f` on the common path.
+__device__ __forceinline__ float rd_f16_bits(
+    const float* arena,
+    unsigned long long w_word,
+    unsigned long long rel
+) {
+    unsigned int w = __float_as_uint(arena[w_word + (rel >> 2ull)]);
+    unsigned int h = (w >> ((unsigned int)(rel & 3ull) * 8u)) & 0xFFFFu;
+    unsigned int exp = (h >> 10u) & 0x1Fu;
+    if (exp == 0u || exp == 31u) {
+        return ((h & 0x7FFFu) == 0u) ? __uint_as_float((h & 0x8000u) << 16u)
+                                      : rd_f16(arena, w_word, rel);
+    }
+    return __uint_as_float(((h & 0x8000u) << 16u) | ((exp + 112u) << 23u) | ((h & 0x3FFu) << 13u));
+}
+
+// Accumulate `x · w` over 8 consecutive weights of a GGUF row from element
+// `e0` (a multiple of 8, so all 8 share one scale group): the block's scales
+// decode once per chunk, not per element. `row_base` = the row's first byte.
+// Q8_0 (20): 32 elems / 34 B, f16 d then 32 i8. Q4_K (0): 256 / 144 B.
+// Q5_K (1): 256 / 176 B, Q4_K's layout plus a 32-byte plane of fifth bits.
+// Q6_K (2): 256 / 210 B. Same decode as the scalar `dequant_matmul_gguf`
+// above and rlx-gguf.
+// The 8 weights at elements `e0..e0+8` of the row at `row_base`, decoded.
+__device__ __forceinline__ void gguf_load8(
+    const float* arena,
+    unsigned long long w_word,
+    unsigned long long row_base,
+    unsigned int scheme_id,
+    unsigned long long e0,
+    float w[8]
+) {
+    if (scheme_id == 20u) {
+        unsigned long long base = row_base + (e0 >> 5ull) * 34ull;
+        float d = rd_f16_bits(arena, w_word, base);
+        unsigned int q0, q1;
+        rd8(arena, w_word, base + 2ull + (e0 & 31ull), q0, q1);
+        #pragma unroll
+        for (unsigned int t = 0u; t < 8u; t++) {
+            unsigned int b = ((t < 4u) ? (q0 >> (t * 8u)) : (q1 >> ((t - 4u) * 8u))) & 0xFFu;
+            w[t] = d * (float)sx8(b);
+        }
+    } else if (scheme_id <= 1u) {
+        unsigned int q5 = scheme_id;
+        unsigned int oi = (unsigned int)(e0 & 255ull);
+        unsigned long long base = row_base + (e0 >> 8ull) * (q5 ? 176ull : 144ull);
+        unsigned int pair = oi >> 6u;
+        unsigned int hi = (oi >> 5u) & 1u;
+        unsigned int l0 = oi & 31u;
+        unsigned int sc, mn;
+        scale_min_k4(arena, w_word, pair * 2u + hi, (unsigned int)(base + 4ull), sc, mn);
+        float dl = rd_f16_bits(arena, w_word, base) * (float)sc;
+        float ml = rd_f16_bits(arena, w_word, base + 2ull) * (float)mn;
+        unsigned int q0, q1, h0 = 0u, h1 = 0u;
+        rd8(arena, w_word, base + (q5 ? 48ull : 16ull) + (unsigned long long)(pair * 32u + l0), q0, q1);
+        if (q5) {
+            rd8(arena, w_word, base + 16ull + (unsigned long long)l0, h0, h1);
+        }
+        unsigned int bit = pair * 2u + hi;
+        #pragma unroll
+        for (unsigned int t = 0u; t < 8u; t++) {
+            unsigned int sh = (t & 3u) * 8u;
+            unsigned int q = ((t < 4u) ? (q0 >> sh) : (q1 >> sh)) & 0xFFu;
+            unsigned int nib = hi ? (q >> 4u) : (q & 0x0Fu);
+            if (q5) {
+                unsigned int qh = ((t < 4u) ? (h0 >> sh) : (h1 >> sh)) & 0xFFu;
+                nib += ((qh >> bit) & 1u) << 4u;
+            }
+            w[t] = dl * (float)nib - ml;
+        }
+    } else {
+        // Q6_K: two halves of 128; in each, four runs of 32 (`quad`).
+        unsigned int oi = (unsigned int)(e0 & 255ull);
+        unsigned long long base = row_base + (e0 >> 8ull) * 210ull;
+        unsigned int h = oi >> 7u;
+        unsigned int quad = (oi >> 5u) & 3u;
+        unsigned int l0 = oi & 31u;
+        float dl = rd_f16_bits(arena, w_word, base + 208ull)
+            * (float)sx8(rd_byte(arena, w_word, base + 192ull + (unsigned long long)(h * 8u + (l0 >> 4u) + quad * 2u)));
+        unsigned int l0w, l1w, h0w, h1w;
+        rd8(arena, w_word, base + (unsigned long long)(h * 64u + l0 + (quad & 1u) * 32u), l0w, l1w);
+        rd8(arena, w_word, base + 128ull + (unsigned long long)(h * 32u + l0), h0w, h1w);
+        unsigned int lo_shift = (quad >> 1u) * 4u;
+        unsigned int qh_shift = quad * 2u;
+        #pragma unroll
+        for (unsigned int t = 0u; t < 8u; t++) {
+            unsigned int sh = (t & 3u) * 8u;
+            unsigned int lo = ((t < 4u) ? (l0w >> sh) : (l1w >> sh)) & 0xFFu;
+            unsigned int qhb = ((t < 4u) ? (h0w >> sh) : (h1w >> sh)) & 0xFFu;
+            int q = (int)(((lo >> lo_shift) & 0x0Fu) | (((qhb >> qh_shift) & 3u) << 4u)) - 32;
+            w[t] = dl * (float)q;
+        }
+    }
+}
+
+// `x[e0..e0+8] · w`, compensated into `acc` / `comp`. Where `x` is 16-byte
+// aligned (`x4`) the 8 values come in two vector loads rather than eight:
+// the same values, so the same sums.
+__device__ __forceinline__ void gguf_acc8(
+    const float* w,
+    const float* x,
+    unsigned long long e0,
+    float& acc,
+    float& comp,
+    bool x4 = false
+) {
+    float xs[8];
+    if (x4) {
+        float4 a = *reinterpret_cast<const float4*>(x + e0);
+        float4 b = *reinterpret_cast<const float4*>(x + e0 + 4ull);
+        xs[0] = a.x; xs[1] = a.y; xs[2] = a.z; xs[3] = a.w;
+        xs[4] = b.x; xs[5] = b.y; xs[6] = b.z; xs[7] = b.w;
+    } else {
+        #pragma unroll
+        for (unsigned int t = 0u; t < 8u; t++) {
+            xs[t] = x[e0 + t];
+        }
+    }
+    #pragma unroll
+    for (unsigned int t = 0u; t < 8u; t++) {
+        float xv = xs[t];
+        float p = xv * w[t];
+        float er = __fmaf_rn(xv, w[t], -p);
+        neumaier_add(acc, comp, p);
+        comp += er;
+    }
+}
+
+__device__ __forceinline__ void gguf_dot8(
+    const float* arena,
+    unsigned long long w_word,
+    unsigned long long row_base,
+    unsigned int scheme_id,
+    unsigned long long e0,
+    const float* x,
+    float& acc,
+    float& comp
+) {
+    float w[8];
+    gguf_load8(arena, w_word, row_base, scheme_id, e0, w);
+    gguf_acc8(w, x, e0, acc, comp);
+}
+
+// The compensated sum of one output row's 32 lanes (an aligned group of 32
+// threads), at its first lane: the pairwise tree lane i += lane i + s for
+// s = 16 … 1, each pair merged Neumaier-style. Register shuffles (width 32,
+// so a 64-lane wavefront holds two rows) instead of shared memory: the old
+// form paid five block-wide barriers per row, a second set for each further
+// activation row, and that — not the weight bytes — set a 3584×1024 Q8_0
+// GEMV at ~30 GB/s on a 780M. Same pairs in the same order, so the same bits.
+__device__ __forceinline__ float row32_sum(float acc, float comp) {
+    #pragma unroll
+    for (unsigned int s = 16u; s > 0u; s >>= 1u) {
+        float a2 = __shfl_down_sync(RLX_SHFL_ALL_LANES, acc, s, 32);
+        float c2 = __shfl_down_sync(RLX_SHFL_ALL_LANES, comp, s, 32);
+        float ssum = acc + a2;
+        float err = (fabsf(acc) >= fabsf(a2)) ? ((acc - ssum) + a2) : ((a2 - ssum) + acc);
+        acc = ssum;
+        comp = comp + c2 + err;
+    }
+    return acc + comp;
+}
+
+// Decode GEMV (m == 1) for Q8_0 / Q4_K / Q5_K / Q6_K: 32 threads per output
+// row, `blockDim.x / 32` rows per block, each thread taking chunks of 8
+// consecutive elements — every thread works at any k (the block-strided
+// kernels leave all but k/256 of 128 threads idle at k = 1024), and one
+// block-wide reduction serves several rows. Neumaier accumulation and tree
+// reduce as in the kernels above. Needs k % 8 == 0; block size ≤ 256 and a
+// multiple of 32 (smem sizing). Launch ceil(n / (blockDim.x / 32)) blocks.
+extern "C" __global__ void dequant_matmul_gguf_gemv_elem(
+    float* arena,
+    unsigned long long n,
+    unsigned long long k,
+    unsigned long long x_off,
+    unsigned long long w_byte_off,
+    unsigned long long out_off,
+    unsigned int scheme_id
+) {
+    unsigned int tid = threadIdx.x;
+    unsigned int lane = tid & 31u;
+    unsigned long long j = (unsigned long long)blockIdx.x * (blockDim.x >> 5u) + (tid >> 5u);
+
+    unsigned long long w_word = w_byte_off / 4ull;
+    unsigned long long row_bytes = (scheme_id == 20u) ? (k / 32ull) * 34ull
+        : (k / 256ull) * ((scheme_id == 0u) ? 144ull : (scheme_id == 1u) ? 176ull : 210ull);
+    float acc = 0.0f;
+    float comp = 0.0f;
+    // No early return: every thread reaches the barriers below.
+    if (j < n) {
+        unsigned long long row_base = j * row_bytes;
+        bool x4 = (x_off & 3ull) == 0ull;
+        for (unsigned long long e0 = (unsigned long long)lane * 8ull; e0 < k; e0 += 256ull) {
+            float w[8];
+            gguf_load8(arena, w_word, row_base, scheme_id, e0, w);
+            gguf_acc8(w, arena + x_off, e0, acc, comp, x4);
+        }
+    }
+    // Every lane of a row shuffles (a row is all in or all out of range).
+    float sum = row32_sum(acc, comp);
+    if (lane == 0u && j < n) {
+        arena[out_off + j] = sum;
+    }
+}
+
+// `dequant_matmul_gguf_gemv_elem` for `m` (≤ 4) activation rows at once, a
+// speculative verify step's: each weight chunk is decoded once and dotted with
+// every row. A row's sums run in the m = 1 kernel's order, so each output row
+// is that kernel's bit for bit.
+#define GGUF_GEMV_MAX_ROWS 4u
+extern "C" __global__ void dequant_matmul_gguf_gemv_rows(
+    float* arena,
+    unsigned long long m,
+    unsigned long long n,
+    unsigned long long k,
+    unsigned long long x_off,
+    unsigned long long w_byte_off,
+    unsigned long long out_off,
+    unsigned int scheme_id
+) {
+    unsigned int tid = threadIdx.x;
+    unsigned int lane = tid & 31u;
+    unsigned long long j = (unsigned long long)blockIdx.x * (blockDim.x >> 5u) + (tid >> 5u);
+
+    unsigned long long w_word = w_byte_off / 4ull;
+    unsigned long long row_bytes = (scheme_id == 20u) ? (k / 32ull) * 34ull
+        : (k / 256ull) * ((scheme_id == 0u) ? 144ull : (scheme_id == 1u) ? 176ull : 210ull);
+    float acc[GGUF_GEMV_MAX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float comp[GGUF_GEMV_MAX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // No early return: every thread reaches the barriers below.
+    if (j < n) {
+        unsigned long long row_base = j * row_bytes;
+        // Row r's x starts r·k floats on: aligned for every row when k % 4 == 0.
+        bool x4 = (x_off & 3ull) == 0ull && (k & 3ull) == 0ull;
+        for (unsigned long long e0 = (unsigned long long)lane * 8ull; e0 < k; e0 += 256ull) {
+            float w[8];
+            gguf_load8(arena, w_word, row_base, scheme_id, e0, w);
+            #pragma unroll
+            for (unsigned int r = 0u; r < GGUF_GEMV_MAX_ROWS; r++) {
+                if (r < m) {
+                    gguf_acc8(w, arena + x_off + r * k, e0, acc[r], comp[r], x4);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int r = 0u; r < GGUF_GEMV_MAX_ROWS; r++) {
+        if (r < m) {
+            float sum = row32_sum(acc[r], comp[r]);
+            if (lane == 0u && j < n) {
+                arena[out_off + r * n + j] = sum;
+            }
+        }
     }
 }

@@ -54,6 +54,11 @@ int rlx_node_last_error(char *buf, size_t cap);
  * Static storage — do not free. */
 const char *rlx_node_platform(void);
 
+/* What this node advertises as `_rlx-node._tcp` (Bonjour/Avahi): `key=value`
+ * lines — platform, devices (comma list), version, mem_gb when known — for a
+ * shell to publish through its own Bonjour API. Returns bytes written. */
+int rlx_node_advert(char *buf, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

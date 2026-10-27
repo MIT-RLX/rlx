@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 /// * it counted things that are **not skips** — `assert!(is_available())`,
 ///   `assert!(!is_available())` asserting a device is *absent*, and
 ///   `.find(|d| !is_available(*d))` searching *for* an unavailable one. See
-///   [`gates_on_availability`]; a skip is now specifically a negated call in an
+///   [`availability_skips`]; a skip is now specifically a negated call in an
 ///   `if` condition.
 ///
 /// Six hand-rolled copies of the skip decision also turned up — as
@@ -102,41 +102,48 @@ fn test_dirs(root: &Path) -> Vec<PathBuf> {
 /// So a skip is: a **negated** availability call **in an `if` condition**.
 /// Assertions and closure predicates do not qualify. That is narrow enough to
 /// exclude all three above and wide enough to catch every real skip left.
-fn gates_on_availability(src: &str) -> bool {
-    src.lines().any(|line| {
-        let t = line.trim_start();
-        if !(t.starts_with("if ") || t.starts_with("} else if ") || t.starts_with("&& ")) {
-            return false;
-        }
-        ["is_available(", "is_supported("].iter().any(|probe| {
-            let mut from = 0usize;
-            while let Some(hit) = line[from..].find(probe) {
-                let at = from + hit;
-                let head = line[..at]
-                    .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':');
-                if head.trim_end().ends_with('!') {
-                    return true;
-                }
-                from = at + probe.len();
+///
+/// Returns the 1-based lines of every such skip. Judged per line, not per
+/// file: the file-level version exempted a whole file once it called the
+/// helper anywhere, and 13 raw skips in 5 files (`fk_prologue_parity`'s
+/// Vulkan-or-WebGPU gates, the wgpu legs of the autodiff GPU suites, two
+/// hipSOLVER gates) sat behind one migrated test each.
+fn availability_skips(src: &str) -> Vec<usize> {
+    src.lines()
+        .enumerate()
+        .filter(|(_, line)| is_availability_skip(line))
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+fn is_availability_skip(line: &str) -> bool {
+    let t = line.trim_start();
+    if !(t.starts_with("if ") || t.starts_with("} else if ") || t.starts_with("&& ")) {
+        return false;
+    }
+    ["is_available(", "is_supported("].iter().any(|probe| {
+        let mut from = 0usize;
+        while let Some(hit) = line[from..].find(probe) {
+            let at = from + hit;
+            let head =
+                line[..at].trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':');
+            if head.trim_end().ends_with('!') {
+                return true;
             }
-            false
-        })
+            from = at + probe.len();
+        }
+        false
     })
 }
 
-/// Does it route that decision through something `RLX_REQUIRE_DEVICE` sees?
+/// Does the file shadow the shared helper with a local copy?
 ///
-/// Matching the *name* alone is not enough, and this gate was fooled by exactly
-/// that: `activation_batch_parity.rs` defined its own local
-/// `fn skip_unless_available` — same name, same signature, no
-/// `RLX_REQUIRE_DEVICE` assert — so a file exempt from the flag counted as
-/// migrated. A local definition now disqualifies the file; only a call into the
-/// shared helper counts.
-fn uses_the_helper(src: &str) -> bool {
-    if src.contains("fn skip_unless_available") || src.contains("fn skip_unless_device") {
-        return false;
-    }
-    src.contains("skip_unless_available") || src.contains("skip_unless_device")
+/// `activation_batch_parity.rs` once defined its own `fn skip_unless_available`
+/// — same name, same signature, no `RLX_REQUIRE_DEVICE` assert — so its skips
+/// looked routed while being exempt from the flag. Only the shared helpers
+/// (`tests/common`, `rlx_ir::env::skip_unless_device`) count.
+fn shadows_the_helper(src: &str) -> bool {
+    src.contains("fn skip_unless_available") || src.contains("fn skip_unless_device")
 }
 
 fn scan(dir: &Path) -> Vec<String> {
@@ -151,7 +158,7 @@ fn scan(dir: &Path) -> Vec<String> {
             continue;
         }
         // This file quotes every pattern it looks for — in the doc comment and
-        // in `uses_the_helper`'s own body — so it matches itself. Scanning a
+        // in `shadows_the_helper`'s own body — so it matches itself. Scanning a
         // scanner is a category error, not a finding.
         if p.file_name().and_then(|s| s.to_str()) == Some("require_device_coverage.rs") {
             continue;
@@ -159,21 +166,48 @@ fn scan(dir: &Path) -> Vec<String> {
         let Ok(src) = std::fs::read_to_string(&p) else {
             continue;
         };
-        if gates_on_availability(&src) && !uses_the_helper(&src) {
-            let name = p
-                .strip_prefix(dir)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .into_owned();
-            let crate_dir = dir
-                .parent()
-                .and_then(|d| d.file_name())
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            out.push(format!("{crate_dir}/tests/{name}"));
+        let name = p
+            .strip_prefix(dir)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .into_owned();
+        let crate_dir = dir
+            .parent()
+            .and_then(|d| d.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for line in availability_skips(&src) {
+            out.push(format!("{crate_dir}/tests/{name}:{line}"));
+        }
+        if shadows_the_helper(&src) {
+            out.push(format!("{crate_dir}/tests/{name} (local skip helper)"));
         }
     }
     out
+}
+
+/// The hole the per-line rule closes: one routed skip used to exempt every raw
+/// skip in the same file.
+#[test]
+fn a_routed_skip_does_not_exempt_a_raw_one_in_the_same_file() {
+    let src = "\
+fn a() {
+    if common::skip_unless(Device::Cuda) {
+        return;
+    }
+}
+fn b() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    assert!(!rlx_tpu::is_available());
+    let _ = devs.iter().find(|d| !is_available(**d));
+}
+";
+    assert_eq!(availability_skips(src), vec![7]);
+    assert!(shadows_the_helper(
+        "fn skip_unless_available(d: Device) -> bool { false }"
+    ));
 }
 
 #[test]
@@ -183,8 +217,7 @@ fn every_device_gated_test_routes_through_the_helper() {
     let mut unmigrated: Vec<String> = dirs.iter().flat_map(|d| scan(d)).collect();
     unmigrated.sort();
     eprintln!(
-        "scanned {} test directory/ies; {} file(s) gate on device availability \
-         without the shared helper",
+        "scanned {} test directory/ies; {} raw device-availability skip(s)",
         dirs.len(),
         unmigrated.len()
     );
@@ -192,7 +225,7 @@ fn every_device_gated_test_routes_through_the_helper() {
     assert_eq!(
         unmigrated.len(),
         PINNED_UNMIGRATED,
-        "these test file(s) gate on device availability with a raw \
+        "these skip(s) gate on device availability with a raw \
          `if !is_available(..) {{ return }}`, which reports `ok` on a rig with no \
          device:\n  {}\n\nRoute the skip through `common::skip_unless(dev)` (label \
          derived), `common::skip_unless_available(dev, label)`, or — in a backend \
@@ -200,7 +233,7 @@ fn every_device_gated_test_routes_through_the_helper() {
          `rlx_ir::env::skip_unless_device(label, compiled, available)`.\n\nIf the \
          call is NOT a skip (a negative assertion that a device is absent, or a \
          search FOR an unavailable device), it should not be in an `if` condition \
-         reachable by `gates_on_availability` — check that function before \
+         reachable by `availability_skips` — check that function before \
          changing this number.",
         unmigrated.join("\n  ")
     );

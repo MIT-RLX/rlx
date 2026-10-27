@@ -18,9 +18,24 @@
 //! Exceptions and `errno` are not modelled; the returned values are.
 
 #![allow(clippy::excessive_precision, clippy::unreadable_literal)]
+// Deliberate in a bit-exact port, flagged by clippy 1.99:
+// - `x - x`, `(x - x) / (x - x)`: the IEEE idioms that turn ±inf into NaN
+//   (glibc's `__math_invalid`); "simplifying" them changes results.
+// - constants are glibc's literals as written (`INVLN2`), not `std` consts, and
+//   the control flow mirrors glibc's source line for line so the port can be
+//   reviewed against it (late init, `a = (t - b) + a`, `(j + 1) / 2`).
+#![allow(
+    clippy::eq_op,
+    clippy::approx_constant,
+    clippy::needless_late_init,
+    clippy::assign_op_pattern,
+    clippy::manual_div_ceil
+)]
 
 mod complex;
 mod erfc;
+mod fma;
+pub use fma::fma_emulated;
 mod expm1_log1p;
 mod sin;
 mod tables;
@@ -682,12 +697,54 @@ pub fn sincosf(y: f32) -> (f32, f32) {
     (nan, nan)
 }
 
-/// The reference platform's libm for a port that must agree with NumPy / SciPy /
-/// torch: Apple's system libm on Apple targets (the macOS reference), glibc's —
-/// these pure-Rust ports — everywhere else (the Linux reference; wasm included,
-/// where `f64::ln` & co. would otherwise be wasi-libc's or Rust's own).
+/// glibc `expf` (`e_expf.c`, the `-mfma` x86-64 variant: gcc fuses each
+/// multiply into the add that consumes it). `2^(i/32)` is entry `4i` of the
+/// double `exp` table, which carries `2^(j/128)` with the same rounding.
+pub fn expf(x: f32) -> f32 {
+    const N: u64 = 32;
+    const INVLN2N: f64 = f64::from_bits(0x3ff71547652b82fe) * 32.0;
+    const SHIFT: f64 = f64::from_bits(0x4338000000000000); // 0x1.8p52
+    const C0: f64 = f64::from_bits(0x3fac6af84b912394) / (32.0 * 32.0 * 32.0);
+    const C1: f64 = f64::from_bits(0x3fcebfce50fac4f3) / (32.0 * 32.0);
+    const C2: f64 = f64::from_bits(0x3fe62e42ff0c52d6) / 32.0;
+    let xd = x as f64;
+    let abstop = (x.to_bits() >> 20) & 0x7ff;
+    if abstop >= (88.0f32.to_bits() >> 20) {
+        if x.to_bits() == f32::NEG_INFINITY.to_bits() {
+            return 0.0;
+        }
+        if abstop >= (f32::INFINITY.to_bits() >> 20) {
+            return x + x;
+        }
+        if x > f32::from_bits(0x42b17217) {
+            // __math_oflowf: 0x1p97f * 0x1p97f
+            return f32::from_bits(0x70000000) * f32::from_bits(0x70000000);
+        }
+        if x < f32::from_bits(0xc2cff1b4) {
+            // __math_uflowf: 0x1p-95f * 0x1p-95f
+            return f32::from_bits(0x10000000) * f32::from_bits(0x10000000);
+        }
+    }
+    // z = InvLn2N*x feeds two adds (+ Shift, - kd): gcc fuses both
+    let kd0 = fma(INVLN2N, xd, SHIFT);
+    let ki = kd0.to_bits();
+    let kd = kd0 - SHIFT;
+    let r = fma(INVLN2N, xd, -kd);
+    let t = EXP_DATA[EXP_TAB + 2 * (4 * (ki % N)) as usize + 1].wrapping_add(ki << (52 - 5));
+    let s = d(t);
+    let z = fma(C0, r, C1);
+    let r2 = r * r;
+    let y = fma(C2, r, 1.0);
+    let y = fma(z, r2, y);
+    (y * s) as f32
+}
+
+/// The libm a port that must agree with NumPy / SciPy / torch computes with:
+/// these pure-Rust ports (glibc's algorithms, so the Linux reference bit for
+/// bit) by default on every target; with the `libm` feature, Apple's system
+/// libm on Apple targets (the macOS reference).
 pub mod reference {
-    const APPLE: bool = cfg!(target_vendor = "apple");
+    const APPLE: bool = cfg!(all(target_vendor = "apple", feature = "libm"));
 
     /// `log(x)`.
     pub fn log(x: f64) -> f64 {
@@ -715,7 +772,7 @@ pub mod reference {
     }
     /// `erfc(x)` (glibc's is correctly rounded since 2.42).
     pub fn erfc(x: f64) -> f64 {
-        #[cfg(target_vendor = "apple")]
+        #[cfg(all(target_vendor = "apple", feature = "libm"))]
         {
             unsafe extern "C" {
                 #[link_name = "erfc"]
@@ -724,7 +781,7 @@ pub mod reference {
             // SAFETY: a pure libm function of one double.
             unsafe { c_erfc(x) }
         }
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(not(all(target_vendor = "apple", feature = "libm")))]
         super::erfc(x)
     }
     /// `tan(x)`.
@@ -751,10 +808,123 @@ pub mod reference {
     pub fn logf(x: f32) -> f32 {
         if APPLE { x.ln() } else { super::logf(x) }
     }
+    /// `expf(x)`.
+    pub fn expf(x: f32) -> f32 {
+        if APPLE { x.exp() } else { super::expf(x) }
+    }
+    /// `tanhf(x)`: the platform's with `libm` on Apple, else musl's (the
+    /// pure-Rust `libm` crate; rlx-libm has no glibc port of it).
+    pub fn tanhf(x: f32) -> f32 {
+        if APPLE {
+            x.tanh()
+        } else {
+            libm_crate::tanhf(x)
+        }
+    }
+    /// `(sin(x), cos(x))` from one call: Apple's `__sincos_stret` (what
+    /// clang turns an adjacent `sin` + `cos` into, so macOS-built C such as
+    /// pocketfft computes this) with the `libm` feature on macOS; the separate
+    /// Rust ports otherwise.
+    pub fn sincos(x: f64) -> (f64, f64) {
+        #[cfg(all(target_os = "macos", feature = "libm"))]
+        {
+            #[repr(C)]
+            struct SinCos {
+                sin: f64,
+                cos: f64,
+            }
+            unsafe extern "C" {
+                fn __sincos_stret(x: f64) -> SinCos;
+            }
+            // SAFETY: a pure libm function of one double.
+            let r = unsafe { __sincos_stret(x) };
+            (r.sin, r.cos)
+        }
+        #[cfg(not(all(target_os = "macos", feature = "libm")))]
+        (sin(std::hint::black_box(x)), cos(std::hint::black_box(x)))
+    }
+    /// `(sinf(x), cosf(x))` — glibc's `sinf` / `cosf` share `sincosf`'s
+    /// reduction and polynomials, so one call gives both bit for bit.
+    pub fn sincosf(x: f32) -> (f32, f32) {
+        if APPLE {
+            (x.sin(), x.cos())
+        } else {
+            super::sincosf(x)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// On a native target, `reference` must BE the platform's libm: std calls
+    /// glibc on Linux, so the ports have to agree with it bit for bit on the
+    /// angles rlx-cpu's FFT twiddles use (and Apple's path is std itself).
+    /// Not on wasm, where std is Rust's own libm — the reason `reference` exists.
+    /// `expf` against the platform's (glibc's on Linux, where the port was also
+    /// checked on all 2^32 inputs: 0 mismatches) on every 257th bit pattern.
+    // `reference` IS the platform libm only off Apple, or on Apple with `libm`.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(not(target_vendor = "apple"), feature = "libm")
+    ))]
+    #[test]
+    fn reference_expf_is_the_platform_expf() {
+        let mut bad = Vec::new();
+        let mut i: u64 = 0;
+        while i < (1u64 << 32) {
+            let x = f32::from_bits(i as u32);
+            let (a, b) = (super::reference::expf(x), x.exp());
+            if a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()) {
+                bad.push((x, a, b));
+            }
+            i += 257;
+        }
+        assert!(
+            bad.is_empty(),
+            "{} mismatches, first {:?}",
+            bad.len(),
+            bad.first()
+        );
+    }
+
+    // `reference` IS the platform libm only off Apple, or on Apple with `libm`.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(not(target_vendor = "apple"), feature = "libm")
+    ))]
+    #[test]
+    fn reference_is_the_platform_libm_on_fft_twiddle_angles() {
+        use super::reference as r;
+        let mut bad = Vec::new();
+        for log2n in 1..=16u32 {
+            let n = 1usize << log2n;
+            for sign in [-1.0f64, 1.0] {
+                let step = sign * 2.0 * std::f64::consts::PI / (n as f64);
+                for k in 0..n.min(4096) {
+                    let theta = sign * std::f64::consts::PI * (k as f64) / (n as f64);
+                    for t in [step, theta] {
+                        if r::cos(t).to_bits() != t.cos().to_bits()
+                            || r::sin(t).to_bits() != t.sin().to_bits()
+                        {
+                            bad.push(t);
+                        }
+                    }
+                    let tf = theta as f32;
+                    let (s, c) = r::sincosf(tf);
+                    if s.to_bits() != tf.sin().to_bits() || c.to_bits() != tf.cos().to_bits() {
+                        bad.push(theta);
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} angles differ from the platform libm, e.g. {:?}",
+            bad.len(),
+            &bad[..bad.len().min(4)]
+        );
+    }
+
     #[test]
     fn sane() {
         assert_eq!(super::exp(0.0), 1.0);

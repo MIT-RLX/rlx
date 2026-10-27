@@ -136,6 +136,7 @@ fn with_value<R>(key: &str, f: impl FnOnce(Option<&str>) -> R) -> R {
     {
         return f(v.as_deref());
     }
+    warn_unknown_once();
     // An override, else the process environment, by the registry's
     // spelling of the key (canonical, aliases, deprecated replacement).
     let raw = |k: &str| match map().read().ok().and_then(|g| g.get(k).cloned()) {
@@ -148,6 +149,44 @@ fn with_value<R>(key: &str, f: impl FnOnce(Option<&str>) -> R) -> R {
         g.insert(key.into_owned(), value);
     }
     out
+}
+
+/// Registered variables set by `RLX_PROFILE`, `RLX_CONFIG` or a family list
+/// (`RLX_DISABLE`/`RLX_TRACE`/`RLX_DEBUG`) rather than explicitly, with their
+/// value and source. Code overrides count as explicit.
+pub fn implied() -> Vec<(&'static str, String, crate::env_registry::Layer)> {
+    let raw = |k: &str| match map().read().ok().and_then(|g| g.get(k).cloned()) {
+        Some(v) => v,
+        None => std::env::var(k).ok(),
+    };
+    crate::env_registry::layered_values(&raw)
+}
+
+/// On the first `RLX_*` read, name every `RLX_*` variable in the process
+/// environment that the registry does not know. Nothing reads such a variable,
+/// so a typo (`RLX_DISPATCH_REPOT=1`) otherwise does nothing, silently.
+/// `RLX_ENV_WARN_UNKNOWN=0` turns it off; `cargo rlx doctor` lists the same.
+fn warn_unknown_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    // Set before reading the opt-out: that read comes back through here.
+    if DONE.swap(true, Ordering::Relaxed) || !flag_or("RLX_ENV_WARN_UNKNOWN", true) {
+        return;
+    }
+    // a browser has no process environment (`std::env::vars` panics there)
+    if cfg!(all(target_family = "wasm", target_os = "unknown")) {
+        return;
+    }
+    for (name, near) in crate::env_registry::unknown_vars(std::env::vars().map(|(k, _)| k)) {
+        match near {
+            Some(near) => {
+                eprintln!("rlx: {name} is not a variable rlx reads; did you mean {near}?")
+            }
+            None => eprintln!(
+                "rlx: {name} is not a variable rlx reads (RLX_ENV_WARN_UNKNOWN=0 silences this)"
+            ),
+        }
+    }
 }
 
 /// Normalize to `RLX_*` form.
@@ -411,16 +450,37 @@ mod tests {
         clear_overrides();
     }
 
+    /// The layers reach real reads, follow code overrides, and refresh when
+    /// the list or profile changes (the resolved cache is cleared by `set`).
+    #[test]
+    fn family_and_profile_values_reach_flag_reads() {
+        with_clean_overrides(|| {
+            assert!(!flag("RLX_DISABLE_CSE"));
+            set("RLX_DISABLE", "cse");
+            assert!(flag("RLX_DISABLE_CSE"));
+            set("RLX_DISABLE", "sccp");
+            assert!(!flag("RLX_DISABLE_CSE"));
+            set("RLX_PROFILE", "deterministic");
+            assert!(flag("RLX_DETERMINISTIC_REDUCE"));
+            assert!(
+                implied()
+                    .iter()
+                    .any(|(n, _, _)| *n == "RLX_DETERMINISTIC_REDUCE")
+            );
+        });
+    }
+
     #[test]
     fn remove_hides_and_unset_restores() {
         with_clean_overrides(|| {
-            set("RLX_TEST_REMOVE_KEY", "1");
-            assert_eq!(var_result("RLX_TEST_REMOVE_KEY").as_deref(), Ok("1"));
-            remove("RLX_TEST_REMOVE_KEY");
-            assert!(var("RLX_TEST_REMOVE_KEY").is_none());
-            assert!(var_result("RLX_TEST_REMOVE_KEY").is_err());
-            unset("RLX_TEST_REMOVE_KEY");
-            assert!(var("RLX_TEST_REMOVE_KEY").is_none());
+            const REMOVE_KEY: &str = "RLX_TEST_REMOVE_KEY"; // env-lint: ignore
+            set(REMOVE_KEY, "1");
+            assert_eq!(var_result(REMOVE_KEY).as_deref(), Ok("1"));
+            remove(REMOVE_KEY);
+            assert!(var(REMOVE_KEY).is_none());
+            assert!(var_result(REMOVE_KEY).is_err());
+            unset(REMOVE_KEY);
+            assert!(var(REMOVE_KEY).is_none());
         });
     }
 
@@ -444,22 +504,21 @@ mod tests {
     #[test]
     fn scoped_is_per_thread_and_nests() {
         with_clean_overrides(|| {
-            set("RLX_TEST_SCOPED_KEY", "global");
+            const SCOPED_KEY: &str = "RLX_TEST_SCOPED_KEY"; // env-lint: ignore
+            set(SCOPED_KEY, "global");
             {
                 let _a = scoped("TEST_SCOPED_KEY", "0.25");
-                assert_eq!(var("RLX_TEST_SCOPED_KEY").as_deref(), Some("0.25"));
+                assert_eq!(var(SCOPED_KEY).as_deref(), Some("0.25"));
                 // Another thread keeps the global value.
-                let other = std::thread::spawn(|| var("RLX_TEST_SCOPED_KEY"))
-                    .join()
-                    .unwrap();
+                let other = std::thread::spawn(|| var(SCOPED_KEY)).join().unwrap();
                 assert_eq!(other.as_deref(), Some("global"));
                 {
-                    let _b = scoped_remove("RLX_TEST_SCOPED_KEY");
-                    assert_eq!(var("RLX_TEST_SCOPED_KEY"), None);
+                    let _b = scoped_remove(SCOPED_KEY);
+                    assert_eq!(var(SCOPED_KEY), None);
                 }
-                assert_eq!(var("RLX_TEST_SCOPED_KEY").as_deref(), Some("0.25"));
+                assert_eq!(var(SCOPED_KEY).as_deref(), Some("0.25"));
             }
-            assert_eq!(var("RLX_TEST_SCOPED_KEY").as_deref(), Some("global"));
+            assert_eq!(var(SCOPED_KEY).as_deref(), Some("global"));
         });
     }
 

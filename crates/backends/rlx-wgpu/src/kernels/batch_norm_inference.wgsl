@@ -17,7 +17,7 @@
 //
 // **`1 / sqrt(v + eps)`, not `inverseSqrt(v + eps)`.** The CPU oracle computes a
 // correctly-rounded `sqrt` then a correctly-rounded divide; `inverseSqrt` is an
-// approximation and Metal's fast math approximates the divide too. `inv`
+// approximation, and neither WGSL `sqrt` nor `/` is correctly rounded. `inv`
 // multiplies every element of its channel, so that error is not local — a bare
 // `1.0 / sqrt(x)` measured 1 ULP off the oracle and broke even the pure-multiply
 // `bwd_input`. (The Vulkan twins still use `inversesqrt`; left alone here
@@ -50,28 +50,12 @@ struct Params {
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1) var<uniform>             params: Params;
 
-// Correctly-rounded a/b — Metal's fast math lowers `/` to a reciprocal
-// multiply, up to 1 ULP off. `fma` forms the residual exactly.
-fn div_rn(a: f32, b: f32) -> f32 {
-    let q = a / b;
-    let r = fma(-b, q, a);
-    return q + r / b;
-}
-
-// One Newton step on `sqrt`, then a correctly-rounded reciprocal.
-//
-// The oracle computes `1.0 / (var + eps).sqrt()` with an IEEE sqrt and an IEEE
-// divide. Under Metal's default fast math neither is exact, and the error lands
-// in `inv` — which multiplies every element of the channel, so a bare
-// `1.0 / sqrt(x)` came out 1 ULP from the oracle on real data.
-fn sqrt_rn(x: f32) -> f32 {
-    let y = sqrt(x);
-    if (y <= 0.0) { return y; }
-    return 0.5 * (y + div_rn(x, y));
-}
-
+// `rlx_div_rn` / `rlx_sqrt_rn` (correctly rounded, from `rlxsl::exact`) are
+// prepended by build.rs. A Newton step on `sqrt` used to stand in for the
+// latter: it repaired Metal's approximate root but moved NVIDIA's exact one by
+// 1 ULP, breaking `bwd_input` there.
 fn inv_std(c: u32) -> f32 {
-    return div_rn(1.0, sqrt_rn(arena[params.var_off + c] + params.eps));
+    return rlx_div_rn(1.0, rlx_sqrt_rn(arena[params.var_off + c] + params.eps));
 }
 
 fn tid(gid: vec3<u32>, ngs: vec3<u32>) -> u32 {

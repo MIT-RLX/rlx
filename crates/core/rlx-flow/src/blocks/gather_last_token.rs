@@ -47,8 +47,20 @@ impl BlockStage for GatherLastTokenStage {
             // the Metal gather kernel both treat the index tensor as I32.
             // Declaring this F32 produced garbage logits (stable wrong
             // token streams like "< as as as…").
-            let idx = ctx.input(&self.input_name, Shape::new(&[self.batch], DType::I32));
+            // A flow that declared the input itself (its tail reads it too)
+            // keeps that one node: a second input under the same name is
+            // never bound and reads zeros, i.e. position 0.
+            let declared = ctx.state.inputs.get(&self.input_name).cloned();
             let mut gb = HirMut::new(ctx.hir());
+            let idx = match declared {
+                Some((id, shape)) if shape.dtype() == DType::I32 => id,
+                Some((id, shape)) => gb.0.mir(
+                    rlx_ir::Op::Cast { to: DType::I32 },
+                    vec![id],
+                    Shape::from_dims(shape.dims(), DType::I32),
+                ),
+                None => gb.input(&self.input_name, Shape::new(&[self.batch], DType::I32)),
+            };
             let idx_2d = gb.reshape_(idx, vec![self.batch as i64, 1]);
             gather_rows_axis1(&mut gb, input.id, idx_2d, self.batch)
         };

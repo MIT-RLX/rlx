@@ -1004,6 +1004,36 @@ mod tests {
         assert!(fused.len() < before);
     }
 
+    /// A region reads a broadcast input at `gid % len`, which is only the
+    /// right element for a trailing slice. A per-channel `[1,C,1,1]` scale
+    /// against `[N,C,H,W]` must stay outside the region; a trailing `[H,W]`
+    /// (with or without leading 1s) and a scalar may join it.
+    #[test]
+    fn region_admits_only_modulus_expressible_broadcasts() {
+        let f = DType::F32;
+        let full = Shape::new(&[2, 3, 4, 5], f);
+        let regions = |b_dims: &[usize]| {
+            let mut g = Graph::new("bcast");
+            let x = g.input("x", full.clone());
+            let b = g.input("b", Shape::new(b_dims, f));
+            let y = g.binary(BinaryOp::Mul, x, b, full.clone());
+            let y = g.activation(Activation::Relu, y, full.clone());
+            g.set_outputs(vec![y]);
+            let fused = MarkElementwiseRegions.run(g);
+            fused
+                .nodes()
+                .iter()
+                .filter(|n| matches!(n.op, Op::ElementwiseRegion { .. }))
+                .count()
+        };
+        assert_eq!(regions(&[1, 3, 1, 1]), 0, "per-channel is not a modulus");
+        assert_eq!(regions(&[2, 1, 4, 5]), 0, "mid-batch is not a modulus");
+        assert_eq!(regions(&[4, 5]), 1, "trailing slice");
+        assert_eq!(regions(&[1, 1, 4, 5]), 1, "trailing slice with leading 1s");
+        assert_eq!(regions(&[1]), 1, "scalar");
+        assert_eq!(regions(&[2, 3, 4, 5]), 1, "dense");
+    }
+
     #[test]
     fn region_does_not_fuse_when_intermediate_has_multiple_consumers() {
         // out1 = add(a, b); out2 = relu(out1). out1 also fed to out_extra.

@@ -2336,18 +2336,24 @@ impl ThunkSchedule {
                     let total = node.shape.num_elements().unwrap();
                     let in_off = off(node.inputs[0]);
                     let out_off = off(node.id);
-                    // Softmax operates in-place. When the planner doesn't
-                    // alias input and output, prepend a Copy so the
-                    // in-place kernel actually sees the input data.
-                    if in_off != out_off {
+                    // f32 has an out-of-place kernel (`softmax_lastax_out`,
+                    // bit-identical to Copy + in-place). The f16 kernel is
+                    // in-place only: when the planner doesn't alias input and
+                    // output, prepend a Copy so it sees the input data.
+                    let dt: HalfFlag = node.shape.dtype().into();
+                    let src = if in_off != out_off && dt == HalfFlag::F16 {
                         thunks.push(Thunk::Copy {
                             src: in_off,
                             dst: out_off,
                             len: total as u32,
-                            dt: node.shape.dtype().into(),
+                            dt,
                         });
-                    }
+                        out_off
+                    } else {
+                        in_off
+                    };
                     Thunk::Softmax {
+                        src,
                         data: out_off,
                         rows: (total / cols) as u32,
                         cols: cols as u32,

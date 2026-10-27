@@ -107,10 +107,78 @@ fn mod_expr(lang: Lang) -> String {
     match lang {
         Lang::Cuda => "fmodf(a, b)".to_string(),
         Lang::Msl | Lang::OpenCl => "fmod(a, b)".to_string(),
-        // No `fmod` builtin: the truncated remainder reproduces it exactly.
-        Lang::Wgsl | Lang::Glsl => "a - b * trunc(a / b)".to_string(),
+        // No `fmod` builtin; see `WGSL_FMOD` / `GLSL_FMOD`.
+        Lang::Wgsl | Lang::Glsl => "rlx_fmod(a, b)".to_string(),
     }
 }
+
+/// `a / b` as the CPU oracle's IEEE divide: WGSL calls the correctly-rounded
+/// [`crate::exact`] helper, GLSL inlines the same correction.
+fn div_expr(lang: Lang) -> (Vec<String>, String) {
+    match lang {
+        Lang::Wgsl => (Vec::new(), "rlx_div_rn(a, b)".to_string()),
+        // GLSL has no hex float literals: 2^-100, 2^64 and 2^-64 are spelled
+        // out in decimal, each of which parses to the exact power of two.
+        Lang::Glsl => (
+            vec![
+                "bool _k = abs(a / b) < 7.888609052210118e-31;".to_string(),
+                "float _a = _k ? a * 18446744073709551616.0 : a;".to_string(),
+                "float _q = _a / b;".to_string(),
+                "float _c = (_q != 0.0 && abs(_q) <= 340282346638528859811704183484516925440.0) ? _q + fma(-b, _q, _a) / b : _q;"
+                    .to_string(),
+            ],
+            "_k ? _c * 5.421010862427522e-20 : _c".to_string(),
+        ),
+        _ => (Vec::new(), "a / b".to_string()),
+    }
+}
+
+/// Exact `fmod` for WGSL, which has none. `a - b * trunc(a / b)` is wrong
+/// once the quotient outgrows 24 bits — `-42166.227 % 0.000107623026` came out
+/// `3.0e-3` against the oracle's `-9.6e-5`, sign and all. This is C's
+/// shift-subtract: take off the largest `|b|·2^k` not above the remainder
+/// until it is below `|b|`. `t` is `|b|`'s mantissa under the remainder's
+/// exponent field, halved if that overshoots — no `frexp`/`ldexp`, which
+/// naga's GLSL frontend lacks. Each `t ≤ x < 2t`, so every subtraction is
+/// exact (Sterbenz), and the loop runs at most once per binade (≤ 277).
+/// NaN, infinite and zero operands are found from the bits: under MoltenVK a
+/// float test like `!(y > 0.0)` let `2 % NaN` through as `2`. An infinite
+/// divisor needs no case: the loop never runs and `a` comes back. The NaN is
+/// built from a runtime value: a constant NaN is a shader-creation error in
+/// Chrome (Tint), though naga accepts it.
+const WGSL_FMOD: &str = "\
+fn rlx_fmod(a: f32, b: f32) -> f32 {
+    let y = abs(b);
+    var x = abs(a);
+    let ua = bitcast<u32>(x);
+    let ub = bitcast<u32>(y);
+    if (ua >= 0x7f800000u || ub > 0x7f800000u || ub == 0u) { return bitcast<f32>((ua & 0u) | 0x7fc00000u); }
+    for (var i = 0u; i < 280u && x >= y; i++) {
+        var t = bitcast<f32>((bitcast<u32>(y) & 0x007fffffu) | (bitcast<u32>(x) & 0x7f800000u));
+        if (t > x) { t = t * 0.5; }
+        x = x - t;
+    }
+    return select(x, -x, (bitcast<u32>(a) & 0x80000000u) != 0u);
+}
+";
+
+/// [`WGSL_FMOD`] in GLSL, declared ahead of `rlx_binary_apply` (GLSL needs a
+/// function defined before its first call).
+const GLSL_FMOD: &str = "\
+float rlx_fmod(float a, float b) {
+    float y = abs(b);
+    float x = abs(a);
+    uint ua = floatBitsToUint(x);
+    uint ub = floatBitsToUint(y);
+    if (ua >= 0x7f800000u || ub > 0x7f800000u || ub == 0u) { return uintBitsToFloat(0x7fc00000u); }
+    for (uint i = 0u; i < 280u && x >= y; i++) {
+        float t = uintBitsToFloat((floatBitsToUint(y) & 0x007fffffu) | (floatBitsToUint(x) & 0x7f800000u));
+        if (t > x) { t = t * 0.5; }
+        x = x - t;
+    }
+    return (floatBitsToUint(a) & 0x80000000u) != 0u ? -x : x;
+}
+";
 
 /// `pow(a, b)` matching Rust `f32::powf`. CUDA/OpenCL have a native primitive
 /// with the right negative-base semantics; WGSL/MSL/GLSL `pow` is `NaN` for a
@@ -158,7 +226,7 @@ pub fn emit_binary(op: BinaryOp, lang: Lang) -> (Vec<String>, String) {
         BinaryOp::Add => simple("a + b".to_string()),
         BinaryOp::Sub => simple("a - b".to_string()),
         BinaryOp::Mul => simple("a * b".to_string()),
-        BinaryOp::Div => simple("a / b".to_string()),
+        BinaryOp::Div => div_expr(lang),
         BinaryOp::Max => simple(format!("{}(a, b)", fmax_name(lang))),
         BinaryOp::Min => simple(format!("{}(a, b)", fmin_name(lang))),
         BinaryOp::Pow => pow_expr(lang),
@@ -206,11 +274,12 @@ fn binary_switch(lang: Lang, signature: &str, default_close: &str) -> String {
 
 /// WGSL `rlx_binary_apply(op, a, b)` — single source for wgpu's `binary` kernel.
 pub fn wgsl_binary_module() -> String {
-    binary_switch(
+    let switch = binary_switch(
         Lang::Wgsl,
         "fn rlx_binary_apply(op: u32, a: f32, b: f32) -> f32 {\n    switch op {\n",
         "        default: { return 0.0; }\n    }\n}\n",
-    )
+    );
+    format!("{switch}{WGSL_FMOD}")
 }
 
 /// CUDA `__device__` binary dispatch generated from the manifest.
@@ -233,11 +302,12 @@ pub fn msl_binary_module() -> String {
 
 /// GLSL (native Vulkan) binary dispatch generated from the manifest.
 pub fn glsl_binary_module() -> String {
-    binary_switch(
+    let switch = binary_switch(
         Lang::Glsl,
         "float rlx_binary_apply(uint op, float a, float b) {\n    switch (op) {\n",
         "        default: return 0.0;\n    }\n}\n",
-    )
+    );
+    format!("{GLSL_FMOD}{switch}")
 }
 
 /// OpenCL-C (Intel oneAPI) binary dispatch generated from the manifest.

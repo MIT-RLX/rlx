@@ -109,7 +109,7 @@ fn dlasd5(i: usize, d: &[f64], z: &[f64], delta: &mut [f64], rho: f64, work: &mu
 }
 
 /// `DLAED6(kniter, orgati, rho, d, z, finit) → (tau, info)`.
-fn dlaed6(
+pub(crate) fn dlaed6(
     kniter: usize,
     orgati: bool,
     rho: f64,

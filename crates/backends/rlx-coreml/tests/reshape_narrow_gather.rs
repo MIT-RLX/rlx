@@ -27,7 +27,11 @@ use rlx_ir::{DType, Graph, GraphExt, Shape};
 use rlx_runtime::{Device, Session};
 
 fn case(lead: usize, last: usize, start: usize, len: usize) -> Option<(Vec<f32>, Vec<f32>)> {
-    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
+    if rlx_ir::env::skip_unless_device(
+        "ane",
+        cfg!(target_vendor = "apple"),
+        rlx_runtime::is_available(Device::Ane),
+    ) {
         eprintln!("skip: CoreML/ANE unavailable");
         return None;
     }

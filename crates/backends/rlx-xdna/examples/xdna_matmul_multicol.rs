@@ -26,11 +26,26 @@ fn env(k: &str, d: &str) -> usize {
         .unwrap_or_else(|| d.parse().unwrap())
 }
 
-fn compile(name: &str, mlir: &str) -> Vec<u32> {
-    let (aiecc, peano) = (
-        std::env::var("AIECC").unwrap(),
-        std::env::var("PEANO").unwrap(),
+/// This pure-MLIR `aievec` path is kept as an investigation artifact: Peano's
+/// `llc` crashes on it for many shapes (21.x and 22.x builds alike, e.g.
+/// "legalizeG_BUILD_VECTOR: Not expected 64-bit elmt type vector"). That's a
+/// compiler limit, not a broken install, so say so and point at the production
+/// matmul instead of panicking. Any other compile error still fails.
+fn known_llc_crash(err: &str) -> ! {
+    if !rlx_xdna::compile::llc_crash(err) {
+        panic!("compile: {err}");
+    }
+    eprintln!(
+        "Peano's llc can't compile this experimental aievec matmul at this shape:\n{err}\n\n\
+         The production NPU matmul is the C++ microkernel path:\n  \
+         cargo run -p rlx-xdna --features xrt --example xdna_matmul_microkernel"
     );
+    std::process::exit(0);
+}
+
+fn compile(name: &str, mlir: &str) -> Vec<u32> {
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let (aiecc, peano) = (tc.aiecc_str(), tc.peano_str());
     let tmp = format!("/tmp/rlx_mmc_{name}");
     std::fs::create_dir_all(&tmp).ok();
     let mp = format!("{tmp}/aie.mlir");
@@ -43,7 +58,7 @@ fn compile(name: &str, mlir: &str) -> Vec<u32> {
         out_xclbin: &format!("{tmp}/k.xclbin"),
         out_insts: &format!("{tmp}/i.bin"),
     })
-    .expect("compile");
+    .unwrap_or_else(|e| known_llc_crash(&e.0));
     std::fs::read(format!("{tmp}/i.bin"))
         .unwrap()
         .chunks_exact(4)

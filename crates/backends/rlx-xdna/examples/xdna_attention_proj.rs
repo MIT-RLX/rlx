@@ -56,9 +56,14 @@ fn main() {
     assert!(n % n_tile == 0, "N must be a multiple of {n_tile}");
     let tiles = n / n_tile;
 
-    let aiecc = std::env::var("AIECC").expect("set AIECC");
-    let peano = std::env::var("PEANO").expect("set PEANO");
-    let include = rlx_ir::env::var("RLX_XDNA_AIE_INCLUDE").expect("set RLX_XDNA_AIE_INCLUDE");
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let aiecc = tc.aiecc_str();
+    let peano = tc.peano_str();
+    let include = tc
+        .include
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .expect("no mlir_aie include tree found (set RLX_XDNA_AIE_INCLUDE)");
 
     // 1) Representative f32 activation + weight (attention-scale std ~ 1/sqrt(K)).
     let wstd = 1.0 / (k as f32).sqrt();

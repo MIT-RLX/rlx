@@ -1548,11 +1548,14 @@ fn expand_attention_rank3(
 
         let bhsd = Shape::new(&[batch, num_heads, seq_q, head_dim], dtype);
         let mut attn_inputs = vec![q4, k4, v4];
-        if matches!(mask_kind, MaskKind::Custom) {
+        // A `Bias` mask too: dropping it left the kernel indexing a fourth
+        // input that was not there (a multi-token verify step's causal bias).
+        if matches!(mask_kind, MaskKind::Custom | MaskKind::Bias) {
             // BERT passes [B, S]; the kernel reads [B, H, S_q, S_k]. We reshape
             // the mask through Reshape + Expand to broadcast across heads and
             // queries (additive padding mask: same per (q, k) pair regardless
-            // of which head or which query position it gates).
+            // of which head or which query position it gates). A `Bias` is
+            // usually that shape already.
             let mask_id = new_inputs[3];
             let mask_dims: Vec<usize> = src
                 .node(orig_inputs[3])
@@ -1939,4 +1942,47 @@ fn make_zero_const(out: &mut Graph, dims: &[usize], dtype: DType) -> NodeId {
         vec![],
         Shape::new(dims, DType::F32),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlx_ir::DType;
+
+    struct Defaults;
+    impl DecomposePolicy for Defaults {}
+
+    /// A rank-3 attention with an additive `[B, H, S_q, S_k]` bias, promoted
+    /// to rank 4 for a kernel that takes nothing else, keeps its bias.
+    #[test]
+    fn rank4_promotion_keeps_a_bias_mask() {
+        let f = |d: &[usize]| Shape::new(d, DType::F32);
+        let mut g = Graph::new("verify");
+        let q = g.input("q", f(&[1, 2, 8]));
+        let k = g.input("k", f(&[1, 5, 8]));
+        let v = g.input("v", f(&[1, 5, 8]));
+        let bias = g.input("bias", f(&[1, 4, 2, 5]));
+        let a = g.add_node(
+            Op::Attention {
+                num_heads: 4,
+                head_dim: 2,
+                v_head_dim: None,
+                mask_kind: MaskKind::Bias,
+                score_scale: None,
+                attn_logit_softcap: None,
+            },
+            vec![q, k, v, bias],
+            f(&[1, 2, 8]),
+        );
+        g.set_outputs(vec![a]);
+        let out = unfuse(g, &Defaults);
+        let attn: Vec<_> = out
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Attention { .. }))
+            .collect();
+        assert_eq!(attn.len(), 1);
+        assert_eq!(attn[0].inputs.len(), 4, "the bias input was dropped");
+        assert!(rlx_ir::verify::verify_all(&out).is_empty());
+    }
 }

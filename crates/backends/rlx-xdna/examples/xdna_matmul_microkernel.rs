@@ -50,18 +50,17 @@ fn main() {
     }
     let (m, k, n) = (d, kt * d, cols * d);
 
-    let aiecc = std::env::var("AIECC").expect("set AIECC (native mlir-aie aiecc)");
-    let peano = std::env::var("PEANO").expect("set PEANO (llvm-aie dir)");
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let aiecc = tc.aiecc_str();
+    let peano = tc.peano_str();
     // The mlir_aie include tree (holds aie_kernels/aie2/mm.cc + aie_api/).
     // RLX_XDNA_AIE_INCLUDE overrides the AIECC-derived path (needed for pip mlir_aie
     // installs where bin/aiecc isn't at <mlir_aie>/bin) — mirrors the backend.
-    let include = rlx_ir::env::var("RLX_XDNA_AIE_INCLUDE").unwrap_or_else(|| {
-        std::path::Path::new(&aiecc)
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| format!("{}/include", p.display()))
-            .expect("derive mlir_aie include from AIECC")
-    });
+    let include = tc
+        .include
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .expect("no mlir_aie include tree found (set RLX_XDNA_AIE_INCLUDE)");
 
     let a: Vec<i8> = (0..m * k).map(|i| (i % 7) as i8 - 3).collect();
     let b: Vec<i8> = (0..k * n).map(|i| (i % 5) as i8 - 2).collect();

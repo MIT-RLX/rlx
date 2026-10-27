@@ -33,6 +33,9 @@ serialize = ["std", "dep:serde", "dep:serde_json", "dep:bincode"]
 # set can cover all of it instead of the handful a test author thought of.
 # Off by default: it is test scaffolding, not part of the IR surface.
 test-support = ["std"]
+# No Apple frameworks: the BNNS samplers / fully-connected layer (Accelerate)
+# compile to their non-macOS stubs. Additive, so it wins under unification.
+pure-rust = []
 
 [dev-dependencies]
 [lints]

@@ -22,11 +22,34 @@
 //! Every module is checked against the reference in `tests/` (fixtures generated
 //! on the reference by `tools/`), zero tolerance.
 
+// Deliberate in a line-for-line port of reference LAPACK / OpenBLAS (flagged
+// by clippy 1.99). The control flow mirrors the Fortran/C source so the port
+// can be reviewed against it, and every result is checked bit for bit:
+// - `mut_range_bound`: Fortran evaluates DO-loop bounds once, so updating `I1`
+//   inside DLARRB's loop leaves the iteration unchanged but feeds later tests —
+//   exactly what a Rust range does.
+// - `if_same_then_else`: DLARRV's `IF … ELSE IF … ELSE GO TO` keeps the second
+//   test unevaluated when the first holds, as the reference does.
+// - `manual_memcpy`, `explicit_counter_loop`, `needless_late_init`,
+//   `int_plus_one`, `assign_op_pattern`, `manual_div_ceil`: shape only, kept as
+//   the source writes them.
+#![allow(
+    clippy::mut_range_bound,
+    clippy::if_same_then_else,
+    clippy::manual_memcpy,
+    clippy::explicit_counter_loop,
+    clippy::needless_late_init,
+    clippy::int_plus_one,
+    clippy::assign_op_pattern,
+    clippy::manual_div_ceil
+)]
+
 pub mod lapack;
 mod lapack_dc;
 mod lapack_dqds;
 mod lapack_eig;
 mod lapack_mrrr;
+mod lapack_syevd;
 pub mod openblas;
 pub mod x87;
 pub mod xss;
@@ -39,3 +62,4 @@ pub const NO_TRANS: i32 = 111;
 pub const TRANS: i32 = 112;
 
 pub use lapack_eig::{DSYEVR_MAX_N, dsyevr_lower, dsytrd_lower_pub as dsytrd_lower};
+pub use lapack_syevd::{dstevd_v, dsyevd_lower};

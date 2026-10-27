@@ -394,13 +394,16 @@ pub(crate) fn compile_reduce(
                 .max(1);
             let src = node_offset(arena, node.inputs[0]);
             let dst = node_offset(arena, node.id);
-            if node.shape.dtype() == rlx_ir::DType::F64 && matches!(op, ReduceOp::Sum) {
+            if node.shape.dtype() == rlx_ir::DType::F64
+                && matches!(op, ReduceOp::Sum | ReduceOp::Mean)
+            {
                 Thunk::ReduceSumF64 {
                     src,
                     dst,
                     outer: outer as u32,
                     reduced: reduced as u32,
                     inner: inner as u32,
+                    mean: matches!(op, ReduceOp::Mean),
                 }
             } else {
                 Thunk::Reduce {
@@ -605,6 +608,7 @@ pub(crate) fn exec_reduce_sum_f64(t: &Thunk, base: *mut u8) {
         outer,
         reduced,
         inner,
+        mean,
     } = t
     else {
         unreachable!()
@@ -615,6 +619,10 @@ pub(crate) fn exec_reduce_sum_f64(t: &Thunk, base: *mut u8) {
             let inp = sl_f64(*src, base, o * r * n);
             let out = sl_mut_f64(*dst, base, o * n);
             reduce_sum_f64(inp, out, o, r, n);
+            if *mean && r > 0 {
+                let inv = 1.0 / r as f64;
+                out.iter_mut().for_each(|v| *v *= inv);
+            }
         }
     }
 }

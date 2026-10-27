@@ -155,6 +155,29 @@ scratch as NaN instead of zeros (at allocation and before each run), so a slot
 nothing wrote — an unfed input, an unwritten constant, a no-op op — reads NaN
 rather than a plausible zero. GPU host-fallback buffers are not covered.
 
+## Toolchain versions and known issues
+
+External toolchains (mlir-aie + Peano, XRT, CUDA driver/NVRTC, ROCm) change under
+us. Three pieces keep that from reaching users first:
+
+- **Version matrix** — `scripts/toolchain_matrix.toml` lists one run per
+  (device, toolchain version, rig), each version installed side by side (its own
+  venv / toolkit dir). `just toolchain-matrix [--only xdna] [--update]` runs them
+  in a fresh `TMPDIR` each (cached kernel builds cannot leak between versions) and
+  `--update` records the result in
+  `crates/core/rlx-runtime/src/doctor/tested_toolchains.tsv`, which
+  `cargo rlx doctor` shows as "tested". To cover a new release: install it next to
+  the others, add a `[[run]]`, run with `--update`.
+- **Upstream watch** — `just toolchain-upstream` exits 1 when a project in the
+  spec has a release newer than anything tested. Run it nightly / before a release.
+- **Known issues** — `crates/core/rlx-runtime/src/doctor/known_issues.rs`: every
+  resolved setup problem becomes an entry (symptom, cause, fix, and a `detect`
+  check over host facts where it can be diagnosed). Each `detect` needs a fake-host
+  test in the same file; `just gen-known-issues` regenerates
+  [known-issues.md](known-issues.md) (a unit test fails while it is stale). Users
+  see matches in `cargo rlx doctor` and paste `cargo rlx doctor --report` into
+  issues (template in `.github/ISSUE_TEMPLATE/bug_report.yml`).
+
 ## Known failures
 
 A case a backend is known to get wrong goes in

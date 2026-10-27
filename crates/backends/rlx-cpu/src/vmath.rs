@@ -30,39 +30,70 @@ pub fn vmath_accurate() -> bool {
     *ON.get_or_init(|| rlx_ir::env::flag("RLX_VMATH_ACCURATE"))
 }
 
+// The accurate scalar tier outside Accelerate: rlx-libm's reference ports
+// for parity (feature `parity`), rlx-cpu's `fastmath` otherwise.
+#[inline(always)]
+fn acc_expf(x: f32) -> f32 {
+    #[cfg(feature = "parity")]
+    return rlx_libm::reference::expf(x);
+    #[cfg(not(feature = "parity"))]
+    crate::fastmath::exp(x)
+}
+#[inline(always)]
+fn acc_tanhf(x: f32) -> f32 {
+    #[cfg(feature = "parity")]
+    return rlx_libm::reference::tanhf(x);
+    #[cfg(not(feature = "parity"))]
+    crate::fastmath::tanh(x)
+}
+#[inline(always)]
+#[cfg_attr(not(feature = "parity"), allow(dead_code))]
+fn acc_logf(x: f32) -> f32 {
+    #[cfg(feature = "parity")]
+    return rlx_libm::reference::logf(x);
+    #[cfg(not(feature = "parity"))]
+    crate::fastmath::log(x)
+}
+
 /// `y[i] = exp(x[i])`. Lengths must match. Aliasing OK.
 pub fn vvexpf(y: &mut [f32], x: &[f32]) {
     assert_eq!(y.len(), x.len());
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", not(feature = "pure-rust")))]
     {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvexpf(y.as_mut_ptr(), x.as_ptr(), &n);
         }
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(all(target_vendor = "apple", not(feature = "pure-rust"))))]
     {
+        #[cfg(feature = "parity")]
         for (yi, &xi) in y.iter_mut().zip(x.iter()) {
-            *yi = xi.exp();
+            *yi = acc_expf(xi);
         }
+        #[cfg(not(feature = "parity"))]
+        crate::fastmath::exp_slice(y, x);
     }
 }
 
 /// In-place `y[i] = exp(y[i])`.
 #[inline]
 pub fn vvexpf_inplace(y: &mut [f32]) {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", not(feature = "pure-rust")))]
     {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvexpf(y.as_mut_ptr(), y.as_ptr(), &n);
         }
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(all(target_vendor = "apple", not(feature = "pure-rust"))))]
     {
+        #[cfg(feature = "parity")]
         for yi in y.iter_mut() {
-            *yi = yi.exp();
+            *yi = acc_expf(*yi);
         }
+        #[cfg(not(feature = "parity"))]
+        crate::fastmath::exp_inplace(y);
     }
 }
 
@@ -578,36 +609,42 @@ pub fn vvlogf_hot_inplace(y: &mut [f32]) {
 /// `y[i] = tanh(x[i])`. Lengths must match. Aliasing OK.
 pub fn vvtanhf(y: &mut [f32], x: &[f32]) {
     assert_eq!(y.len(), x.len());
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", not(feature = "pure-rust")))]
     {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvtanhf(y.as_mut_ptr(), x.as_ptr(), &n);
         }
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(all(target_vendor = "apple", not(feature = "pure-rust"))))]
     {
+        #[cfg(feature = "parity")]
         for (yi, &xi) in y.iter_mut().zip(x.iter()) {
-            *yi = xi.tanh();
+            *yi = acc_tanhf(xi);
         }
+        #[cfg(not(feature = "parity"))]
+        crate::fastmath::tanh_slice(y, x);
     }
 }
 
 /// In-place `y[i] = tanh(y[i])`.
 #[inline]
 pub fn vvtanhf_inplace(y: &mut [f32]) {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", not(feature = "pure-rust")))]
     {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvtanhf(y.as_mut_ptr(), y.as_ptr(), &n);
         }
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(all(target_vendor = "apple", not(feature = "pure-rust"))))]
     {
+        #[cfg(feature = "parity")]
         for yi in y.iter_mut() {
-            *yi = yi.tanh();
+            *yi = acc_tanhf(*yi);
         }
+        #[cfg(not(feature = "parity"))]
+        crate::fastmath::tanh_inplace(y);
     }
 }
 
@@ -704,43 +741,49 @@ pub fn vvrecf_inplace(y: &mut [f32]) {
 /// `y[i] = ln(x[i])`. Lengths must match. Aliasing OK.
 pub fn vvlogf(y: &mut [f32], x: &[f32]) {
     assert_eq!(y.len(), x.len());
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", not(feature = "pure-rust")))]
     {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvlogf(y.as_mut_ptr(), x.as_ptr(), &n);
         }
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(all(target_vendor = "apple", not(feature = "pure-rust"))))]
     {
+        #[cfg(feature = "parity")]
         for (yi, &xi) in y.iter_mut().zip(x.iter()) {
-            *yi = xi.ln();
+            *yi = acc_logf(xi);
         }
+        #[cfg(not(feature = "parity"))]
+        crate::fastmath::log_slice(y, x);
     }
 }
 
 /// In-place `y[i] = ln(y[i])`.
 #[inline]
 pub fn vvlogf_inplace(y: &mut [f32]) {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", not(feature = "pure-rust")))]
     {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvlogf(y.as_mut_ptr(), y.as_ptr(), &n);
         }
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(all(target_vendor = "apple", not(feature = "pure-rust"))))]
     {
+        #[cfg(feature = "parity")]
         for yi in y.iter_mut() {
-            *yi = yi.ln();
+            *yi = acc_logf(*yi);
         }
+        #[cfg(not(feature = "parity"))]
+        crate::fastmath::log_inplace(y);
     }
 }
 
 /// `y[i] = sqrt(x[i])`. Lengths must match. Aliasing OK.
 pub fn vvsqrtf(y: &mut [f32], x: &[f32]) {
     assert_eq!(y.len(), x.len());
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", not(feature = "pure-rust")))]
     if vmath_accurate() {
         let n = y.len() as i32;
         unsafe {
@@ -754,7 +797,7 @@ pub fn vvsqrtf(y: &mut [f32], x: &[f32]) {
 /// In-place `y[i] = sqrt(y[i])`.
 #[inline]
 pub fn vvsqrtf_inplace(y: &mut [f32]) {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", not(feature = "pure-rust")))]
     if vmath_accurate() {
         let n = y.len() as i32;
         unsafe {
@@ -769,7 +812,7 @@ pub fn vvsqrtf_inplace(y: &mut [f32]) {
 /// `y[i] = 1 / sqrt(x[i])`. Lengths must match. Aliasing OK.
 pub fn vvrsqrtf(y: &mut [f32], x: &[f32]) {
     assert_eq!(y.len(), x.len());
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", not(feature = "pure-rust")))]
     if vmath_accurate() {
         let n = y.len() as i32;
         unsafe {
@@ -783,7 +826,7 @@ pub fn vvrsqrtf(y: &mut [f32], x: &[f32]) {
 /// In-place `y[i] = 1 / sqrt(y[i])`.
 #[inline]
 pub fn vvrsqrtf_inplace(y: &mut [f32]) {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", not(feature = "pure-rust")))]
     if vmath_accurate() {
         let n = y.len() as i32;
         unsafe {
@@ -809,7 +852,7 @@ pub fn vvsigmoidf(y: &mut [f32], x: &[f32]) {
     vvrecf(y, &tmp);
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", not(feature = "pure-rust")))]
 mod accelerate {
     #[link(name = "Accelerate", kind = "framework")]
     unsafe extern "C" {
@@ -871,7 +914,7 @@ fn vvexpf_neon(y: &mut [f32], x: &[f32]) {
         }
     }
     for i in chunks * 4..n {
-        y[i] = x[i].exp();
+        y[i] = acc_expf(x[i]);
     }
 }
 
@@ -895,7 +938,7 @@ fn vvtanhf_neon(y: &mut [f32], x: &[f32]) {
         }
     }
     for i in chunks * 4..n {
-        y[i] = x[i].tanh();
+        y[i] = acc_tanhf(x[i]);
     }
 }
 
@@ -966,7 +1009,7 @@ unsafe fn vvexpf_avx2(y: &mut [f32], x: &[f32]) {
         _mm256_storeu_ps(y.as_mut_ptr().add(off), avx2_exp8(v));
     }
     for i in chunks * 8..n {
-        y[i] = x[i].exp();
+        y[i] = acc_expf(x[i]);
     }
 }
 
@@ -989,7 +1032,7 @@ unsafe fn vvtanhf_avx2(y: &mut [f32], x: &[f32]) {
         _mm256_storeu_ps(y.as_mut_ptr().add(off), _mm256_div_ps(num, den));
     }
     for i in chunks * 8..n {
-        y[i] = x[i].tanh();
+        y[i] = acc_tanhf(x[i]);
     }
 }
 

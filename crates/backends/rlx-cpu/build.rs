@@ -39,7 +39,13 @@ fn main() {
     // The `blas` feature is the top-level switch; `--no-default-features`
     // (or a target with no BLAS) falls back to the portable gemm.
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BLAS");
-    if std::env::var_os("CARGO_FEATURE_BLAS").is_none() {
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PURE_RUST");
+    // `pure-rust` wins over `blas` (features unify additively, so it must be
+    // the one that switches the native library off): no Accelerate /
+    // OpenBLAS / MKL, the portable gemm instead.
+    if std::env::var_os("CARGO_FEATURE_BLAS").is_none()
+        || std::env::var_os("CARGO_FEATURE_PURE_RUST").is_some()
+    {
         return;
     }
 

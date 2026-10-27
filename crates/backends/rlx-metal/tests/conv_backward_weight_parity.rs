@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![cfg(target_os = "macos")]
+
 //! Depthwise (grouped) conv backward w.r.t. the weight, CPU vs Metal.
 //!
 //! At `N == 1` this used to take a per-group im2col+GEMM path whose answer

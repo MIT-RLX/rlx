@@ -585,6 +585,14 @@ kernel_cache!(
     "softmax_cross_entropy_backward"
 );
 kernel_cache!(LAYERNORM, layernorm_kernel, LAYERNORM_CU, "rlx_norm");
+// The shared gated delta-net recurrence (CUDA's): one block per
+// (batch, head), one thread per state row.
+kernel_cache!(
+    GATED_DELTA_NET,
+    gated_delta_net_kernel,
+    GATED_DELTA_NET_CU,
+    "gated_delta_net"
+);
 kernel_cache!(
     LAYER_NORM_BWD_INPUT,
     layer_norm_bwd_input_kernel,
@@ -852,6 +860,21 @@ kernel_cache!(
     dequant_matmul_gguf_q4k_gemv_kernel,
     DEQUANT_MATMUL_GGUF_CU,
     "dequant_matmul_gguf_q4k_gemv"
+);
+// Element-strided decode GEMV for Q8_0 / Q4_K / Q6_K (all threads busy at
+// any k; the Q4_K kernel above idles all but k/256 of them).
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF_GEMV_ELEM,
+    dequant_matmul_gguf_gemv_elem_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_gemv_elem"
+);
+// The same GEMV for a verify step's 2–4 rows.
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF_GEMV_ROWS,
+    dequant_matmul_gguf_gemv_rows_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_gemv_rows"
 );
 kernel_cache!(SAMPLE, sample_kernel, SAMPLE_CU, "sample");
 // On-device Philox4×32-10 RNG (shared `rng_philox.cu`, bit-matched to

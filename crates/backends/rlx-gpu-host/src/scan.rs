@@ -83,22 +83,26 @@ pub fn run_host_op_span<A: DeviceArena>(a: &mut A, desc: HostOpDesc) {
 /// host-only chain does one batched H2D instead of one per op.
 #[derive(Default)]
 pub struct HostTensorCache {
+    /// Read mirror, keyed by byte offset. An entry can be longer than the
+    /// tensor last written at its offset (see [`Self::insert`]).
     map: std::collections::HashMap<usize, std::sync::Arc<[f32]>>,
-    /// Byte offsets that exist in `map` but may not yet be on the device, in
-    /// **host write order** (`dirty_set` mirrors it for O(1) membership).
+    /// Deferred device writes, in **host write order**: exactly the bytes each
+    /// host step produced at its offset, nothing more.
     ///
-    /// Order is load-bearing, not cosmetic: mirror entries routinely *overlap*
-    /// in the arena — a view aliasing its parent's slot (see [`Self::insert`]),
-    /// or a slot the memory planner reused after its first tenant died. Two
-    /// overlapping deferred writes must reach the device in the order the host
-    /// produced them, exactly as the eager (non-deferred) path would, otherwise
-    /// a stale longer entry lands *after* the live shorter one inside its span
-    /// and silently clobbers it. A `HashSet` here made that a per-process coin
-    /// flip (randomly-seeded iteration order): `Cholesky`'s dead `[5,5]` L slot
-    /// overwrote the live `LogDet` scalar the planner had placed inside it, so
-    /// wgpu linalg parity failed ~47% of runs with `logdet == 0.0`.
-    dirty: Vec<usize>,
-    dirty_set: std::collections::HashSet<usize>,
+    /// Order is load-bearing: mirror entries routinely *overlap* in the arena
+    /// — a view aliasing its parent's slot, or a slot the memory planner reused
+    /// after its first tenant died — so two overlapping deferred writes must
+    /// reach the device in the order the host produced them, exactly as the
+    /// eager path would. A `HashSet` here once made that a per-process coin
+    /// flip (`Cholesky`'s dead `[5,5]` slot overwrote the live `LogDet` scalar
+    /// ~47% of runs).
+    ///
+    /// Exactness is load-bearing too. This used to flush the merged *mirror*
+    /// entry, so a `[4]` write into the slot of a dead `[16]` tensor also wrote
+    /// the old tenant's 12-value tail — after, and over, a live tensor the
+    /// planner had since placed there. AdamW's bias update on host-routed wgpu
+    /// (discrete NVIDIA Vulkan) read that stale tail back as `b'`.
+    pending: Vec<(usize, std::sync::Arc<[f32]>)>,
 }
 
 impl HostTensorCache {
@@ -108,12 +112,11 @@ impl HostTensorCache {
 
     pub fn clear(&mut self) {
         self.map.clear();
-        self.dirty.clear();
-        self.dirty_set.clear();
+        self.pending.clear();
     }
 
     pub fn has_deferred_writes(&self) -> bool {
-        !self.dirty.is_empty()
+        !self.pending.is_empty()
     }
 
     pub fn get(&self, byte_off: usize) -> Option<&[f32]> {
@@ -136,117 +139,104 @@ impl HostTensorCache {
     }
 
     pub fn is_dirty(&self, byte_off: usize) -> bool {
-        self.dirty_set.contains(&byte_off)
+        self.pending.iter().any(|(o, _)| *o == byte_off)
     }
 
-    /// Queue `byte_off` as the most recent deferred write. Re-writing an offset
-    /// moves it to the back so the flush keeps matching host program order.
-    fn mark_dirty(&mut self, byte_off: usize) {
-        if !self.dirty_set.insert(byte_off) {
-            if let Some(pos) = self.dirty.iter().position(|&o| o == byte_off) {
-                self.dirty.remove(pos);
-            }
-        }
-        self.dirty.push(byte_off);
-    }
-
-    fn unmark_dirty(&mut self, byte_off: usize) -> bool {
-        if !self.dirty_set.remove(&byte_off) {
-            return false;
-        }
-        if let Some(pos) = self.dirty.iter().position(|&o| o == byte_off) {
-            self.dirty.remove(pos);
-        }
-        true
+    fn drop_pending_at(&mut self, byte_off: usize) -> bool {
+        let before = self.pending.len();
+        self.pending.retain(|(o, _)| *o != byte_off);
+        self.pending.len() != before
     }
 
     pub fn invalidate(&mut self, byte_off: usize) {
         self.map.remove(&byte_off);
-        self.unmark_dirty(byte_off);
+        self.drop_pending_at(byte_off);
     }
 
     pub fn insert(&mut self, byte_off: usize, data: Vec<f32>, defer_htod: bool) {
+        let data: std::sync::Arc<[f32]> = std::sync::Arc::from(data);
         if defer_htod {
-            self.mark_dirty(byte_off);
+            // An earlier pending write at this offset that this one fully
+            // covers is redundant whatever landed in between: this one is
+            // newer than all of it.
+            self.pending
+                .retain(|(o, v)| *o != byte_off || v.len() > data.len());
+            self.pending.push((byte_off, data.clone()));
         } else {
-            self.unmark_dirty(byte_off);
+            // The caller just wrote `data` eagerly; an older deferred write at
+            // this offset must not land on top of it later.
+            self.drop_pending_at(byte_off);
         }
-        // Preserve a longer entry's tail. The cache is keyed by byte offset,
-        // but *views alias their parent's slot*: a `Narrow(start=0)` of a
-        // concat has the parent's exact offset. Replacing outright means the
-        // shorter view write destroys the parent's mirror beyond its own
-        // length, and a sibling view at an interior offset — `Narrow(start=6)`
-        // reading parent+144 — then finds nothing in the cache, nothing dirty
-        // to flush, and reads a device region the deferred parent never wrote:
-        // zeros, which propagate until the whole graph output is zero.
-        //
-        // The arena bytes past `data` are unchanged by this write, so the
-        // mirror must keep showing them.
+        // Preserve a longer entry's tail in the *mirror*. Views alias their
+        // parent's slot: a `Narrow(start=0)` of a concat has the parent's exact
+        // offset, and replacing outright would destroy the parent's mirror
+        // beyond the view, so a sibling view at an interior offset then found
+        // nothing cached and read a device region the deferred parent never
+        // wrote. The arena bytes past `data` are unchanged by this write, so
+        // the mirror keeps showing them — but only `data` is owed to the
+        // device (see `pending`).
         let merged: std::sync::Arc<[f32]> = match self.map.get(&byte_off) {
             Some(prev) if prev.len() > data.len() => {
                 let mut v = prev.to_vec();
                 v[..data.len()].copy_from_slice(&data);
                 std::sync::Arc::from(v)
             }
-            _ => std::sync::Arc::<[f32]>::from(data),
+            _ => data,
         };
         self.map.insert(byte_off, merged);
     }
 
-    /// Flush every deferred entry overlapping `[byte_off, byte_off + len)` —
-    /// call before reading that range from the device on a mirror miss.
+    /// Flush every deferred write overlapping `[byte_off, byte_off + len)`, in
+    /// host order — call before reading that range from the device on a mirror
+    /// miss.
     ///
-    /// [`Self::flush_offset`] only finds a write keyed at exactly `byte_off`,
-    /// which misses one deferred *inside* the range: a KV row appended at
-    /// `cache + pos·row`, then the cache read whole at `cache` by a host step
-    /// (`ExpandHost` repeating KV heads on discrete NVIDIA). That read the
-    /// device before the row was flushed, so every decode step attended to the
-    /// cache without its newest token.
+    /// Matching only writes keyed at exactly `byte_off` misses one deferred
+    /// *inside* the range: a KV row appended at `cache + pos·row`, then the
+    /// cache read whole at `cache` by a host step (`ExpandHost` repeating KV
+    /// heads on discrete NVIDIA). That read the device before the row was
+    /// flushed, so every decode step attended to the cache without its newest
+    /// token.
     pub fn flush_range<A: DeviceArena>(&mut self, a: &mut A, byte_off: usize, len: usize) {
         let hi = byte_off + len;
-        let owed: Vec<usize> = self
-            .dirty
-            .iter()
-            .copied()
-            .filter(|k| {
-                self.map
-                    .get(k)
-                    .is_some_and(|v| *k < hi && byte_off < k + v.len() * 4)
-            })
-            .collect();
-        for k in owed {
-            self.flush_offset(a, k);
+        let overlaps = |k: usize, v: &[f32]| k < hi && byte_off < k + v.len() * 4;
+        let mut kept = Vec::with_capacity(self.pending.len());
+        for (k, v) in std::mem::take(&mut self.pending) {
+            if overlaps(k, &v) {
+                if !v.is_empty() {
+                    a.htod(k, bytemuck::cast_slice(&v));
+                }
+            } else {
+                kept.push((k, v));
+            }
         }
+        self.pending = kept;
     }
 
     /// Write all deferred host outputs to the device (call before a GPU pass),
-    /// oldest write first — see the `dirty` field docs for why order matters.
+    /// oldest write first — see the `pending` field docs for why order and
+    /// exactness matter.
     pub fn flush_to_device<A: DeviceArena>(&mut self, a: &mut A) {
-        if self.dirty.is_empty() {
-            return;
-        }
-        let offs = std::mem::take(&mut self.dirty);
-        for off in offs {
-            if let Some(v) = self.map.get(&off) {
-                if !v.is_empty() {
-                    a.htod(off, bytemuck::cast_slice(v));
-                }
+        for (off, v) in std::mem::take(&mut self.pending) {
+            if !v.is_empty() {
+                a.htod(off, bytemuck::cast_slice(&v));
             }
         }
-        self.dirty_set.clear();
     }
 
-    /// Flush one deferred offset (before a cache-miss D2H that would otherwise
-    /// read zeros for a HostOp that deferred its write).
+    /// Flush the deferred writes at one offset (before a cache-miss D2H that
+    /// would otherwise read zeros for a HostOp that deferred its write).
     pub fn flush_offset<A: DeviceArena>(&mut self, a: &mut A, byte_off: usize) {
-        if !self.unmark_dirty(byte_off) {
-            return;
-        }
-        if let Some(v) = self.map.get(&byte_off) {
-            if !v.is_empty() {
-                a.htod(byte_off, bytemuck::cast_slice(v));
+        let mut kept = Vec::with_capacity(self.pending.len());
+        for (k, v) in std::mem::take(&mut self.pending) {
+            if k == byte_off {
+                if !v.is_empty() {
+                    a.htod(k, bytemuck::cast_slice(&v));
+                }
+            } else {
+                kept.push((k, v));
             }
         }
+        self.pending = kept;
     }
 }
 
@@ -294,6 +284,19 @@ pub fn run_host_op_packed_cached<A: DeviceArena>(
             let n = sh.size_bytes().unwrap_or(0).div_ceil(4).max(n_elems);
             if let Some(c) = cache.as_ref() {
                 if let Some(hit) = c.get_arc_covering(*off, n_elems) {
+                    // Trim to this input's own extent. A mirror entry can be
+                    // LONGER than the tensor now in its slot: `insert` keeps a
+                    // previous tenant's tail (views alias a parent's offset),
+                    // and the planner reuses dead slots. Handing the whole
+                    // entry over made a 0-d scalar placed in a dead [4,4]
+                    // slot arrive as 16 values, so the kernel computed
+                    // elementwise instead of broadcasting — element 0 right,
+                    // the rest the old tenant's data. That broke AdamW's bias
+                    // update on every host-routed wgpu backend (discrete
+                    // NVIDIA Vulkan). The device path below reads exactly `n`.
+                    if hit.len() > n {
+                        return (sh.clone(), std::sync::Arc::<[f32]>::from(&hit[..n]));
+                    }
                     return (sh.clone(), hit);
                 }
             }
@@ -584,6 +587,29 @@ mod host_cache_tests {
 
         assert_eq!(a.writes, vec![(16, 4), (0, 32)]);
         assert_eq!(a.f32_at(16), 2.0, "newest write to the span must win");
+    }
+
+    /// A short write into a dead longer tenant's slot owes the device only its
+    /// own bytes. Flushing the merged mirror entry also wrote the old tenant's
+    /// tail — over a live tensor placed there since (AdamW's `b'` on
+    /// host-routed wgpu). Checked with the old tenant both flushed and pending.
+    #[test]
+    fn a_short_write_does_not_flush_the_previous_tenants_tail() {
+        for flush_old_first in [true, false] {
+            let mut c = HostTensorCache::new();
+            let mut a = VecArena::new(128);
+            c.insert(0, vec![9.0; 16], true); // dead [16] tenant, bytes 0..64
+            if flush_old_first {
+                c.flush_to_device(&mut a);
+            }
+            c.insert(48, vec![5.0; 4], true); // live [4] tensor inside it, 48..64
+            c.insert(0, vec![1.0; 4], true); // short write at the old slot, 0..16
+            c.flush_to_device(&mut a);
+            assert_eq!(a.f32_at(48), 5.0, "stale tail clobbered a live tensor");
+            assert_eq!(a.f32_at(0), 1.0);
+            // The mirror still shows the old tail for reads at offset 0.
+            assert_eq!(c.get(0).map(|v| v.len()), Some(16));
+        }
     }
 
     /// `flush_offset` drains just that offset and leaves the rest ordered.

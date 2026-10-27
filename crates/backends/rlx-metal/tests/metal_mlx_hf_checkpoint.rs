@@ -19,7 +19,11 @@ use rlx_runtime::{Device, Session};
 
 #[test]
 fn metal_hf_mlx_one_linear() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         return;
     }
     let repo = rlx_ir::env::var("RLX_HF_MLX_REPO").unwrap_or_else(|| DEFAULT_HF_MLX_REPO.into());

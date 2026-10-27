@@ -6,6 +6,9 @@
 //!
 //! # Crate boundary
 //!
+//! Without the default `io` feature only the quant math is built (`MlxConfig`,
+//! the affine / mxfp dequant kernels, RoPE tables) — what a backend needs.
+//!
 //! This is a leaf **I/O** crate: it may depend on [`rlx_ir`] and host crates
 //! (`anyhow`, `safetensors`, …) but **must not** depend on runtime or backend
 //! crates (`rlx-runtime`, `rlx-cpu`, `rlx-metal`, …). Backend crates may depend
@@ -25,16 +28,23 @@
 //!   mlx-lm `nvfp4` maps to `MlxMxfp4` (same pack layout; typical
 //!   `group_size=16` with FP8 E4M3 scales) — not GGUF/NVIDIA `Nvfp4Block`.
 
+#[cfg(feature = "io")]
 mod arch;
 mod config;
 mod dequant;
+#[cfg(feature = "io")]
 mod dtype;
+#[cfg(feature = "io")]
 mod graph;
+#[cfg(feature = "io")]
 mod hf;
+#[cfg(feature = "io")]
 mod load;
+#[cfg(feature = "io")]
 mod npz;
 mod rope;
 
+#[cfg(feature = "io")]
 pub use arch::{
     EmbedSource, build_llama_decoder_layer, build_llama_decoder_layer_kv, build_llama_like_decode,
     build_llama_like_decode_dyn, build_llama_like_decode_masked,
@@ -49,14 +59,17 @@ pub use dequant::{
     dequant_mxfp8_f32, grouped_matmul_mxfp4_bt, mxfp4_scale_e8m0_to_f32, pack_factor,
     validate_dequant_matmul_dims,
 };
+#[cfg(feature = "io")]
 pub use graph::{
     PackedLinearBinding, build_mlp_chain_graph, build_parallel_dequant_graph,
     collect_packed_linears, param_bindings_for,
 };
+#[cfg(feature = "io")]
 pub use hf::{
     DEFAULT_HF_MLX_REPO, fetch_default_mlx_community, fetch_mlx_community, fetch_ok, hf_cache_dir,
     write_fetch_ok,
 };
+#[cfg(feature = "io")]
 pub use load::{
     LazyMlxWeights, MlxPackedLinear, MlxRead, MlxTensor, MlxWeights, PackedMlxBorrow, load_path,
     load_path_lazy,
@@ -66,12 +79,16 @@ pub use rope::{build_default_tables, default_inv_freq};
 /// Dense f32 payload with logical shape preserved.
 pub type ShapedF32 = (Vec<usize>, Vec<f32>);
 
+#[cfg(feature = "io")]
 use anyhow::Result;
+#[cfg(feature = "io")]
 use std::collections::HashMap;
+#[cfg(feature = "io")]
 use std::path::Path;
 
 /// Convenience: load any supported path and return dense f32 tensors
 /// (affine / mxfp layers are dequantized).
+#[cfg(feature = "io")]
 pub fn load_f32_map(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<f32>>> {
     load_path(path)?.into_f32_map()
 }

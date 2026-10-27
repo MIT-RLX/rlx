@@ -115,7 +115,11 @@ fn check(c: Case) {
 }
 
 fn metal() -> bool {
-    !rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal))
+    !rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    )
 }
 
 fn base(d: usize) -> Case {

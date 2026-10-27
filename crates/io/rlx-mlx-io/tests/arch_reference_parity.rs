@@ -12,6 +12,7 @@
 //! that primitive has its own coverage — and re-derives the transformer
 //! maths from the weights.
 
+#![cfg(feature = "io")]
 use rlx_ir::QuantScheme;
 use rlx_mlx_io::{
     MlxArchConfig, MlxPackedLinear, PackedLinearBinding, build_llama_like_decode_dyn,

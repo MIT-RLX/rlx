@@ -98,6 +98,8 @@ pub fn rocm_context() -> Option<Arc<RocmContext>> {
 /// One attempt at bringing up HIP. Separated from the caching so the retry
 /// policy is visible in one place.
 fn build_context() -> Option<Arc<RocmContext>> {
+    // Before hipInit, so HIP's own threads inherit it.
+    crate::numa_guard::apply();
     let Some(runtime) = HipRuntime::load() else {
         // Only this failure is permanent.
         let _ = RUNTIME_MISSING.set(true);

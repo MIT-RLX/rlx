@@ -199,6 +199,8 @@ pub fn train_spec(graph: &Graph, spec: &Value) -> ApiResult<TrainSpec> {
         device: o.str("device")?.unwrap_or("auto").to_string(),
         grad_group: o.u64("grad_group")?.unwrap_or(0),
         push_data: o.bool("push_data", false)?,
+        options: None,
+        frozen: Vec::new(),
     };
     o.finish()?;
     Ok(s)

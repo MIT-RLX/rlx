@@ -20,7 +20,12 @@ fn main() {
     unsafe {
         std::env::set_var("PROTOC", protoc);
     }
+    // Ordered maps: prost encodes a HashMap field in its (per-process random)
+    // iteration order, so the same model serialised to different bytes in
+    // every process and the compiled-model cache, keyed by those bytes,
+    // never hit.
     prost_build::Config::new()
+        .btree_map(["."])
         .compile_protos(&["proto/coreml.proto"], &["proto"])
         .expect("prost-build: compile_protos failed");
     println!("cargo:rerun-if-changed=proto/coreml.proto");

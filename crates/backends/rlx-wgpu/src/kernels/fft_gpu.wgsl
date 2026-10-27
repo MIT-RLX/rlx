@@ -218,16 +218,20 @@ fn fft_inner(
     let num_tiles = (n + tile - 1u) / tile;
     if (tile_id >= num_tiles) { return; }
     let local = lid.x;
-    if (local >= half_tile) { return; }
+    // Threads past half the tile do no work, but must still reach every
+    // barrier: an early `return` on `lid` before `workgroupBarrier()` fails
+    // WGSL's uniformity analysis — Chrome (Tint) rejects the whole module,
+    // and every FFT entry point in it, while naga accepts it.
+    let in_tile = local < half_tile;
 
     let row_base = params.off + row * 2u * n;
     let tile_base = tile_id * tile;
 
-    if (tile_base + local < n) {
+    if (in_tile && tile_base + local < n) {
         sre_in[local] = re_at(row_base, tile_base + local, n);
         sim_in[local] = im_at(row_base, tile_base + local, n);
     }
-    if (tile_base + local + half_tile < n) {
+    if (in_tile && tile_base + local + half_tile < n) {
         sre_in[local + half_tile] = re_at(row_base, tile_base + local + half_tile, n);
         sim_in[local + half_tile] = im_at(row_base, tile_base + local + half_tile, n);
     }
@@ -236,30 +240,32 @@ fn fft_inner(
     let sign = select(-1.0, 1.0, params.inverse != 0u);
     let pi = 3.14159265358979323846;
     for (var s: u32 = 0u; s < params.inner_stages; s = s + 1u) {
-        let hs = 1u << s;
-        let k = local % hs;
-        let i = (local / hs) * (hs * 2u) + k;
-        let j = i + hs;
-        let angle = sign * pi * f32(k) / f32(hs);
-        let cos_a = cos(angle);
-        let sin_a = sin(angle);
-        let ur = sre_in[i];
-        let ui = sim_in[i];
-        let vr = cos_a * sre_in[j] - sin_a * sim_in[j];
-        let vi = sin_a * sre_in[j] + cos_a * sim_in[j];
-        sre_in[i] = ur + vr;
-        sim_in[i] = ui + vi;
-        sre_in[j] = ur - vr;
-        sim_in[j] = ui - vi;
+        if (in_tile) {
+            let hs = 1u << s;
+            let k = local % hs;
+            let i = (local / hs) * (hs * 2u) + k;
+            let j = i + hs;
+            let angle = sign * pi * f32(k) / f32(hs);
+            let cos_a = cos(angle);
+            let sin_a = sin(angle);
+            let ur = sre_in[i];
+            let ui = sim_in[i];
+            let vr = cos_a * sre_in[j] - sin_a * sim_in[j];
+            let vi = sin_a * sre_in[j] + cos_a * sim_in[j];
+            sre_in[i] = ur + vr;
+            sim_in[i] = ui + vi;
+            sre_in[j] = ur - vr;
+            sim_in[j] = ui - vi;
+        }
         workgroupBarrier();
     }
 
     let scale = params.norm_scale;
-    if (tile_base + local < n) {
+    if (in_tile && tile_base + local < n) {
         set_re(row_base, tile_base + local, n, sre_in[local] * scale);
         set_im(row_base, tile_base + local, n, sim_in[local] * scale);
     }
-    if (tile_base + local + half_tile < n) {
+    if (in_tile && tile_base + local + half_tile < n) {
         set_re(row_base, tile_base + local + half_tile, n, sre_in[local + half_tile] * scale);
         set_im(row_base, tile_base + local + half_tile, n, sim_in[local + half_tile] * scale);
     }

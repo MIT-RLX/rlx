@@ -40,7 +40,8 @@ impl Session {
         // wrong (and misleading) on a headless host where it already is enabled.
         assert!(
             crate::device_ext::is_available(device),
-            "device {} is not available — {}",
+            "device {} is not available — {}\n\
+             Run `cargo rlx doctor` for a diagnosis and the fix (see docs/known-issues.md).",
             device,
             if crate::device_ext::feature_compiled(device) {
                 match crate::device_ext::unavailable_reason(device) {
@@ -102,10 +103,12 @@ impl Session {
             return self.compile_deferred(graph, self.default_options());
         }
         let opts = self.default_options();
-        // A number format (`RLX_NUMBER_FORMAT`) rewrites the graph first.
+        // A number format (`RLX_NUMBER_FORMAT`) or rounding half casts
+        // (`RLX_HALF_CASTS=round`) rewrites the graph first.
         if opts
             .number_format
             .is_some_and(|f| f != rlx_ir::NumberFormat::F32)
+            || opts.half_casts == crate::HalfCasts::Round
         {
             return self.compile_with(graph, &opts);
         }
@@ -207,6 +210,11 @@ impl Session {
         let graph = if self.device == Device::Metal {
             use rlx_opt::pass::Pass as _;
             rlx_opt::rlx_fusion::assoc_scan::ParallelizeAffineScan::default().run(graph)
+        } else {
+            graph
+        };
+        let graph = if options.half_casts == crate::HalfCasts::Round {
+            crate::cpu_low_precision::round_half_casts(graph)
         } else {
             graph
         };
@@ -454,7 +462,7 @@ impl Session {
     }
 }
 
-fn feature_name(device: Device) -> &'static str {
+pub(crate) fn feature_name(device: Device) -> &'static str {
     match device {
         Device::Cpu => "cpu",
         Device::Metal => "metal",
