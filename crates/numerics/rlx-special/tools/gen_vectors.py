@@ -28,7 +28,12 @@ import scipy, scipy.special as sc, scipy.stats as st
 
 oracle = sys.argv[1]
 xsf_oracle = sys.argv[2]
+# macOS arm64 → tests/vectors/; the Linux x86-64 reference (msi, oracles built with
+# g++ -O2 for the x86-64 baseline as SciPy's manylinux wheel is) → tests/vectors/linux-x86_64/
 out_dir = pathlib.Path(__file__).resolve().parent.parent / "tests" / "vectors"
+if sys.platform != "darwin":
+    out_dir = out_dir / "linux-x86_64"
+out_dir.mkdir(exist_ok=True)
 h = lambda v: "%016x" % struct.unpack("<Q", struct.pack("<d", float(v)))[0]
 rng = np.random.default_rng(20261024)
 U = lambda lo, hi: float(rng.uniform(lo, hi))

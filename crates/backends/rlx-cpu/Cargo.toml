@@ -79,6 +79,8 @@ amx-sme = []
 libm = "0.2"
 rlx-ir = { workspace = true }
 rlx-pocketfft = { workspace = true }
+# the Linux x86-64 reference BLAS/LAPACK (non-Apple fallbacks of numpy_blas)
+rlx-linux-ref = { workspace = true }
 # Double-single (df) host arithmetic — the reference every df kernel matches.
 rlxsl = { workspace = true }
 rlx-opt = { workspace = true }

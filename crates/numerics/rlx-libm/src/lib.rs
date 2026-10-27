@@ -4,7 +4,8 @@
 
 //! # rlx-libm — glibc's `libm`, bit for bit, in pure Rust
 //!
-//! NumPy, SciPy and torch on Linux call glibc's `exp`/`log`/`log2`/`pow`. On
+//! NumPy, SciPy and torch on Linux call glibc's `exp`/`log`/`log2`/`pow` (and torch's
+//! sampler `logf`/`sincosf`, checked against aarch64 glibc). On
 //! x86_64 glibc selects the variant compiled with `-mfma -mavx2`
 //! (`__exp_fma`, …) on any CPU with FMA, and gcc (`-ffp-contract=fast`) turns a
 //! multiply into FMAs when every use of the product is an add or subtract. These
@@ -18,7 +19,17 @@
 
 #![allow(clippy::excessive_precision, clippy::unreadable_literal)]
 
+mod complex;
+mod erfc;
+mod expm1_log1p;
+mod sin;
 mod tables;
+pub use complex::{cexp, csqrt, hypot};
+pub use erfc::erfc;
+#[doc(hidden)]
+pub use erfc::hard_cases as erfc_hard_cases;
+pub use expm1_log1p::{expm1, log1p};
+pub use sin::{cos, sin, tan};
 use tables::*;
 
 #[inline(always)]
@@ -36,12 +47,20 @@ fn fma(a: f64, b: f64, c: f64) -> f64 {
 
 /// `__math_oflow(sign)`: `±0x1p769 * 0x1p769`.
 fn oflow(sign: bool) -> f64 {
-    let y = if sign { -f64::from_bits(0x7000000000000000) } else { f64::from_bits(0x7000000000000000) };
+    let y = if sign {
+        -f64::from_bits(0x7000000000000000)
+    } else {
+        f64::from_bits(0x7000000000000000)
+    };
     y * f64::from_bits(0x7000000000000000)
 }
 /// `__math_uflow(sign)`: `±0x1p-767 * 0x1p-767`.
 fn uflow(sign: bool) -> f64 {
-    let y = if sign { -f64::from_bits(0x1000000000000000) } else { f64::from_bits(0x1000000000000000) };
+    let y = if sign {
+        -f64::from_bits(0x1000000000000000)
+    } else {
+        f64::from_bits(0x1000000000000000)
+    };
     y * f64::from_bits(0x1000000000000000)
 }
 
@@ -78,7 +97,9 @@ fn exp_specialcase(tmp: f64, sbits: u64, ki: u64) -> f64 {
 /// glibc `exp` (`__exp_fma`).
 pub fn exp(x: f64) -> f64 {
     let mut abstop = top12(x) & 0x7ff;
-    if abstop.wrapping_sub(top12(f64::from_bits(0x3c90000000000000))) >= top12(512.0) - top12(f64::from_bits(0x3c90000000000000)) {
+    if abstop.wrapping_sub(top12(f64::from_bits(0x3c90000000000000)))
+        >= top12(512.0) - top12(f64::from_bits(0x3c90000000000000))
+    {
         if abstop.wrapping_sub(top12(f64::from_bits(0x3c90000000000000))) >= 0x80000000 {
             return 1.0 + x; // tiny x
         }
@@ -89,7 +110,11 @@ pub fn exp(x: f64) -> f64 {
             if abstop >= top12(f64::INFINITY) {
                 return 1.0 + x;
             }
-            return if x.to_bits() >> 63 != 0 { uflow(false) } else { oflow(false) };
+            return if x.to_bits() >> 63 != 0 {
+                uflow(false)
+            } else {
+                oflow(false)
+            };
         }
         abstop = 0; // large |x|: special-cased below
     }
@@ -97,13 +122,22 @@ pub fn exp(x: f64) -> f64 {
     let kd0 = fma(d(EXP_DATA[EXP_INVLN2N]), x, d(EXP_DATA[EXP_SHIFT]));
     let ki = kd0.to_bits();
     let kd = kd0 - d(EXP_DATA[EXP_SHIFT]);
-    let r = fma(kd, d(EXP_DATA[EXP_NEGLN2LON]), fma(kd, d(EXP_DATA[EXP_NEGLN2HIN]), x));
+    let r = fma(
+        kd,
+        d(EXP_DATA[EXP_NEGLN2LON]),
+        fma(kd, d(EXP_DATA[EXP_NEGLN2HIN]), x),
+    );
     let idx = (2 * (ki % EXP_N)) as usize;
     let top = ki << (52 - EXP_TABLE_BITS);
     let tail = d(EXP_DATA[EXP_TAB + idx]);
     let sbits = EXP_DATA[EXP_TAB + idx + 1].wrapping_add(top);
     let r2 = r * r;
-    let (c2, c3, c4, c5) = (d(EXP_DATA[EXP_POLY]), d(EXP_DATA[EXP_POLY + 1]), d(EXP_DATA[EXP_POLY + 2]), d(EXP_DATA[EXP_POLY + 3]));
+    let (c2, c3, c4, c5) = (
+        d(EXP_DATA[EXP_POLY]),
+        d(EXP_DATA[EXP_POLY + 1]),
+        d(EXP_DATA[EXP_POLY + 2]),
+        d(EXP_DATA[EXP_POLY + 3]),
+    );
     // tmp = tail + r + r2*(C2 + r*C3) + r2*r2*(C4 + r*C5)
     let tmp = fma(r2 * r2, fma(r, c5, c4), fma(r2, fma(r, c3, c2), tail + r));
     if abstop == 0 {
@@ -243,7 +277,11 @@ pub fn log2(x: f64) -> f64 {
     let r4 = r2 * r2;
     let a = |i: usize| d(LOG2_DATA[LOG2_POLY + i]);
     // p = A0 + r*A1 + r2*(A2 + r*A3) + r4*(A4 + r*A5); y = lo + r2*p + hi
-    let p = fma(r4, fma(r, a(5), a(4)), fma(r2, fma(r, a(3), a(2)), fma(r, a(1), a(0))));
+    let p = fma(
+        r4,
+        fma(r, a(5), a(4)),
+        fma(r2, fma(r, a(3), a(2)), fma(r, a(1), a(0))),
+    );
     fma(r2, p, lo) + hi
 }
 
@@ -279,7 +317,11 @@ fn pow_log_inline(ix: u64) -> (f64, f64) {
     let lo3 = fma(ar, r, -ar2);
     let lo4 = t2 - hi + ar2;
     // p = ar3*(A1 + r*A2 + ar2*(A3 + r*A4 + ar2*(A5 + r*A6))), only used by the sum below
-    let q = fma(ar2, fma(ar2, fma(r, a(6), a(5)), fma(r, a(4), a(3))), fma(r, a(2), a(1)));
+    let q = fma(
+        ar2,
+        fma(ar2, fma(r, a(6), a(5)), fma(r, a(4), a(3))),
+        fma(r, a(2), a(1)),
+    );
     let lo = fma(ar3, q, lo1 + lo2 + lo3 + lo4);
     let y = hi + lo;
     (y, hi - y + lo)
@@ -318,21 +360,34 @@ fn pow_exp_inline(x: f64, xtail: f64, sign_bias: u64) -> f64 {
             return if sign_bias != 0 { -one } else { one };
         }
         if abstop >= top12(1024.0) {
-            return if x.to_bits() >> 63 != 0 { uflow(sign_bias != 0) } else { oflow(sign_bias != 0) };
+            return if x.to_bits() >> 63 != 0 {
+                uflow(sign_bias != 0)
+            } else {
+                oflow(sign_bias != 0)
+            };
         }
         abstop = 0;
     }
     let kd0 = fma(d(EXP_DATA[EXP_INVLN2N]), x, d(EXP_DATA[EXP_SHIFT]));
     let ki = kd0.to_bits();
     let kd = kd0 - d(EXP_DATA[EXP_SHIFT]);
-    let mut r = fma(kd, d(EXP_DATA[EXP_NEGLN2LON]), fma(kd, d(EXP_DATA[EXP_NEGLN2HIN]), x));
+    let mut r = fma(
+        kd,
+        d(EXP_DATA[EXP_NEGLN2LON]),
+        fma(kd, d(EXP_DATA[EXP_NEGLN2HIN]), x),
+    );
     r += xtail;
     let idx = (2 * (ki % EXP_N)) as usize;
     let top = ki.wrapping_add(sign_bias) << (52 - EXP_TABLE_BITS);
     let tail = d(EXP_DATA[EXP_TAB + idx]);
     let sbits = EXP_DATA[EXP_TAB + idx + 1].wrapping_add(top);
     let r2 = r * r;
-    let (c2, c3, c4, c5) = (d(EXP_DATA[EXP_POLY]), d(EXP_DATA[EXP_POLY + 1]), d(EXP_DATA[EXP_POLY + 2]), d(EXP_DATA[EXP_POLY + 3]));
+    let (c2, c3, c4, c5) = (
+        d(EXP_DATA[EXP_POLY]),
+        d(EXP_DATA[EXP_POLY + 1]),
+        d(EXP_DATA[EXP_POLY + 2]),
+        d(EXP_DATA[EXP_POLY + 3]),
+    );
     let tmp = fma(r2 * r2, fma(r, c5, c4), fma(r2, fma(r, c3, c2), tail + r));
     if abstop == 0 {
         return pow_specialcase(tmp, sbits, ki);
@@ -375,7 +430,9 @@ pub fn pow(x: f64, y: f64) -> f64 {
     let iy = y.to_bits();
     let mut topx = top12(x);
     let topy = top12(y);
-    if topx.wrapping_sub(0x001) >= 0x7ff - 0x001 || (topy & 0x7ff).wrapping_sub(0x3be) >= 0x43e - 0x3be {
+    if topx.wrapping_sub(0x001) >= 0x7ff - 0x001
+        || (topy & 0x7ff).wrapping_sub(0x3be) >= 0x43e - 0x3be
+    {
         if zeroinfnan(iy) {
             if iy << 1 == 0 {
                 return if issignaling(x) { x + y } else { 1.0 };
@@ -417,9 +474,17 @@ pub fn pow(x: f64, y: f64) -> f64 {
                 return 1.0;
             }
             if (topy & 0x7ff) < 0x3be {
-                return if ix > 1.0f64.to_bits() { 1.0 + y } else { 1.0 - y };
+                return if ix > 1.0f64.to_bits() {
+                    1.0 + y
+                } else {
+                    1.0 - y
+                };
             }
-            return if (ix > 1.0f64.to_bits()) == (topy < 0x800) { oflow(false) } else { uflow(false) };
+            return if (ix > 1.0f64.to_bits()) == (topy < 0x800) {
+                oflow(false)
+            } else {
+                uflow(false)
+            };
         }
         if topx == 0 {
             ix = (f64::from_bits(ix) * f64::from_bits(0x4330000000000000)).to_bits();
@@ -432,6 +497,260 @@ pub fn pow(x: f64, y: f64) -> f64 {
     let ehi = y * hi;
     let elo = fma(y, lo, fma(y, hi, -ehi));
     pow_exp_inline(ehi, elo, sign_bias)
+}
+
+// ── single precision: `logf`, `sincosf` (sysdeps/ieee754/flt-32) ─────────────
+
+/// glibc `logf` (`e_logf.c`; the `-mfma` x86-64 variant and aarch64 contract alike —
+/// for a float result the placement of the FMAs is inert: un-fusing them changes no
+/// output on 15M sampled inputs).
+pub fn logf(x: f32) -> f32 {
+    const OFF: u32 = 0x3f33_0000;
+    const LN2: f64 = f64::from_bits(0x3fe62e42fefa39ef);
+    // (invc, logc)
+    const T: [(u64, u64); 16] = [
+        (0x3ff661ec79f8f3be, 0xbfd57bf7808caade),
+        (0x3ff571ed4aaf883d, 0xbfd2bef0a7c06ddb),
+        (0x3ff49539f0f010b0, 0xbfd01eae7f513a67),
+        (0x3ff3c995b0b80385, 0xbfcb31d8a68224e9),
+        (0x3ff30d190c8864a5, 0xbfc6574f0ac07758),
+        (0x3ff25e227b0b8ea0, 0xbfc1aa2bc79c8100),
+        (0x3ff1bb4a4a1a343f, 0xbfba4e76ce8c0e5e),
+        (0x3ff12358f08ae5ba, 0xbfb1973c5a611ccc),
+        (0x3ff0953f419900a7, 0xbfa252f438e10c1e),
+        (0x3ff0000000000000, 0x0000000000000000),
+        (0x3fee608cfd9a47ac, 0x3faaa5aa5df25984),
+        (0x3feca4b31f026aa0, 0x3fbc5e53aa362eb4),
+        (0x3feb2036576afce6, 0x3fc526e57720db08),
+        (0x3fe9c2d163a1aa2d, 0x3fcbc2860d224770),
+        (0x3fe886e6037841ed, 0x3fd1058bc8a07ee1),
+        (0x3fe767dcf5534862, 0x3fd4043057b6ee09),
+    ];
+    const A: [u64; 3] = [0xbfd00ea348b88334, 0x3fd5575b0be00b6a, 0xbfdffffef20a4123];
+    let mut ix = x.to_bits();
+    if ix == 0x3f80_0000 {
+        return 0.0;
+    }
+    if ix.wrapping_sub(0x0080_0000) >= 0x7f80_0000 - 0x0080_0000 {
+        if ix.wrapping_mul(2) == 0 {
+            return f32::NEG_INFINITY;
+        }
+        if ix == 0x7f80_0000 {
+            return x;
+        }
+        if (ix & 0x8000_0000) != 0 || ix.wrapping_mul(2) >= 0xff00_0000 {
+            return f32::NAN;
+        }
+        ix = (x * f32::from_bits(0x4b00_0000)).to_bits();
+        ix = ix.wrapping_sub(23 << 23);
+    }
+    let tmp = ix.wrapping_sub(OFF);
+    let i = ((tmp >> (23 - 4)) % 16) as usize;
+    let k = (tmp as i32) >> 23;
+    let iz = ix.wrapping_sub(tmp & 0xff80_0000);
+    let (invc, logc) = (f64::from_bits(T[i].0), f64::from_bits(T[i].1));
+    let z = f32::from_bits(iz) as f64;
+    let a = |j: usize| f64::from_bits(A[j]);
+    // gcc contracts every single-use product into its add
+    let r = fma(z, invc, -1.0);
+    let y0 = fma(k as f64, LN2, logc);
+    let r2 = r * r;
+    let mut y = fma(a(1), r, a(2));
+    y = fma(a(0), r2, y);
+    y = fma(y, r2, y0 + r);
+    y as f32
+}
+
+/// `sincos_t` (`sincosf_poly.h`): the aarch64 (`TOINT_INTRINSICS`) table.
+struct SinCosT {
+    sign: [f64; 4],
+    hpi_inv: f64,
+    hpi: f64,
+    c: [f64; 5],
+    s: [f64; 3],
+}
+
+const SINCOSF_TABLE: [SinCosT; 2] = [
+    SinCosT {
+        sign: [1.0, -1.0, -1.0, 1.0],
+        hpi_inv: f64::from_bits(0x3fe45f306dc9c883),
+        hpi: f64::from_bits(0x3ff921fb54442d18),
+        c: [
+            f64::from_bits(0x3ff0000000000000),
+            f64::from_bits(0xbfdffffffd0c621c),
+            f64::from_bits(0x3fa55553e1068f19),
+            f64::from_bits(0xbf56c087e89a359d),
+            f64::from_bits(0x3ef99343027bf8c3),
+        ],
+        s: [
+            f64::from_bits(0xbfc555545995a603),
+            f64::from_bits(0x3f81107605230bc4),
+            f64::from_bits(0xbf2994eb3774cf24),
+        ],
+    },
+    SinCosT {
+        sign: [1.0, -1.0, -1.0, 1.0],
+        hpi_inv: f64::from_bits(0x3fe45f306dc9c883),
+        hpi: f64::from_bits(0x3ff921fb54442d18),
+        c: [
+            f64::from_bits(0xbff0000000000000),
+            f64::from_bits(0x3fdffffffd0c621c),
+            f64::from_bits(0xbfa55553e1068f19),
+            f64::from_bits(0x3f56c087e89a359d),
+            f64::from_bits(0xbef99343027bf8c3),
+        ],
+        s: [
+            f64::from_bits(0xbfc555545995a603),
+            f64::from_bits(0x3f81107605230bc4),
+            f64::from_bits(0xbf2994eb3774cf24),
+        ],
+    },
+];
+
+const INV_PIO4: [u32; 24] = [
+    0xa2, 0xa2f9, 0xa2f983, 0xa2f9836e, 0xf9836e4e, 0x836e4e44, 0x6e4e4415, 0x4e441529, 0x441529fc,
+    0x1529fc27, 0x29fc2757, 0xfc2757d1, 0x2757d1f5, 0x57d1f534, 0xd1f534dd, 0xf534ddc0, 0x34ddc0db,
+    0xddc0db62, 0xc0db6295, 0xdb629599, 0x6295993c, 0x95993c43, 0x993c4390, 0x3c439041,
+];
+
+fn abstop12f(x: f32) -> u32 {
+    (x.to_bits() >> 20) & 0x7ff
+}
+
+fn sincosf_poly(x: f64, x2: f64, p: &SinCosT, n: i64) -> (f32, f32) {
+    let x4 = x2 * x2;
+    let x3 = x2 * x;
+    let c2 = fma(x2, p.c[4], p.c[3]);
+    let s1 = fma(x2, p.s[2], p.s[1]);
+    let c1 = fma(x2, p.c[1], p.c[0]);
+    let x5 = x3 * x2;
+    let x6 = x4 * x2;
+    let s = fma(x3, p.s[0], x);
+    let c = fma(x4, p.c[2], c1);
+    let sv = fma(x5, s1, s) as f32;
+    let cv = fma(x6, c2, c) as f32;
+    if n & 1 != 0 { (cv, sv) } else { (sv, cv) }
+}
+
+/// glibc `sincosf(x)` → `(sin x, cos x)` (`s_sincosf.c`) as aarch64 builds it
+/// (`TOINT_INTRINSICS`: the quadrant by `round`/`lround`, `x − n·π/2` fused).
+pub fn sincosf(y: f32) -> (f32, f32) {
+    let pio4 = f32::from_bits(0x3f490fdb);
+    let mut x = y as f64;
+    let at = abstop12f(y);
+    if at < abstop12f(pio4) {
+        let x2 = x * x;
+        if at < abstop12f(f32::from_bits(0x3980_0000)) {
+            return (y, 1.0);
+        }
+        return sincosf_poly(x, x2, &SINCOSF_TABLE[0], 0);
+    }
+    if at < abstop12f(120.0) {
+        let p0 = &SINCOSF_TABLE[0];
+        let r = x * p0.hpi_inv;
+        let n = r.round() as i64;
+        x = fma(-r.round(), p0.hpi, x);
+        let s = p0.sign[(n & 3) as usize];
+        let p = if n & 2 != 0 { &SINCOSF_TABLE[1] } else { p0 };
+        return sincosf_poly(x * s, x * x, p, n);
+    }
+    if at < abstop12f(f32::INFINITY) {
+        let xi = y.to_bits();
+        let sign = (xi >> 31) as i64;
+        let arr = &INV_PIO4[((xi >> 26) & 15) as usize..];
+        let shift = (xi >> 23) & 7;
+        let xm = ((xi & 0xff_ffff) | 0x80_0000) << shift;
+        let mut res0 = xm.wrapping_mul(arr[0]) as u64;
+        let res1 = xm as u64 * arr[4] as u64;
+        let res2 = xm as u64 * arr[8] as u64;
+        res0 = (res2 >> 32) | (res0 << 32);
+        res0 = res0.wrapping_add(res1);
+        let n = res0.wrapping_add(1 << 61) >> 62;
+        res0 = res0.wrapping_sub(n << 62);
+        x = (res0 as i64) as f64 * f64::from_bits(0x3c1921fb54442d18);
+        let n = n as i64;
+        let p0 = &SINCOSF_TABLE[0];
+        let s = p0.sign[((n + sign) & 3) as usize];
+        let p = if (n + sign) & 2 != 0 {
+            &SINCOSF_TABLE[1]
+        } else {
+            p0
+        };
+        return sincosf_poly(x * s, x * x, p, n);
+    }
+    let nan = y - y;
+    (nan, nan)
+}
+
+/// The reference platform's libm for a port that must agree with NumPy / SciPy /
+/// torch: Apple's system libm on Apple targets (the macOS reference), glibc's —
+/// these pure-Rust ports — everywhere else (the Linux reference; wasm included,
+/// where `f64::ln` & co. would otherwise be wasi-libc's or Rust's own).
+pub mod reference {
+    const APPLE: bool = cfg!(target_vendor = "apple");
+
+    /// `log(x)`.
+    pub fn log(x: f64) -> f64 {
+        if APPLE { x.ln() } else { super::log(x) }
+    }
+    /// `exp(x)`.
+    pub fn exp(x: f64) -> f64 {
+        if APPLE { x.exp() } else { super::exp(x) }
+    }
+    /// `log2(x)`.
+    pub fn log2(x: f64) -> f64 {
+        if APPLE { x.log2() } else { super::log2(x) }
+    }
+    /// `pow(x, y)`.
+    pub fn pow(x: f64, y: f64) -> f64 {
+        if APPLE { x.powf(y) } else { super::pow(x, y) }
+    }
+    /// `sin(x)`.
+    pub fn sin(x: f64) -> f64 {
+        if APPLE { x.sin() } else { super::sin(x) }
+    }
+    /// `cos(x)`.
+    pub fn cos(x: f64) -> f64 {
+        if APPLE { x.cos() } else { super::cos(x) }
+    }
+    /// `erfc(x)` (glibc's is correctly rounded since 2.42).
+    pub fn erfc(x: f64) -> f64 {
+        #[cfg(target_vendor = "apple")]
+        {
+            unsafe extern "C" {
+                #[link_name = "erfc"]
+                fn c_erfc(x: f64) -> f64;
+            }
+            // SAFETY: a pure libm function of one double.
+            unsafe { c_erfc(x) }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        super::erfc(x)
+    }
+    /// `tan(x)`.
+    pub fn tan(x: f64) -> f64 {
+        if APPLE { x.tan() } else { super::tan(x) }
+    }
+    /// `hypot(x, y)`.
+    pub fn hypot(x: f64, y: f64) -> f64 {
+        if APPLE {
+            x.hypot(y)
+        } else {
+            super::hypot(x, y)
+        }
+    }
+    /// `expm1(x)`.
+    pub fn expm1(x: f64) -> f64 {
+        if APPLE { x.exp_m1() } else { super::expm1(x) }
+    }
+    /// `log1p(x)`.
+    pub fn log1p(x: f64) -> f64 {
+        if APPLE { x.ln_1p() } else { super::log1p(x) }
+    }
+    /// `logf(x)`.
+    pub fn logf(x: f32) -> f32 {
+        if APPLE { x.ln() } else { super::logf(x) }
+    }
 }
 
 #[cfg(test)]

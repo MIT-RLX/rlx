@@ -8,13 +8,15 @@
 //!
 //! As with the Boost port, the arithmetic follows clang's `-ffp-contract=on`:
 //! `a*b + c` (or `a - b*c`, `s -= c*b`) inside one C++ expression is a single
-//! [`f64::mul_add`]; nothing fuses across statements. The polynomial helpers are
+//! `fmac` call (fused on Apple, plain on the Linux reference); nothing fuses across
+//! statements. The polynomial helpers are
 //! cephes' own plain Horner loops (`polevl`, `p1evl`, `ratevl`), every step fused.
 //! Note cephes carries its **own** `log1p`, `expm1`, `log1pmx` and Lanczos — they
 //! are not libm's or Boost's.
 
 use crate::cephes_tables::{IGAM_ASYMP_D, IGAM_ASYMP_K, IGAM_ASYMP_N};
 
+use crate::Contract;
 use std::f64::consts::{FRAC_1_SQRT_2, PI, SQRT_2};
 
 // ── const.h ──
@@ -33,7 +35,7 @@ const MAXITER: u64 = 500;
 fn polevl(x: f64, coef: &[f64], n: usize) -> f64 {
     let mut ans = coef[0];
     for &c in &coef[1..=n] {
-        ans = ans.mul_add(x, c);
+        ans = ans.fmac(x, c);
     }
     ans
 }
@@ -43,7 +45,7 @@ fn polevl(x: f64, coef: &[f64], n: usize) -> f64 {
 fn p1evl(x: f64, coef: &[f64], n: usize) -> f64 {
     let mut ans = x + coef[0];
     for &c in &coef[1..n] {
-        ans = ans.mul_add(x, c);
+        ans = ans.fmac(x, c);
     }
     ans
 }
@@ -61,13 +63,13 @@ fn ratevl(x: f64, num: &[f64], m: usize, denom: &[f64], n: usize) -> f64 {
         if rev {
             let mut ans = c[k];
             for i in (0..k).rev() {
-                ans = ans.mul_add(y, c[i]);
+                ans = ans.fmac(y, c[i]);
             }
             ans
         } else {
             let mut ans = c[0];
             for &ci in &c[1..=k] {
-                ans = ans.mul_add(y, ci);
+                ans = ans.fmac(y, ci);
             }
             ans
         }
@@ -77,7 +79,7 @@ fn ratevl(x: f64, num: &[f64], m: usize, denom: &[f64], n: usize) -> f64 {
     if absx > 1.0 {
         let i = m as i32 - n as i32;
         // `pow(x, i)` with an int exponent promotes to `pow(double, double)`.
-        x.powf(f64::from(i)) * num_ans / denom_ans
+        rlx_libm::reference::pow(x, f64::from(i)) * num_ans / denom_ans
     } else {
         num_ans / denom_ans
     }
@@ -150,7 +152,7 @@ pub fn erfc(a: f64) -> f64 {
     if z < -MAXLOG {
         return if a < 0.0 { 2.0 } else { 0.0 };
     }
-    z = z.exp();
+    z = rlx_libm::reference::exp(z);
     let (p, q) = if x < 8.0 {
         (polevl(x, &NDTR_P, 8), p1evl(x, &NDTR_Q, 8))
     } else {
@@ -189,7 +191,7 @@ pub fn ndtr(a: f64) -> f64 {
     let x = a * FRAC_1_SQRT_2;
     let z = x.abs();
     if z < 1.0 {
-        0.5f64.mul_add(erf(x), 0.5) // `0.5 + 0.5 * erf(x)`
+        0.5f64.fmac(erf(x), 0.5) // `0.5 + 0.5 * erf(x)`
     } else {
         let y = 0.5 * erfc(z);
         if x > 0.0 { 1.0 - y } else { y }
@@ -279,12 +281,12 @@ pub fn ndtri(y0: f64) -> f64 {
         y -= 0.5;
         let y2 = y * y;
         // `y + y * (y2 * P / Q)`
-        let mut x = y.mul_add(y2 * polevl(y2, &NDTRI_P0, 4) / p1evl(y2, &NDTRI_Q0, 8), y);
+        let mut x = y.fmac(y2 * polevl(y2, &NDTRI_P0, 4) / p1evl(y2, &NDTRI_Q0, 8), y);
         x *= SQRT2PI;
         return x;
     }
-    let x = (-2.0 * y.ln()).sqrt();
-    let x0 = x - x.ln() / x;
+    let x = (-2.0 * rlx_libm::reference::log(y)).sqrt();
+    let x0 = x - rlx_libm::reference::log(x) / x;
     let z = 1.0 / x;
     let x1 = if x < 8.0 {
         z * polevl(z, &NDTRI_P1, 8) / p1evl(z, &NDTRI_Q1, 8)
@@ -308,11 +310,11 @@ fn sinpi(mut x: f64) -> f64 {
     }
     let r = x % 2.0;
     if r < 0.5 {
-        s * (PI * r).sin()
+        s * rlx_libm::reference::sin(PI * r)
     } else if r > 1.5 {
-        s * (PI * (r - 2.0)).sin()
+        s * rlx_libm::reference::sin(PI * (r - 2.0))
     } else {
-        -s * (PI * (r - 1.0)).sin()
+        -s * rlx_libm::reference::sin(PI * (r - 1.0))
     }
 }
 
@@ -351,13 +353,13 @@ fn stirf(x: f64) -> f64 {
         return f64::INFINITY;
     }
     let mut w = 1.0 / x;
-    w = w.mul_add(polevl(w, &GAMMA_STIR, 4), 1.0); // `1.0 + w * polevl(...)`
-    let mut y = x.exp();
+    w = w.fmac(polevl(w, &GAMMA_STIR, 4), 1.0); // `1.0 + w * polevl(...)`
+    let mut y = rlx_libm::reference::exp(x);
     if x > MAXSTIR {
-        let v = x.powf(0.5 * x - 0.25);
+        let v = rlx_libm::reference::pow(x, 0.5 * x - 0.25);
         y = v * (v / y);
     } else {
-        y = x.powf(x - 0.5) / y;
+        y = rlx_libm::reference::pow(x, x - 0.5) / y;
     }
     SQRT2PI * y * w
 }
@@ -430,7 +432,7 @@ fn gamma_small(x: f64, z: f64) -> f64 {
     if x == 0.0 {
         f64::NAN
     } else {
-        z / (0.5772156649015329f64.mul_add(x, 1.0) * x)
+        z / (0.5772156649015329f64.fmac(x, 1.0) * x)
     }
 }
 
@@ -462,14 +464,14 @@ const MAXLGM: f64 = 2.556348e305;
 
 fn lgam_large_x(x: f64) -> f64 {
     // `(x - 0.5) * log(x) - x + LS2PI`
-    let q = (x - 0.5).mul_add(x.ln(), -x) + LS2PI;
+    let q = (x - 0.5).fmac(rlx_libm::reference::log(x), -x) + LS2PI;
     if x > 1.0e8 {
         return q;
     }
     let mut p = 1.0 / (x * x);
     p = 7.9365079365079365079365e-4f64
-        .mul_add(p, -2.7777777777777777777778e-3)
-        .mul_add(p, 0.0833333333333333333333)
+        .fmac(p, -2.7777777777777777777778e-3)
+        .fmac(p, 0.0833333333333333333333)
         / x;
     q + p
 }
@@ -498,7 +500,7 @@ pub fn lgam_sgn(x: f64) -> (f64, i32) {
         if z == 0.0 {
             return (f64::INFINITY, sign);
         }
-        return (LOGPI - z.ln() - w, sign);
+        return (LOGPI - rlx_libm::reference::log(z) - w, sign);
     }
     if x < 13.0 {
         let mut z = 1.0f64;
@@ -524,12 +526,12 @@ pub fn lgam_sgn(x: f64) -> (f64, i32) {
             sign = 1;
         }
         if u == 2.0 {
-            return (z.ln(), sign);
+            return (rlx_libm::reference::log(z), sign);
         }
         p -= 2.0;
         let xx = x + p;
         let pp = xx * polevl(xx, &GAMMA_B, 5) / p1evl(xx, &GAMMA_C, 6);
-        return (z.ln() + pp, sign);
+        return (rlx_libm::reference::log(z) + pp, sign);
     }
     if x > MAXLGM {
         return (f64::from(sign) * f64::INFINITY, sign);
@@ -537,7 +539,7 @@ pub fn lgam_sgn(x: f64) -> (f64, i32) {
     if x >= 1000.0 {
         return (lgam_large_x(x), sign);
     }
-    let q = (x - 0.5).mul_add(x.ln(), -x) + LS2PI;
+    let q = (x - 0.5).fmac(rlx_libm::reference::log(x), -x) + LS2PI;
     let p = 1.0 / (x * x);
     (q + polevl(p, &GAMMA_A, 4) / x, sign)
 }
@@ -581,16 +583,16 @@ pub fn zeta(x: f64, q: f64) -> f64 {
         }
     }
     if q > 1e8 {
-        return (1.0 / (x - 1.0) + 1.0 / (2.0 * q)) * q.powf(1.0 - x);
+        return (1.0 / (x - 1.0) + 1.0 / (2.0 * q)) * rlx_libm::reference::pow(q, 1.0 - x);
     }
-    let mut s = q.powf(-x);
+    let mut s = rlx_libm::reference::pow(q, -x);
     let mut a = q;
     let mut i = 0;
     let mut b = 0.0f64;
     while i < 9 || a <= 9.0 {
         i += 1;
         a += 1.0;
-        b = a.powf(-x);
+        b = rlx_libm::reference::pow(a, -x);
         s += b;
         if (b / s).abs() < MACHEP {
             return s;
@@ -598,7 +600,7 @@ pub fn zeta(x: f64, q: f64) -> f64 {
     }
     let w = a;
     s += b * w / (x - 1.0);
-    s = (-0.5f64).mul_add(b, s); // `s -= 0.5 * b`
+    s = (-0.5f64).fmac(b, s); // `s -= 0.5 * b`
     a = 1.0;
     let mut k = 0.0f64;
     for za in ZETA_A {
@@ -641,11 +643,11 @@ const UNITY_LQ: [f64; 6] = [
 pub fn log1p(x: f64) -> f64 {
     let z = 1.0 + x;
     if z < FRAC_1_SQRT_2 || z > SQRT_2 {
-        return z.ln();
+        return rlx_libm::reference::log(z);
     }
     let z = x * x;
     // `-0.5 * z + x * (z * P / Q)`
-    let z = (-0.5f64).mul_add(
+    let z = (-0.5f64).fmac(
         z,
         x * (z * polevl(x, &UNITY_LP, 6) / p1evl(x, &UNITY_LQ, 6)),
     );
@@ -694,7 +696,7 @@ pub fn expm1(x: f64) -> f64 {
         return -1.0;
     }
     if !(-0.5..=0.5).contains(&x) {
-        return x.exp() - 1.0;
+        return rlx_libm::reference::exp(x) - 1.0;
     }
     let xx = x * x;
     let mut r = x * polevl(xx, &UNITY_EP, 2);
@@ -724,7 +726,7 @@ pub fn lgam1p(x: f64) -> f64 {
     if x.abs() <= 0.5 {
         lgam1p_taylor(x)
     } else if (x - 1.0).abs() < 0.5 {
-        x.ln() + lgam1p_taylor(x - 1.0)
+        rlx_libm::reference::log(x) + lgam1p_taylor(x - 1.0)
     } else {
         lgam(x + 1.0)
     }
@@ -788,21 +790,21 @@ const IGAM_BIGINV: f64 = 2.22044604925031308085e-16;
 fn igam_fac(a: f64, x: f64) -> f64 {
     if (a - x).abs() > 0.4 * a.abs() {
         // `a * log(x) - x - lgam(a)`
-        let ax = a.mul_add(x.ln(), -x) - lgam(a);
+        let ax = a.fmac(rlx_libm::reference::log(x), -x) - lgam(a);
         if ax < -MAXLOG {
             return 0.0;
         }
-        return ax.exp();
+        return rlx_libm::reference::exp(ax);
     }
     let fac = a + LANCZOS_G - 0.5;
-    let mut res = (fac / 1f64.exp()).sqrt() / lanczos_sum_expg_scaled(a);
+    let mut res = (fac / rlx_libm::reference::exp(1f64)).sqrt() / lanczos_sum_expg_scaled(a);
     if a < 200.0 && x < 200.0 {
-        res *= (a - x).exp() * (x / fac).powf(a);
+        res *= rlx_libm::reference::exp(a - x) * rlx_libm::reference::pow(x / fac, a);
     } else {
         let num = x - a - LANCZOS_G + 0.5;
         // `a * log1pmx(num/fac) + x * (0.5 - g) / fac`
         res *= a
-            .mul_add(log1pmx(num / fac), x * (0.5 - LANCZOS_G) / fac)
+            .fmac(log1pmx(num / fac), x * (0.5 - LANCZOS_G) / fac)
             .exp();
     }
     res
@@ -826,8 +828,8 @@ fn igamc_continued_fraction(a: f64, x: f64) -> f64 {
         y += 1.0;
         z += 2.0;
         let yc = y * c;
-        let pk = pkm1.mul_add(z, -(pkm2 * yc)); // `pkm1 * z - pkm2 * yc`
-        let qk = qkm1.mul_add(z, -(qkm2 * yc));
+        let pk = pkm1.fmac(z, -(pkm2 * yc)); // `pkm1 * z - pkm2 * yc`
+        let qk = qkm1.fmac(z, -(qkm2 * yc));
         let t;
         if qk != 0.0 {
             let r = pk / qk;
@@ -883,10 +885,10 @@ fn igamc_series(a: f64, x: f64) -> f64 {
             break;
         }
     }
-    let logx = x.ln();
-    let term = -expm1(a.mul_add(logx, -lgam1p(a)));
+    let logx = rlx_libm::reference::log(x);
+    let term = -expm1(a.fmac(logx, -lgam1p(a)));
     // `term - exp(a * logx - lgam(a)) * sum`
-    (-(a.mul_add(logx, -lgam(a)).exp())).mul_add(sum, term)
+    (-(rlx_libm::reference::exp(a.fmac(logx, -lgam(a))))).fmac(sum, term)
 }
 
 fn asymptotic_series(a: f64, x: f64, igam: bool) -> f64 {
@@ -932,7 +934,7 @@ fn asymptotic_series(a: f64, x: f64, igam: bool) -> f64 {
         absoldterm = absterm;
         afac /= a;
     }
-    res += sgn * (-0.5 * a * eta * eta).exp() * sum / (2.0 * PI * a).sqrt();
+    res += sgn * rlx_libm::reference::exp(-0.5 * a * eta * eta) * sum / (2.0 * PI * a).sqrt();
     res
 }
 
@@ -993,7 +995,7 @@ pub fn igamc(a: f64, x: f64) -> f64 {
             igamc_continued_fraction(a, x)
         }
     } else if x <= 0.5 {
-        if -0.4 / x.ln() < a {
+        if -0.4 / rlx_libm::reference::log(x) < a {
             1.0 - igam_series(a, x)
         } else {
             igamc_series(a, x)

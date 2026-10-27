@@ -31,8 +31,9 @@
 //!   polynomial and rational, see [`tools`].
 //! * **The same fused multiply-adds** — clang contracts `a*b + c` (and
 //!   `a - b*c`, `a += b*c`) *within one C++ expression*, the left product of an
-//!   addition first. Each such site is a [`f64::mul_add`] here; everything else
-//!   rounds as written. Without the contractions ~2-3% of `betainc` values differ
+//!   addition first. Each such site is a `fmac` call here — fused on Apple targets,
+//!   two roundings on the Linux x86-64 reference, whose SciPy wheel is built without
+//!   FMA; everything else rounds as written. Without the contractions ~2-3% of `betainc` values differ
 //!   by an ulp.
 //! * **libm where Boost uses libm** — Boost's `double` overloads of `log1p` and
 //!   `expm1` forward to the C library, so do [`f64::ln_1p`] / [`f64::exp_m1`].
@@ -57,6 +58,26 @@ pub mod quadpack;
 pub mod tools;
 
 pub use beta::{beta, ibeta, ibetac};
+
+/// `a*b + c` at a site where the reference compiler contracts: clang fuses it on
+/// Apple targets (SciPy's macOS arm64 wheel); SciPy's Linux x86-64 wheel builds Boost
+/// and xsf for the SSE baseline, so there it rounds twice (measured: no FMA
+/// instruction in `special/_ufuncs*.so`). Every contraction site of the port is a
+/// `fmac` call.
+pub(crate) trait Contract {
+    fn fmac(self, b: f64, c: f64) -> f64;
+}
+
+impl Contract for f64 {
+    #[inline(always)]
+    fn fmac(self, b: f64, c: f64) -> f64 {
+        if cfg!(target_vendor = "apple") {
+            self.mul_add(b, c)
+        } else {
+            self * b + c
+        }
+    }
+}
 pub use dist::{normal_cdf, students_t_cdf, students_t_sf};
 pub use erf::{erf, erfc};
 pub use gamma::{gamma_p, gamma_q, lgamma, log1pmx, powm1, tgamma, tgamma_delta_ratio, tgamma1pm1};

@@ -103,7 +103,7 @@ impl RandomState {
             let x2 = 2.0 * self.random_double() - 1.0;
             let r2 = x1.mul_add(x1, x2 * x2);
             if r2 < 1.0 && r2 != 0.0 {
-                let f = (-2.0 * r2.ln() / r2).sqrt();
+                let f = (-2.0 * rlx_libm::reference::log(r2) / r2).sqrt();
                 self.gauss = f * x1;
                 self.has_gauss = true;
                 return f * x2;
@@ -178,16 +178,21 @@ fn sincosf(x: f32) -> (f32, f32) {
     (r.s, r.c)
 }
 
-/// `sincosf(x)` → `(sin, cos)` as the platform's merged call computes it.
+/// `sincosf(x)` → `(sin, cos)` as the platform's merged call computes it: off
+/// macOS the reference is glibc's (torch on Linux), ported in [`rlx_libm`] so a
+/// wasm or non-glibc build draws the same values.
 #[cfg(not(target_os = "macos"))]
 fn sincosf(x: f32) -> (f32, f32) {
-    unsafe extern "C" {
-        fn sincosf(x: f32, s: *mut f32, c: *mut f32);
+    rlx_libm::sincosf(x)
+}
+
+/// `std::log(float)`: Apple's `logf` on macOS, glibc's ([`rlx_libm::logf`]) elsewhere.
+fn logf(x: f32) -> f32 {
+    if cfg!(target_os = "macos") {
+        x.ln()
+    } else {
+        rlx_libm::logf(x)
     }
-    let (mut s, mut c) = (0.0f32, 0.0f32);
-    // SAFETY: libm's `sincosf` writes the two outputs.
-    unsafe { sincosf(x, &mut s, &mut c) };
-    (s, c)
 }
 
 impl RandomState {
@@ -243,7 +248,7 @@ impl RandomState {
                 for j in 0..8 {
                     let u1 = 1.0f32 - d[j];
                     let u2 = d[j + 8];
-                    let radius = (-2.0f32 * u1.ln()).sqrt();
+                    let radius = (-2.0f32 * logf(u1)).sqrt();
                     // `2.0f * c10::pi<double> * u2` is a DOUBLE product, narrowed on assignment
                     let theta = (2.0f64 * std::f64::consts::PI * u2 as f64) as f32;
                     // ATen's `std::cos(theta)` / `std::sin(theta)` are merged into ONE
@@ -277,10 +282,10 @@ impl RandomState {
                         None => {
                             let u1 = self.uniform_f64();
                             let u2 = self.uniform_f64();
-                            let r = (-2.0 * (-u2).ln_1p()).sqrt();
+                            let r = (-2.0 * rlx_libm::reference::log1p(-u2)).sqrt();
                             let theta = 2.0 * std::f64::consts::PI * u1;
-                            self.torch_normal_cache = Some(r * theta.sin());
-                            r * theta.cos()
+                            self.torch_normal_cache = Some(r * rlx_libm::reference::sin(theta));
+                            r * rlx_libm::reference::cos(theta)
                         }
                     };
                     (z * std + mean) as f32
@@ -303,7 +308,7 @@ impl RandomState {
                 for j in 0..8 {
                     let u1 = 1.0 - d[j];
                     let u2 = d[j + 8];
-                    let radius = (-2.0 * u1.ln()).sqrt();
+                    let radius = (-2.0 * rlx_libm::reference::log(u1)).sqrt();
                     let theta = 2.0 * std::f64::consts::PI * u2;
                     let (s, c) = sincos(theta);
                     d[j] = radius * c * std + mean;
@@ -331,10 +336,10 @@ impl RandomState {
                         None => {
                             let u1 = self.uniform_f64();
                             let u2 = self.uniform_f64();
-                            let r = (-2.0 * (-u2).ln_1p()).sqrt();
+                            let r = (-2.0 * rlx_libm::reference::log1p(-u2)).sqrt();
                             let theta = 2.0 * std::f64::consts::PI * u1;
-                            self.torch_normal_cache = Some(r * theta.sin());
-                            r * theta.cos()
+                            self.torch_normal_cache = Some(r * rlx_libm::reference::sin(theta));
+                            r * rlx_libm::reference::cos(theta)
                         }
                     };
                     z * std + mean
@@ -360,16 +365,11 @@ fn sincos(x: f64) -> (f64, f64) {
     (r.s, r.c)
 }
 
-/// `sincos(x)` → `(sin, cos)` as the platform's merged call computes it.
+/// `sincos(x)` → `(sin, cos)` as the platform's merged call computes it: off macOS
+/// glibc's, which equals its separate `sin` and `cos` (measured), ported in [`rlx_libm`].
 #[cfg(not(target_os = "macos"))]
 fn sincos(x: f64) -> (f64, f64) {
-    unsafe extern "C" {
-        fn sincos(x: f64, s: *mut f64, c: *mut f64);
-    }
-    let (mut s, mut c) = (0.0f64, 0.0f64);
-    // SAFETY: libm's `sincos` writes the two outputs.
-    unsafe { sincos(x, &mut s, &mut c) };
-    (s, c)
+    (rlx_libm::sin(x), rlx_libm::cos(x))
 }
 
 /// How one parameter is initialised by its module's `reset_parameters` (or

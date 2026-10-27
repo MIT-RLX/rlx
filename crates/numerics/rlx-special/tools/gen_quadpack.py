@@ -17,6 +17,12 @@ for _ in range(400):
 for _ in range(20000):
     z = float(rng.normal(0, 4)) if rng.uniform() < .7 else float(rng.uniform(-30, 30))
     rows.append(("c_erfc", (z,), math.erfc(z)))
-out = pathlib.Path(__file__).resolve().parent.parent / "tests" / "vectors" / "quadpack.txt"
+import sys
+# macOS arm64 → tests/vectors/; the Linux x86-64 reference (msi) → tests/vectors/linux-x86_64/
+out = pathlib.Path(__file__).resolve().parent.parent / "tests" / "vectors"
+if sys.platform != "darwin":
+    out = out / "linux-x86_64"
+out.mkdir(exist_ok=True)
+out = out / "quadpack.txt"
 out.write_text(f"# SciPy {scipy.__version__} studentized_range (df=inf) + C erfc; tools/gen_quadpack.py\n" + "".join(f + " " + " ".join(h(v) for v in a) + " " + h(r) + "\n" for f, a, r in rows))
 print("wrote", out, len(rows))

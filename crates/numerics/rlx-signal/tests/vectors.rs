@@ -103,7 +103,7 @@ fn sig(n: usize, seed: u64) -> Vec<f64> {
     (0..n)
         .map(|i| {
             c += a[i];
-            c * 0.1 + std::hint::black_box(0.05 * i as f64).sin() + b[i]
+            c * 0.1 + rlx_libm::reference::sin(std::hint::black_box(0.05 * i as f64)) + b[i]
         })
         .collect()
 }

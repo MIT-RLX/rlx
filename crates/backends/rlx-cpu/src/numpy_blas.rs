@@ -176,7 +176,11 @@ pub fn dgemm(
     c: &mut [f64],
     ldc: usize,
 ) {
-    trace(|| format!("dgemm order={order} ta={transa} tb={transb} m={m} n={n} k={k} lda={lda} ldb={ldb} ldc={ldc}"));
+    trace(|| {
+        format!(
+            "dgemm order={order} ta={transa} tb={transb} m={m} n={n} k={k} lda={lda} ldb={ldb} ldc={ldc}"
+        )
+    });
     #[cfg(rlx_cpu_blas_accelerate)]
     unsafe {
         np_cblas_dgemm(
@@ -197,19 +201,7 @@ pub fn dgemm(
         );
     }
     #[cfg(not(rlx_cpu_blas_accelerate))]
-    {
-        let at = |i: usize, l: usize| idx2(order, transa, a, lda, i, l);
-        let bt = |l: usize, j: usize| idx2(order, transb, b, ldb, l, j);
-        for i in 0..m {
-            for j in 0..n {
-                let mut s = 0.0;
-                for l in 0..k {
-                    s += at(i, l) * bt(l, j);
-                }
-                c[out_index(order, ldc, i, j)] = s;
-            }
-        }
-    }
+    crate::numpy_openblas::dgemm(order, transa, transb, m, n, k, a, lda, b, ldb, c, ldc);
 }
 
 /// `cblas_dgemv` with `alpha = 1, beta = 0` (`y = op(A)·x`).
@@ -245,7 +237,8 @@ pub fn dgemv(
         );
     }
     #[cfg(not(rlx_cpu_blas_accelerate))]
-    {
+    if !crate::numpy_openblas::dgemv(order, trans, m, n, a, lda, x, incx, y, incy) {
+        // above OpenBLAS's threading threshold — NOT at parity
         let (rows, cols) = if trans == NO_TRANS { (m, n) } else { (n, m) };
         for i in 0..rows {
             let mut s = 0.0;
@@ -433,8 +426,14 @@ pub fn dgesv_numpy(a: &[f64], b: &[f64], n: usize) -> Result<Vec<f64>, i64> {
         Ok(x)
     }
     #[cfg(not(rlx_cpu_blas_accelerate))]
+    if let Some(info) = crate::numpy_openblas::dgesv(n, &mut a_col, &mut x) {
+        // OpenBLAS 0.3.30 Haswell, the Linux reference (n ≤ 33)
+        return if info != 0 { Err(info as i64) } else { Ok(x) };
+    }
+    #[cfg(not(rlx_cpu_blas_accelerate))]
     {
-        // partial-pivoting LU, the algorithm (not the rounding) of dgesv
+        // n > 33: partial-pivoting LU, the algorithm (not the rounding) of OpenBLAS's
+        // blocked getrf — NOT at parity
         let mut piv: Vec<usize> = (0..n).collect();
         for k in 0..n {
             let p = (k..n)
@@ -647,6 +646,16 @@ pub fn dsyevr_scipy(a: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>), i32> {
 #[cfg(not(rlx_cpu_blas_accelerate))]
 pub fn dgesdd_scipy(a: &[f64], m: usize, n: usize) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), i32> {
     trace(|| format!("dgesdd m={m} n={n}"));
+    // the Linux reference's own dgesdd, bit for bit, where modelled
+    let mut a_col = vec![0.0f64; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            a_col[i + j * m] = a[i * n + j];
+        }
+    }
+    if let Some(r) = rlx_linux_ref::lapack::dgesdd_s(m, n, &mut a_col, m.max(1)) {
+        return r.map_err(|i| i as i32);
+    }
     let k = m.min(n);
     let mut a2 = a.to_vec();
     let (mut s, mut u, mut vt) = (vec![0.0f64; k], vec![0.0f64; m * k], vec![0.0f64; k * n]);
@@ -670,13 +679,24 @@ pub fn dgesdd_scipy(a: &[f64], m: usize, n: usize) -> Result<(Vec<f64>, Vec<f64>
     Ok((u_f, s, vt_f))
 }
 
-/// [`dsyevr_scipy`] without Accelerate: ascending eigenvalues and Fortran-ordered
-/// eigenvectors from [`crate::blas::dsyevd_uplo`] (lower triangle) — the platform
-/// LAPACK's `dsyevd` when linked, else rlx's pure-Rust Jacobi solver. **Not**
-/// bit-identical to SciPy's `dsyevr` on macOS; eigenvector signs may differ.
+/// [`dsyevr_scipy`] without Accelerate: SciPy's `eigh` as the Linux x86-64
+/// reference computes it — reference LAPACK's `dsyevr` on OpenBLAS Haswell,
+/// `lwork = 33n` — bit for bit ([`rlx_linux_ref::dsyevr_lower`]) up to
+/// [`rlx_linux_ref::DSYEVR_MAX_N`]; larger matrices fall back to
+/// [`crate::blas::dsyevd_uplo`] (not bit-identical; eigenvector signs may differ).
 #[cfg(not(rlx_cpu_blas_accelerate))]
 pub fn dsyevr_scipy(a: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>), i32> {
     trace(|| format!("dsyevr n={n}"));
+    if n <= rlx_linux_ref::DSYEVR_MAX_N {
+        // the Fortran copy SciPy hands LAPACK (lower triangle read)
+        let mut a_col = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                a_col[i + j * n] = a[i * n + j];
+            }
+        }
+        return rlx_linux_ref::dsyevr_lower(n, &mut a_col, n.max(1), 33 * n as i64);
+    }
     let mut z = a[..n * n].to_vec();
     let mut w = vec![0.0f64; n];
     let info = crate::blas::dsyevd_uplo(&mut z, &mut w, n, true);
@@ -694,14 +714,5 @@ fn idx2(order: i32, trans: i32, a: &[f64], ld: usize, i: usize, j: usize) -> f64
         a[r * ld + c]
     } else {
         a[r + c * ld]
-    }
-}
-
-#[cfg(not(rlx_cpu_blas_accelerate))]
-fn out_index(order: i32, ld: usize, i: usize, j: usize) -> usize {
-    if order == ROW_MAJOR {
-        i * ld + j
-    } else {
-        i + j * ld
     }
 }

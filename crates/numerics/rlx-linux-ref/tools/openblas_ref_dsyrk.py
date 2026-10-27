@@ -1,7 +1,7 @@
 # Reference for tests/fixtures/openblas_haswell_dsyrk.txt: run on the Linux reference
 # (msi: numpy 2.3.5, OpenBLAS 0.3.30 Haswell, 20 threads): python -I tools/openblas_ref_dsyrk.py out.txt
 # NumPy routes `A @ A.T` / `A.T @ A` (same buffer) to cblas_dsyrk(RowMajor, Upper, NoTrans/Trans).
-# One line per case: "n k trans <upper-triangle hex, row-major i<=j>". Inputs: the ddot xorshift stream.
+# One line per case: "n k trans <upper-triangle hex, row-major i<=j>" (over 64 values: "fnv:<hash>"). Inputs: the ddot xorshift stream.
 import numpy as np, struct, sys
 M = (1 << 64) - 1
 def stream(seed, n):
@@ -11,9 +11,20 @@ def stream(seed, n):
         out.append((s >> 11) / float(1 << 53) * 2.0 - 1.0)
     return np.array(out)
 def hx(v): return "%016x" % struct.unpack("<Q", struct.pack("<d", float(v)))[0]
+def fnv(vals):
+    h = 0xcbf29ce484222325
+    for v in vals:
+        for b in struct.pack("<d", float(v)):
+            h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return h
+def out(vals):  # over 64 values: an FNV-1a hash of the f64 bits
+    vals = list(vals)
+    return " ".join(hx(v) for v in vals) if len(vals) <= 64 else "fnv:%016x" % fnv(vals)
 shapes = [(n, k) for n in (1, 2, 3, 4, 5, 7, 8, 9, 12, 13, 17, 29) for k in (1, 2, 3, 7, 8, 16, 17, 255, 256, 257)]
 shapes += [(2, k) for k in (511, 512, 513, 600, 767, 768, 769, 1000, 1023, 2500, 3000, 4097)]
 shapes += [(9, 513), (13, 1000), (40, 300), (64, 120), (100, 50), (120, 40)]  # last ones above the thread threshold
+shapes += [(n, k) for n in (33, 35, 37, 41, 45, 49, 65) for k in (9, 17, 60)]  # off-diagonal kernel blocks
+shapes += [(240, 34), (80, 34), (48, 34), (16, 34), (16, 36), (241, 33), (199, 50), (300, 20)]  # threaded, LDA-benchmark sizes
 lines = []
 for n, k in shapes:
     for trans in (0, 1):
@@ -22,7 +33,7 @@ for n, k in shapes:
             A = a.reshape(n, k); C = A @ A.T     # NoTrans: op(A) = A (n×k)
         else:
             A = a.reshape(k, n); C = A.T @ A     # Trans:   op(A) = Aᵀ, A is k×n
-        up = [hx(C[i, j]) for i in range(n) for j in range(i, n)]
-        lines.append(f"{n} {k} {trans} " + " ".join(up))
+        up = [C[i, j] for i in range(n) for j in range(i, n)]
+        lines.append(f"{n} {k} {trans} " + out(up))
 open(sys.argv[1], "w").write("\n".join(lines) + "\n")
 print(len(lines), "cases")

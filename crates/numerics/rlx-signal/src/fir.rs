@@ -38,7 +38,7 @@ pub fn general_cosine(m: usize, a: &[f64]) -> Vec<f64> {
     let mut w = vec![0.0f64; m];
     for (k, &ak) in a.iter().enumerate() {
         for (wi, &f) in w.iter_mut().zip(&fac) {
-            *wi += ak * (k as f64 * f).cos();
+            *wi += ak * rlx_libm::reference::cos(k as f64 * f);
         }
     }
     w
@@ -59,7 +59,7 @@ pub fn get_window(window: Window, m: usize) -> Vec<f64> {
 pub fn np_sinc(x: f64) -> f64 {
     let y = std::f64::consts::PI * x;
     let y = if y != 0.0 { y } else { f64::EPSILON };
-    std::hint::black_box(y).sin() / y
+    rlx_libm::reference::sin(std::hint::black_box(y)) / y
 }
 
 /// `scipy.signal.firwin(numtaps, cutoff, window=window, pass_zero=pass_zero,
@@ -135,7 +135,7 @@ pub fn firwin(
     let hc: Vec<f64> = h
         .iter()
         .zip(&m)
-        .map(|(hi, mi)| hi * (std::f64::consts::PI * mi * scale_frequency).cos())
+        .map(|(hi, mi)| hi * rlx_libm::reference::cos(std::f64::consts::PI * mi * scale_frequency))
         .collect();
     let s = rlx_numpy::pairwise_sum(&hc);
     for hi in h.iter_mut() {

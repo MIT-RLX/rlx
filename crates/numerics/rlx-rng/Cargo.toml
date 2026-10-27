@@ -16,6 +16,10 @@ documentation.workspace = true
 name = "rlx_rng"
 path = "src/lib.rs"
 
+[dependencies]
+# glibc's logf/sincosf in pure Rust: the Linux torch reference, also on wasm
+rlx-libm = { workspace = true }
+
 [lints]
 workspace = true
 

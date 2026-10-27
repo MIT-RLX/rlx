@@ -16,6 +16,7 @@ use crate::tools::{
     MIN_VALUE, continued_fraction_b, itrunc, sum_series,
 };
 
+use crate::Contract;
 use std::f64::consts::{E, FRAC_PI_2};
 
 /// `boost::math::beta(a, b)` (`detail::beta_imp` with Lanczos).
@@ -47,14 +48,14 @@ pub fn beta(mut a: f64, mut b: f64) -> f64 {
     let mut result = lsum(a) * (lsum(b) / lsum(c));
     let ambh = a - 0.5 - b;
     if (b * ambh).abs() < cgh * 100.0 && a > 100.0 {
-        result *= (ambh * (-b / cgh).ln_1p()).exp();
+        result *= rlx_libm::reference::exp(ambh * rlx_libm::reference::log1p(-b / cgh));
     } else {
-        result *= (agh / cgh).powf(a - 0.5 - b);
+        result *= rlx_libm::reference::pow(agh / cgh, a - 0.5 - b);
     }
     if cgh > 1e10 {
-        result *= ((agh / cgh) * (bgh / cgh)).powf(b);
+        result *= rlx_libm::reference::pow((agh / cgh) * (bgh / cgh), b);
     } else {
-        result *= ((agh * bgh) / (cgh * cgh)).powf(b);
+        result *= rlx_libm::reference::pow((agh * bgh) / (cgh * cgh), b);
     }
     result *= (E / bgh).sqrt();
     result
@@ -76,103 +77,109 @@ fn ibeta_power_terms(a: f64, b: f64, x: f64, y: f64) -> f64 {
     result *= (bgh / E).sqrt();
     result *= (agh / cgh).sqrt();
     // `((x*b - y*a) - y*gh) / agh` — both subtractions of a product fuse.
-    let l1 = (-y).mul_add(gh, x.mul_add(b, -(y * a))) / agh;
-    let l2 = (-x).mul_add(gh, y.mul_add(a, -(x * b))) / bgh;
+    let l1 = (-y).fmac(gh, x.fmac(b, -(y * a))) / agh;
+    let l2 = (-x).fmac(gh, y.fmac(a, -(x * b))) / bgh;
     if l1.abs().min(l2.abs()) < 0.2 {
         if l1 * l2 > 0.0 || a.min(b) < 1.0 {
             if l1.abs() < 0.1 {
-                result *= (a * l1.ln_1p()).exp();
+                result *= rlx_libm::reference::exp(a * rlx_libm::reference::log1p(l1));
             } else {
-                result *= ((x * cgh) / agh).powf(a);
+                result *= rlx_libm::reference::pow((x * cgh) / agh, a);
             }
             if l2.abs() < 0.1 {
-                result *= (b * l2.ln_1p()).exp();
+                result *= rlx_libm::reference::exp(b * rlx_libm::reference::log1p(l2));
             } else {
-                result *= ((y * cgh) / bgh).powf(b);
+                result *= rlx_libm::reference::pow((y * cgh) / bgh, b);
             }
         } else if l1.abs().max(l2.abs()) < 0.5 {
             let small_a = a < b;
             let ratio = b / a;
             if (small_a && ratio * l2 < 0.1) || (!small_a && l1 / ratio > 0.1) {
-                let mut l3 = (ratio * l2.ln_1p()).exp_m1();
-                l3 = l3.mul_add(l1, l1 + l3); // `l1 + l3 + l3 * l1`
-                l3 = a * l3.ln_1p();
-                result *= l3.exp();
+                let mut l3 = rlx_libm::reference::expm1(ratio * rlx_libm::reference::log1p(l2));
+                l3 = l3.fmac(l1, l1 + l3); // `l1 + l3 + l3 * l1`
+                l3 = a * rlx_libm::reference::log1p(l3);
+                result *= rlx_libm::reference::exp(l3);
             } else {
-                let mut l3 = (l1.ln_1p() / ratio).exp_m1();
-                l3 = l3.mul_add(l2, l2 + l3); // `l2 + l3 + l3 * l2`
-                l3 = b * l3.ln_1p();
-                result *= l3.exp();
+                let mut l3 = rlx_libm::reference::expm1(rlx_libm::reference::log1p(l1) / ratio);
+                l3 = l3.fmac(l2, l2 + l3); // `l2 + l3 + l3 * l2`
+                l3 = b * rlx_libm::reference::log1p(l3);
+                result *= rlx_libm::reference::exp(l3);
             }
         } else if l1.abs() < l2.abs() {
-            let mut l = a.mul_add(l1.ln_1p(), b * ((y * cgh) / bgh).ln());
+            let mut l = a.fmac(
+                rlx_libm::reference::log1p(l1),
+                b * rlx_libm::reference::log((y * cgh) / bgh),
+            );
             if l <= LOG_MIN_VALUE || l >= LOG_MAX_VALUE {
-                l += result.ln();
+                l += rlx_libm::reference::log(result);
                 if l >= LOG_MAX_VALUE {
                     return f64::INFINITY;
                 }
-                result = l.exp();
+                result = rlx_libm::reference::exp(l);
             } else {
-                result *= l.exp();
+                result *= rlx_libm::reference::exp(l);
             }
         } else {
-            let mut l = b.mul_add(l2.ln_1p(), a * ((x * cgh) / agh).ln());
+            let mut l = b.fmac(
+                rlx_libm::reference::log1p(l2),
+                a * rlx_libm::reference::log((x * cgh) / agh),
+            );
             if l <= LOG_MIN_VALUE || l >= LOG_MAX_VALUE {
-                l += result.ln();
+                l += rlx_libm::reference::log(result);
                 if l >= LOG_MAX_VALUE {
                     return f64::INFINITY;
                 }
-                result = l.exp();
+                result = rlx_libm::reference::exp(l);
             } else {
-                result *= l.exp();
+                result *= rlx_libm::reference::exp(l);
             }
         }
     } else {
         let b1 = (x * cgh) / agh;
         let b2 = (y * cgh) / bgh;
-        let l1 = a * b1.ln();
-        let mut l2 = b * b2.ln();
+        let l1 = a * rlx_libm::reference::log(b1);
+        let mut l2 = b * rlx_libm::reference::log(b2);
         if l1 >= LOG_MAX_VALUE || l1 <= LOG_MIN_VALUE || l2 >= LOG_MAX_VALUE || l2 <= LOG_MIN_VALUE
         {
             if a < b {
-                let p1 = b2.powf(b / a);
+                let p1 = rlx_libm::reference::pow(b2, b / a);
                 let l3 = if b1 != 0.0 && p1 != 0.0 {
-                    a * (b1.ln() + p1.ln())
+                    a * (rlx_libm::reference::log(b1) + rlx_libm::reference::log(p1))
                 } else {
                     MAX_VALUE
                 };
                 if l3 < LOG_MAX_VALUE && l3 > LOG_MIN_VALUE {
-                    result *= (p1 * b1).powf(a);
+                    result *= rlx_libm::reference::pow(p1 * b1, a);
                 } else {
-                    l2 += l1 + result.ln();
+                    l2 += l1 + rlx_libm::reference::log(result);
                     if l2 >= LOG_MAX_VALUE {
                         return f64::INFINITY;
                     }
-                    result = l2.exp();
+                    result = rlx_libm::reference::exp(l2);
                 }
             } else {
                 let p1 = if b1 < 1.0 && b < 1.0 && MAX_VALUE * b < a {
                     0.0
                 } else {
-                    b1.powf(a / b)
+                    rlx_libm::reference::pow(b1, a / b)
                 };
                 let l3 = if p1 != 0.0 && b2 != 0.0 {
-                    (p1.ln() + b2.ln()) * b
+                    (rlx_libm::reference::log(p1) + rlx_libm::reference::log(b2)) * b
                 } else {
                     MAX_VALUE
                 };
                 if l3 < LOG_MAX_VALUE && l3 > LOG_MIN_VALUE {
-                    result *= (p1 * b2).powf(b);
+                    result *= rlx_libm::reference::pow(p1 * b2, b);
                 } else if result != 0.0 {
-                    l2 += l1 + result.ln();
+                    l2 += l1 + rlx_libm::reference::log(result);
                     if l2 >= LOG_MAX_VALUE {
                         return f64::INFINITY;
                     }
-                    result = l2.exp();
+                    result = rlx_libm::reference::exp(l2);
                 }
             }
         } else {
-            result *= b1.powf(a) * b2.powf(b);
+            result *= rlx_libm::reference::pow(b1, a) * rlx_libm::reference::pow(b2, b);
         }
     }
     // `result == 0` is a true zero or an underflow; both return 0 under SciPy's policy.
@@ -201,19 +208,22 @@ fn ibeta_series(a: f64, b: f64, x: f64, s0: f64) -> f64 {
     if !result.is_finite() {
         result = 0.0;
     }
-    let l1 = (cgh / bgh).ln() * (b - 0.5);
-    let l2 = (x * cgh / agh).ln() * a;
+    let l1 = rlx_libm::reference::log(cgh / bgh) * (b - 0.5);
+    let l2 = rlx_libm::reference::log(x * cgh / agh) * a;
     if l1 > LOG_MIN_VALUE && l1 < LOG_MAX_VALUE && l2 > LOG_MIN_VALUE && l2 < LOG_MAX_VALUE {
         if a * b < bgh * 10.0 {
-            result *= ((b - 0.5) * (a / bgh).ln_1p()).exp();
+            result *= rlx_libm::reference::exp((b - 0.5) * rlx_libm::reference::log1p(a / bgh));
         } else {
-            result *= (cgh / bgh).powf(b - 0.5);
+            result *= rlx_libm::reference::pow(cgh / bgh, b - 0.5);
         }
-        result *= (x * cgh / agh).powf(a);
+        result *= rlx_libm::reference::pow(x * cgh / agh, a);
         result *= (agh / E).sqrt();
     } else if result != 0.0 {
-        result = result.ln() + l1 + l2 + (agh.ln() - 1.0) / 2.0;
-        result = result.exp();
+        result = rlx_libm::reference::log(result)
+            + l1
+            + l2
+            + (rlx_libm::reference::log(agh) - 1.0) / 2.0;
+        result = rlx_libm::reference::exp(result);
     }
     if result < MIN_VALUE {
         return s0;
@@ -249,7 +259,7 @@ fn ibeta_fraction2(a: f64, b: f64, x: f64, y: f64) -> f64 {
         let mut bn = mf;
         bn += (mf * (b - mf) * x) / (a + two_m - 1.0);
         // `a*y - b*x + 1 + m*(2 - x)`: `a*y - b*x` fuses, then `… + m*(2 - x)` fuses.
-        let inner = mf.mul_add(2.0 - x, a.mul_add(y, -(b * x)) + 1.0);
+        let inner = mf.fmac(2.0 - x, a.fmac(y, -(b * x)) + 1.0);
         bn += ((a + mf) * inner) / (a + two_m + 1.0);
         m += 1;
         (an, bn)
@@ -283,19 +293,23 @@ const PN_SIZE: usize = 30;
 fn beta_small_b_large_a_series(a: f64, b: f64, x: f64, y: f64, s0: f64, mult: f64) -> f64 {
     let bm1 = b - 1.0;
     let t = a + bm1 / 2.0;
-    let lx = if y < 0.35 { (-y).ln_1p() } else { x.ln() };
+    let lx = if y < 0.35 {
+        rlx_libm::reference::log1p(-y)
+    } else {
+        rlx_libm::reference::log(x)
+    };
     let u = -t * lx;
     let h = regularised_gamma_prefix(b, u);
     if h <= MIN_VALUE {
         return s0;
     }
     let mut prefix = h / tgamma_delta_ratio(a, b);
-    prefix /= t.powf(b);
+    prefix /= rlx_libm::reference::pow(t, b);
     prefix *= mult;
     let mut p = [0.0f64; PN_SIZE];
     p[0] = 1.0;
     let mut j = gamma_q(b, u) / h;
-    let mut sum = prefix.mul_add(j, s0); // `s0 + prefix * j`
+    let mut sum = prefix.fmac(j, s0); // `s0 + prefix * j`
     let mut tnp1: u32 = 1;
     let mut lx2 = lx / 2.0;
     lx2 *= lx2;
@@ -308,14 +322,14 @@ fn beta_small_b_large_a_series(a: f64, b: f64, x: f64, y: f64, s0: f64, mult: f6
         let nf = n as f64;
         let mut tmp1: u32 = 3;
         for m in 1..n {
-            let mbn = (m as f64).mul_add(b, -nf); // `m * b - n`
+            let mbn = (m as f64).fmac(b, -nf); // `m * b - n`
             p[n] += mbn * p[n - m] / unchecked_factorial(tmp1);
             tmp1 += 2;
         }
         p[n] /= nf;
         p[n] += bm1 / unchecked_factorial(tnp1);
         // `(b2n*(b2n+1)*j + (u+b2n+1)*lxp) / t4`
-        j = (b2n * (b2n + 1.0)).mul_add(j, (u + b2n + 1.0) * lxp) / t4;
+        j = (b2n * (b2n + 1.0)).fmac(j, (u + b2n + 1.0) * lxp) / t4;
         lxp *= lx2;
         b2n += 2.0;
         let r = prefix * p[n] * j;
@@ -359,7 +373,7 @@ fn binomial_coefficient(n: u32, k: u32) -> f64 {
 
 /// `detail::binomial_ccdf(n, k, x, y)`.
 fn binomial_ccdf(n: f64, k: f64, x: f64, y: f64) -> f64 {
-    let mut result = x.powf(n);
+    let mut result = rlx_libm::reference::pow(x, n);
     if result > MIN_VALUE {
         let mut term = result;
         let mut i = itrunc(n - 1.0) as u32;
@@ -374,15 +388,16 @@ fn binomial_ccdf(n: f64, k: f64, x: f64, y: f64) -> f64 {
             start = itrunc(k + 2.0) as i32;
         }
         let nn = itrunc(n) as u32;
-        result = x.powf(f64::from(start))
-            * y.powf(n - f64::from(start))
+        result = rlx_libm::reference::pow(x, f64::from(start))
+            * rlx_libm::reference::pow(y, n - f64::from(start))
             * binomial_coefficient(nn, start as u32);
         if result == 0.0 {
             let mut i = (start - 1) as u32;
             while f64::from(i) > k {
                 // `result += pow(x,i) * pow(y,n-i) * C(n,i)`: compound-assign of a product fuses.
                 let fi = f64::from(i);
-                result = (x.powf(fi) * y.powf(n - fi)).mul_add(binomial_coefficient(nn, i), result);
+                result = (rlx_libm::reference::pow(x, fi) * rlx_libm::reference::pow(y, n - fi))
+                    .fmac(binomial_coefficient(nn, i), result);
                 i -= 1;
             }
         } else {
@@ -410,7 +425,10 @@ fn binomial_ccdf(n: f64, k: f64, x: f64, y: f64) -> f64 {
 fn ibeta_large_ab(a: f64, b: f64, x: f64, y: f64, invert: bool) -> f64 {
     let x0 = a / (a + b);
     let y0 = b / (a + b);
-    let mut nu = x0.mul_add((x / x0).ln(), y0 * (y / y0).ln());
+    let mut nu = x0.fmac(
+        rlx_libm::reference::log(x / x0),
+        y0 * rlx_libm::reference::log(y / y0),
+    );
     if nu > 0.0 || x == x0 || y == y0 {
         nu = 0.0;
     }
@@ -471,14 +489,14 @@ fn ibeta_imp(mut a: f64, mut b: f64, mut x: f64, inv: bool) -> f64 {
         }
         return if y < 0.5 {
             if invert {
-                -(a * (-y).ln_1p()).exp_m1()
+                -rlx_libm::reference::expm1(a * rlx_libm::reference::log1p(-y))
             } else {
-                (a * (-y).ln_1p()).exp()
+                rlx_libm::reference::exp(a * rlx_libm::reference::log1p(-y))
             }
         } else if invert {
             -powm1(x, a)
         } else {
-            x.powf(a)
+            rlx_libm::reference::pow(x, a)
         };
     }
 
@@ -509,7 +527,7 @@ fn ibeta_imp(mut a: f64, mut b: f64, mut x: f64, inv: bool) -> f64 {
             flip!();
         }
         if a.max(b) <= 1.0 {
-            if a >= 0.2f64.min(b) || x.powf(a) <= 0.9 {
+            if a >= 0.2f64.min(b) || rlx_libm::reference::pow(x, a) <= 0.9 {
                 fract = series_or_complement!(ibeta_series(a, b, x, s0), s0);
             } else {
                 flip!();
@@ -527,7 +545,7 @@ fn ibeta_imp(mut a: f64, mut b: f64, mut x: f64, inv: bool) -> f64 {
                     fract = f;
                 }
             }
-        } else if b <= 1.0 || (x < 0.1 && (b * x).powf(a) <= 0.7) {
+        } else if b <= 1.0 || (x < 0.1 && rlx_libm::reference::pow(b * x, a) <= 0.7) {
             fract = series_or_complement!(ibeta_series(a, b, x, s0), s0);
         } else {
             flip!();
@@ -604,8 +622,8 @@ fn ibeta_imp(mut a: f64, mut b: f64, mut x: f64, inv: bool) -> f64 {
                 if a == b {
                     use_asym = true;
                 } else {
-                    powers = ((x / (a / (a + b))).ln())
-                        .mul_add(a, (y / (b / (a + b))).ln() * b)
+                    powers = (rlx_libm::reference::log(x / (a / (a + b))))
+                        .fmac(a, rlx_libm::reference::log(y / (b / (a + b))) * b)
                         .exp();
                     if powers < EPSILON {
                         use_asym = true;

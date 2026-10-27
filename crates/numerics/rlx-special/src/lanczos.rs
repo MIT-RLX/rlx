@@ -5,6 +5,7 @@
 //! `boost::math::lanczos::lanczos13m53` — the Lanczos approximation Boost
 //! selects for 53-bit `double`.
 
+use crate::Contract;
 use crate::tools::evaluate_rational;
 
 /// `lanczos13m53::g()`.
@@ -45,7 +46,7 @@ pub fn lanczos_sum(z: f64) -> f64 {
         210.824_277_751_579_345_872_509_733_920_713_362_711_7,
         2.506_628_274_631_000_270_164_908_177_133_837_338_626,
     ];
-    evaluate_rational(&NUM, &DENOM, z)
+    sum(&NUM, z, 4.31965e+25)
 }
 
 /// `lanczos13m53::lanczos_sum_expG_scaled(z)`: `lanczos_sum(z) * exp(-g)`.
@@ -65,7 +66,47 @@ pub fn lanczos_sum_exp_g_scaled(z: f64) -> f64 {
         0.509_841_665_565_667_618_812_517_864_480_469_450_999_3,
         0.006_061_842_346_248_906_525_783_753_964_555_936_883_222,
     ];
-    evaluate_rational(&NUM, &DENOM, z)
+    sum(&NUM, z, 4.76886e+25)
+}
+
+/// Both sums. On Apple targets the generic `evaluate_rational`; on the Linux x86-64
+/// reference Boost's SSE2 specialisation (`detail/lanczos_sse2.hpp`, selected when
+/// `__SSE2__` is defined): numerator and denominator as the two lanes of one even/odd
+/// second-order Horner in `x²` (plain `mulpd`/`addpd`, no `1/x` reversal), and above
+/// `lim` a plain Horner in `1/x`.
+fn sum(num: &[f64; 13], x: f64, lim: f64) -> f64 {
+    if cfg!(target_vendor = "apple") {
+        return evaluate_rational(num, &DENOM, x);
+    }
+    // coefficient pairs from the highest degree down, as `coeff[26]` lays them out
+    let c = |d: usize| [num[d], DENOM[d]];
+    if x > lim {
+        let z = 1.0 / x;
+        let h = |lane: usize| {
+            let mut r = c(0)[lane];
+            for d in 1..13 {
+                r = r * z + c(d)[lane];
+            }
+            r
+        };
+        return h(0) / h(1);
+    }
+    let x2 = x * x;
+    let (mut even, mut odd) = (c(12), c(11));
+    let mut d = 10;
+    for _ in 0..5 {
+        for l in 0..2 {
+            even[l] = even[l] * x2 + c(d)[l];
+            odd[l] = odd[l] * x2 + c(d - 1)[l];
+        }
+        d -= 2;
+    }
+    for l in 0..2 {
+        even[l] = even[l] * x2 + c(0)[l];
+        odd[l] *= x;
+        even[l] += odd[l];
+    }
+    even[0] / even[1]
 }
 
 /// `lanczos13m53::lanczos_sum_near_1(dz)`.
@@ -88,7 +129,7 @@ pub fn lanczos_sum_near_1(dz: f64) -> f64 {
     for (k, &d) in D.iter().enumerate() {
         let k = (k + 1) as f64;
         // `(-d*dz)/(k*dz + k*k)`: `k*k` is an unsigned product, `k*dz + …` fuses.
-        result += (-d * dz) / k.mul_add(dz, k * k);
+        result += (-d * dz) / k.fmac(dz, k * k);
     }
     result
 }
@@ -114,7 +155,7 @@ pub fn lanczos_sum_near_2(dz: f64) -> f64 {
     for (k, &d) in D.iter().enumerate() {
         let k = (k + 1) as f64;
         // `z + k*z + k*k - 1` parses as `((z + k*z) + k*k) - 1`; only `z + k*z` fuses.
-        result += (-d * dz) / ((k.mul_add(z, z) + k * k) - 1.0);
+        result += (-d * dz) / ((k.fmac(z, z) + k * k) - 1.0);
     }
     result
 }

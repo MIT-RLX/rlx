@@ -17,6 +17,10 @@ name = "rlx_special"
 path = "src/lib.rs"
 
 
+[dependencies]
+# the reference platform's libm: glibc's erfc/exp/pow off Apple (Linux and wasm agree)
+rlx-libm = { workspace = true }
+
 [lints]
 workspace = true
 

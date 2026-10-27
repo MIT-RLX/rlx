@@ -11,6 +11,8 @@
 //! FMA contraction follows clang's `-ffp-contract=on`: the Kronrod accumulations
 //! `resk = resk + wgk[j]*fsum` are single fused operations.
 
+use crate::Contract;
+
 const EPMACH: f64 = 2.220446049250313e-016;
 const UFLOW: f64 = 2.2250738585072014e-308;
 const OFLOW: f64 = 1.7976931348623157e+308;
@@ -85,21 +87,21 @@ fn dqk15i(
         fv1[j] = f1;
         fv2[j] = f2;
         let fsum = f1 + f2;
-        resg = WG[j].mul_add(fsum, resg);
-        resk = WGK[j].mul_add(fsum, resk);
-        resabs = WGK[j].mul_add(f1.abs() + f2.abs(), resabs);
+        resg = WG[j].fmac(fsum, resg);
+        resk = WGK[j].fmac(fsum, resk);
+        resabs = WGK[j].fmac(f1.abs() + f2.abs(), resabs);
     }
     let reskh = resk * 0.5;
     let mut resasc = WGK[7] * (fc - reskh).abs();
     for j in 0..7 {
-        resasc = WGK[j].mul_add((fv1[j] - reskh).abs() + (fv2[j] - reskh).abs(), resasc);
+        resasc = WGK[j].fmac((fv1[j] - reskh).abs() + (fv2[j] - reskh).abs(), resasc);
     }
     let result = resk * hlgth;
     resabs *= hlgth;
     resasc *= hlgth;
     let mut abserr = ((resk - resg) * hlgth).abs();
     if resasc != 0.0 && abserr != 0.0 {
-        abserr = resasc * (1.0f64).min((200.0 * abserr / resasc).powf(1.5));
+        abserr = resasc * (1.0f64).min(rlx_libm::reference::pow(200.0 * abserr / resasc, 1.5));
     }
     if resabs > UFLOW / (50.0 * EPMACH) {
         abserr = (EPMACH * 50.0 * resabs).max(abserr);
@@ -401,7 +403,7 @@ pub fn dqagie(
             ier = 1;
         }
         // `(1.0 + 100.0*epmach)*(fabs(a2) + 1000.0*uflow)`: the inner sum fuses
-        if a1.abs().max(b2.abs()) <= (1.0 + 100.0 * EPMACH) * 1000.0f64.mul_add(UFLOW, a2.abs()) {
+        if a1.abs().max(b2.abs()) <= (1.0 + 100.0 * EPMACH) * 1000.0f64.fmac(UFLOW, a2.abs()) {
             ier = 4;
         }
         if !(error2 > error1) {
@@ -572,18 +574,11 @@ pub fn dqagie(
     goto_110(result, abserr, ier)
 }
 
-unsafe extern "C" {
-    /// The C library's `erfc` — what SciPy's Cython integrands call (`libc.math`).
-    /// Not the `libm` crate: its fdlibm `erfc` differs from macOS libm's on ~31 % of
-    /// arguments (measured against `math.erfc`).
-    #[link_name = "erfc"]
-    fn c_erfc(x: f64) -> f64;
-}
-
-/// The C library `erfc(x)`.
+/// The C library `erfc(x)` SciPy's Cython integrands call (`libc.math`): Apple's on
+/// macOS, glibc's — correctly rounded since 2.42, ported in [`rlx_libm`] — elsewhere.
+/// (Not the `libm` crate: its fdlibm `erfc` differs from both on ~31 % of arguments.)
 pub fn libc_erfc(x: f64) -> f64 {
-    // SAFETY: a pure libm function of one double.
-    unsafe { c_erfc(x) }
+    rlx_libm::reference::erfc(x)
 }
 
 /// `scipy.stats.studentized_range.cdf(q, k, df=inf)`:
@@ -591,9 +586,10 @@ pub fn libc_erfc(x: f64) -> f64 {
 /// (`epsabs=1e-11, epsrel=1e-12, limit=50`), clipped to `[0, 1]`. φ and Φ are
 /// SciPy's Cython helpers on the C library's `exp` / `erfc`.
 pub fn studentized_range_cdf_inf(q: f64, k: f64) -> f64 {
-    let phi = |z: f64| 0.3989422804014327 * (-0.5 * z * z).exp();
+    let phi = |z: f64| 0.3989422804014327 * rlx_libm::reference::exp(-0.5 * z * z);
     let big_phi = |z: f64| 0.5 * libc_erfc(-z * 0.7071067811865475);
-    let mut f = |z: f64| k * phi(z) * (big_phi(z + q) - big_phi(z)).powf(k - 1.0);
+    let mut f =
+        |z: f64| k * phi(z) * rlx_libm::reference::pow(big_phi(z + q) - big_phi(z), k - 1.0);
     let (r, ..) = dqagie(&mut f, 0.0, 2, 1e-11, 1e-12, 50);
     r.clamp(0.0, 1.0)
 }

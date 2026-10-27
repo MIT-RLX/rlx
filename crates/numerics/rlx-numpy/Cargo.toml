@@ -22,5 +22,9 @@ workspace = true
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 
+[dependencies]
+# np.argsort's Linux x86-64 spelling (x86-simd-sort)
+rlx-linux-ref = { workspace = true }
+
 [dev-dependencies]
 serde_json = "1"

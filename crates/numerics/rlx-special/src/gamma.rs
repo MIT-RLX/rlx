@@ -16,6 +16,7 @@ use crate::tools::{
     ROOT_EPSILON, continued_fraction_a, evaluate_polynomial, itrunc, sum_series,
 };
 
+use crate::Contract;
 use std::f64::consts::{E, PI};
 
 /// `constants::euler<double>()`.
@@ -37,7 +38,7 @@ pub fn log1pmx(x: f64) -> f64 {
     }
     let a = x.abs();
     if a > 0.95 {
-        return (1.0 + x).ln() - x;
+        return rlx_libm::reference::log(1.0 + x) - x;
     }
     if a < EPSILON {
         return -x * x / 2.0;
@@ -58,15 +59,15 @@ pub fn log1pmx(x: f64) -> f64 {
 /// `boost::math::powm1(x, y)` = `x^y - 1`, for `x > 0`.
 pub fn powm1(x: f64, y: f64) -> f64 {
     if (y * (x - 1.0)).abs() < 0.5 || y.abs() < 0.2 {
-        let l = y * x.ln();
+        let l = y * rlx_libm::reference::log(x);
         if l < 0.5 {
-            return l.exp_m1();
+            return rlx_libm::reference::expm1(l);
         }
         if l > LOG_MAX_VALUE {
             return f64::INFINITY;
         }
     }
-    x.powf(y) - 1.0
+    rlx_libm::reference::pow(x, y) - 1.0
 }
 
 /// `detail::sinpx(z)` = `z * sin(pi * z)`, reduced exactly.
@@ -87,7 +88,7 @@ fn sinpx(z: f64) -> f64 {
     if dist > 0.5 {
         dist = 1.0 - dist;
     }
-    let result = (dist * PI).sin();
+    let result = rlx_libm::reference::sin(dist * PI);
     sign * z * result
 }
 
@@ -110,19 +111,19 @@ fn gamma_imp_final(mut z: f64) -> f64 {
     } else {
         result *= lanczos::lanczos_sum(z);
         let zgh = z + G - 0.5;
-        let lzgh = zgh.ln();
+        let lzgh = rlx_libm::reference::log(zgh);
         if z * lzgh > LOG_MAX_VALUE {
             if lzgh * z / 2.0 > LOG_MAX_VALUE {
                 return result.signum() * f64::INFINITY;
             }
-            let hp = zgh.powf((z / 2.0) - 0.25);
-            result *= hp / zgh.exp();
+            let hp = rlx_libm::reference::pow(zgh, (z / 2.0) - 0.25);
+            result *= hp / rlx_libm::reference::exp(zgh);
             if MAX_VALUE / hp < result {
                 return result.signum() * f64::INFINITY;
             }
             result *= hp;
         } else {
-            result *= zgh.powf(z - 0.5) / zgh.exp();
+            result *= rlx_libm::reference::pow(zgh, z - 0.5) / rlx_libm::reference::exp(zgh);
         }
     }
     result
@@ -157,7 +158,7 @@ pub(crate) fn lgamma_small_imp(mut z: f64, mut zm1: f64, mut zm2: f64) -> f64 {
             // Boost also decrements `zm2` here, then overwrites it below.
             loop {
                 z -= 1.0;
-                result += z.ln();
+                result += rlx_libm::reference::log(z);
                 if !(z >= 3.0) {
                     break;
                 }
@@ -187,10 +188,10 @@ pub(crate) fn lgamma_small_imp(mut z: f64, mut zm1: f64, mut zm2: f64) -> f64 {
         let r = zm2 * (z + 1.0);
         let mut rr = evaluate_polynomial(&P, zm2);
         rr /= evaluate_polynomial(&Q, zm2);
-        result += r.mul_add(Y, r * rr);
+        result += r.fmac(Y, r * rr);
     } else {
         if z < 1.0 {
-            result += -z.ln();
+            result += -rlx_libm::reference::log(z);
             zm2 = zm1;
             zm1 = z;
             z += 1.0;
@@ -217,7 +218,7 @@ pub(crate) fn lgamma_small_imp(mut z: f64, mut zm1: f64, mut zm2: f64) -> f64 {
             ];
             let r = evaluate_polynomial(&P, zm1) / evaluate_polynomial(&Q, zm1);
             let prefix = zm1 * zm2;
-            result += prefix.mul_add(Y, prefix * r);
+            result += prefix.fmac(Y, prefix * r);
         } else {
             const Y: f64 = 0.452017307281494140625;
             const P: [f64; 6] = [
@@ -239,7 +240,7 @@ pub(crate) fn lgamma_small_imp(mut z: f64, mut zm1: f64, mut zm2: f64) -> f64 {
             ];
             let r = zm2 * zm1;
             let rr = evaluate_polynomial(&P, -zm2) / evaluate_polynomial(&Q, -zm2);
-            result += r.mul_add(Y, r * rr);
+            result += r.fmac(Y, r * rr);
         }
     }
     result
@@ -254,9 +255,9 @@ fn lgamma_imp_final(z: f64) -> (f64, i32) {
             return (f64::INFINITY, 1);
         }
         if 4.0 * z.abs() < EPSILON {
-            result = -z.abs().ln();
+            result = -rlx_libm::reference::log(z.abs());
         } else {
-            result = (1.0 / z - EULER).abs().ln();
+            result = rlx_libm::reference::log((1.0 / z - EULER).abs());
         }
         if z < 0.0 {
             sresult = -1;
@@ -264,13 +265,13 @@ fn lgamma_imp_final(z: f64) -> (f64, i32) {
     } else if z < 15.0 {
         result = lgamma_small_imp(z, z - 1.0, z - 2.0);
     } else if z >= 3.0 && z < 100.0 {
-        result = tgamma(z).ln();
+        result = rlx_libm::reference::log(tgamma(z));
     } else {
         let zgh = z + G - 0.5;
-        let mut r = zgh.ln() - 1.0;
+        let mut r = rlx_libm::reference::log(zgh) - 1.0;
         r *= z - 0.5;
         if r * EPSILON < 20.0 {
-            r += lanczos::lanczos_sum_exp_g_scaled(z).ln();
+            r += rlx_libm::reference::log(lanczos::lanczos_sum_exp_g_scaled(z));
         }
         result = r;
     }
@@ -290,7 +291,8 @@ pub fn lgamma_with_sign(z: f64) -> (f64, i32) {
         } else {
             sresult = -sresult;
         }
-        let result = PI.ln() - lgamma_imp_final(-z).0 - t.ln();
+        let result =
+            rlx_libm::reference::log(PI) - lgamma_imp_final(-z).0 - rlx_libm::reference::log(t);
         return (result, sresult);
     }
     lgamma_imp_final(z)
@@ -307,10 +309,12 @@ pub fn tgamma1pm1(dz: f64) -> f64 {
         if dz < -0.5 {
             tgamma(1.0 + dz) - 1.0
         } else {
-            (-dz.ln_1p() + lgamma_small_imp(dz + 2.0, dz + 1.0, dz)).exp_m1()
+            rlx_libm::reference::expm1(
+                -rlx_libm::reference::log1p(dz) + lgamma_small_imp(dz + 2.0, dz + 1.0, dz),
+            )
         }
     } else if dz < 2.0 {
-        lgamma_small_imp(dz + 1.0, dz, dz - 1.0).exp_m1()
+        rlx_libm::reference::expm1(lgamma_small_imp(dz + 1.0, dz, dz - 1.0))
     } else {
         tgamma(1.0 + dz) - 1.0
     }
@@ -321,16 +325,16 @@ fn tgamma_delta_ratio_lanczos_final(z: f64, delta: f64) -> f64 {
     let zgh = z + G - 0.5;
     let mut result;
     if z + delta == z {
-        result = (-delta).exp();
+        result = rlx_libm::reference::exp(-delta);
     } else {
         if delta.abs() < 10.0 {
-            result = ((0.5 - z) * (delta / zgh).ln_1p()).exp();
+            result = rlx_libm::reference::exp((0.5 - z) * rlx_libm::reference::log1p(delta / zgh));
         } else {
-            result = (zgh / (zgh + delta)).powf(z - 0.5);
+            result = rlx_libm::reference::pow(zgh / (zgh + delta), z - 0.5);
         }
         result *= lanczos::lanczos_sum(z) / lanczos::lanczos_sum(z + delta);
     }
-    result *= (E / (zgh + delta)).powf(delta);
+    result *= rlx_libm::reference::pow(E / (zgh + delta), delta);
     result
 }
 
@@ -399,35 +403,37 @@ pub(crate) fn regularised_gamma_prefix(a: f64, z: f64) -> f64 {
     if a < 1.0 {
         if z <= LOG_MIN_VALUE || a < 1.0 / MAX_VALUE {
             // `a * log(z) - z - lgamma(a)`: the left product fuses.
-            return (a.mul_add(z.ln(), -z) - lgamma(a)).exp();
+            return rlx_libm::reference::exp(a.fmac(rlx_libm::reference::log(z), -z) - lgamma(a));
         }
-        return z.powf(a) * (-z).exp() / tgamma(a);
+        return rlx_libm::reference::pow(z, a) * rlx_libm::reference::exp(-z) / tgamma(a);
     } else if (d * d * a).abs() <= 100.0 && a > 150.0 {
         // `a * log1pmx(d) + z * (0.5 - g) / agh`
-        prefix = a.mul_add(log1pmx(d), z * (0.5 - G) / agh);
-        prefix = prefix.exp();
+        prefix = a.fmac(log1pmx(d), z * (0.5 - G) / agh);
+        prefix = rlx_libm::reference::exp(prefix);
     } else {
-        let alz = a * (z / agh).ln();
+        let alz = a * rlx_libm::reference::log(z / agh);
         let amz = a - z;
         if alz.min(amz) <= LOG_MIN_VALUE || alz.max(amz) >= LOG_MAX_VALUE {
             let amza = amz / a;
             if alz.min(amz) / 2.0 > LOG_MIN_VALUE && alz.max(amz) / 2.0 < LOG_MAX_VALUE {
-                let sq = (z / agh).powf(a / 2.0) * (amz / 2.0).exp();
+                let sq = rlx_libm::reference::pow(z / agh, a / 2.0)
+                    * rlx_libm::reference::exp(amz / 2.0);
                 prefix = sq * sq;
             } else if alz.min(amz) / 4.0 > LOG_MIN_VALUE
                 && alz.max(amz) / 4.0 < LOG_MAX_VALUE
                 && z > a
             {
-                let sq = (z / agh).powf(a / 4.0) * (amz / 4.0).exp();
+                let sq = rlx_libm::reference::pow(z / agh, a / 4.0)
+                    * rlx_libm::reference::exp(amz / 4.0);
                 prefix = sq * sq;
                 prefix *= prefix;
             } else if amza > LOG_MIN_VALUE && amza < LOG_MAX_VALUE {
-                prefix = ((z * amza.exp()) / agh).powf(a);
+                prefix = rlx_libm::reference::pow((z * rlx_libm::reference::exp(amza)) / agh, a);
             } else {
-                prefix = (alz + amz).exp();
+                prefix = rlx_libm::reference::exp(alz + amz);
             }
         } else {
-            prefix = (z / agh).powf(a) * amz.exp();
+            prefix = rlx_libm::reference::pow(z / agh, a) * rlx_libm::reference::exp(amz);
         }
     }
     prefix *= (agh / E).sqrt() / lanczos::lanczos_sum_exp_g_scaled(a);
@@ -492,7 +498,7 @@ fn tgamma_small_upper_part(a: f64, x: f64, invert: bool) -> (f64, f64) {
 
 /// `detail::finite_gamma_q(a, x)` (integer `a`).
 fn finite_gamma_q(a: f64, x: f64) -> f64 {
-    let e = (-x).exp();
+    let e = rlx_libm::reference::exp(-x);
     let mut sum = e;
     if sum != 0.0 {
         let mut term = sum;
@@ -511,7 +517,7 @@ fn finite_gamma_q(a: f64, x: f64) -> f64 {
 fn finite_half_gamma_q(a: f64, x: f64) -> f64 {
     let mut e = erfc(x.sqrt());
     if e != 0.0 && a > 1.0 {
-        let mut term = (-x).exp() / (PI * x).sqrt();
+        let mut term = rlx_libm::reference::exp(-x) / (PI * x).sqrt();
         term *= x;
         const HALF: f64 = 0.5;
         term /= HALF;
@@ -660,7 +666,7 @@ fn igamma_temme_large(a: f64, x: f64) -> f64 {
         -0.00059676129019274625,
     ];
     let mut result = evaluate_polynomial(&workspace, 1.0 / a);
-    result *= (-y).exp() / (2.0 * PI * a).sqrt();
+    result *= rlx_libm::reference::exp(-y) / (2.0 * PI * a).sqrt();
     if x < a {
         result = -result;
     }
@@ -697,7 +703,11 @@ fn gamma_incomplete_regularized(a: f64, x: f64, mut invert: bool) -> f64 {
         invert = !invert;
         eval_method = 7;
     } else if x < 0.5 {
-        eval_method = if -0.4 / x.ln() < a { 2 } else { 3 };
+        eval_method = if -0.4 / rlx_libm::reference::log(x) < a {
+            2
+        } else {
+            3
+        };
     } else if x < 1.1 {
         eval_method = if x * 0.75 < a { 2 } else { 3 };
     } else {
@@ -761,7 +771,7 @@ fn gamma_incomplete_regularized(a: f64, x: f64, mut invert: bool) -> f64 {
             }
         }
         6 => {
-            result = x.powf(a) / tgamma(a + 1.0);
+            result = rlx_libm::reference::pow(x, a) / tgamma(a + 1.0);
             result *= 1.0 - a * x / (a + 1.0);
         }
         _ => {

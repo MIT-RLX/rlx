@@ -14,6 +14,19 @@
 
 use crate::complex::{self as cx, C};
 
+/// `a*b + c` as SciPy's compiled C/Cython computes it on this target's reference:
+/// fused where clang `-ffp-contract=on` fuses on Apple arm64, two roundings on the
+/// Linux x86-64 wheel (an SSE2 baseline build — measured: no FMA instruction in
+/// `_sigtools*.so` / `_sosfilt*.so`).
+#[inline(always)]
+fn fma_c(a: f64, b: f64, c: f64) -> f64 {
+    if cfg!(target_vendor = "apple") {
+        a.mul_add(b, c)
+    } else {
+        a * b + c
+    }
+}
+
 /// SciPy 1.17.1's `filt<NPY_DOUBLE>` (`scipy/signal/_lfilter.cc`, one 1-D slice) with
 /// the rounding its macOS arm64 wheel's clang (`-ffp-contract=on`) gives each source
 /// expression: one `a*b + c` per expression is fused, the LEFT product first.
@@ -29,14 +42,14 @@ fn lfilter_kernel(b: &mut [f64], a: &mut [f64], x: &[f64], y: &mut [f64], z: &mu
     for (k, &xn) in x.iter().enumerate() {
         if len_b > 1 {
             // *yn = *ptr_Z + *ptr_b * *xn;
-            let yn = b[0].mul_add(xn, z[0]);
+            let yn = fma_c(b[0], xn, z[0]);
             y[k] = yn;
             for n in 0..len_b - 2 {
                 // *ptr_Z = ptr_Z[1] + *xn * (*ptr_b) - *yn * (*ptr_a);
-                z[n] = (-yn).mul_add(a[n + 1], xn.mul_add(b[n + 1], z[n + 1]));
+                z[n] = fma_c(-yn, a[n + 1], fma_c(xn, b[n + 1], z[n + 1]));
             }
             // *ptr_Z = *xn * (*ptr_b) - *yn * (*ptr_a);
-            z[len_b - 2] = xn.mul_add(b[len_b - 1], -(yn * a[len_b - 1]));
+            z[len_b - 2] = fma_c(xn, b[len_b - 1], -(yn * a[len_b - 1]));
         } else {
             y[k] = xn * b[0];
         }
@@ -54,11 +67,11 @@ fn sosfilt_kernel(sos: &[f64], x: &mut [f64], zi: &mut [f64]) {
         for s in 0..n_sections {
             let c = &sos[s * 6..s * 6 + 6];
             // x_new = sos[0] * x_cur + zi[0];
-            let x_new = c[0].mul_add(x_cur, zi[s * 2]);
+            let x_new = fma_c(c[0], x_cur, zi[s * 2]);
             // zi[0] = (sos[1] * x_cur - sos[4] * x_new + zi[1]);
-            zi[s * 2] = c[1].mul_add(x_cur, -(c[4] * x_new)) + zi[s * 2 + 1];
+            zi[s * 2] = fma_c(c[1], x_cur, -(c[4] * x_new)) + zi[s * 2 + 1];
             // zi[1] = sos[2] * x_cur - sos[5] * x_new;
-            zi[s * 2 + 1] = c[2].mul_add(x_cur, -(c[5] * x_new));
+            zi[s * 2 + 1] = fma_c(c[2], x_cur, -(c[5] * x_new));
             x_cur = x_new;
         }
         *xv = x_cur;
@@ -141,7 +154,7 @@ fn relative_degree(z: &Roots, p: &Roots) -> Result<usize, String> {
 
 /// Python `float ** int` (libm `pow`).
 fn pypow(x: f64, e: usize) -> f64 {
-    x.powf(e as f64)
+    rlx_libm::reference::pow(x, e as f64)
 }
 
 /// `lp2lp_zpk(z, p, k, wo)`.
@@ -288,8 +301,16 @@ fn convolve_root_complex(a: &[C], r: C) -> Vec<C> {
         .map(|k| {
             let t = convolve_terms(a, &v, k);
             let d = match t.as_slice() {
-                [(x, y)] if swapped => cx::mul(*x, *y),
+                [(x, y)] if swapped && cx::BASELINE_FUSED => cx::mul(*x, *y),
                 [(x, y)] => cx::mul_plain(*x, *y),
+                // OpenBLAS `zdotu` (Linux reference): four plain accumulators from 0
+                [(x0, y0), (x1, y1)] if !cx::BASELINE_FUSED => {
+                    let s1 = (0.0 + x0.re * y0.re) + x1.re * y1.re;
+                    let s2 = (0.0 + x0.im * y0.im) + x1.im * y1.im;
+                    let s3 = (0.0 + x0.re * y0.im) + x1.re * y1.im;
+                    let s4 = (0.0 + x0.im * y0.re) + x1.im * y1.re;
+                    C::new(s1 - s2, s3 + s4)
+                }
                 [(x0, y0), (x1, y1)] => {
                     let s1 = x1.re.mul_add(y1.re, x0.re * y0.re);
                     let s2 = x1.im.mul_add(y1.im, x0.im * y0.im);
@@ -546,7 +567,7 @@ pub fn butter_zpk(n: usize, wn: &[f64], btype: BType) -> Result<Zpk, String> {
     let fs = 2.0;
     let warped: Vec<f64> = wn
         .iter()
-        .map(|&w| 2.0 * fs * (std::f64::consts::PI * w / fs).tan())
+        .map(|&w| 2.0 * fs * rlx_libm::reference::tan(std::f64::consts::PI * w / fs))
         .collect();
     let analog = match btype {
         BType::Lowpass | BType::Highpass => {

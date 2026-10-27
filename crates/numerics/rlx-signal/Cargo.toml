@@ -20,6 +20,8 @@ path = "src/lib.rs"
 # NumPy's LAPACK entry points (`np.linalg.solve` in `lfilter_zi`)
 rlx-cpu = { workspace = true }
 rlx-numpy = { workspace = true }
+# the reference platform's libm (glibc's off Apple: Linux and wasm agree)
+rlx-libm = { workspace = true }
 
 [lints]
 workspace = true

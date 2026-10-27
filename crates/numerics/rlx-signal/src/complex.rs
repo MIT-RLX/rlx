@@ -22,6 +22,7 @@ pub struct C {
     pub im: f64,
 }
 
+#[cfg(target_vendor = "apple")]
 unsafe extern "C" {
     fn cexp(z: C) -> C;
     fn csqrt(z: C) -> C;
@@ -40,7 +41,7 @@ impl C {
     }
     /// `np.abs(z)` = `hypot(re, im)`.
     pub fn abs(self) -> f64 {
-        self.re.hypot(self.im)
+        rlx_libm::reference::hypot(self.re, self.im)
     }
     /// `np.isreal(z)`: imaginary part exactly zero.
     pub fn is_real(self) -> bool {
@@ -69,7 +70,25 @@ pub fn radd(x: f64, z: C) -> C {
     C::new(x + z.re, 0.0 + z.im)
 }
 
-/// Elementwise / scalar `a * b` (FMA-contracted, left product fused).
+/// Whether NumPy's baseline-compiled complex loops fuse `x ± a*b` on this target's
+/// reference. On macOS arm64 clang fuses them (left product first); NumPy's Linux
+/// x86-64 wheel builds them for the SSE baseline, so they round twice — measured on
+/// msi (NumPy 2.3.5, 3000 random cases each): `np.prod`'s complex `multiply.reduce`,
+/// complex scalar `*` and `/`, and the array `/` loop are all plain, while the array
+/// `*` and `**2` loops (AVX2/FMA3 dispatch) are fused, as on macOS.
+pub const BASELINE_FUSED: bool = cfg!(target_vendor = "apple");
+
+#[inline(always)]
+fn fma_b(a: f64, b: f64, c: f64) -> f64 {
+    if BASELINE_FUSED {
+        a.mul_add(b, c)
+    } else {
+        a * b + c
+    }
+}
+
+/// The elementwise array `a * b` loop (and `z**2`): FMA-contracted, left product
+/// fused, on every reference.
 pub fn mul(a: C, b: C) -> C {
     C::new(
         a.re.mul_add(b.re, -(a.im * b.im)),
@@ -82,7 +101,17 @@ pub fn mul_plain(a: C, b: C) -> C {
     C::new(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re)
 }
 
-/// `a / b`: Smith's algorithm as NumPy spells it (contracted).
+/// A complex scalar `a * b`, or one step of `np.prod`'s `multiply.reduce`: fused
+/// as [`mul`] on macOS, plain on the Linux reference ([`BASELINE_FUSED`]).
+pub fn mul_baseline(a: C, b: C) -> C {
+    C::new(
+        fma_b(a.re, b.re, -(a.im * b.im)),
+        fma_b(a.re, b.im, a.im * b.re),
+    )
+}
+
+/// `a / b` (array or scalar): Smith's algorithm as NumPy spells it, contracted on
+/// macOS, plain on the Linux reference ([`BASELINE_FUSED`]).
 pub fn div(a: C, b: C) -> C {
     let (br, bi) = (b.re.abs(), b.im.abs());
     if br >= bi {
@@ -90,32 +119,38 @@ pub fn div(a: C, b: C) -> C {
             return C::new(a.re / br, a.im / br);
         }
         let rat = b.im / b.re;
-        let scl = 1.0 / b.im.mul_add(rat, b.re);
-        C::new(
-            a.im.mul_add(rat, a.re) * scl,
-            (-a.re).mul_add(rat, a.im) * scl,
-        )
+        let scl = 1.0 / fma_b(b.im, rat, b.re);
+        C::new(fma_b(a.im, rat, a.re) * scl, fma_b(-a.re, rat, a.im) * scl)
     } else {
         let rat = b.re / b.im;
-        let scl = 1.0 / b.re.mul_add(rat, b.im);
-        C::new(
-            a.re.mul_add(rat, a.im) * scl,
-            a.im.mul_add(rat, -a.re) * scl,
-        )
+        let scl = 1.0 / fma_b(b.re, rat, b.im);
+        C::new(fma_b(a.re, rat, a.im) * scl, fma_b(a.im, rat, -a.re) * scl)
     }
 }
 
-/// `np.exp(z)` → libm `cexp`.
+/// `np.exp(z)` → libm `cexp`: Apple's, or glibc's ([`rlx_libm::cexp`]) elsewhere.
 pub fn exp(z: C) -> C {
+    #[cfg(target_vendor = "apple")]
     // SAFETY: `cexp` is a pure libm function; `C` is `repr(C)` with the layout and
     // calling convention of `double _Complex` (an HFA of two doubles).
-    unsafe { cexp(z) }
+    return unsafe { cexp(z) };
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let (re, im) = rlx_libm::cexp(z.re, z.im);
+        C::new(re, im)
+    }
 }
 
-/// `np.sqrt(z)` → libm `csqrt`.
+/// `np.sqrt(z)` → libm `csqrt`: Apple's, or glibc's ([`rlx_libm::csqrt`]) elsewhere.
 pub fn sqrt(z: C) -> C {
+    #[cfg(target_vendor = "apple")]
     // SAFETY: as for `exp`.
-    unsafe { csqrt(z) }
+    return unsafe { csqrt(z) };
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let (re, im) = rlx_libm::csqrt(z.re, z.im);
+        C::new(re, im)
+    }
 }
 
 /// `np.prod(v)` of a non-empty complex array: a left-to-right `multiply.reduce`
@@ -124,6 +159,6 @@ pub fn prod(v: &[C]) -> C {
     let mut it = v.iter();
     match it.next() {
         None => C::real(1.0),
-        Some(&first) => it.fold(first, |acc, &x| mul(acc, x)),
+        Some(&first) => it.fold(first, |acc, &x| mul_baseline(acc, x)),
     }
 }

@@ -137,6 +137,8 @@ pub mod accelerate;
 pub mod npy;
 mod tanh_table;
 pub mod torch;
+/// `np.argsort` on the Linux x86-64 reference (x86-simd-sort AVX2).
+pub use rlx_linux_ref::xss;
 
 /// `np.tanh(x)` for `float64` on a SIMD-with-FMA build (NumPy ≥ 2.0 on arm64 and
 /// AVX-512 x86): NumPy does **not** call libm here but its own SVML-derived kernel

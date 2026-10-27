@@ -2583,6 +2583,22 @@ pub fn dgelsd_solve(
             b_col[i + j * ldb] = b[i * nrhs + j];
         }
     }
+    // Off Apple: reference LAPACK as the Linux SciPy/NumPy wheels run it (OpenBLAS
+    // 0.3.30, Haswell kernels) — `numpy_lapack`, where its ported branches reach.
+    #[cfg(not(rlx_cpu_blas_accelerate))]
+    if let Some(r) =
+        crate::numpy_lapack::dgelsd(m, n, nrhs, &mut a_col.clone(), &mut b_col, ldb, rcond)
+    {
+        if r.info != 0 {
+            return r.info as i32;
+        }
+        for i in 0..n {
+            for j in 0..nrhs {
+                x[i * nrhs + j] = b_col[i + j * ldb];
+            }
+        }
+        return 0;
+    }
     let mm = m as i32;
     let nn = n as i32;
     let nrhs_i = nrhs as i32;

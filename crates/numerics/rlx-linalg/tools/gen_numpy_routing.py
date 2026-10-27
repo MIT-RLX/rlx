@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 """Generate tests/vectors/numpy_routing.txt: np.dot / np.matmul results for every
-routing branch rlx_linalg::numpy reproduces. Run with NumPy 2.x on macOS (Accelerate).
+routing branch rlx_linalg::numpy reproduces. Run with NumPy 2.x on macOS (Accelerate) for
+tests/vectors/, and on the Linux x86-64 reference (msi: OpenBLAS Haswell) for
+tests/vectors/linux-x86_64/ — the directory follows the platform.
 
 Record format (one per line, floats as IEEE-754 hex):
   case <fn> <m> <k> <n> <layout_a> <layout_b>
@@ -43,5 +45,7 @@ for _ in range(120):
         rec("matmul", 1, m, k, "C", la, y.reshape(1, m), A, y.reshape(1, m) @ a)
     v = rng.normal(size=k); w = rng.normal(size=k)
     rec("dot_vv", 1, k, 1, "C", "C", v, w, np.dot(v, w))
-out = pathlib.Path(__file__).resolve().parent.parent / "tests" / "vectors" / "numpy_routing.txt"
+vec = pathlib.Path(__file__).resolve().parent.parent / "tests" / "vectors"
+out = (vec if sys.platform == "darwin" else vec / "linux-x86_64") / "numpy_routing.txt"
+out.parent.mkdir(parents=True, exist_ok=True)
 out.write_text("\n".join(lines) + "\n"); print("wrote", out, len(lines))

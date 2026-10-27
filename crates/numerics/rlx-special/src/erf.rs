@@ -5,6 +5,7 @@
 //! `boost::math::erf` / `erfc` for `double` — `detail::erf_imp` with the
 //! 53-bit tag. (Boost does *not* forward these to libm on the host.)
 
+use crate::Contract;
 use crate::tools::evaluate_polynomial;
 
 /// `boost::math::erf(z)`.
@@ -26,8 +27,8 @@ fn exp_neg_sq_over_z(z: f64) -> f64 {
     let lo = z - hi;
     let sq = z * z;
     // `((hi*hi - sq) + 2*hi*lo) + lo*lo`: three fused steps.
-    let err_sqr = lo.mul_add(lo, (2.0 * hi).mul_add(lo, hi.mul_add(hi, -sq)));
-    (-sq).exp() * (-err_sqr).exp() / z
+    let err_sqr = lo.fmac(lo, (2.0 * hi).fmac(lo, hi.fmac(hi, -sq)));
+    rlx_libm::reference::exp(-sq) * rlx_libm::reference::exp(-err_sqr) / z
 }
 
 pub(crate) fn erf_imp(mut z: f64, mut invert: bool) -> f64 {
@@ -56,7 +57,7 @@ pub(crate) fn erf_imp(mut z: f64, mut invert: bool) -> f64 {
             } else {
                 const C: f64 = 0.003379167095512573896158903121545171688;
                 // `z * 1.125f + z * c`: the left product fuses.
-                result = z.mul_add(1.125, z * C);
+                result = z.fmac(1.125, z * C);
             }
         } else {
             const Y: f64 = 1.044948577880859375;
@@ -99,7 +100,7 @@ pub(crate) fn erf_imp(mut z: f64, mut invert: bool) -> f64 {
                 0.337511472483094676155e-5,
             ];
             let mut r = Y + evaluate_polynomial(&P, z - 0.5) / evaluate_polynomial(&Q, z - 0.5);
-            r *= (-z * z).exp() / z;
+            r *= rlx_libm::reference::exp(-z * z) / z;
             result = r;
         } else if z < 2.5 {
             const Y: f64 = 0.50672817230224609375;
@@ -177,7 +178,7 @@ pub(crate) fn erf_imp(mut z: f64, mut invert: bool) -> f64 {
     }
     // `prefix_adder + prefix_multiplier * result`, both ints promoted: one fma,
     // exact here since the multiplier is ±1.
-    f64::from(prefix_multiplier).mul_add(result, f64::from(prefix_adder))
+    f64::from(prefix_multiplier).fmac(result, f64::from(prefix_adder))
 }
 
 /// `frexp`: `x = m · 2^e` with `0.5 <= |m| < 1` (finite, nonzero `x`).

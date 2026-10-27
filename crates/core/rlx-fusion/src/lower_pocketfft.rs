@@ -153,7 +153,11 @@ impl MatchRewrite for LowerPocketFft {
             return None;
         }
         // pocketfft's `fct`: the norm scale rounded to the element type
-        let scale = norm.output_scale(n, inverse);
+        let scale = match (norm, inverse) {
+            (FftNorm::Ortho, _) => rlx_pocketfft::norm_fct(1, n),
+            (FftNorm::Forward, true) => rlx_pocketfft::norm_fct(2, n),
+            _ => 1.0,
+        };
         let fct = if dt == DType::F32 {
             scale as f32 as f64
         } else {

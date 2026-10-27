@@ -45,7 +45,12 @@ fn view<'a>(buf: &'a [f64], r: usize, c: usize, order: &str) -> View<'a> {
 
 #[test]
 fn numpy_routing_is_bit_exact() {
+    // this target's reference: macOS (Accelerate) on Apple, the Linux x86-64 wheel
+    // (OpenBLAS Haswell, msi) elsewhere
+    #[cfg(target_vendor = "apple")]
     let text = include_str!("vectors/numpy_routing.txt");
+    #[cfg(not(target_vendor = "apple"))]
+    let text = include_str!("vectors/linux-x86_64/numpy_routing.txt");
     let mut lines = text.lines().filter(|l| !l.starts_with('#'));
     let (mut n_cases, mut bad) = (0usize, Vec::new());
     while let Some(head) = lines.next() {

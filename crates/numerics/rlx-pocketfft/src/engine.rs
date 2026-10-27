@@ -184,8 +184,8 @@ pub enum Twiddles {
     /// (SciPy's and torch's macOS wheels). Only macOS has it; on other targets this
     /// is [`Twiddles::Separate`], which can differ in the last bit.
     AppleSinCos,
-    /// Separate `cos` and `sin` calls to this target's libm (glibc on Linux, the
-    /// `libm` port on wasm32).
+    /// Separate `cos` and `sin` calls: Apple's libm, or glibc's (Linux, and its
+    /// pure-Rust port in [`rlx_libm`] on wasm).
     Separate,
 }
 
@@ -267,7 +267,10 @@ fn cos_sin(a: f64, merged: bool) -> (f64, f64) {
         return (r.cos, r.sin);
     }
     let _ = merged;
-    (std::hint::black_box(a).cos(), std::hint::black_box(a).sin())
+    (
+        rlx_libm::reference::cos(std::hint::black_box(a)),
+        rlx_libm::reference::sin(std::hint::black_box(a)),
+    )
 }
 
 /// `sincos_2pibyn<T>::calc(x, n, ang)` (in `f64`).
@@ -322,8 +325,8 @@ struct SinCos2PiByN {
 impl SinCos2PiByN {
     fn new(n: usize, tw: Twiddles) -> Self {
         let merged = tw.merged();
-        // Thigh(0.25L*pi/n): long double is double on Apple arm64
-        let ang = 0.25 * std::f64::consts::PI / n as f64;
+        // Thigh(0.25L*pi/n): long double is double on Apple arm64, x87 on x86-64 Linux
+        let ang = crate::x87::quarter_pi_over(n);
         let nval = (n + 2) / 2;
         let mut shift = 1u32;
         while (1usize << shift) * (1usize << shift) < nval {

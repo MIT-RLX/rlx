@@ -1,0 +1,23 @@
+[package]
+name = "rlx-linux-ref"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "NumPy/SciPy's Linux x86-64 reference numerics in pure Rust, bit for bit: OpenBLAS 0.3.30 Haswell kernels, its bundled reference LAPACK, x86-simd-sort AVX2 argsort, x87 extended arithmetic"
+authors.workspace      = true
+license.workspace      = true
+keywords = ["openblas", "lapack", "numpy", "scipy", "parity"]
+categories = ["science", "mathematics"]
+repository.workspace   = true
+documentation.workspace = true
+
+[lib]
+name = "rlx_linux_ref"
+path = "src/lib.rs"
+
+[dependencies]
+# glibc-exact pow/log (LAPACK's EPS**MEIGTH, DLAED6's LOG(SAFMIN))
+rlx-libm = { workspace = true }
+
+[lints]
+workspace = true

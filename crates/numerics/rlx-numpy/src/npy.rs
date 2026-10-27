@@ -95,7 +95,13 @@ pub fn write_f32(path: &Path, data: &[f32], shape: &[usize]) -> Result<(), Strin
 mod tests {
     #[test]
     fn round_trip() {
-        let p = std::env::temp_dir().join("rlx_numpy_npy_round_trip.npy");
+        // `std::env::temp_dir()` panics under WASI ("not supported"): `$TMPDIR`, else /tmp
+        let tmp = if cfg!(target_os = "wasi") {
+            std::env::var_os("TMPDIR").map_or_else(|| "/tmp".into(), std::path::PathBuf::from)
+        } else {
+            std::env::temp_dir()
+        };
+        let p = tmp.join("rlx_numpy_npy_round_trip.npy");
         let d: Vec<f32> = (0..24).map(|i| i as f32 * 0.5 - 3.0).collect();
         super::write_f32(&p, &d, &[2, 3, 4]).unwrap();
         assert_eq!(super::read_f32(&p).unwrap(), (d, vec![2, 3, 4]));

@@ -86,6 +86,7 @@ members = [
 
     # Downstream packages (registered against the custom-op scaffold)
     "crates/numerics/rlx-sparse",      # Sparse linear algebra (CSR LU/MatVec/CG) — JAX-style downstream
+    "crates/numerics/rlx-linux-ref", # NumPy/SciPy Linux x86-64 reference: OpenBLAS Haswell, LAPACK, x86-simd-sort, x87
     "crates/numerics/rlx-linalg",    # Dense linalg (eigh/svd/qr/cholesky/solve_triangular) via LAPACK
     "crates/numerics/rlx-peft",      # Parameter-efficient adaptation: LoRA/IA3/AdaLoRA/DoRA/OFT
     "crates/numerics/rlx-rng",       # Bit-exact numpy/torch random streams
@@ -242,6 +243,7 @@ rlx-special = { path = "crates/numerics/rlx-special", version = "0.2.19" }
 rlx-nnpack = { path = "crates/numerics/rlx-nnpack", version = "0.2.19" }
 rlx-pocketfft = { path = "crates/numerics/rlx-pocketfft", version = "0.2.19" }
 rlx-libm = { path = "crates/numerics/rlx-libm", version = "0.2.19" }
+rlx-linux-ref = { path = "crates/numerics/rlx-linux-ref", version = "0.2.19" }
 rlx-signal = { path = "crates/numerics/rlx-signal", version = "0.2.19" }
 rlx-search = { path = "crates/numerics/rlx-search", version = "0.2.19" }
 rlx-macros = { path = "crates/core/rlx-macros", version = "0.2.19" }

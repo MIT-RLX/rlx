@@ -287,7 +287,9 @@ pub(crate) const EXP_NEGLN2HIN: usize = 1;
 pub(crate) const EXP_NEGLN2LON: usize = 2;
 pub(crate) const EXP_POLY: usize = 3;
 pub(crate) const EXP_TAB: usize = 21;
+#[allow(dead_code)]
 pub(crate) const EXP2_SHIFT: usize = 8;
+#[allow(dead_code)]
 pub(crate) const EXP2_POLY: usize = 9;
 pub(crate) const LOG_DATA: [u64; 274] = [
     0x3fe62e42fefa3800,

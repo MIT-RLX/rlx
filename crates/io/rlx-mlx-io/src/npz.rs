@@ -5,7 +5,6 @@
 //! NumPy `.npy` / `.npz` loaders (`mx.save` / `mx.savez`).
 
 use anyhow::{Context, Result, bail};
-use npyz::npz::NpzArchive;
 use npyz::{DType, NpyFile, TypeChar};
 use std::collections::HashMap;
 use std::fs::File;
@@ -120,16 +119,70 @@ pub fn load_npy(path: &Path) -> Result<HashMap<String, MlxTensor>> {
 
 pub fn load_npz(path: &Path) -> Result<HashMap<String, MlxTensor>> {
     let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut npz = NpzArchive::new(BufReader::new(f))
+    let mut npz = zip::ZipArchive::new(BufReader::new(f))
         .with_context(|| format!("parse npz {}", path.display()))?;
-    let names: Vec<String> = npz.array_names().map(|s| s.to_string()).collect();
     let mut out = HashMap::new();
-    for name in names {
-        let npy = npz
-            .by_name(&name)?
-            .with_context(|| format!("missing npz member {name}"))?;
+    // An .npz is a zip of `<name>.npy` members (what npyz's NpzArchive reads).
+    for i in 0..npz.len() {
+        let member = npz.by_index(i)?;
+        let Some(name) = member.name()?.strip_suffix(".npy").map(str::to_string) else {
+            continue;
+        };
+        let npy = NpyFile::new(member).with_context(|| format!("parse npz member {name}"))?;
         let t = tensor_from_npy(name.clone(), npy)?;
         out.insert(name, t);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// `.npy` v1 bytes for a little-endian f32 array.
+    fn npy_f32(shape: &str, data: &[f32]) -> Vec<u8> {
+        let mut header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape}, }}");
+        while (10 + header.len() + 1) % 64 != 0 {
+            header.push(' ');
+        }
+        header.push('\n');
+        let mut out = b"\x93NUMPY\x01\x00".to_vec();
+        out.extend_from_slice(&(header.len() as u16).to_le_bytes());
+        out.extend_from_slice(header.as_bytes());
+        for v in data {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn load_npz_reads_stored_and_deflated_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.npz");
+        {
+            let mut zw = zip::ZipWriter::new(File::create(&path).unwrap());
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let deflated = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file("a.npy", stored).unwrap();
+            zw.write_all(&npy_f32("(2,)", &[1.0, -2.5])).unwrap();
+            zw.start_file("layer.b.npy", deflated).unwrap();
+            zw.write_all(&npy_f32("(2, 2)", &[0.0, 1.0, 2.0, 3.0]))
+                .unwrap();
+            zw.start_file("README.txt", stored).unwrap();
+            zw.write_all(b"not an array").unwrap();
+            zw.finish().unwrap();
+        }
+        let got = load_npz(&path).unwrap();
+        assert_eq!(got.len(), 2, "non-.npy members are skipped");
+        assert_eq!(got["a"].shape, vec![2]);
+        assert_eq!(got["a"].data_f32.as_deref(), Some(&[1.0, -2.5][..]));
+        assert_eq!(got["layer.b"].shape, vec![2, 2]);
+        assert_eq!(
+            got["layer.b"].data_f32.as_deref(),
+            Some(&[0.0, 1.0, 2.0, 3.0][..])
+        );
+    }
 }

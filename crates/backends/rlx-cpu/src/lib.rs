@@ -25,11 +25,15 @@ pub mod dequant_cache;
 pub mod dispatch;
 pub mod executor;
 pub mod expand;
+// F64 RmsNorm/LayerNorm/Softmax/Rope/Attention for graphs promoted to F64
 pub mod f64_kernels;
 pub mod geev;
+// the exact Accelerate symbols NumPy / SciPy call ($NEWLAPACK$ILP64 / $NEWLAPACK)
 pub mod numpy_blas;
-pub mod numpy_openblas; // the OpenBLAS (Haswell) kernels NumPy/SciPy run on the Linux reference // the exact Accelerate symbols NumPy / SciPy call ($NEWLAPACK$ILP64 / $NEWLAPACK) // F64 RmsNorm/LayerNorm/Softmax/Rope/Attention for graphs promoted to F64
+// the OpenBLAS (Haswell) kernels and LAPACK NumPy/SciPy run on the Linux reference
 pub use expand::{NO_THUNK_ARM, expand_cpu_nop_fused, prepare_graph_for_thunks};
+pub use rlx_linux_ref::lapack as numpy_lapack;
+pub use rlx_linux_ref::openblas as numpy_openblas;
 pub mod gdn;
 pub mod gguf_matmul;
 pub mod gguf_scheme;

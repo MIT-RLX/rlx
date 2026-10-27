@@ -7,6 +7,19 @@
 //! `check_random_state`); `Generator`/PCG64 is the modern one. They are not
 //! interchangeable — same distribution, different stream.
 
+/// `a*b + c` as NumPy's C distributions compute it on this target's reference: clang
+/// fuses it on macOS arm64; the Linux x86-64 wheel is an SSE-baseline build, plain
+/// (measured on msi, NumPy 2.3.5: `RandomState.uniform` 20000/20000 plain vs 9845
+/// fused, legacy `standard_normal` 20000 vs 17107).
+#[inline(always)]
+fn fma_c(a: f64, b: f64, c: f64) -> f64 {
+    if cfg!(target_vendor = "apple") {
+        a.mul_add(b, c)
+    } else {
+        a * b + c
+    }
+}
+
 const N: usize = 624;
 const M: usize = 397;
 const MATRIX_A: u32 = 0x9908_b0df;
@@ -96,9 +109,9 @@ impl RandomState {
         loop {
             let x1 = 2.0 * self.random_double() - 1.0;
             let x2 = 2.0 * self.random_double() - 1.0;
-            let r2 = x1.mul_add(x1, x2 * x2);
+            let r2 = fma_c(x1, x1, x2 * x2);
             if r2 < 1.0 && r2 != 0.0 {
-                let f = (-2.0 * r2.ln() / r2).sqrt();
+                let f = (-2.0 * rlx_libm::reference::log(r2) / r2).sqrt();
                 self.gauss = f * x1;
                 self.has_gauss = true;
                 return f * x2;
@@ -198,7 +211,7 @@ impl RandomState {
     /// on none.
     pub fn uniform_range(&mut self, low: f64, high: f64) -> f64 {
         let range = high - low;
-        range.mul_add(self.random_double(), low)
+        fma_c(range, self.random_double(), low)
     }
 
     /// `rng.random_sample()` — numpy's own name for [`Self::random_double`].
@@ -424,7 +437,7 @@ impl Generator {
     /// (numpy's `random_uniform` is FMA-contracted; see [`RandomState::uniform_range`]).
     pub fn uniform_range(&mut self, low: f64, high: f64) -> f64 {
         let range = high - low;
-        range.mul_add(self.random(), low)
+        fma_c(range, self.random(), low)
     }
 
     /// numpy's `random_interval(bitgen, max)` — uniform on `[0, max]` by

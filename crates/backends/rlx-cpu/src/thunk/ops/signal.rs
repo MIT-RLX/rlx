@@ -1605,7 +1605,12 @@ pub unsafe fn execute_fft1d_pocketfft(
             rlx_ir::FftTwiddles::Separate => Twiddles::Separate,
         },
     };
-    let scale = rlx_ir::fft::FftNorm::from_tag(norm_tag).output_scale(n_complex, inverse);
+    // `FftNorm::output_scale`, spelled as pocketfft's `norm_fct` (`ldbl_t`)
+    let scale = match (rlx_ir::fft::FftNorm::from_tag(norm_tag), inverse) {
+        (rlx_ir::fft::FftNorm::Ortho, _) => rlx_pocketfft::norm_fct(1, n_complex),
+        (rlx_ir::fft::FftNorm::Forward, true) => rlx_pocketfft::norm_fct(2, n_complex),
+        _ => 1.0,
+    };
     let n = n_complex;
     /// One row: read `n` complex values, transform, write them back.
     /// Plans are pure functions of `(T, n, opt)`: built once per process (a few

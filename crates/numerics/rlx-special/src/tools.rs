@@ -8,10 +8,13 @@
 //! Everything here reproduces what clang emits for the Boost headers under its
 //! default `-ffp-contract=on`, which is how SciPy builds them: a product and a sum
 //! **in one C++ expression** become one `fma`, the *left* product of an addition
-//! first, and nothing fuses across statements. The fused steps are spelled with
-//! [`f64::mul_add`]; every other operation rounds separately, as written.
+//! first, and nothing fuses across statements. The fused steps are spelled `fmac`
+//! (fused on Apple, plain on the Linux reference); every other operation rounds
+//! separately, as written.
 
 /// `tools::epsilon<double>()` and `policies::get_epsilon<double, Policy>()`: 2⁻⁵².
+use crate::Contract;
+
 pub const EPSILON: f64 = f64::EPSILON;
 /// `tools::root_epsilon<double>()`: 2⁻²⁶ (Boost stores the literal, not `sqrt(eps)`).
 pub const ROOT_EPSILON: f64 = 1.490_116_119_384_765_625e-8;
@@ -44,7 +47,7 @@ pub fn evaluate_polynomial(a: &[f64], x: f64) -> f64 {
         2..=4 => {
             let mut r = a[n - 1];
             for &c in a[..n - 1].iter().rev() {
-                r = r.mul_add(x, c);
+                r = r.fmac(x, c);
             }
             r
         }
@@ -63,10 +66,7 @@ pub fn evaluate_polynomial(a: &[f64], x: f64) -> f64 {
 fn second_order(c: impl Fn(usize) -> f64, n: usize, x2: f64) -> (f64, f64) {
     debug_assert!(n >= 5);
     let hi = n - 1;
-    let mut acc = [
-        c(hi).mul_add(x2, c(hi - 2)),
-        c(hi - 1).mul_add(x2, c(hi - 3)),
-    ];
+    let mut acc = [c(hi).fmac(x2, c(hi - 2)), c(hi - 1).fmac(x2, c(hi - 3))];
     // `acc[0]` walks hi, hi-2, …; `acc[1]` walks hi-1, hi-3, …
     let mut next = [hi as isize - 4, hi as isize - 5];
     for (k, slot) in acc.iter_mut().enumerate() {
@@ -171,7 +171,7 @@ fn lentz(g: &mut impl FnMut() -> (f64, f64), b0: f64, factor: f64, max_terms: u6
     loop {
         let (a, b) = g();
         // `D = b + a * D` is one expression: fused.
-        d = a.mul_add(d, b);
+        d = a.fmac(d, b);
         if d == 0.0 {
             d = TINY;
         }

@@ -114,30 +114,37 @@ fn check(file: &str, text: &str, eval: fn(&str, &[f64]) -> f64) {
     );
 }
 
+/// The vectors of this target's reference: macOS arm64 on Apple targets, the Linux
+/// x86-64 SciPy wheel (msi) elsewhere.
+#[cfg(target_vendor = "apple")]
+macro_rules! vectors {
+    ($f:literal) => {
+        include_str!(concat!("vectors/", $f))
+    };
+}
+#[cfg(not(target_vendor = "apple"))]
+macro_rules! vectors {
+    ($f:literal) => {
+        include_str!(concat!("vectors/linux-x86_64/", $f))
+    };
+}
+
 #[test]
 fn bit_exact_against_boost_oracle() {
-    check("boost.txt", include_str!("vectors/boost.txt"), eval);
+    check("boost.txt", vectors!("boost.txt"), eval);
 }
 
 #[test]
 fn bit_exact_against_scipy() {
-    check("scipy.txt", include_str!("vectors/scipy.txt"), eval);
+    check("scipy.txt", vectors!("scipy.txt"), eval);
 }
 
 #[test]
 fn bit_exact_against_xsf_oracle() {
-    check(
-        "cephes.txt",
-        include_str!("vectors/cephes.txt"),
-        eval_cephes,
-    );
+    check("cephes.txt", vectors!("cephes.txt"), eval_cephes);
 }
 
 #[test]
 fn quadpack_studentized_range_against_scipy() {
-    check(
-        "quadpack.txt",
-        include_str!("vectors/quadpack.txt"),
-        eval_cephes,
-    );
+    check("quadpack.txt", vectors!("quadpack.txt"), eval_cephes);
 }

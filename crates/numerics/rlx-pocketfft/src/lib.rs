@@ -23,6 +23,7 @@
 // The allow sits here, not in engine.rs, so it survives that file being rewritten.
 #[allow(clippy::excessive_precision)]
 pub mod engine;
+mod x87;
 
 pub use engine::{Contraction, Options, Twiddles};
 
@@ -41,9 +42,8 @@ pub enum Norm {
     Forward,
 }
 
-/// `norm_fct(inorm, N)` of `pypocketfft.cxx` (`long double` is `double` on the
-/// platforms SciPy's arm64/x86-64 macOS and Linux wheels target with clang/gcc —
-/// on x86-64 Linux gcc `long double` is 80-bit, where `1/N` can round differently).
+/// `norm_fct(inorm, N)` of `pypocketfft.cxx`, in `ldbl_t`: `double` on Apple arm64,
+/// x87 extended on the Linux x86-64 reference (see [`x87`]).
 fn fct(norm: Norm, inverse: bool, n: usize) -> f64 {
     let inorm = match (norm, inverse) {
         (Norm::Backward, false) | (Norm::Forward, true) => 0,
@@ -52,8 +52,19 @@ fn fct(norm: Norm, inverse: bool, n: usize) -> f64 {
     };
     match inorm {
         0 => 1.0,
-        1 => 1.0 / (n as f64).sqrt(),
-        _ => 1.0 / n as f64,
+        1 => x87::recip_sqrt(n),
+        _ => x87::recip(n),
+    }
+}
+
+/// `norm_fct(inorm, n)` of `pypocketfft.cxx` for one axis of length `n`: `inorm`
+/// 0 → `1`, 1 → `1/sqrt(n)`, 2 → `1/n`, computed in `ldbl_t` as SciPy's wheel for
+/// this target does (x87 extended on the Linux x86-64 reference).
+pub fn norm_fct(inorm: u8, n: usize) -> f64 {
+    match inorm {
+        0 => 1.0,
+        1 => x87::recip_sqrt(n),
+        _ => x87::recip(n),
     }
 }
 

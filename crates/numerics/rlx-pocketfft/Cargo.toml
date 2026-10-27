@@ -17,6 +17,12 @@ name = "rlx_pocketfft"
 path = "src/lib.rs"
 
 
+[dependencies]
+# x87 `long double` (pypocketfft's ldbl_t on the Linux x86-64 reference)
+rlx-linux-ref = { workspace = true }
+# glibc's sin/cos off Apple (the Linux reference; wasm agrees)
+rlx-libm = { workspace = true }
+
 [lints]
 workspace = true
 
