@@ -25,6 +25,7 @@
 //! host, so MIL emission can be unit-tested anywhere. Only execution is
 //! gated behind `all(target_vendor = "apple", not(target_os = "watchos"))`.
 
+pub mod fft_lower;
 pub mod host_exec;
 pub mod hybrid;
 pub mod mil;

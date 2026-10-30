@@ -2661,6 +2661,19 @@ pub(crate) fn encode_sdpa(
             // float4 row loads/stores: every operand 16-byte aligned.
             && [q, k_off, v, out].iter().all(|o| o % 16 == 0)
             && rlx_ir::env::var("RLX_METAL_PREFILL_FA2").as_deref() != Some("0");
+        // `sdpa_prefill_fa3_d64`: the head_dim-64 FA2 kernel with K and V in
+        // separate tiles (two barriers per key step instead of four), exp2
+        // softmax, per-key mask. Opt-in while it is measured.
+        let fa3_mode = rlx_ir::env::var("RLX_METAL_PREFILL_FA3");
+        let use_prefill_fa3 = use_prefill_fa2
+            && head_dim == 64
+            && matches!(fa3_mode.as_deref(), Some("1") | Some("64"));
+        // `=64`: 64 query rows per threadgroup (8 simdgroups).
+        let fa3_rows: u32 = if fa3_mode.as_deref() == Some("64") {
+            64
+        } else {
+            32
+        };
         let use_prefill_fa = seq > 1
             && !use_prefill_fa2
             && !use_mma
@@ -2709,6 +2722,10 @@ pub(crate) fn encode_sdpa(
             crate::prefill_stats::record_sdpa_prefill_fa();
             if head_dim == 128 {
                 &k.sdpa_prefill_fa2_d128
+            } else if use_prefill_fa3 && fa3_rows == 64 {
+                &k.sdpa_prefill_fa3_d64_q64
+            } else if use_prefill_fa3 {
+                &k.sdpa_prefill_fa3_d64
             } else {
                 &k.sdpa_prefill_fa2_d64
             }
@@ -2738,6 +2755,25 @@ pub(crate) fn encode_sdpa(
             }
             &k.sdpa_long
         };
+        if rlx_ir::env::flag("RLX_METAL_ATTN_TRACE") {
+            let chosen = [
+                (use_mma, "sdpa_mma"),
+                (use_fa2, "sdpa_fa2"),
+                (use_splitk, "sdpa_splitk"),
+                (use_fa, "sdpa_fa_f32"),
+                (use_prefill_fa3, "sdpa_prefill_fa3_d64"),
+                (use_prefill_fa2, "sdpa_prefill_fa2"),
+                (use_prefill_fa, "sdpa_prefill_fa"),
+                (use_prefill_hd256, "sdpa_prefill_hd256"),
+                (use_decode_m1, "sdpa_decode_m1"),
+            ]
+            .iter()
+            .find(|(on, _)| *on)
+            .map_or("sdpa_long", |(_, n)| n);
+            eprintln!(
+                "[metal-attn] encode_sdpa kernel={chosen} seq={seq} kv_seq={kv_seq} head_dim={head_dim}"
+            );
+        }
         enc.set_compute_pipeline_state(pipeline);
         // Bind to arena base (offset 0) and pass byte offsets via inline
         // constants — large `set_buffer` offsets silently lose kernel writes
@@ -2951,14 +2987,16 @@ pub(crate) fn encode_sdpa(
             };
             enc.dispatch_thread_groups(grid, tg);
         } else if use_prefill_fa2 {
-            // 32 query rows (4 simdgroups x 8) per threadgroup.
+            // 32 query rows (4 simdgroups x 8) per threadgroup; FA3 at 64
+            // rows uses 8 simdgroups.
+            let rows = if use_prefill_fa3 { fa3_rows } else { 32 };
             let grid = crate::mtl::MTLSize {
-                width: seq.div_ceil(32) as u64,
+                width: seq.div_ceil(rows) as u64,
                 height: heads as u64,
                 depth: batch as u64,
             };
             let tg = crate::mtl::MTLSize {
-                width: 128,
+                width: (rows * 4) as u64,
                 height: 1,
                 depth: 1,
             };

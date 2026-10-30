@@ -94,8 +94,9 @@ impl<'a> LowerCtx<'a> {
                 let qc = self.bshd_to_bhsd(in0, b, s_q, h, head_dim, &format!("{out_name}_q"))?;
                 let kc = self.bshd_to_bhsd(in1, b, s_k, h, head_dim, &format!("{out_name}_k"))?;
                 let vc = self.bshd_to_bhsd(in2, b, s_k, h, head_dim, &format!("{out_name}_v"))?;
-                let q_canon = bhsd_shape(b, h, s_q, head_dim);
-                let k_canon = bhsd_shape(b, h, s_k, head_dim);
+                let dt = out_shape.dtype();
+                let q_canon = bhsd_shape(b, h, s_q, head_dim).with_dtype(dt);
+                let k_canon = bhsd_shape(b, h, s_k, head_dim).with_dtype(dt);
                 let core = format!("{out_name}_attn");
                 self.attention_core(
                     &qc,
@@ -154,8 +155,9 @@ impl<'a> LowerCtx<'a> {
             let (kc, s_k) = self.fused_to_bhsd_kv(in1, b, head_dim, &format!("{out_name}_k"))?;
             let (vc, _) = self.fused_to_bhsd_kv(in2, b, head_dim, &format!("{out_name}_v"))?;
             let kh = dim_static(&self.graph.shape(in1).clone(), 2)? / head_dim;
-            let q_canon = bhsd_shape(b, num_heads, s_q, head_dim);
-            let k_canon = bhsd_shape(b, kh, s_k, head_dim);
+            let dt = out_shape.dtype();
+            let q_canon = bhsd_shape(b, num_heads, s_q, head_dim).with_dtype(dt);
+            let k_canon = bhsd_shape(b, kh, s_k, head_dim).with_dtype(dt);
             let core = format!("{out_name}_attn");
             self.attention_core(
                 &qc,
@@ -175,7 +177,7 @@ impl<'a> LowerCtx<'a> {
             self.emit(
                 "transpose",
                 &t,
-                &bhsd_shape(b, s_q, num_heads, head_dim),
+                &bhsd_shape(b, s_q, num_heads, head_dim).with_dtype(dt),
                 vec![
                     ("x", bind_name(&core)),
                     ("perm", bind_value(vec_i32(&[0, 2, 1, 3]))),
@@ -212,11 +214,12 @@ impl<'a> LowerCtx<'a> {
         prefix: &str,
     ) -> Result<String> {
         let x = self.val(in_id);
+        let dt = self.graph.shape(in_id).dtype();
         let t = format!("{prefix}_bhsd");
         self.emit(
             "transpose",
             &t,
-            &bhsd_shape(b, h, s, d),
+            &bhsd_shape(b, h, s, d).with_dtype(dt),
             vec![
                 ("x", bind_name(&x)),
                 ("perm", bind_value(vec_i32(&[0, 2, 1, 3]))),
@@ -236,11 +239,12 @@ impl<'a> LowerCtx<'a> {
         prefix: &str,
     ) -> Result<String> {
         let x = self.val(in_id);
+        let dt = self.graph.shape(in_id).dtype();
         let r = format!("{prefix}_r");
         self.emit(
             "reshape",
             &r,
-            &bhsd_shape(b, s, h, d),
+            &bhsd_shape(b, s, h, d).with_dtype(dt),
             vec![
                 ("x", bind_name(&x)),
                 (
@@ -253,7 +257,7 @@ impl<'a> LowerCtx<'a> {
         self.emit(
             "transpose",
             &t,
-            &bhsd_shape(b, h, s, d),
+            &bhsd_shape(b, h, s, d).with_dtype(dt),
             vec![
                 ("x", bind_name(&r)),
                 ("perm", bind_value(vec_i32(&[0, 2, 1, 3]))),
@@ -305,7 +309,7 @@ impl<'a> LowerCtx<'a> {
                 self.operations.push(make_const(
                     &mut self.blob,
                     &mask_name,
-                    &Shape::new(&[s_q, s_k], DType::F32),
+                    &Shape::new(&[s_q, s_k], scores_shape.dtype()),
                     &mask,
                 )?);
                 let masked = format!("{out_name}_msk");
@@ -341,6 +345,10 @@ impl<'a> LowerCtx<'a> {
                 })?;
                 let mask = self.val(mid);
                 let mask_shape = self.graph.shape(mid).clone();
+                let mdt = mask_shape.dtype();
+                // -1e9 is -inf in f16 and 0 * inf is NaN for every KEPT key;
+                // 3e4 is finite in f16 and exp(-3e4) is still 0.
+                let drop = if mdt == DType::F16 { 3e4 } else { 1e9 };
                 let b = dim_static(&mask_shape, 0)?;
                 let sub1 = format!("{out_name}_mk_s");
                 self.emit(
@@ -354,7 +362,7 @@ impl<'a> LowerCtx<'a> {
                     "mul",
                     &bias_flat,
                     &mask_shape,
-                    vec![("x", bind_name(&sub1)), ("y", bind_value(scalar_f32(1e9)))],
+                    vec![("x", bind_name(&sub1)), ("y", bind_value(scalar_f32(drop)))],
                 )?;
                 let mut bd = vec![Dim::Static(1); scores_shape.rank()];
                 bd[0] = Dim::Static(b);
@@ -384,7 +392,7 @@ impl<'a> LowerCtx<'a> {
                     .product();
                 let have = mask_shape.num_elements().unwrap_or(0);
                 let src = if have > want {
-                    let flat = Shape::new(&[have], DType::F32);
+                    let flat = Shape::new(&[have], mdt);
                     let flat_name = format!("{out_name}_mk_f");
                     self.emit(
                         "reshape",
@@ -399,7 +407,7 @@ impl<'a> LowerCtx<'a> {
                     self.emit(
                         "slice_by_size",
                         &head,
-                        &Shape::new(&[want], DType::F32),
+                        &Shape::new(&[want], mdt),
                         vec![
                             ("x", bind_name(&flat_name)),
                             ("begin", bind_value(vec_i32(&[0]))),
@@ -410,7 +418,7 @@ impl<'a> LowerCtx<'a> {
                 } else {
                     bias_flat
                 };
-                let bshape = Shape::from_dims(&bd, DType::F32);
+                let bshape = Shape::from_dims(&bd, mdt);
                 let bias = format!("{out_name}_mk_b");
                 self.emit(
                     "reshape",
@@ -436,7 +444,7 @@ impl<'a> LowerCtx<'a> {
                 self.operations.push(make_const(
                     &mut self.blob,
                     &mask_name,
-                    &Shape::new(&[s_q, s_k], DType::F32),
+                    &Shape::new(&[s_q, s_k], scores_shape.dtype()),
                     &mask,
                 )?);
                 let masked = format!("{out_name}_msk");
@@ -472,7 +480,7 @@ impl<'a> LowerCtx<'a> {
         let scores_shape = {
             let mut d = q_shape.dims().to_vec();
             d[rank - 1] = Dim::Static(s_k); // [..,Sq,Sk]
-            Shape::from_dims(&d, DType::F32)
+            Shape::from_dims(&d, q_shape.dtype())
         };
         let scale = score_scale.unwrap_or((head_dim as f32).powf(-0.5));
 

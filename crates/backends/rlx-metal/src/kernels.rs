@@ -14043,6 +14043,194 @@ const SDPA_PREFILL_FA2_TMPL: &str = r####"kernel void __NAME__(
     }
 }"####;
 
+/// `sdpa_prefill_fa2_d64` with K and V in separate threadgroup tiles loaded
+/// together, so a 32-key step needs two threadgroup barriers instead of four
+/// (the score scratch is per simdgroup, so the softmax needs only a
+/// simdgroup barrier). Q is pre-scaled by `scale * log2(e)` and the softmax
+/// uses `exp2`. The key-padding mask is read once per key, not once per row.
+/// Same arguments, masks and layouts as the FA2 kernel; head_dim 64 only
+/// (two 64-wide f32 tiles fill the threadgroup memory budget).
+/// `__BQ__` query rows per threadgroup (`__BQ__ / 8` simdgroups): 64 halves
+/// the K/V traffic, since every threadgroup streams its head's whole K and V.
+const SDPA_PREFILL_FA3_D64_TMPL: &str = r####"kernel void __NAME__(
+    device const float* arena_q   [[buffer(0)]],
+    device const float* arena_k   [[buffer(1)]],
+    device const float* arena_v   [[buffer(2)]],
+    device const float* arena_m   [[buffer(3)]],
+    device float*       arena_o   [[buffer(4)]],
+    constant uint& batch       [[buffer(5)]],
+    constant uint& seq_q       [[buffer(6)]],
+    constant uint& heads       [[buffer(7)]],
+    constant uint& head_dim    [[buffer(8)]],
+    constant uint& q_stride    [[buffer(9)]],
+    constant uint& mask_kind   [[buffer(10)]],
+    constant uint& seq_k       [[buffer(11)]],
+    constant uint& k_stride    [[buffer(12)]],
+    constant uint& bhsd        [[buffer(13)]],
+    constant uint& window      [[buffer(14)]],
+    constant float& score_scale  [[buffer(15)]],
+    constant float& attn_softcap [[buffer(16)]],
+    constant SdpaOffsets& byte_offs [[buffer(17)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint3 tid3  [[thread_position_in_threadgroup]],
+    uint sgid   [[simdgroup_index_in_threadgroup]],
+    uint lane   [[thread_index_in_simdgroup]]
+) {
+    constexpr uint D = 64u;
+    constexpr uint ND = D / 8u;
+    constexpr uint BQ = __BQ__u;
+    constexpr uint BK = 32u;
+    constexpr uint NSG = BQ / 8u;
+    constexpr uint NT = NSG * 32u;
+    constexpr uint D4 = D / 4u;
+    constexpr float LOG2E = 1.4426950408889634f;
+    // K tile then V tile; the whole array also stages Q first and O last
+    // (BQ * D <= 2 * BK * D).
+    threadgroup float KV_tg[2u * BK * D];
+    threadgroup float S_tg[BQ * BK];
+    threadgroup float G_tg[NSG * 64u];  // per-simdgroup 8x8 diagonal
+    threadgroup float* K_tg = KV_tg;
+    threadgroup float* V_tg = KV_tg + BK * D;
+
+    uint tid = tid3.x;
+    uint q_start = tgid.x * BQ;
+    uint hi = tgid.y;
+    uint bi = tgid.z;
+    if (bi >= batch) return;
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const float* K = (device const float*)((device const char*)arena_k + byte_offs.k);
+    device const float* V = (device const float*)((device const char*)arena_v + byte_offs.v);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+    device float* OUT     = (device float*)((device char*)arena_o + byte_offs.o);
+    uint nkv = byte_offs.kv_heads;
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(D));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+    // Scores come out of the QK product in log2 units.
+    float qscale = scale * LOG2E;
+    uint q_off = seq_k - seq_q;
+    uint q_base = qkv_q_offset(bi, hi, 0u, heads, seq_q, D, q_stride, bhsd);
+    uint q_rs = qkv_q_offset(bi, hi, 1u, heads, seq_q, D, q_stride, bhsd) - q_base;
+    uint k_base = qkv_kv_offset(bi, hi, 0u, heads, nkv, seq_k, D, k_stride, bhsd);
+    uint k_rs = qkv_kv_offset(bi, hi, 1u, heads, nkv, seq_k, D, k_stride, bhsd) - k_base;
+    uint v_base = qkv_v_offset(bi, hi, 0u, heads, nkv, seq_k, D, k_stride, bhsd);
+    uint v_rs = qkv_v_offset(bi, hi, 1u, heads, nkv, seq_k, D, k_stride, bhsd) - v_base;
+    uint o_base = qkv_out_offset(bi, hi, 0u, heads, seq_q, D, q_stride, bhsd);
+    uint o_rs = qkv_out_offset(bi, hi, 1u, heads, seq_q, D, q_stride, bhsd) - o_base;
+    threadgroup float4* K4 = (threadgroup float4*)K_tg;
+    threadgroup float4* V4 = (threadgroup float4*)V_tg;
+    threadgroup float4* KV4 = (threadgroup float4*)KV_tg;
+
+    for (uint i = tid; i < BQ * D4; i += NT) {
+        uint qi = i / D4, d4 = i % D4;
+        uint pos = q_start + qi;
+        KV4[i] = (pos < seq_q)
+            ? *((device const float4*)(Q + q_base + pos * q_rs) + d4) * qscale
+            : float4(0.0f);
+    }
+    for (uint i = tid; i < NSG * 64u; i += NT) G_tg[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 qf[ND];
+    simdgroup_float8x8 of[ND];
+    for (uint d = 0; d < ND; ++d) {
+        simdgroup_load(qf[d], KV_tg + sgid * 8u * D + d * 8u, D);
+        of[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    float m_r[8];
+    float l_r[8];
+    for (uint r = 0; r < 8u; ++r) { m_r[r] = -1e30f; l_r[r] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint kt_end = seq_k;
+    if (mask_kind == 1u) kt_end = min(seq_k, q_off + q_start + BQ);
+    threadgroup float* Ssg = S_tg + sgid * 8u * BK;
+    threadgroup float* Gsg = G_tg + sgid * 64u;
+    uint q_row0 = q_start + sgid * 8u;
+
+    for (uint kt = 0; kt < kt_end; kt += BK) {
+        for (uint i = tid; i < BK * D4; i += NT) {
+            uint ki = i / D4, d4 = i % D4;
+            uint pos = kt + ki;
+            bool in = pos < seq_k;
+            K4[i] = in ? *((device const float4*)(K + k_base + pos * k_rs) + d4) : float4(0.0f);
+            V4[i] = in ? *((device const float4*)(V + v_base + pos * v_rs) + d4) : float4(0.0f);
+        }
+        // This lane's key: one validity test for all eight rows.
+        uint kpos = kt + lane;
+        bool key_ok = kpos < seq_k;
+        if (key_ok && mask_kind == 2u) key_ok = M[bi * k_stride + kpos] >= 0.5f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint n = 0; n < BK / 8u; ++n) {
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint d = 0; d < ND; ++d) {
+                simdgroup_float8x8 kb;
+                simdgroup_load(kb, K_tg + n * 8u * D + d * 8u, D, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc, qf[d], kb, acc);
+            }
+            simdgroup_store(acc, Ssg + n * 8u, BK);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint r = 0; r < 8u; ++r) {
+            uint qpos = q_row0 + r;
+            float s = Ssg[r * BK + lane];
+            if (softcap_inv > 0.0f) s = precise::tanh(s * (softcap_inv / LOG2E)) * (attn_softcap * LOG2E);
+            bool ok = key_ok && qpos < seq_q;
+            if (ok) {
+                if (mask_kind == 1u) { if (kpos > q_off + qpos) ok = false; }
+                else if (mask_kind == 3u) { s += M[((bi * heads + hi) * seq_q + qpos) * seq_k + kpos] * LOG2E; }
+                else if (mask_kind == 4u) { uint hp = q_off + qpos; uint lo = hp > window ? hp - window : 0u; if (kpos < lo || kpos > hp) ok = false; }
+            }
+            if (!ok) s = -1e9f;
+            float m_new = max(m_r[r], simd_max(s));
+            float p = exp2(s - m_new);
+            float alpha = exp2(m_r[r] - m_new);
+            l_r[r] = l_r[r] * alpha + simd_sum(p);
+            m_r[r] = m_new;
+            Ssg[r * BK + lane] = p;
+            if (lane == 0u) Gsg[r * 9u] = alpha;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 g;
+        simdgroup_load(g, Gsg, 8u);
+        for (uint d = 0; d < ND; ++d) {
+            simdgroup_float8x8 t;
+            simdgroup_multiply(t, g, of[d]);
+            of[d] = t;
+        }
+        for (uint kk = 0; kk < BK / 8u; ++kk) {
+            simdgroup_float8x8 pa;
+            simdgroup_load(pa, Ssg + kk * 8u, BK);
+            for (uint d = 0; d < ND; ++d) {
+                simdgroup_float8x8 vb;
+                simdgroup_load(vb, V_tg + kk * 8u * D + d * 8u, D);
+                simdgroup_multiply_accumulate(of[d], pa, vb, of[d]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0u) {
+        for (uint r = 0; r < 8u; ++r) Gsg[r * 9u] = (l_r[r] > 0.0f) ? (1.0f / l_r[r]) : 0.0f;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 g;
+    simdgroup_load(g, Gsg, 8u);
+    for (uint d = 0; d < ND; ++d) {
+        simdgroup_float8x8 t;
+        simdgroup_multiply(t, g, of[d]);
+        simdgroup_store(t, KV_tg + sgid * 8u * D + d * 8u, D);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < BQ * D4; i += NT) {
+        uint qi = i / D4, d4 = i % D4;
+        uint pos = q_start + qi;
+        if (pos < seq_q) *((device float4*)(OUT + o_base + pos * o_rs) + d4) = KV4[i];
+    }
+}"####;
+
 // Scalar score: fused Q·K dot + scale + mask → S_tg.
 const FA_SCORE_SCALAR: &str = r####"        for (uint c = tid; c < Br * Bc; c += tsize) {
             uint qi = c / Bc, ki = c % Bc;
@@ -14195,7 +14383,7 @@ pub(crate) fn msl_source() -> String {
         .replace(
             "// @@RLX_SDPA_DECODE_M1@@",
             &format!(
-                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 SDPA_PREFILL_HD256,
                 sdpa_decode_m1_variant!("sdpa_decode_m1", "float"),
                 sdpa_decode_m1_variant!("sdpa_decode_m1_f16kv", "half"),
@@ -14253,6 +14441,12 @@ pub(crate) fn msl_source() -> String {
                 SDPA_PREFILL_FA2_TMPL
                     .replace("__NAME__", "sdpa_prefill_fa2_d64")
                     .replace("__D__", "64"),
+                SDPA_PREFILL_FA3_D64_TMPL
+                    .replace("__NAME__", "sdpa_prefill_fa3_d64")
+                    .replace("__BQ__", "32"),
+                SDPA_PREFILL_FA3_D64_TMPL
+                    .replace("__NAME__", "sdpa_prefill_fa3_d64_q64")
+                    .replace("__BQ__", "64"),
                 kv_quant_i8_variant!("kv_quant_i8", "float"),
                 kv_quant_i8_variant!("kv_quant_i8_f16", "half"),
                 SDPA_DECODE_M1_PARTIAL_W8A8,
@@ -14436,6 +14630,8 @@ pub struct Kernels {
     pub sdpa_prefill_fa_mma: ComputePipelineState,
     pub sdpa_prefill_fa2_d128: ComputePipelineState,
     pub sdpa_prefill_fa2_d64: ComputePipelineState,
+    pub sdpa_prefill_fa3_d64: ComputePipelineState,
+    pub sdpa_prefill_fa3_d64_q64: ComputePipelineState,
     pub sdpa_fa_f32: ComputePipelineState,
     pub sdpa_splitk: ComputePipelineState,
     pub sdpa_fa2: ComputePipelineState,
@@ -15237,6 +15433,8 @@ impl Kernels {
             sdpa_prefill_fa_mma: pipeline("sdpa_prefill_fa_mma"),
             sdpa_prefill_fa2_d128: pipeline("sdpa_prefill_fa2_d128"),
             sdpa_prefill_fa2_d64: pipeline("sdpa_prefill_fa2_d64"),
+            sdpa_prefill_fa3_d64: pipeline("sdpa_prefill_fa3_d64"),
+            sdpa_prefill_fa3_d64_q64: pipeline("sdpa_prefill_fa3_d64_q64"),
             sdpa_fa_f32: pipeline("sdpa_fa_f32"),
             sdpa_splitk: pipeline("sdpa_splitk"),
             sdpa_fa2: pipeline("sdpa_fa2"),

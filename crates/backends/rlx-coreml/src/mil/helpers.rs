@@ -544,6 +544,45 @@ fn tensor_type_dt(dims: &[usize], dt: proto::DataType) -> proto::TensorType {
 /// LSB-first). `dims` is the LOGICAL (unpacked) shape; `packed` is
 /// `ceil(num_elems / 8)` bytes. Feeds `constexpr_lut_to_dense` palettization
 /// indices — the Q1_0 no-unfold path (keeps 1-bit storage, ~n·k/8 bytes).
+/// An int8 blob `const` of shape `dims`.
+pub(super) fn make_const_i8(
+    blob: &mut crate::mlpackage::BlobWriter,
+    out_name: &str,
+    dims: &[usize],
+    data: &[i8],
+) -> Result<proto::Operation> {
+    let offset = blob.write_i8(data);
+    let vt = proto::ValueType {
+        r#type: Some(proto::value_type::Type::TensorType(tensor_type_dt(
+            dims,
+            proto::DataType::Int8,
+        ))),
+    };
+    let val = proto::Value {
+        doc_string: String::new(),
+        r#type: Some(vt.clone()),
+        value: Some(proto::value::Value::BlobFileValue(
+            proto::value::BlobFileValue {
+                file_name: "@model_path/weights/weight.bin".to_string(),
+                offset,
+            },
+        )),
+    };
+    let mut attributes = BTreeMap::new();
+    attributes.insert("name".to_string(), scalar_str(out_name));
+    attributes.insert("val".to_string(), val);
+    Ok(proto::Operation {
+        r#type: "const".to_string(),
+        inputs: BTreeMap::new(),
+        outputs: vec![proto::NamedValueType {
+            name: out_name.to_string(),
+            r#type: Some(vt),
+        }],
+        blocks: vec![],
+        attributes,
+    })
+}
+
 pub(super) fn make_const_u1_packed(
     blob: &mut crate::mlpackage::BlobWriter,
     out_name: &str,

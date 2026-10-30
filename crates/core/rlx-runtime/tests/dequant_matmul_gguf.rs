@@ -389,6 +389,7 @@ fn run_gguf_gemv_on(device: Device, scheme: QuantScheme, k: usize, n: usize) {
 
 /// `x` (`[m, k]`, row-major) through the packed weight on `device`, checked
 /// against the rlx-gguf dequant; returns the device's `[m, n]`.
+#[cfg(any(feature = "gpu", feature = "cuda", feature = "rocm"))]
 fn run_gguf_gemv_x(device: Device, scheme: QuantScheme, k: usize, n: usize, x: &[f32]) -> Vec<f32> {
     use half::f16;
     assert_eq!(k % QK_K, 0, "k must be a multiple of {QK_K}");

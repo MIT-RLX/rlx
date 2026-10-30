@@ -45,7 +45,11 @@ impl Backend for CoremlBackend {
         let (graph, mut lower_opts) = match options.policy.clone() {
             Some(policy) => {
                 use rlx_opt::pass::Pass as _;
-                let g = rlx_opt::AutoMixedPrecision::new(policy).run(graph);
+                // MIL attention is generic ops, which run in f16 (and on
+                // the Neural Engine), so attention follows the policy here.
+                let g = rlx_opt::AutoMixedPrecision::new(policy)
+                    .with_f16_attention(true)
+                    .run(graph);
                 let opts = default_lower_options(&g);
                 (g, opts)
             }

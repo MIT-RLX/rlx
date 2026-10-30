@@ -312,6 +312,11 @@ int rlx_coreml_compute_plan(RlxCoremlModel *handle, int *counts, char *err,
           per[key] = @(per[key].intValue + 1);
           MLComputePlanCost *c = [plan estimatedCostOfMLProgramOperation:op];
           if (c) cost[d] += c.weight;
+          if (d == 0 && getenv("RLX_COREML_PLAN_CPU_NAMES")) {
+            NSString *out = op.outputs.count ? op.outputs[0].name : @"?";
+            fprintf(stderr, "[coreml-plan] cpu op %s -> %s (cost %.4f)\n",
+                    op.operatorName.UTF8String, out.UTF8String, c ? c.weight : -1.0);
+          }
         }
       }
       if (dump) {

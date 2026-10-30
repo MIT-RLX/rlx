@@ -206,6 +206,18 @@ fn demote_unsupported_floats(graph: &mut Graph) {
 fn demote_float_to_f16(graph: &mut Graph) {
     for node in graph.nodes_mut() {
         if node.shape.dtype() == DType::F32 {
+            // Baked f32 tensors must be converted, not just relabelled: the
+            // lowering reads the bytes at the new dtype, and twice as many bytes
+            // as elements failed with "shape wants N elems, got 2N" (any graph
+            // with a constant matrix — DFT, STFT window, filter taps — in f16 mode).
+            if let Op::Constant { data } = &mut node.op {
+                *data = data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|c| half::f16::from_f32(f32::from_le_bytes(*c)).to_le_bytes())
+                    .collect();
+            }
             node.shape = node.shape.clone().with_dtype(DType::F16);
         }
         if let Op::Cast { to } = &mut node.op {
@@ -300,6 +312,9 @@ pub fn default_compute_units(graph: &Graph) -> ComputeUnits {
         // runtime loss. (A size-based CpuAndGpu carve-out for large-batch nets
         // was tried but gave no stable win — the GPU-compile-vs-matmul tradeoff
         // is noise-dominated for these graphs.) `RLX_COREML_UNITS` overrides.
+        // FFTs are the only host ops and fit the DFT island: run them on the
+        // Neural Engine rather than splitting the graph and staying on CPU.
+        _ if crate::fft_lower::only_offloadable_host_ops(graph) => ComputeUnits::CpuAndNeuralEngine,
         _ if graph_has_host_split(graph) => ComputeUnits::CpuOnly,
         // fp32 inference + training: CPU+GPU. Avoids Neural-Engine BNNS crashes
         // on large ML Programs; matches the precision path documented above.
@@ -376,6 +391,16 @@ impl CoremlExecutable {
         graph = crate::hybrid::hoist_transpose_out_of_reduce(graph);
         // BNNS segfaults on a conv-fused, elementwise eval BatchNorm (see the pass).
         graph = crate::hybrid::recip_bn_div_after_conv(graph);
+        // FFT → f16 1×1-conv DFT island when the Neural Engine is allowed (it
+        // runs there), else stays a host FFT (faster on CPU/GPU). Before the
+        // C64 promotion: only F32 2N-block FFTs are rewritten. See fft_lower.
+        let fft_form = crate::fft_lower::form_for(compute_units);
+        if fft_form == crate::fft_lower::FftForm::ConvF16 && crate::fft_lower::fft_only(&graph) {
+            // An all-f16 model is what CoreML places on the Neural Engine; an
+            // f16 island inside f32 I/O stays on the CPU (measured).
+            lower_opts.float_dtype = DType::F16;
+        }
+        graph = crate::fft_lower::lower(graph, fft_form);
         promote_int_to_f32(&mut graph);
         // C64 → interleaved F32 before hybrid plan (MIL has no complex dtype).
         promote_c64_to_interleaved_f32(&mut graph);

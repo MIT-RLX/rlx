@@ -480,8 +480,50 @@ impl<'a> LowerCtx<'a> {
                     } else {
                         self.opts.float_dtype
                     };
-                    let op = make_const_float(&mut self.blob, &out_name, &shape, data, fdt)?;
-                    self.operations.push(op);
+                    // RLX_COREML_W8=1: store 2-D f16 weights as int8 with one f16
+                    // scale per row (symmetric), dequantized by CoreML at load
+                    // (`constexpr_blockwise_shift_scale`, iOS 18).
+                    let w8 = half_only
+                        && node.shape.rank() == 2
+                        && rlx_ir::env::var("RLX_COREML_W8").as_deref() == Some("1");
+                    if w8 {
+                        let d0 = dim_static(&node.shape, 0)?;
+                        let d1 = dim_static(&node.shape, 1)?;
+                        let mut q = vec![0i8; d0 * d1];
+                        let mut sc = vec![0f32; d0];
+                        for r in 0..d0 {
+                            let row = &data[r * d1..(r + 1) * d1];
+                            let amax = row.iter().fold(0f32, |m, &v| m.max(v.abs()));
+                            // The f16 scale is what CoreML multiplies by: quantize with it.
+                            let s =
+                                half::f16::from_f32(if amax > 0.0 { amax / 127.0 } else { 1.0 })
+                                    .to_f32();
+                            sc[r] = s;
+                            for (o, &v) in q[r * d1..(r + 1) * d1].iter_mut().zip(row) {
+                                *o = (v / s).round().clamp(-127.0, 127.0) as i8;
+                            }
+                        }
+                        let qn = format!("{out_name}_q8");
+                        self.operations
+                            .push(make_const_i8(&mut self.blob, &qn, &[d0, d1], &q)?);
+                        let sn = format!("{out_name}_s8");
+                        self.operations.push(make_const_float(
+                            &mut self.blob,
+                            &sn,
+                            &Shape::new(&[d0, 1], DType::F16),
+                            &sc,
+                            DType::F16,
+                        )?);
+                        self.emit(
+                            "constexpr_blockwise_shift_scale",
+                            &out_name,
+                            &shape,
+                            vec![("data", bind_name(&qn)), ("scale", bind_name(&sn))],
+                        )?;
+                    } else {
+                        let op = make_const_float(&mut self.blob, &out_name, &shape, data, fdt)?;
+                        self.operations.push(op);
+                    }
                     if half_only {
                         self.half_params.insert(id.0);
                     }
@@ -536,8 +578,11 @@ impl<'a> LowerCtx<'a> {
                 // declare the const as F32 so downstream f32 ops accept it. Bool
                 // constants stay bool (make_const bakes them as inline bool immediates
                 // for `select` conds).
+                // F16 constants stay F16 (`make_const` writes f16 storage): an f16
+                // graph declares its inputs f16, so an f32-retyped constant made
+                // e.g. `matmul(x: f16, W: f32)` and CoreML refused to load the model.
                 let cshape = match node.shape.dtype() {
-                    DType::Bool | DType::F32 => node.shape.clone(),
+                    DType::Bool | DType::F32 | DType::F16 => node.shape.clone(),
                     _ => node.shape.clone().with_dtype(DType::F32),
                 };
                 let op = make_const(&mut self.blob, &out_name, &cshape, &floats)?;
@@ -1956,10 +2001,12 @@ impl<'a> LowerCtx<'a> {
         // models at specification version ≥ 9 (iOS 18 / macOS 15). Ordinary
         // graphs stay at CoreML6 so existing behavior is unchanged.
         let needs_ios18 = self.inputs.is_empty()
-            || self
-                .operations
-                .iter()
-                .any(|op| op.r#type == "constexpr_lut_to_dense");
+            || self.operations.iter().any(|op| {
+                matches!(
+                    op.r#type.as_str(),
+                    "constexpr_lut_to_dense" | "constexpr_blockwise_shift_scale"
+                )
+            });
         let (opset, spec_version) = if needs_ios18 {
             (OPSET_IOS18, SPEC_VERSION_IOS18)
         } else {
@@ -1984,8 +2031,11 @@ impl<'a> LowerCtx<'a> {
         // constants, ...) are still f32 immediates, and MIL rejects an op whose
         // operands differ in dtype ("tensors parameter x[0], parameter y[0]
         // ... must have the same data type").
-        if self.opts.float_dtype == DType::F16 {
-            for op in self.operations.iter_mut() {
+        // Under a mixed-precision policy the same holds per op: an op whose
+        // output is f16 takes f16 scalars.
+        let all_f16 = self.opts.float_dtype == DType::F16;
+        for op in self.operations.iter_mut() {
+            if all_f16 || outputs_f16(op) {
                 f16_scalar_immediates(op);
             }
         }
@@ -2140,6 +2190,17 @@ mod narrow_fold_tests {
         g.set_outputs(vec![out]);
         assert!(narrow_nodes_miscompiled_through_elementwise(&g).is_empty());
     }
+}
+
+/// True if any output of `op` is declared as an f16 tensor.
+fn outputs_f16(op: &proto::Operation) -> bool {
+    use proto::value_type::Type;
+    op.outputs.iter().any(|o| {
+        matches!(
+            o.r#type.as_ref().and_then(|t| t.r#type.as_ref()),
+            Some(Type::TensorType(t)) if t.data_type == proto::DataType::Float16 as i32
+        )
+    })
 }
 
 /// Rewrite the rank-0 f32 immediates bound to `op`'s inputs (and to the ops of

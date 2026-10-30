@@ -355,11 +355,25 @@ impl PrecisionPolicy {
 /// shape dtype. Backends dispatch kernels per-node.
 pub struct AutoMixedPrecision {
     pub policy: PrecisionPolicy,
+    /// Let `Op::Attention` / `Op::AttentionBackward` take the policy's
+    /// precision instead of staying F32. Off by default because Metal has no
+    /// f16 attention kernel; CoreML lowers attention to generic MIL ops that
+    /// run in f16, which is what puts it on the Neural Engine.
+    pub f16_attention: bool,
 }
 
 impl AutoMixedPrecision {
     pub fn new(policy: PrecisionPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            f16_attention: false,
+        }
+    }
+
+    /// See [`Self::f16_attention`].
+    pub fn with_f16_attention(mut self, on: bool) -> Self {
+        self.f16_attention = on;
+        self
     }
 }
 
@@ -450,7 +464,7 @@ impl Pass for AutoMixedPrecision {
                 | Op::LayerNorm2d { .. }
                 | Op::LayerNormBackwardInput { .. }
                 | Op::LayerNormBackwardGamma { .. }
-                | Op::GroupNorm { .. }
+                | Op::GroupNorm { .. } => true,
                 // `Op::Attention` and its backward. Metal dispatches the SAME
                 // f32 sdpa kernel regardless of the node's dtype — the `dt`
                 // flag does not select an f16 variant because none exists — so
@@ -461,9 +475,8 @@ impl Pass for AutoMixedPrecision {
                 // scale of one op. `FusedAttentionBlock` was already listed; the
                 // unfused op was not. Guarded by
                 // `rlx-metal/tests/precision_policy_f16_attention.rs`.
-                | Op::Attention { .. }
-                | Op::AttentionBackward { .. }
-                | Op::FusedAttentionBlock { .. }
+                Op::Attention { .. } | Op::AttentionBackward { .. } => !self.f16_attention,
+                Op::FusedAttentionBlock { .. }
                 | Op::TopK { .. }
                 | Op::ScatterAdd { .. }
                 | Op::ScatterNd { .. }

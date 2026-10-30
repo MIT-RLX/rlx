@@ -372,6 +372,44 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ### Fixed
 
+- Metal: `sdpa_prefill_fa3_d64` (opt-in, `RLX_METAL_PREFILL_FA3=1`, or
+  `=64` for 64 query rows per threadgroup) is the head_dim-64 FA2 prefill
+  kernel reworked:
+  - separate K and V tiles, so a key step needs two threadgroup barriers
+    instead of four;
+  - simdgroup barriers around the per-simdgroup softmax;
+  - Q pre-scaled by `scale * log2(e)`, with an `exp2` softmax;
+  - the key-padding mask read once per key instead of once per row;
+  - with `=64`, half the K/V traffic.
+  At V-JEPA2 ViT-g's shape (22 heads, 8192 tokens, head_dim 64), it is
+  15% (32 rows) and 26% (64 rows) faster per call than FA2, measured in both
+  orders. The output is within 9.6e-8 of FA2's. On a full ViT-g clip with
+  `metal:f16`, the end-to-end change was within run-to-run noise, so it stays
+  opt-in. Tests: `tests/metal_prefill_fa3_parity.rs` covers every mask kind,
+  both layouts, GQA, cross lengths, ragged tails, batch 2 and softcap against
+  the CPU, and asserts that the switch changes the output.
+  `RLX_METAL_ATTN_TRACE=1` now prints the kernel `encode_sdpa` picked. The
+  thunk-level `PATH=non-flash (base atomic sdpa_decode_m1)` line also prints
+  for prefill, which the FA2 kernel serves.
+- CoreML: under a mixed-precision policy the Neural Engine took no ops of a
+  ViT block; with `AlwaysF16` it now takes all of them. Four fixes:
+  - `AutoMixedPrecision::with_f16_attention(true)`, which the CoreML
+    backend sets, lets `Op::Attention` follow the policy. It stays pinned to
+    f32 by default, because Metal has no f16 attention kernel.
+  - The attention lowering declares its transposes, reshapes and scores in
+    the operands' dtype; they were hardcoded to f32.
+  - The Custom-mask bias is built in the mask's dtype, and in f16 it uses a
+    scale of 3e4 instead of 1e9. In f16, 1e9 is inf, so every kept key would
+    have computed 0 * inf = NaN.
+  - f32 scalar operands are converted to f16 for every op whose output is
+    f16, not only in blanket f16 mode.
+  `RLX_COREML_PLAN=1` prints MLComputePlan's placement after each load.
+  `RLX_COREML_PLAN_OPS=1` adds a per-operator breakdown with cost shares,
+  and `RLX_COREML_PLAN_CPU_NAMES=1` names each op placed on the CPU.
+- CoreML: `RLX_COREML_W8=1` (opt-in, lossy) stores 2-D f16 weights as int8
+  with a per-row f16 scale (`constexpr_blockwise_shift_scale`, which moves
+  the model to the iOS 18 opset). On V-JEPA2 ViT-g it was slower on both the
+  GPU (178-183 ms against 145-150 ms per block) and the Neural Engine.
 - CoreML: the compiled-model cache (`$TMPDIR/rlx-coreml-cache`) never hit.
   It is keyed by a hash of the serialised model, and prost encoded the
   protobuf map fields in `HashMap` order, which differs per process. So every
