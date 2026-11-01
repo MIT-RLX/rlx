@@ -34,6 +34,7 @@ mod prelude {
     pub use alloc::vec::Vec;
 }
 
+pub mod board;
 pub mod codegen;
 pub mod estimate;
 // Graph import/export needs `std` (files, hash maps, rlx-ir's full surface).
@@ -43,6 +44,7 @@ pub mod export_config;
 #[cfg(feature = "std")]
 pub mod from_graph;
 pub mod ir;
+pub mod lattice;
 #[cfg(feature = "std")]
 pub mod legalize;
 pub mod model;

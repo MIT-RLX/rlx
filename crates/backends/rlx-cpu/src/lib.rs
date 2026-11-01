@@ -14,6 +14,7 @@ pub mod arena;
 pub mod asm_check;
 pub mod attention_bwd;
 pub mod autotune;
+mod avx2_mirror;
 pub mod blas;
 /// Accurate vectorized f32 exp / log / tanh (the `rlx-fastmath` crate).
 pub use rlx_fastmath as fastmath;
@@ -71,3 +72,5 @@ pub mod tile;
 pub mod training_bwd;
 pub mod umap_knn;
 pub mod vmath;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod wasm_gemm;

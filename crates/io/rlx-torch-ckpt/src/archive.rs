@@ -12,7 +12,10 @@
 //!
 //! Both operate directly on a [`std::fs::File`] with `seek`/`read` so we
 //! never have to slurp a multi-gigabyte checkpoint into RAM; callers pull
-//! out only the few members / tensor storages they actually need.
+//! out only the few members / tensor storages they actually need. The ZIP
+//! readers take any `Read + Seek`, so a checkpoint already in memory (a
+//! `Cursor` over bytes fetched in a browser, where there is no file system)
+//! goes through the same code.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -153,13 +156,18 @@ fn parse_pax_path(buf: &[u8]) -> Option<String> {
 /// corrupt or hostile container header can otherwise declare a huge size and
 /// force a multi-GB speculative allocation before the (absent) backing bytes
 /// are ever read — a cheap denial-of-service.
-fn read_exact_bounded(file: &mut File, len: u64, avail: u64, what: &str) -> Result<Vec<u8>> {
+fn read_exact_bounded<R: Read>(file: &mut R, len: u64, avail: u64, what: &str) -> Result<Vec<u8>> {
     if len > avail {
         bail!("{what}: declared length {len} exceeds {avail} available byte(s)");
     }
     let mut buf = vec![0u8; len as usize];
     file.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+/// A reader's total length (a file's size, a cursor's buffer).
+fn stream_len<R: Seek>(r: &mut R) -> Result<u64> {
+    Ok(r.seek(SeekFrom::End(0))?)
 }
 
 /// List every regular-file member of an uncompressed tar archive.
@@ -248,7 +256,7 @@ pub fn read_member(file: &mut File, m: &TarMember) -> Result<Vec<u8>> {
     // `m.size`/`m.offset` come from the untrusted tar header; bound the read
     // to the bytes actually present so a bogus size can't trigger a giant
     // up-front allocation.
-    let total = file.metadata()?.len();
+    let total = stream_len(file)?;
     let avail = total
         .checked_sub(m.offset)
         .ok_or_else(|| anyhow!("tar member {} starts past EOF", m.name))?;
@@ -276,7 +284,11 @@ const CDH_SIG: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
 /// List the entries of a zip archive embedded in `file` at absolute byte
 /// range `[zip_start, zip_start + zip_size)`. Parses the central
 /// directory; offsets are resolved to absolute file positions.
-pub fn list_zip(file: &mut File, zip_start: u64, zip_size: u64) -> Result<Vec<ZipEntry>> {
+pub fn list_zip<R: Read + Seek>(
+    file: &mut R,
+    zip_start: u64,
+    zip_size: u64,
+) -> Result<Vec<ZipEntry>> {
     if zip_size < 22 {
         bail!("zip region too small ({zip_size} bytes)");
     }
@@ -284,7 +296,7 @@ pub fn list_zip(file: &mut File, zip_start: u64, zip_size: u64) -> Result<Vec<Zi
     // outer tar header). Reject a region that runs past EOF up front: this
     // both avoids u64 overflow in the offset math below and keeps every
     // subsequent length (tail scan, central directory) bounded by real bytes.
-    let file_len = file.metadata()?.len();
+    let file_len = stream_len(file)?;
     let zip_end = zip_start
         .checked_add(zip_size)
         .ok_or_else(|| anyhow!("zip: region offset overflow"))?;
@@ -371,7 +383,7 @@ pub fn list_zip(file: &mut File, zip_start: u64, zip_size: u64) -> Result<Vec<Zi
 }
 
 /// Read a STORED zip entry's raw bytes.
-pub fn read_zip_entry(file: &mut File, entry: &ZipEntry) -> Result<Vec<u8>> {
+pub fn read_zip_entry<R: Read + Seek>(file: &mut R, entry: &ZipEntry) -> Result<Vec<u8>> {
     if entry.method != 0 {
         bail!(
             "zip entry {} uses compression method {} (only STORED/0 is supported; \
@@ -382,7 +394,7 @@ pub fn read_zip_entry(file: &mut File, entry: &ZipEntry) -> Result<Vec<u8>> {
     }
     // `entry.size` is the central-directory-declared length (untrusted);
     // bound it to the bytes actually present before allocating.
-    let total = file.metadata()?.len();
+    let total = stream_len(file)?;
     let avail = total
         .checked_sub(entry.data_offset)
         .ok_or_else(|| anyhow!("zip entry {} starts past EOF", entry.name))?;

@@ -46,10 +46,23 @@ export_graph(&graph, &FpgaExportConfig::default(), "hw/out")?;
 | `HwTarget` | RTL | Sidecars |
 |------------|-----|----------|
 | `Generic` (default) | soft ports | `synth.sh` (Yosys generic), `EXPORT.md` |
-| `Ecp5` | same RTL | + `constraints.lpf` stub, ecp5 P&R script |
-| `Ice40` | same RTL | + `constraints.pcf` stub |
+| `Ecp5` (part only) | same RTL | + `constraints.lpf` stub, ecp5 P&R script |
+| `Ice40` (part only) | same RTL | + `constraints.pcf` stub |
+| `Lattice` board (`lattice:icebreaker`, `lattice:ulx3s-85f`, …) | + UART host-link `board_top` (+ ECP5 PLL) | real PCF/LPF, IceStorm / Trellis `synth.sh` → `out.bin` / `out.bit`, `program.sh`, `run_uart.py` |
 | `Xilinx7` (part only) | same RTL | + `constraints.xdc` stub; openXC7 synth |
 | `Xilinx7` + board (`xc7:arty-a7-35`, `basys3`, …) | + UART host-link `board_top` | real XDC, openXC7 `synth.sh` → `out.bit`, `program.sh`, `run_uart.py` |
+
+Lattice boards, measured with the generated scripts in the `hdlc/impl`
+containers (`tests/lattice_docker.rs`), on the MNIST TinyConv demo:
+
+| board | device | logic | block RAM | DSP | fmax / design clock |
+|---|---|---|---|---|---|
+| iCEBreaker | iCE40UP5K | 41% | 26 / 30 | 7 / 8 | 16 MHz / 12 MHz |
+| ULX3S | LFE5U-85F | 2% | 7 DP16KD | 14 MULT18X18D | 22.6 MHz / 12.5 MHz (PLL) |
+
+ULX3S designs run at 12.5 MHz from the ECP5 PLL. At the 25 MHz oscillator
+the shared Q0.31 requantize misses timing by about 2 ns: four chained
+`MULT18X18D`s and a carry chain in one cycle.
 
 Ternary (BitNet b1.58) weights + QAT → FPGA: [docs/bitnet-fpga.md](../../../docs/bitnet-fpga.md).
 

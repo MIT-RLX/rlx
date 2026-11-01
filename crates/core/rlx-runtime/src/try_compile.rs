@@ -165,10 +165,19 @@ impl Session {
                 name: node.name.clone(),
             });
         }
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        // Quiet the hook while a backend's panic becomes an error — but only
+        // where it can: with `panic = "abort"` (the browser builds) nothing is
+        // caught, and a silenced hook left a bare wasm trap ("unreachable")
+        // or a native abort with no word of what went wrong.
+        let quiet = cfg!(panic = "unwind");
+        let prev = quiet.then(std::panic::take_hook);
+        if quiet {
+            std::panic::set_hook(Box::new(|_| {}));
+        }
         let r = catch_unwind(AssertUnwindSafe(|| self.compile_with(graph, options)));
-        std::panic::set_hook(prev);
+        if let Some(prev) = prev {
+            std::panic::set_hook(prev);
+        }
         r.map_err(|p| {
             CompileError::Backend(
                 p.downcast_ref::<String>()

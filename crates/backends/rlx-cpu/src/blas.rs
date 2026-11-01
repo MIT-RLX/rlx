@@ -288,6 +288,47 @@ unsafe fn cblas_sgemm(
         return;
     }
 
+    // wasm with simd128: the register-tiled kernel, bit-identical to the
+    // loops in `sgemm_loops`.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        unsafe {
+            crate::wasm_gemm::sgemm(
+                m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
+            )
+        };
+        return;
+    }
+    #[allow(unreachable_code)]
+    unsafe {
+        sgemm_loops(
+            m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
+        )
+    };
+}
+
+/// The portable loops behind the `cblas_sgemm` fallback (and the reference
+/// the wasm kernel is tested against).
+///
+/// # Safety
+/// Same contract as `cblas_sgemm`: the pointers cover the strided extents.
+#[cfg(not(rlx_cpu_blas))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn sgemm_loops(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: *const f32,
+    lda: usize,
+    trans_a: bool,
+    b: *const f32,
+    ldb: usize,
+    trans_b: bool,
+    beta: f32,
+    c: *mut f32,
+    ldc: usize,
+) {
     // Fast path: the common NoTrans×NoTrans case, reordered i→p→j so the
     // inner j-loop is unit-stride in both B and C. The compiler
     // auto-vectorizes it (NEON / AVX) and it stays cache-resident — several×

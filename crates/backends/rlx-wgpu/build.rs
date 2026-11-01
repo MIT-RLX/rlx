@@ -75,6 +75,32 @@ fn main() {
     )
     .expect("write $OUT_DIR/compare.wgsl");
 
+    // conv3d and group-norm kernels: the store applies an optional folded activation with
+    // the same generated math as the unary kernel.
+    for k in ["conv3d", "conv3d_ctile", "group_norm"] {
+        let src = fs::read_to_string(format!("src/kernels/{k}.wgsl"))
+            .unwrap_or_else(|e| panic!("read src/kernels/{k}.wgsl: {e}"));
+        // The output goes through `put` / `got`: into the arena binding, or
+        // (`{k}_split.wgsl`) into binding 2, the output's own window — for an
+        // arena striped past one storage binding, where input and output sit
+        // in different stripes (`Conv3dParams::split`, `GroupNormParams::split`).
+        let one =
+            "fn put(i: u32, v: f32) { arena[i] = v; }\nfn got(i: u32) -> f32 { return arena[i]; }";
+        let split = "@group(0) @binding(2) var<storage, read_write> dst: array<f32>;\n\
+                     fn put(i: u32, v: f32) { dst[i] = v; }\nfn got(i: u32) -> f32 { return dst[i]; }";
+        for (name, io) in [(k.to_string(), one), (format!("{k}_split"), split)] {
+            if name.ends_with("_split") && k == "conv3d" {
+                continue;
+            }
+            fs::write(
+                Path::new(&out_dir).join(format!("{name}.wgsl")),
+                format!("{helpers}\n{activation}\n{io}\n{src}"),
+            )
+            .unwrap_or_else(|e| panic!("write $OUT_DIR/{name}.wgsl: {e}"));
+        }
+        println!("cargo:rerun-if-changed=src/kernels/{k}.wgsl");
+    }
+
     println!("cargo:rerun-if-changed=src/kernels/unary_main.wgsl");
     println!("cargo:rerun-if-changed=src/kernels/activation_backward_main.wgsl");
     println!("cargo:rerun-if-changed=src/kernels/binary_main.wgsl");

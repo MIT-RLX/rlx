@@ -149,25 +149,26 @@ fn whole_arena_host_ok(arena: &crate::buffer::Arena, node: &rlx_ir::Node) -> boo
 /// See the guard at the top of the node loop. `ConvTranspose2d`/`3d` check
 /// [`whole_arena_host_ok`] in their own arms.
 fn lowers_to_u32_offset_host_step(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Fft { .. }
-            | Op::FftQ { .. }
-            | Op::WelchPeaks { .. }
-            | Op::LogMel
-            | Op::LogMelBackward
-            | Op::Im2Col { .. }
-            | Op::RngNormal { .. }
-            | Op::RngUniform { .. }
-            | Op::Lstm { .. }
-            | Op::GroupNorm { .. }
-            | Op::LayerNorm2d { .. }
-            | Op::ResizeNearest2x
-            | Op::Reverse { .. }
-            | Op::ArgMax { .. }
-            | Op::ArgMin { .. }
-            | Op::AxialRope2d { .. }
-    )
+    crate::unfuse::group_norm_act(op).is_some()
+        || matches!(
+            op,
+            Op::Fft { .. }
+                | Op::FftQ { .. }
+                | Op::WelchPeaks { .. }
+                | Op::LogMel
+                | Op::LogMelBackward
+                | Op::Im2Col { .. }
+                | Op::RngNormal { .. }
+                | Op::RngUniform { .. }
+                | Op::Lstm { .. }
+                | Op::GroupNorm { .. }
+                | Op::LayerNorm2d { .. }
+                | Op::ResizeNearest2x
+                | Op::Reverse { .. }
+                | Op::ArgMax { .. }
+                | Op::ArgMin { .. }
+                | Op::AxialRope2d { .. }
+        )
 }
 
 /// Ops whose GPU lowering binds the output's arena window
@@ -473,6 +474,42 @@ fn op_straddles_shards(arena: &crate::buffer::Arena, node: &rlx_ir::Node, graph:
     true
 }
 
+/// Whether `node` runs on the GPU with its input and output in separate
+/// windows ([`crate::kernels::two_window_kernel`]) on a striped arena: an
+/// ungrouped conv3d (plain, folded, LeakyReLU, or the argmax head) or a group
+/// norm. Each tensor lies inside one stripe; an op whose input and output do
+/// not share one used to run on the host — every layer of MindGrab under a
+/// 1 GiB binding. `RLX_WGPU_NO_TWO_WINDOW` turns it off.
+fn two_window_ok(arena: &crate::buffer::Arena, node: &rlx_ir::Node, graph: &Graph) -> bool {
+    if !arena.is_sharded() || rlx_ir::env::flag("RLX_WGPU_NO_TWO_WINDOW") {
+        return false;
+    }
+    // the weights are staged into the input stripe's reserve: there must be
+    // a stripe beyond it (a reserve as large as the stripe overlaps the
+    // tensors — 3% of labels wrong in `folds_on_striped_arena`)
+    if crate::buffer::shard_stage_reserve() >= arena.shard_size {
+        return false;
+    }
+    let conv = crate::unfuse::conv3d_geometry(&node.op).is_some_and(|g| g.3 <= 1)
+        && node.inputs.len() >= 2;
+    let norm = crate::unfuse::group_norm_act(&node.op).is_some();
+    // each activation operand inside one stripe
+    let one_stripe = |id: NodeId| {
+        let o = arena.offset(id);
+        crate::buffer::is_weight_off(o)
+            || arena
+                .straddles_shards(&[(o, 1), (o + arena.len_of(id).max(1) - 1, 1)])
+                .is_none()
+    };
+    let f32 = |id: NodeId| {
+        graph.node(id).shape.dtype() == rlx_ir::DType::F32 || crate::unfuse::is_half(graph.node(id))
+    };
+    (conv || norm)
+        && f32(node.id)
+        && one_stripe(node.id)
+        && node.inputs.iter().all(|&i| f32(i) && one_stripe(i))
+}
+
 fn should_pack_host_op(
     arena: &crate::buffer::Arena,
     op: &Op,
@@ -525,7 +562,10 @@ fn should_pack_host_op(
     // "return zeros". So the straddle test runs BEFORE that opt-out and hosting
     // wins — the host path reads whole tensors and is stripe-agnostic, so the
     // answer is right and only this one op pays.
-    if arena.is_sharded() && op_straddles_shards(arena, node, graph) {
+    if arena.is_sharded()
+        && !two_window_ok(arena, node, graph)
+        && op_straddles_shards(arena, node, graph)
+    {
         return true;
     }
     if rlx_ir::env::flag("RLX_WGPU_SHARD_GPU") {
@@ -563,6 +603,19 @@ fn should_pack_host_op(
     false
 }
 
+/// Workgroups per group for the native group norm: one per 16 Ki elements,
+/// at most 256 (one partial per thread when they are combined). A norm whose
+/// output overlaps its input keeps one: the split kernels park partials in
+/// the output before the input is read in full.
+/// `RLX_WGPU_GROUP_NORM_ONE_WG=1` keeps one everywhere.
+fn group_norm_chunks(span: u32, in_byte: usize, out_byte: usize, out_bytes: usize) -> u32 {
+    let overlap = in_byte < out_byte + out_bytes && out_byte < in_byte + out_bytes;
+    if overlap || rlx_ir::env::flag("RLX_WGPU_GROUP_NORM_ONE_WG") {
+        return 1;
+    }
+    span.div_ceil(16 << 10).clamp(1, 256)
+}
+
 /// Whether `Op::GroupNorm` must fall back to the whole-arena host step.
 ///
 /// Mirrors the LayerNorm/RmsNorm policy in [`wgpu_prefer_host_fallback`]:
@@ -581,9 +634,76 @@ fn wgpu_prefer_conv_host(arena: &crate::buffer::Arena) -> bool {
     wgpu_prefer_structure_host(arena) || rlx_ir::env::flag("RLX_WGPU_CONV_HOST")
 }
 
+thread_local! {
+    /// Set when a node only the GPU kernels run ([`crate::unfuse::is_folded`])
+    /// was about to be replayed on the host.
+    static FOLDED_HOSTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A packed host replay of `node`. A folded node would replay wrong, so it
+/// marks the compile for a retry without the folds.
+fn host_op_step(graph: &Graph, node: &rlx_ir::Node, arena: &crate::buffer::Arena) -> Step {
+    note_host_reads(graph, node);
+    Step::HostOp {
+        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
+    }
+}
+
+/// A node about to run on the host: if the GPU kernels alone know its form
+/// (a fold) or its storage (a packed half tensor, in or out), `compile`
+/// starts again without the folds and packing.
+fn note_host_reads(graph: &Graph, node: &rlx_ir::Node) {
+    let half = crate::unfuse::is_half(node)
+        || node
+            .inputs
+            .iter()
+            .any(|&i| crate::unfuse::is_half(graph.node(i)));
+    if half {
+        if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+            eprintln!(
+                "[rlx-wgpu] half-packed {:?} node {} would host",
+                node.op.kind(),
+                node.id.0
+            );
+        }
+        FOLDED_HOSTED.with(|f| f.set(true));
+    }
+    if crate::unfuse::is_folded(node) {
+        if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+            eprintln!(
+                "[rlx-wgpu] folded {:?} node {} would host",
+                node.op.kind(),
+                node.id.0
+            );
+        }
+        FOLDED_HOSTED.with(|f| f.set(true));
+    }
+}
+
 pub(crate) fn compile_static_inner(
     graph: Graph,
     rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+) -> crate::backend::WgpuExecutable {
+    // The activation folds are GPU-kernel forms. Where a folded node would
+    // leave the GPU (a striped arena hosts ops whose operands span stripes),
+    // compile again without them: the host replays the plain ops correctly,
+    // and that op is slow either way.
+    FOLDED_HOSTED.with(|f| f.set(false));
+    let exe = compile_static_with(graph.clone(), rng.clone(), true);
+    if !FOLDED_HOSTED.with(|f| f.replace(false)) {
+        return exe;
+    }
+    if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+        eprintln!("[rlx-wgpu] a folded activation would run on the host: compiling without folds");
+    }
+    drop(exe);
+    compile_static_with(graph, rng, false)
+}
+
+fn compile_static_with(
+    graph: Graph,
+    rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    folds: bool,
 ) -> crate::backend::WgpuExecutable {
     let dev = wgpu_device().expect("rlx-wgpu: no compatible adapter found");
 
@@ -593,7 +713,7 @@ pub(crate) fn compile_static_inner(
     // regular arena slot. CPU/Metal/MLX lower the fused variants
     // directly with bespoke kernels; we choose simplicity over peak
     // throughput here.
-    let graph = crate::unfuse::unfuse(graph);
+    let graph = crate::unfuse::unfuse_with(graph, folds);
     // Elide the redundant reshapes unfuse/matmul-lowering emit — they alias
     // parents and block the planner's slot reuse (see collapse_reshapes).
     let graph = crate::unfuse::collapse_reshapes(graph);
@@ -621,8 +741,21 @@ pub(crate) fn compile_static_inner(
         eprintln!("rlx-wgpu op histogram: {sorted:?}");
     }
 
-    // f32-uniform slots + liveness reuse (pairwise `[n,n]` graphs).
-    let mut plan = plan_f32_uniform(&graph, 16);
+    // conv/norm activations as f16, two to a word (`RLX_WGPU_HALF_ACTIVATIONS`);
+    // a packed tensor bound for the host restarts without folds or packing
+    let graph = if folds {
+        crate::unfuse::maybe_pack_half(graph)
+    } else {
+        crate::unfuse::set_half_packed(false);
+        graph
+    };
+    // f32-uniform slots + liveness reuse (pairwise `[n,n]` graphs); a packed
+    // graph's halves at two bytes (the hybrid planner)
+    let mut plan = if crate::unfuse::half_packed() {
+        crate::buffer::plan_hybrid(&graph, 16)
+    } else {
+        plan_f32_uniform(&graph, 16)
+    };
     // The shared planner only allocates a slot when its byte size is non-zero
     // (`rlx_compile::memory`), so a tensor with a zero-length dimension gets no entry at all —
     // LuxTTS's flow decoder builds an `Expand [0,1,512]`. Every arena lookup in this backend
@@ -786,6 +919,16 @@ pub(crate) fn compile_static_inner(
         Arena::from_plan_with_scratch(&dev.device, &plan, scratch_bytes)
     };
     let _ = max_buf;
+    if rlx_ir::env::flag("RLX_WGPU_ARENA_REPORT") {
+        eprintln!(
+            "[rlx-wgpu] arena build: plan {} + scratch {} vs split_at {} -> size {} sharded {}",
+            plan.arena_size,
+            scratch_bytes,
+            split_at,
+            arena.size,
+            arena.is_sharded()
+        );
+    }
     // Override slot lengths with the actual elem*4 byte counts so
     // readback returns the right element count (slots may be
     // padded for alignment).
@@ -799,6 +942,9 @@ pub(crate) fn compile_static_inner(
         let dt = node.shape.dtype();
         let actual = if dt.is_complex() {
             elems * dt.size_bytes()
+        } else if crate::unfuse::is_half(node) {
+            // two halves to a word (`pack_half_activations`)
+            (elems * 2).div_ceil(4) * 4
         } else {
             elems * 4
         };
@@ -1270,12 +1416,11 @@ pub(crate) fn compile_static_inner(
         // and resolves both cases.
         let absolute_offsets_wrong = lowers_with_absolute_offsets(&node.op)
             && !absolute_offsets_ok(&dev.device, &arena, node);
-        if absolute_offsets_wrong
-            || (lowers_to_u32_offset_host_step(&node.op) && !whole_arena_host_ok(&arena, node))
+        if (absolute_offsets_wrong
+            || (lowers_to_u32_offset_host_step(&node.op) && !whole_arena_host_ok(&arena, node)))
+            && !two_window_ok(&arena, node, &graph)
         {
-            schedule.push(Step::HostOp {
-                desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-            });
+            schedule.push(host_op_step(&graph, node, &arena));
             continue;
         }
         match &node.op {
@@ -1287,9 +1432,7 @@ pub(crate) fn compile_static_inner(
             // Unsharded discrete: Binary/Activation stay on GPU; Expand/Conv/…
             // still host via wgpu_prefer_structure_host / wgpu_prefer_conv_host.
             op if should_pack_host_op(&arena, op, node, &graph) => {
-                schedule.push(Step::HostOp {
-                    desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-                });
+                schedule.push(host_op_step(&graph, node, &arena));
                 continue;
             }
             Op::MatMul => {
@@ -1426,7 +1569,7 @@ pub(crate) fn compile_static_inner(
                     n,
                 );
                 if b_is_param
-                    && b_bytes > ARENA_STAGE_CAP
+                    && b_bytes > arena_stage_cap()
                     && arena.param_fits_f16_mirror(b_id)
                     && !rlx_ir::env::flag("RLX_WGPU_NO_F16_MIRROR")
                     && f16_mirror_needed(&dev.device, &arena, &[node.id, a_id, b_id])
@@ -1476,7 +1619,7 @@ pub(crate) fn compile_static_inner(
                 if param_anchor {
                     arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
                 }
-                if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
+                if b_is_param && b_bytes > arena_stage_cap() && b_in_arena {
                     // Large act-arena params stage into the bind window via
                     // `arena_off_in_bind_window` below. Weight-buffer params
                     // are tagged and skipped here. Do not assert in-window —
@@ -1503,7 +1646,7 @@ pub(crate) fn compile_static_inner(
                     // it into the f16 weight window.
                     (arena.offset(b_id) / 4) as u32
                 } else if b_is_param
-                    && b_bytes > ARENA_STAGE_CAP
+                    && b_bytes > arena_stage_cap()
                     && arena_tensor_in_window(&arena, b_id, base, size)
                 {
                     arena_local_off_f32(&arena, b_id, base)
@@ -2941,7 +3084,8 @@ pub(crate) fn compile_static_inner(
                 {
                     let gamma_is_param = tensor_is_graph_param(&graph, &param_offsets, gamma_id);
                     let gamma_bytes = arena.len_of(gamma_id) as u64;
-                    let frlt_win: Vec<NodeId> = if gamma_is_param && gamma_bytes > ARENA_STAGE_CAP {
+                    let frlt_win: Vec<NodeId> = if gamma_is_param && gamma_bytes > arena_stage_cap()
+                    {
                         vec![gamma_id, node.id, h_id, delta_id, beta_id, sum_id]
                     } else {
                         vec![node.id, h_id, delta_id, gamma_id, beta_id, sum_id]
@@ -3082,7 +3226,7 @@ pub(crate) fn compile_static_inner(
                 };
                 let gamma_is_param = tensor_is_graph_param(&graph, &param_offsets, gamma_id);
                 let gamma_bytes = arena.len_of(gamma_id) as u64;
-                let ln_win: Vec<NodeId> = if gamma_is_param && gamma_bytes > ARENA_STAGE_CAP {
+                let ln_win: Vec<NodeId> = if gamma_is_param && gamma_bytes > arena_stage_cap() {
                     vec![gamma_id, node.id, in_id]
                 } else {
                     let mut v = vec![node.id, in_id];
@@ -4641,7 +4785,7 @@ pub(crate) fn compile_static_inner(
                 let batch = total / (seq * last as u32).max(1);
                 let cos_is_param = tensor_is_graph_param(&graph, &param_offsets, cos_id);
                 let cos_bytes = arena.len_of(cos_id) as u64;
-                let rope_win: Vec<NodeId> = if cos_is_param && cos_bytes > ARENA_STAGE_CAP {
+                let rope_win: Vec<NodeId> = if cos_is_param && cos_bytes > arena_stage_cap() {
                     vec![cos_id, sin_id, node.id, x_id]
                 } else {
                     vec![node.id, x_id, cos_id, sin_id]
@@ -5011,7 +5155,7 @@ pub(crate) fn compile_static_inner(
                     rlx_ir::DType::C128 => 4,
                     _ => 1,
                 };
-                let gather_win: Vec<NodeId> = if table_is_param && table_bytes > ARENA_STAGE_CAP {
+                let gather_win: Vec<NodeId> = if table_is_param && table_bytes > arena_stage_cap() {
                     vec![table_id, node.id, idx_id]
                 } else {
                     vec![node.id, idx_id, table_id]
@@ -5185,7 +5329,7 @@ pub(crate) fn compile_static_inner(
                     n,
                 );
                 if b_is_param
-                    && b_bytes > ARENA_STAGE_CAP
+                    && b_bytes > arena_stage_cap()
                     && arena.param_fits_f16_mirror(b_id)
                     && !rlx_ir::env::flag("RLX_WGPU_NO_F16_MIRROR")
                     && f16_mirror_needed(&dev.device, &arena, &[node.id, a_id, b_id])
@@ -5236,7 +5380,7 @@ pub(crate) fn compile_static_inner(
                     if param_anchor {
                         arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
                     }
-                    if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
+                    if b_is_param && b_bytes > arena_stage_cap() && b_in_arena {
                         // Staging via arena_off_in_bind_window — no in-window assert
                         // (VirtIO/DX12 ~2 GiB caps leave large F32 params outside).
                         let _ = arena.offset(b_id);
@@ -5299,7 +5443,7 @@ pub(crate) fn compile_static_inner(
                     let b_off_f32 = if !b_in_arena {
                         (arena.offset(b_id) / 4) as u32
                     } else if b_is_param
-                        && b_bytes > ARENA_STAGE_CAP
+                        && b_bytes > arena_stage_cap()
                         && arena_tensor_in_window(&arena, b_id, base, size)
                     {
                         arena_local_off_f32(&arena, b_id, base)
@@ -5447,7 +5591,7 @@ pub(crate) fn compile_static_inner(
                     if param_anchor {
                         arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
                     }
-                    if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
+                    if b_is_param && b_bytes > arena_stage_cap() && b_in_arena {
                         // Staging via arena_off_in_bind_window — no in-window assert
                         // (VirtIO/DX12 ~2 GiB caps leave large F32 params outside).
                         let _ = arena.offset(b_id);
@@ -5467,7 +5611,7 @@ pub(crate) fn compile_static_inner(
                     let b_off_f32 = if !b_in_arena {
                         (arena.offset(b_id) / 4) as u32
                     } else if b_is_param
-                        && b_bytes > ARENA_STAGE_CAP
+                        && b_bytes > arena_stage_cap()
                         && arena_tensor_in_window(&arena, b_id, base, size)
                     {
                         arena_local_off_f32(&arena, b_id, base)
@@ -6159,8 +6303,10 @@ pub(crate) fn compile_static_inner(
                             // silently drop a bias if that contract changes.
                             bias_off,
                             has_bias,
-                            _p1: 0,
-                            _p2: 0,
+                            act: 0,
+                            alpha: 0,
+                            split: 0,
+                            half: 0,
                         };
                         schedule.push(Step::Conv3d { params: p3 });
                         let ck = conv3d_kernel(&dev.device);
@@ -6184,7 +6330,7 @@ pub(crate) fn compile_static_inner(
                 groups,
                 activation,
                 has_residual,
-            } => {
+            } if kernel_size.len() != 3 => {
                 // Native 2D conv fused with the bias + optional-residual + act
                 // epilogue: y = act(conv(x,w) + bias[c] + residual). Replaces the
                 // CPU host round-trip; conv body matches conv2d.wgsl bit-for-bit.
@@ -7407,17 +7553,37 @@ pub(crate) fn compile_static_inner(
                 // The uniform/bind_group lanes are indexed by GPU-step count
                 // (`gpu_ui`), so host steps must NOT push to them.
             }
-            Op::Conv3d {
-                stride,
-                padding,
-                dilation,
-                groups,
-            } => {
+            // A rank-5 `FusedConvBiasAct` or `CONV3D_LEAKY` here carries the
+            // activation `fold_conv_activation` folded into it; the conv3d
+            // shaders apply it in their store.
+            op @ (Op::Conv3d { .. } | Op::FusedConvBiasAct { .. } | Op::Custom { .. })
+                if crate::unfuse::conv3d_geometry(op).is_some() =>
+            {
+                let (stride, padding, dilation, groups, act, alpha) =
+                    crate::unfuse::conv3d_geometry(op).unwrap();
+                let (stride, padding, dilation, groups) = (&stride, &padding, &dilation, &groups);
                 let in_id = node.inputs[0];
                 let w_id = node.inputs[1];
-                let win_ids = [node.id, in_id, w_id];
                 let max_binding = dev.device.limits().max_storage_buffer_binding_size;
-                let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                let fits = arena_span_bytes(&arena, &[node.id, in_id, w_id]) <= max_binding
+                    && !arena_span_crosses_shard(&arena, &[node.id, in_id]);
+                // input and output in different stripes: each its own window
+                // (`two_window_kernel`), the weights staged beside the input
+                let two = !fits && two_window_ok(&arena, node, &graph);
+                if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+                    eprintln!(
+                        "[rlx-wgpu] conv3d node {}: fits {fits} two {two} in@{} out@{} sharded {}",
+                        node.id.0,
+                        arena.offset(in_id),
+                        arena.offset(node.id),
+                        arena.is_sharded()
+                    );
+                }
+                let win_ids: Vec<NodeId> = if two {
+                    vec![in_id, w_id]
+                } else {
+                    vec![node.id, in_id, w_id]
+                };
                 let mut scratch = arena.scratch_off as u64;
                 let (mut base, mut size, param_anchor) = arena_multi_op_window(
                     &dev.device,
@@ -7428,8 +7594,15 @@ pub(crate) fn compile_static_inner(
                     &mut scratch,
                     &win_ids,
                 );
-                arena_expand_bind_window(&arena, &win_ids, &mut base, &mut size, max_binding);
-                if !fits && !param_anchor {
+                if two {
+                    // the input's own stripe (the helper above can anchor on
+                    // another), its stage reserve taking the weights
+                    (base, size) = arena_window_for_nodes(&dev.device, &arena, &[in_id]);
+                    arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
+                } else {
+                    arena_expand_bind_window(&arena, &win_ids, &mut base, &mut size, max_binding);
+                }
+                if !fits && !param_anchor && !two {
                     base =
                         arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
                 }
@@ -7455,10 +7628,18 @@ pub(crate) fn compile_static_inner(
                     &mut base,
                     &mut size,
                 );
-                let out_off = arena_local_off_f32(&arena, node.id, base);
+                let out_win = two.then(|| arena_window_for_nodes(&dev.device, &arena, &[node.id]));
                 let in_shape = graph.node(in_id).shape.dims();
                 let w_shape = graph.node(w_id).shape.dims();
+                // a `CONV3D_ARGMAX` writes `[n, d, h, w]`: its channels are the
+                // weight's, its spatial dims the output's last three
                 let out_shape = node.shape.dims();
+                let argmax = act == crate::unfuse::ARGMAX_ACT;
+                let (c_out, out_sp) = if argmax {
+                    (w_shape[0], &out_shape[1..4])
+                } else {
+                    (out_shape[1], &out_shape[2..5])
+                };
                 // A third input is the per-output-channel bias, folded into
                 // the conv's store — see `fold_conv_bias_into_conv3d`.
                 let (bias_off, has_bias) = match node.inputs.get(2) {
@@ -7478,16 +7659,26 @@ pub(crate) fn compile_static_inner(
                     ),
                     None => (0u32, 0u32),
                 };
+                // staging the bias may have moved the input's window
+                let in_off = if two && arena_tensor_in_window(&arena, in_id, base, size) {
+                    arena_local_off_f32(&arena, in_id, base)
+                } else {
+                    in_off
+                };
+                let out_off = match out_win {
+                    Some((b1, _)) => arena_local_off_f32(&arena, node.id, b1),
+                    None => arena_local_off_f32(&arena, node.id, base),
+                };
                 let p3 = Conv3dParams {
                     n: in_shape[0].unwrap_static() as u32,
                     c_in: in_shape[1].unwrap_static() as u32,
-                    c_out: out_shape[1].unwrap_static() as u32,
+                    c_out: c_out.unwrap_static() as u32,
                     d: in_shape[2].unwrap_static() as u32,
                     h: in_shape[3].unwrap_static() as u32,
                     w: in_shape[4].unwrap_static() as u32,
-                    d_out: out_shape[2].unwrap_static() as u32,
-                    h_out: out_shape[3].unwrap_static() as u32,
-                    w_out: out_shape[4].unwrap_static() as u32,
+                    d_out: out_sp[0].unwrap_static() as u32,
+                    h_out: out_sp[1].unwrap_static() as u32,
+                    w_out: out_sp[2].unwrap_static() as u32,
                     kd: w_shape[2].unwrap_static() as u32,
                     kh: w_shape[3].unwrap_static() as u32,
                     kw: w_shape[4].unwrap_static() as u32,
@@ -7506,13 +7697,24 @@ pub(crate) fn compile_static_inner(
                     out_off,
                     bias_off,
                     has_bias,
-                    _p1: 0,
-                    _p2: 0,
+                    act,
+                    alpha: alpha.to_bits(),
+                    split: two as u32,
+                    half: crate::unfuse::is_half(graph.node(in_id)) as u32
+                        | (crate::unfuse::is_half(node) as u32) << 1,
                 };
                 schedule.push(Step::Conv3d { params: p3 });
-                let ck = conv3d_kernel(&dev.device);
                 let u = emit_uniform(std::mem::size_of::<Conv3dParams>());
-                let bg = bind_arena_window(&dev.device, ck, &arena, base, size, &u);
+                let bg = match out_win {
+                    Some((b1, s1)) => {
+                        let k = crate::kernels::two_window_kernel(&dev.device, "conv3d_ctile_w4");
+                        bind_two_windows(&dev.device, k, &arena, (base, size), (b1, s1), &u)
+                    }
+                    None => {
+                        let ck = conv3d_kernel(&dev.device);
+                        bind_arena_window(&dev.device, ck, &arena, base, size, &u)
+                    }
+                };
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
@@ -7656,8 +7858,10 @@ pub(crate) fn compile_static_inner(
                         out_off: arena_local_off_f32(&arena, node.id, base),
                         bias_off: 0,
                         has_bias: 0,
-                        _p1: 0,
-                        _p2: 0,
+                        act: 0,
+                        alpha: 0,
+                        split: 0,
+                        half: 0,
                     };
                     schedule.push(Step::ConvTranspose3d { params: p3 });
                     let sk = conv_transpose3d_kernel(&dev.device);
@@ -7667,7 +7871,14 @@ pub(crate) fn compile_static_inner(
                     bind_groups.push(bg);
                 }
             }
-            Op::GroupNorm { num_groups, eps } if !wgpu_prefer_host_norm(&arena) => {
+            // `GROUP_NORM_ACT` is a group norm carrying the activation that
+            // read it (`fold_norm_activation`), applied in its write-back.
+            op @ (Op::GroupNorm { .. } | Op::Custom { .. })
+                if crate::unfuse::group_norm_act(op).is_some()
+                    && (!wgpu_prefer_host_norm(&arena) || two_window_ok(&arena, node, &graph)) =>
+            {
+                let (num_groups, eps, act) = crate::unfuse::group_norm_act(op).unwrap();
+                let (num_groups, eps) = (&num_groups, &eps);
                 // Native WGSL kernel: one workgroup per (batch, group). The
                 // host step below mirrors the WHOLE arena per norm, which is
                 // ruinous on any graph with more than a couple of them.
@@ -7683,7 +7894,7 @@ pub(crate) fn compile_static_inner(
 
                 let gamma_is_param = tensor_is_graph_param(&graph, &param_offsets, gamma_id);
                 let gamma_bytes = arena.len_of(gamma_id) as u64;
-                let gn_win: Vec<NodeId> = if gamma_is_param && gamma_bytes > ARENA_STAGE_CAP {
+                let gn_win: Vec<NodeId> = if gamma_is_param && gamma_bytes > arena_stage_cap() {
                     vec![gamma_id, node.id, in_id]
                 } else {
                     let mut v = vec![node.id, in_id];
@@ -7694,7 +7905,16 @@ pub(crate) fn compile_static_inner(
                     v
                 };
                 let max_binding = dev.device.limits().max_storage_buffer_binding_size;
-                let gn_fits = arena_span_bytes(&arena, &gn_win) <= max_binding;
+                let gn_fits = arena_span_bytes(&arena, &gn_win) <= max_binding
+                    && !arena_span_crosses_shard(&arena, &[node.id, in_id]);
+                // input and output in different stripes: the output its own
+                // window (`two_window_kernel`)
+                let two = !gn_fits && two_window_ok(&arena, node, &graph);
+                let gn_win: Vec<NodeId> = if two {
+                    gn_win.into_iter().filter(|&i| i != node.id).collect()
+                } else {
+                    gn_win
+                };
                 let mut scratch = arena.scratch_off as u64;
                 let (mut base, mut size, param_anchor) = arena_multi_op_window(
                     &dev.device,
@@ -7705,7 +7925,11 @@ pub(crate) fn compile_static_inner(
                     &mut scratch,
                     &gn_win,
                 );
-                if !gn_fits && !param_anchor {
+                if two {
+                    (base, size) = arena_window_for_nodes(&dev.device, &arena, &[in_id]);
+                    arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
+                }
+                if !gn_fits && !param_anchor && !two {
                     base =
                         arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
                 }
@@ -7760,28 +7984,50 @@ pub(crate) fn compile_static_inner(
                 } else {
                     beta_off
                 };
+                let out_win = two.then(|| arena_window_for_nodes(&dev.device, &arena, &[node.id]));
                 let p = GroupNormParams {
                     groups_total: n * g,
                     group_elems: (c / g) * h * w,
                     in_off,
-                    out_off: arena_local_off_f32(&arena, node.id, base),
+                    out_off: arena_local_off_f32(&arena, node.id, out_win.map_or(base, |w| w.0)),
                     gamma_off,
                     beta_off,
                     eps_bits: eps.to_bits(),
                     num_groups: g,
                     c,
                     hw: h * w,
-                    _pad0: 0,
-                    _pad1: 0,
+                    act: act.map_or(0, |a| activation_op_id(a) + 1),
+                    chunks: group_norm_chunks(
+                        (c / g) * h * w,
+                        arena.offset(in_id),
+                        arena.offset(node.id),
+                        arena.len_of(node.id),
+                    ),
+                    split: two as u32,
+                    half: crate::unfuse::is_half(graph.node(in_id)) as u32
+                        | (crate::unfuse::is_half(node) as u32) << 1,
                 };
                 schedule.push(Step::GroupNorm { params: p });
-                let gk = group_norm_kernel(&dev.device);
                 let u = emit_uniform(std::mem::size_of::<GroupNormParams>());
-                let bg = bind_arena_window(&dev.device, gk, &arena, base, size, &u);
+                let bg = match out_win {
+                    Some(w1) => {
+                        let k = crate::kernels::two_window_kernel(&dev.device, "group_norm");
+                        bind_two_windows(&dev.device, k, &arena, (base, size), w1, &u)
+                    }
+                    None => {
+                        let gk = group_norm_kernel(&dev.device);
+                        bind_arena_window(&dev.device, gk, &arena, base, size, &u)
+                    }
+                };
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
-            Op::GroupNorm { num_groups, eps } => {
+            op @ (Op::GroupNorm { .. } | Op::Custom { .. })
+                if crate::unfuse::group_norm_act(op).is_some() =>
+            {
+                let (num_groups, eps, act) = crate::unfuse::group_norm_act(op).unwrap();
+                let (num_groups, eps) = (&num_groups, &eps);
+                note_host_reads(&graph, node);
                 // NCHW: x [n,c,h,w], gamma/beta [c]. Host step (schedule-only).
                 let in_shape = &graph.node(node.inputs[0]).shape;
                 schedule.push(Step::GroupNormHost {
@@ -7796,6 +8042,28 @@ pub(crate) fn compile_static_inner(
                     num_groups: *num_groups as u32,
                     eps: *eps,
                 });
+                // ... and a folded activation in place on the GPU
+                if let Some(a) = act {
+                    let (base, size) = arena_window_for_nodes(&dev.device, &arena, &[node.id]);
+                    let off = arena_local_off_f32(&arena, node.id, base);
+                    schedule.push(Step::Unary {
+                        params: UnaryParams {
+                            n: elems,
+                            in_off: off,
+                            out_off: off,
+                            op: activation_op_id(a),
+                            _p0: 0,
+                            _p1: 0,
+                            _p2: 0,
+                            _p3: 0,
+                        },
+                        f16_mirror: false,
+                    });
+                    let u = emit_uniform(std::mem::size_of::<UnaryParams>());
+                    let bg = bind_arena_window(&dev.device, uk, &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
             }
             Op::LayerNorm2d { eps } => {
                 // NCHW: x [n,c,h,w], gamma/beta [c]. Host step (schedule-only).
@@ -12007,7 +12275,7 @@ fn report_slot_hazards(graph: &Graph, plan: &rlx_opt::memory::MemoryPlan) {
 /// The shadow exists for adapters whose storage binding cannot hold the
 /// weight together with the activations it multiplies (VirtIO / DX12 cap
 /// bindings near 2 GiB). It halves the weight's precision, so taking it
-/// whenever a weight passed `ARENA_STAGE_CAP` cost every big matmul ~1e-3
+/// whenever a weight passed `arena_stage_cap()` cost every big matmul ~1e-3
 /// relative error even where one f32 window covers everything — a 2048 ×
 /// 158 241 LM head on wgpu-Metal (4 GiB bindings) moved its logits by 5e-3.
 /// Now only when the span of `ids` exceeds the binding limit, or when

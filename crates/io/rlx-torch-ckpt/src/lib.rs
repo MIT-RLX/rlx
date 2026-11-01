@@ -77,8 +77,8 @@ use archive::read_zip_entry;
 /// `entries` must be the ZIP's entry list with **absolute** file offsets, so
 /// the same routine serves a bare `.pth` (ZIP at offset 0) and a checkpoint
 /// nested inside another container such as a `.nemo` tar.
-pub fn index_torch_zip(
-    file: &mut File,
+pub fn index_torch_zip<R: std::io::Read + std::io::Seek>(
+    file: &mut R,
     entries: &[ZipEntry],
 ) -> Result<(BTreeMap<String, TensorMeta>, HashMap<String, ZipEntry>)> {
     // Locate `<archive>/data.pkl` and the `<archive>/data/<key>` storages.
@@ -141,10 +141,19 @@ pub fn read_torch_tensor(
     meta: &TensorMeta,
     storages: &HashMap<String, ZipEntry>,
 ) -> Result<Vec<f32>> {
+    read_torch_tensor_from(&mut File::open(path)?, meta, storages)
+}
+
+/// [`read_torch_tensor`] from any `Read + Seek` holding the archive — a
+/// `Cursor` over a checkpoint already in memory.
+pub fn read_torch_tensor_from<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    meta: &TensorMeta,
+    storages: &HashMap<String, ZipEntry>,
+) -> Result<Vec<f32>> {
     let entry = storages
         .get(&meta.storage_key)
         .ok_or_else(|| anyhow!("missing storage {:?}", meta.storage_key))?;
-
     let expected = meta.dtype.size() as u64;
     if entry.size % expected != 0 {
         bail!(
@@ -154,9 +163,7 @@ pub fn read_torch_tensor(
             expected
         );
     }
-
-    let mut file = File::open(path)?;
-    let raw = read_zip_entry(&mut file, entry)?;
+    let raw = read_zip_entry(reader, entry)?;
     let storage_f32 = meta.dtype.decode_f32(&raw);
     storage::gather(meta, &storage_f32)
 }

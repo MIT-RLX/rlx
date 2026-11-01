@@ -132,7 +132,7 @@ pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[allow(clippy::excessive_precision)]
-unsafe fn bias_gelu_avx2(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
+pub(crate) unsafe fn bias_gelu_avx2(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     use std::arch::x86_64::*;
     let chunks = n / 8;
     unsafe {
@@ -188,10 +188,10 @@ unsafe fn bias_gelu_avx2(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     }
 }
 
-/// Portable bias + erf-GELU. Shared by the non-SIMD targets and by x86-64's
-/// runtime fallback, so one binary covers AVX2 hosts and pre-AVX ones
-/// (every Atom through Tremont) without recompiling.
-#[cfg(not(target_arch = "aarch64"))]
+/// Portable bias + erf-GELU: x86-64's runtime fallback, so one binary covers
+/// AVX2 hosts and pre-AVX ones (every Atom through Tremont) without
+/// recompiling.
+#[cfg(target_arch = "x86_64")]
 fn bias_gelu_scalar(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     for row in 0..m {
         let base = row * n;
@@ -216,9 +216,11 @@ pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     bias_gelu_scalar(data, bias, m, n);
 }
 
+/// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]), so a wasm run
+/// rounds like Linux x86-64.
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
-    bias_gelu_scalar(data, bias, m, n);
+    crate::avx2_mirror::bias_gelu(data, bias, m, n);
 }
 
 /// SwiGLU over `outer` rows: `out[i] = up[i] · silu(gate[i])`, where each input
@@ -296,7 +298,7 @@ pub fn silu_inplace(data: &mut [f32]) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn silu_inplace_avx2(data: &mut [f32]) {
+pub(crate) unsafe fn silu_inplace_avx2(data: &mut [f32]) {
     use std::arch::x86_64::*;
     let chunks = data.len() / 8;
     let one = _mm256_set1_ps(1.0);
@@ -330,12 +332,10 @@ pub fn silu_inplace(data: &mut [f32]) {
     }
 }
 
+/// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]).
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn silu_inplace(data: &mut [f32]) {
-    for v in data.iter_mut() {
-        let x = *v;
-        *v = x / (1.0 + crate::vmath::exp_poly(-x));
-    }
+    crate::avx2_mirror::silu_inplace(data);
 }
 
 // ── LayerNorm (2-pass) ──────────────────────────────────────────────────
@@ -407,7 +407,7 @@ pub fn layer_norm_row(
 /// Caller has checked `is_x86_feature_detected!("avx2")` and `"fma"`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn layer_norm_row_avx2(
+pub(crate) unsafe fn layer_norm_row_avx2(
     input: &[f32],
     gamma: &[f32],
     beta: &[f32],
@@ -475,9 +475,8 @@ unsafe fn layer_norm_row_avx2(
     }
 }
 
-/// Portable two-pass LayerNorm over one row. Shared by the non-SIMD targets
-/// and by x86-64's runtime fallback.
-#[cfg(not(target_arch = "aarch64"))]
+/// Portable two-pass LayerNorm over one row: x86-64's runtime fallback.
+#[cfg(target_arch = "x86_64")]
 fn layer_norm_row_scalar(
     input: &[f32],
     gamma: &[f32],
@@ -525,6 +524,7 @@ pub fn layer_norm_row(
     layer_norm_row_scalar(input, gamma, beta, output, h, eps);
 }
 
+/// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]).
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn layer_norm_row(
     input: &[f32],
@@ -534,7 +534,7 @@ pub fn layer_norm_row(
     h: usize,
     eps: f32,
 ) {
-    layer_norm_row_scalar(input, gamma, beta, output, h, eps);
+    crate::avx2_mirror::layer_norm_row(input, gamma, beta, output, h, eps);
 }
 
 /// LayerNorm over `rows` contiguous rows of width `h`.
@@ -851,7 +851,7 @@ pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn softmax_rows_avx2(data: &mut [f32], rows: usize, cols: usize) {
+pub(crate) unsafe fn softmax_rows_avx2(data: &mut [f32], rows: usize, cols: usize) {
     use std::arch::x86_64::*;
     let chunks = cols / 8;
     for r in 0..rows {
@@ -1083,9 +1083,10 @@ fn softmax_row_poly(row: &mut [f32]) {
     }
 }
 
+/// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]).
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
-    par_softmax_rows(data, rows, cols, &softmax_rows_poly);
+    par_softmax_rows(data, rows, cols, &crate::avx2_mirror::softmax_rows);
 }
 
 // ── GELU in-place (no bias) ────────────────────────────────────────────
@@ -1140,7 +1141,7 @@ pub fn gelu_inplace(data: &mut [f32]) {
 // full-precision values whose nearest-f32 is exactly what we want. Keep the
 // literals verbatim; the precision lint is a false positive here.
 #[allow(unsafe_op_in_unsafe_fn, clippy::excessive_precision)]
-unsafe fn gelu_inplace_avx2(data: &mut [f32]) {
+pub(crate) unsafe fn gelu_inplace_avx2(data: &mut [f32]) {
     use std::arch::x86_64::*;
     let chunks = data.len() / 8;
     let half = _mm256_set1_ps(0.5);
@@ -1194,11 +1195,10 @@ pub fn gelu_inplace(data: &mut [f32]) {
     }
 }
 
+/// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]).
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn gelu_inplace(data: &mut [f32]) {
-    for v in data.iter_mut() {
-        *v = scalar_gelu(*v);
-    }
+    crate::avx2_mirror::gelu_inplace(data);
 }
 
 /// Parallel GELU in-place (splits work across thread pool).
@@ -1445,7 +1445,7 @@ pub fn neon_sgemm_bias_small(
 
 // ── Scalar fallbacks ────────────────────────────────────────────────────
 
-fn scalar_gelu(x: f32) -> f32 {
+pub(crate) fn scalar_gelu(x: f32) -> f32 {
     x * 0.5 * (1.0 + scalar_erf(x * std::f32::consts::FRAC_1_SQRT_2))
 }
 

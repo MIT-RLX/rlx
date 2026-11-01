@@ -14,6 +14,7 @@ pub mod model_codec;
 pub mod sampling;
 pub mod tokenizer;
 pub mod tool_parse;
+pub mod tool_plan;
 
 pub use chat::{
     ChatMessage, ChatRenderOptions, ChatTemplate, ChatTemplateSource, auto_chat_template,
@@ -24,3 +25,4 @@ pub use rlx_runtime::SampleOpts;
 pub use sampling::{argmax, sample_next};
 pub use tokenizer::{TokenizerHandle, decode_ids, load_tokenizer};
 pub use tool_parse::{ToolCall, ToolFormat};
+pub use tool_plan::{DirectAnswer, PlannedCall, PlannedStep, RoundReview, ToolIntent, ToolPlan};

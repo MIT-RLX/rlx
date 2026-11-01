@@ -31,6 +31,15 @@ pub enum WindowKind {
     Blackman,
 }
 
+/// `cos` for window coefficients: rlx-libm's reference under `parity` (std's
+/// is musl on wasm, so a browser would bake different windows).
+fn cosf(x: f32) -> f32 {
+    #[cfg(feature = "parity")]
+    return rlx_libm::reference::sincosf(x).1;
+    #[cfg(not(feature = "parity"))]
+    x.cos()
+}
+
 impl WindowKind {
     fn coeffs(self, n: usize) -> Vec<f32> {
         use core::f32::consts::PI;
@@ -43,10 +52,10 @@ impl WindowKind {
                 let t = i as f32 / d;
                 match self {
                     WindowKind::Rectangular => 1.0,
-                    WindowKind::Hann => 0.5 - 0.5 * (2.0 * PI * t).cos(),
-                    WindowKind::Hamming => 0.54 - 0.46 * (2.0 * PI * t).cos(),
+                    WindowKind::Hann => 0.5 - 0.5 * cosf(2.0 * PI * t),
+                    WindowKind::Hamming => 0.54 - 0.46 * cosf(2.0 * PI * t),
                     WindowKind::Blackman => {
-                        0.42 - 0.5 * (2.0 * PI * t).cos() + 0.08 * (4.0 * PI * t).cos()
+                        0.42 - 0.5 * cosf(2.0 * PI * t) + 0.08 * cosf(4.0 * PI * t)
                     }
                 }
             })

@@ -305,6 +305,117 @@ fn group_norm_matches_reference() {
     }
 }
 
+/// Groups far larger than a workgroup's 256 threads: the reduction's
+/// four-loads-per-thread main loop and its tail both run (an instance norm
+/// over a volume, MindGrab's shape, is millions per group), on a large DC
+/// offset that a one-pass variance would cancel away.
+#[test]
+fn group_norm_large_groups_matches_reference() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let (n, c, h, w) = (1usize, 3usize, 61usize, 97usize); // 5917 per channel
+    let hw = h * w;
+    let xs: Vec<f32> = (0..n * c * hw)
+        .map(|i| 100.0 + ((i * 37 % 101) as f32 / 101.0) + (i % 7) as f32 * 0.25)
+        .collect();
+    let gamma: Vec<f32> = (0..c).map(|i| 1.0 + i as f32 * 0.1).collect();
+    let beta: Vec<f32> = (0..c).map(|i| i as f32 * 0.05 - 0.15).collect();
+    for &groups in &[1usize, 3] {
+        let mut g = Graph::new("gn_large");
+        let x = g.input("x", Shape::new(&[n, c, h, w], DType::F32));
+        let ga = g.param("g", Shape::new(&[c], DType::F32));
+        let be = g.param("b", Shape::new(&[c], DType::F32));
+        let y = g.add_node(
+            Op::GroupNorm {
+                num_groups: groups,
+                eps: 1e-5,
+            },
+            vec![x, ga, be],
+            Shape::new(&[n, c, h, w], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        let mut exe = WgpuExecutable::compile(g);
+        exe.set_param("g", &gamma);
+        exe.set_param("b", &beta);
+        let r = exe.run(&[("x", &xs)]);
+        let want = group_norm_ref(&xs, &gamma, &beta, n, c, h, w, groups, 1e-5);
+        assert!(
+            close(&r[0], &want, 1e-3),
+            "group_norm(groups={groups}, {hw} per channel) mismatch"
+        );
+    }
+}
+
+/// Groups split over many workgroups (`GroupNormParams::chunks`): a few
+/// chunks with batch and several channels per group, and a group past the
+/// 256-chunk cap with uneven chunk lengths — on a DC offset, against an f64
+/// reference. Also with the norm's activation folded in, which the split
+/// write-back applies too.
+#[test]
+fn group_norm_split_over_workgroups_matches_reference() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    for &(n, c, h, w, groups) in &[
+        (2usize, 4usize, 211usize, 191usize, 2usize),
+        (1, 1, 2111, 2131, 1),
+    ] {
+        let hw = h * w;
+        let xs: Vec<f32> = (0..n * c * hw)
+            .map(|i| {
+                50.0 + ((i * 37 % 101) as f32 / 101.0) + (i % 7) as f32 * 0.25 + (i / hw) as f32
+            })
+            .collect();
+        let gamma: Vec<f32> = (0..c).map(|i| 1.0 + i as f32 * 0.1).collect();
+        let beta: Vec<f32> = (0..c).map(|i| i as f32 * 0.05 - 0.15).collect();
+        let (cpg, span) = (c / groups, c / groups * hw);
+        let mut want = vec![0f32; xs.len()];
+        for ni in 0..n {
+            for gi in 0..groups {
+                let base = ni * c * hw + gi * span;
+                let v = &xs[base..base + span];
+                let mean = v.iter().map(|&x| x as f64).sum::<f64>() / span as f64;
+                let var = v.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / span as f64;
+                let inv = 1.0 / (var + 1e-5).sqrt();
+                for i in 0..span {
+                    let ch = gi * cpg + i / hw;
+                    let y = (v[i] as f64 - mean) * inv * gamma[ch] as f64 + beta[ch] as f64;
+                    want[base + i] = y.max(0.0) as f32;
+                }
+            }
+        }
+        let sh = Shape::new(&[n, c, h, w], DType::F32);
+        let mut g = Graph::new("gn_split");
+        let x = g.input("x", sh.clone());
+        let ga = g.param("g", Shape::new(&[c], DType::F32));
+        let be = g.param("b", Shape::new(&[c], DType::F32));
+        let y = g.add_node(
+            Op::GroupNorm {
+                num_groups: groups,
+                eps: 1e-5,
+            },
+            vec![x, ga, be],
+            sh.clone(),
+        );
+        let r = g.add_node(Op::Activation(Activation::Relu), vec![y], sh.clone());
+        g.set_outputs(vec![r]);
+        let mut exe = WgpuExecutable::compile(g);
+        exe.set_param("g", &gamma);
+        exe.set_param("b", &beta);
+        let got = exe.run(&[("x", &xs)]);
+        let worst = got[0]
+            .iter()
+            .zip(&want)
+            .map(|(a, e)| (a - e).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst < 1e-3,
+            "{n}x{c}x{h}x{w} groups={groups}: max error {worst}"
+        );
+    }
+}
+
 /// The divergence that motivated the native kernel only showed up once the
 /// norm had a *consumer*: with the norm as the graph output the host staging
 /// round-trip looked right, and the following op read stale data. Chain two
@@ -361,6 +472,58 @@ fn group_norm_chain_matches_reference() {
         "group_norm chain mismatch:\n got {:?}\nwant {want:?}",
         got[0]
     );
+}
+
+/// MeshNet's shape: an instance norm over a flattened volume, reshaped back,
+/// then an activation — folded into the norm's write-back. With the reshape
+/// also an output, the norm keeps its value and the activation runs alone.
+#[test]
+fn group_norm_reshape_activation_matches_reference() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let (c, d, h, w) = (5usize, 4usize, 3usize, 7usize);
+    let sp = d * h * w;
+    let xs: Vec<f32> = (0..c * sp)
+        .map(|i| ((i * 53 % 197) as f32 / 197.0) - 0.5 + (i / sp) as f32)
+        .collect();
+    let gamma: Vec<f32> = (0..c).map(|i| 1.0 + i as f32 * 0.05).collect();
+    let beta: Vec<f32> = (0..c).map(|i| i as f32 * 0.02 - 0.08).collect();
+    let flat = Shape::new(&[1, c, sp, 1], DType::F32);
+    let vol = Shape::new(&[1, c, d, h, w], DType::F32);
+    let elu = |v: f32| if v > 0.0 { v } else { v.exp() - 1.0 };
+    let normed = group_norm_ref(&xs, &gamma, &beta, 1, c, sp, 1, c, 1e-5);
+    let want: Vec<f32> = normed.iter().map(|&v| elu(v)).collect();
+    for both in [false, true] {
+        let mut g = Graph::new("gn_reshape_act");
+        let x = g.input("x", vol.clone());
+        let ga = g.param("g", Shape::new(&[c], DType::F32));
+        let be = g.param("b", Shape::new(&[c], DType::F32));
+        let xf = g.reshape(x, vec![1, c as i64, sp as i64, 1], flat.clone());
+        let n = g.add_node(
+            Op::GroupNorm {
+                num_groups: c,
+                eps: 1e-5,
+            },
+            vec![xf, ga, be],
+            flat.clone(),
+        );
+        let r = g.reshape(
+            n,
+            vec![1, c as i64, d as i64, h as i64, w as i64],
+            vol.clone(),
+        );
+        let a = g.add_node(Op::Activation(Activation::Elu), vec![r], vol.clone());
+        g.set_outputs(if both { vec![a, r] } else { vec![a] });
+        let mut exe = WgpuExecutable::compile(g);
+        exe.set_param("g", &gamma);
+        exe.set_param("b", &beta);
+        let got = exe.run(&[("x", &xs)]);
+        assert!(close(&got[0], &want, 1e-3), "both={both}: {:?}", got[0]);
+        if both {
+            assert!(close(&got[1], &normed, 1e-3), "norm output: {:?}", got[1]);
+        }
+    }
 }
 
 #[test]

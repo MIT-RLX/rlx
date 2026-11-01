@@ -261,7 +261,9 @@ fn lower_group_norm(
     g.reshape_(normed5, vec![n as i64, c as i64, h as i64, w as i64])
 }
 
-/// Nearest 2× upsample on NCHW → concat along H and W.
+/// Nearest 2× upsample on NCHW → reshape `[N,C,H,1,W,1]`, expand the two unit
+/// axes to 2, reshape to `[N,C,2H,2W]`, so `out[y][x] = in[y/2][x/2]`.
+/// (Concatenating `x` with itself along H and W instead *tiles* the image.)
 pub struct LowerResizeNearest2x;
 
 impl Pass for LowerResizeNearest2x {
@@ -290,8 +292,16 @@ impl Pass for LowerResizeNearest2x {
         for node in graph.nodes() {
             let new_id = if matches!(node.op, Op::ResizeNearest2x) {
                 let x = id_map[&node.inputs[0]];
-                let cat_h = new_graph.concat_(vec![x, x], 2);
-                new_graph.concat_(vec![cat_h, cat_h], 3)
+                let d: Vec<i64> = new_graph
+                    .shape(x)
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as i64)
+                    .collect();
+                let (n, c, h, w) = (d[0], d[1], d[2], d[3]);
+                let x6 = new_graph.reshape_(x, vec![n, c, h, 1, w, 1]);
+                let up = expand_to(&mut new_graph, x6, &[n, c, h, 2, w, 2]);
+                new_graph.reshape_(up, vec![n, c, 2 * h, 2 * w])
             } else {
                 let inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
                 new_graph.add_node(node.op.clone(), inputs, node.shape.clone())
@@ -368,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn resize_nearest_2x_lowers_to_concat() {
+    fn resize_nearest_2x_lowers_to_expand() {
         let f = DType::F32;
         let mut g = Graph::new("up");
         let x = g.input("x", Shape::new(&[1, 2, 2, 2], f));
@@ -386,7 +396,11 @@ mod tests {
             lowered
                 .nodes()
                 .iter()
-                .any(|n| matches!(n.op, Op::Concat { .. }))
+                .any(|n| matches!(n.op, Op::Expand { .. }))
+        );
+        assert_eq!(
+            lowered.shape(lowered.outputs[0]).dims(),
+            Shape::new(&[1, 2, 4, 4], f).dims()
         );
     }
 }

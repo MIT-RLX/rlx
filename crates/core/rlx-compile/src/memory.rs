@@ -1745,6 +1745,19 @@ pub fn plan_memory_f32_uniform_no_params(graph: &Graph, alignment: usize) -> Mem
     plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::F32Uniform)
 }
 
+/// [`plan_memory_f32_uniform_no_params`] with the [`plan_memory_hybrid`]
+/// widths: f16/bf16 activations at two bytes. For a backend's split arena
+/// over a graph whose half activations it packs (rlx-wgpu's
+/// `pack_half_activations`).
+pub fn plan_memory_hybrid_no_params(graph: &Graph, alignment: usize) -> MemoryPlan {
+    let opts = MemoryPlanOptions {
+        pin_output_ancestors: graph_has_host_indexing(graph),
+        allocate_params: false,
+        ..MemoryPlanOptions::default()
+    };
+    plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::Hybrid)
+}
+
 /// True when the graph indexes with a **data-dependent** index tensor.
 ///
 /// Such ops are hosted on several backends, and a hosted step's arena write is

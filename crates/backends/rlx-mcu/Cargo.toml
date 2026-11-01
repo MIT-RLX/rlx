@@ -1,0 +1,30 @@
+[package]
+name = "rlx-mcu"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "no_std building blocks for ML models on MCUs: in-place model files, int8/int4 matrix kernels, a log-mel frontend, paged weights"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+documentation.workspace = true
+
+# Library is no_std unless `std` is on.
+[features]
+default = ["std"]
+# `std` adds the host-side blob writer. Inference never needs it.
+std = []
+# Arm DSP-extension (`SXTB16`/`SMLAD`) int8 dot products on `target_arch = "arm"`.
+# Needs a core that has it (Cortex-M4/M7/M33/M55; build with `-C target-cpu=…`):
+# stable Rust does not expose Arm target features to `cfg`. Same bits as the
+# portable loops.
+dsp = []
+
+[dependencies]
+libm = { version = "0.2", default-features = false }
+
+[lints]
+workspace = true

@@ -16,12 +16,23 @@ struct Params {
     in_off: u32, w_off: u32, out_off: u32,
     bias_off: u32,   // per-output-channel bias; valid when has_bias != 0
     has_bias: u32,
-    _p1: u32,
-    _p2: u32,
+    act: u32,
+    alpha: u32,       // LeakyReLU slope bits when act == 0xFFFF
 };
 
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1) var<uniform>              params: Params;
+
+// `params.act`: 0 none, 0xFFFF LeakyReLU `max(v, alpha * v)`, else the
+// activation's `opcode_relu_first + 1` — folded from what read this conv
+// (`fold_conv_activation`). The same arithmetic as the kernels it replaces
+// (the unary kernel's generated `rlx_activation_apply`, or a `*` and a `max`),
+// so bit-identical.
+fn conv_act(v: f32) -> f32 {
+    if (params.act == 0u) { return v; }
+    if (params.act == 0xFFFFu) { return max(v, v * bitcast<f32>(params.alpha)); }
+    return rlx_activation_apply(params.act - 1u, v);
+}
 
 @compute @workgroup_size(64)
 fn conv3d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ngs: vec3<u32>) {
@@ -70,5 +81,5 @@ fn conv3d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
         }
     }
     if (params.has_bias != 0u) { acc = acc + arena[params.bias_off + co]; }
-    arena[params.out_off + i] = acc;
+    arena[params.out_off + i] = conv_act(acc);
 }

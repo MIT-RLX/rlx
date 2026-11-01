@@ -1043,6 +1043,9 @@ pub enum Thunk {
         src: usize,
         weight: usize,
         dst: usize,
+        /// a per-channel bias added in the store: a `FusedConvBiasAct` the
+        /// CPU expand folded into the conv (`expand::fold_conv3d_bias`)
+        bias: Option<usize>,
         n: u32,
         c_in: u32,
         d: u32,

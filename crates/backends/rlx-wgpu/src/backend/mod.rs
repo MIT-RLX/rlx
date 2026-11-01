@@ -22,7 +22,7 @@ use crate::kernels::{GatherParams, Kernel, gather_split_kernel, matmul_coop_f16_
 /// Compute the maximum tail-scratch bytes any single op needs across
 /// the graph. Currently only `Op::LayerNormBackwardGamma` uses scratch
 /// — it stores `num_workgroups * H` f32 partial sums.
-fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
+pub(crate) fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
     const ROWS_PER_WG: u32 = 16;
     let mut max_bytes = 0usize;
     for node in graph.nodes() {
@@ -1204,6 +1204,49 @@ fn bind_arena_window(
     bind_two_buf0_window(device, kernel, buf, local, size, params)
 }
 
+/// A [`crate::kernels::two_window_kernel`] bind group: binding 0 the input's
+/// window, 2 the output's — disjoint ranges (they lie in different stripes),
+/// so both may be writable.
+fn bind_two_windows(
+    device: &wgpu::Device,
+    kernel: &Kernel,
+    arena: &Arena,
+    (mut b0, mut s0): (u64, u64),
+    (mut b1, mut s1): (u64, u64),
+    params: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    arena_clamp_bind_window(arena, &mut b0, &mut s0);
+    arena_clamp_bind_window(arena, &mut b1, &mut s1);
+    assert!(
+        b0 + s0 <= b1 || b1 + s1 <= b0,
+        "rlx-wgpu: two-window op with overlapping windows ({b0}+{s0}, {b1}+{s1})"
+    );
+    let (buf0, l0) = arena_bind_buf(arena, b0);
+    let (buf1, l1) = arena_bind_buf(arena, b1);
+    fn entry(binding: u32, buf: &wgpu::Buffer, off: u64, size: u64) -> wgpu::BindGroupEntry<'_> {
+        wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: buf,
+                offset: off,
+                size: aligned_bind_size(size, off, buf.size()),
+            }),
+        }
+    }
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("rlx-wgpu two-window"),
+        layout: &kernel.bgl,
+        entries: &[
+            entry(0, buf0, l0, s0),
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: params.as_entire_binding(),
+            },
+            entry(2, buf1, l1, s1),
+        ],
+    })
+}
+
 /// True when activation nodes do not all lie in one shard stripe.
 fn arena_span_crosses_shard(arena: &Arena, ids: &[NodeId]) -> bool {
     if !arena.is_sharded() {
@@ -1527,7 +1570,7 @@ fn arena_matmul_bind_window(
     let param_anchor = !arena.is_sharded()
         && b_is_param
         && b_bytes <= max_binding
-        && (!all_fits || b_bytes > ARENA_STAGE_CAP);
+        && (!all_fits || b_bytes > arena_stage_cap());
     let (mut base, mut size) = if param_anchor {
         arena_window_for_nodes(device, arena, &[b_id])
     } else if all_fits {
@@ -1537,7 +1580,7 @@ fn arena_matmul_bind_window(
     {
         // Prefer covering activation+weight over staging a huge B (F5 packs a
         // 0.5 GiB Concat weight at off=0; staging it into a far output window
-        // exceeds ARENA_STAGE_CAP).
+        // exceeds arena_stage_cap()).
         arena_window_for_nodes(device, arena, &[out_id, b_id])
     } else if arena_span_bytes(arena, &[out_id, a_id]) <= max_binding
         && !arena_span_crosses_shard(arena, &[out_id, a_id])
@@ -1644,7 +1687,7 @@ fn arena_off_in_bind_window(
                 id, len
             );
         }
-        if len > ARENA_STAGE_CAP {
+        if len > arena_stage_cap() {
             let op = &graph.node(id).op;
             panic!(
                 "rlx-wgpu: bind_window would stage {} bytes for {:?} op={op:?} \
@@ -1749,7 +1792,7 @@ fn arena_bind_window_covering_scratch_if_needed(
     if scratch <= arena.scratch_off as u64 {
         return base;
     }
-    if scratch >= base && scratch.saturating_add(ARENA_STAGE_CAP) <= base.saturating_add(size) {
+    if scratch >= base && scratch.saturating_add(arena_stage_cap()) <= base.saturating_add(size) {
         return base;
     }
     arena_window_covering_scratch(arena, base, size)
@@ -1758,7 +1801,7 @@ fn arena_bind_window_covering_scratch_if_needed(
 /// Keep staging writes inside `[base, base+size)` when the bind window is anchored on a
 /// param far from the arena tail scratch zone.
 fn arena_ensure_scratch_in_window(scratch: &mut u64, base: u64, size: u64) {
-    let cap = ARENA_STAGE_CAP.min(size);
+    let cap = arena_stage_cap().min(size);
     let end = base.saturating_add(size);
     if *scratch < base || scratch.saturating_add(cap) > end {
         *scratch = end.saturating_sub(cap);
@@ -1783,7 +1826,7 @@ fn arena_ensure_scratch_for_window(arena: &Arena, scratch: &mut u64, base: u64, 
             return;
         }
         if stage >= base
-            && stage.saturating_add(ARENA_STAGE_CAP.min(size)) <= base.saturating_add(size)
+            && stage.saturating_add(arena_stage_cap().min(size)) <= base.saturating_add(size)
         {
             *scratch = stage;
             return;
@@ -1919,7 +1962,12 @@ pub(crate) fn coop_f16_vk_window(
     (base, size, (base / 2) as u32)
 }
 
-const ARENA_STAGE_CAP: u64 = crate::buffer::SHARD_STAGE_RESERVE as u64;
+/// The most one staging copy may hold: the stage reserve in effect (smaller
+/// in wasm, or under `RLX_WGPU_SHARD_STAGE_MIB`), which is all the room there
+/// is. The full constant here let a copy run past a smaller reserve.
+fn arena_stage_cap() -> u64 {
+    crate::buffer::shard_stage_reserve() as u64
+}
 
 /// Output spatial positions computed per thread by `conv2d.wgsl` (register
 /// tiling for weight reuse). MUST equal `TILE` in that kernel.
@@ -1940,10 +1988,12 @@ fn arena_off_in_window_or_stage(
     let len = arena.len_of(id) as u64;
     if crate::buffer::is_weight_off(src_tagged) {
         // Params live in a separate buffer — always stage into the act window.
-        if len > ARENA_STAGE_CAP {
+        if len > arena_stage_cap() {
             panic!(
-                "rlx-wgpu: cannot stage {} bytes for weight node {:?} (cap {ARENA_STAGE_CAP})",
-                len, id
+                "rlx-wgpu: cannot stage {} bytes for weight node {:?} (cap {})",
+                len,
+                id,
+                arena_stage_cap()
             );
         }
         if arena.is_sharded() {
@@ -2041,10 +2091,12 @@ fn arena_off_in_window_or_stage(
     if src >= *base && src.saturating_add(len) <= (*base).saturating_add(*size) {
         return arena_local_off_f32(arena, id, *base);
     }
-    if len > ARENA_STAGE_CAP {
+    if len > arena_stage_cap() {
         panic!(
-            "rlx-wgpu: cannot stage {} bytes for node {:?} (cap {ARENA_STAGE_CAP})",
-            len, id
+            "rlx-wgpu: cannot stage {} bytes for node {:?} (cap {})",
+            len,
+            id,
+            arena_stage_cap()
         );
     }
     if arena.is_sharded() {
@@ -2150,7 +2202,7 @@ fn arena_off_in_window_or_stage(
 /// If scratch does not fall inside `[base, base+size)`, slide the window to the tail.
 fn arena_window_covering_scratch(arena: &Arena, base: u64, size: u64) -> u64 {
     let scratch = arena.scratch_off as u64;
-    if scratch >= base && scratch.saturating_add(ARENA_STAGE_CAP) <= base.saturating_add(size) {
+    if scratch >= base && scratch.saturating_add(arena_stage_cap()) <= base.saturating_add(size) {
         return base;
     }
     if arena.is_sharded() {

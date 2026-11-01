@@ -6,7 +6,7 @@
 //!
 //! ```text
 //!   rlx-fpga-emit [--target latency|size|energy|precision|bandwidth]
-//!                 [--hw generic|ecp5|ice40|xc7:BOARD|xilinx7:PART]
+//!                 [--hw generic|ecp5|ice40|xc7:BOARD|xilinx7:PART|lattice:BOARD]
 //!                 [--out DIR]
 //! ```
 //!

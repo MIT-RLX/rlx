@@ -196,7 +196,7 @@ SKIPPED=(
 #     GPU backends, so it rides tier 0 *before* rlx-gpu-kernels. Its dir has no
 #     hyphen, so validate_publish_order's `rlx-*` glob skips it — cargo publish
 #     still enforces the order, so keep it first.
-#   rlx-dduf / rlx-hub are dep-free leaves → tier 0. rlx-mlx-io (rlx-ir) → tier 1.
+#   rlx-dduf / rlx-hub are dep-free leaves → tier 0. So is rlx-mcu (libm only). rlx-mlx-io (rlx-ir) → tier 1.
 #   rlx-pkg (rlx-ir/rlx-gguf/rlx-nemo/rlx-mlx-io/rlx-dduf) → tier 2. rlx-runtime
 #     now has [dependencies] on rlx-pkg/rlx-mlx-io/rlx-dduf (+ optional rlx-xdna),
 #     so all four must precede tier 7 — they do.
@@ -223,7 +223,7 @@ SKIPPED=(
 TIERS=(
     "rlx-libm rlx-fastmath"
     "rlx-linux-ref rlx-spectral"
-    "rlx-ir rlxsl rlx-gguf rlx-torch-ckpt rlx-nemo rlx-gpu-dispatch rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim rlx-hwprofile rlx-onnx-proto rlx-dduf rlx-hub rlx-fem rlx-rng rlx-program rlx-search rlx-numpy rlx-special rlx-pocketfft rlx-nnpack"
+    "rlx-ir rlxsl rlx-gguf rlx-torch-ckpt rlx-nemo rlx-gpu-dispatch rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-mcu rlx-optim rlx-hwprofile rlx-onnx-proto rlx-dduf rlx-hub rlx-fem rlx-rng rlx-program rlx-search rlx-numpy rlx-special rlx-pocketfft rlx-nnpack"
     "rlx-unfuse rlx-flow rlx-fusion rlx-driver rlx-mlx-io"
     "rlx-autodiff rlx-extend rlx-pkg"
     "rlx-compile"

@@ -10,10 +10,12 @@
 #[allow(unused_imports)]
 use crate::prelude::*;
 
+use crate::board::{UART_BAUD, UART_SYNC};
 use crate::codegen::Artifact;
 use crate::export_config::{FpgaExportConfig, HwTarget};
+use crate::lattice::{LatticeBoard, LatticeFamily};
 use crate::model::Model;
-use crate::xc7::{UART_BAUD, UART_SYNC, Xc7Board};
+use crate::xc7::Xc7Board;
 
 /// Emit `synth.sh`, `EXPORT.md`, and optional constraint files.
 pub fn collect_synth_artifacts(model: &Model, cfg: &FpgaExportConfig) -> Vec<Artifact> {
@@ -28,13 +30,18 @@ pub fn collect_synth_artifacts(model: &Model, cfg: &FpgaExportConfig) -> Vec<Art
             content: emit_export_md(model, cfg),
         });
     }
-    if cfg.emit_synth_scripts
-        && cfg.emit_board_shell
-        && let Some(board) = cfg.hw_target.xc7()
-    {
+    if cfg.emit_synth_scripts && cfg.emit_board_shell && cfg.hw_target.shell_board().is_some() {
+        let loader = match &cfg.hw_target {
+            HwTarget::Lattice(b) => b.loader_board(),
+            _ => cfg.hw_target.xc7().map_or("", Xc7Board::loader_board),
+        };
+        let image = match cfg.hw_target.lattice().map(LatticeBoard::family) {
+            Some(LatticeFamily::Ice40) => "out.bin",
+            _ => "out.bit",
+        };
         out.push(Artifact {
             rel_path: "program.sh".into(),
-            content: emit_xc7_program_sh(board),
+            content: emit_program_sh(loader, image),
         });
         out.push(Artifact {
             rel_path: "run_uart.py".into(),
@@ -88,8 +95,76 @@ echo "wrote out.bin"
             let board = board.filter(|_| board_shell);
             s.push_str(&emit_openxc7_flow(part, board));
         }
+        HwTarget::Lattice(board) => s.push_str(&emit_lattice_flow(*board, board_shell)),
     }
     s
+}
+
+/// iCE40: yosys → nextpnr-ice40 → icepack. ECP5: yosys → nextpnr-ecp5 →
+/// ecppack. Synthesizes `board_top` (UART host link) with the board's
+/// constraints, or the soft `top` alone without a board shell.
+fn emit_lattice_flow(board: LatticeBoard, board_shell: bool) -> String {
+    let (top, sources) = if board_shell {
+        (
+            "board_top",
+            "board_top.sv top.sv layers/*.sv primitives/*.sv",
+        )
+    } else {
+        ("top", "top.sv layers/*.sv primitives/*.sv")
+    };
+    let freq = board.shell().core_mhz_str();
+    let (device, package) = (board.device(), board.package());
+    let tools_note = "install the open toolchain: https://github.com/YosysHQ/oss-cad-suite-build";
+    match board.family() {
+        LatticeFamily::Ice40 => {
+            let pnr = if board_shell {
+                format!(
+                    "nextpnr-ice40 --{device} --package {package} --pcf constraints.pcf --json out.json \\
+    --asc out.asc --freq {freq} -l nextpnr.log ${{NEXTPNR_OPTS:-}}
+                     icepack out.asc out.bin
+echo \"wrote out.bin\"
+"
+                )
+            } else {
+                format!(
+                    "nextpnr-ice40 --{device} --package {package} --pcf-allow-unconstrained --json out.json \\
+    --asc out.asc --freq {freq} -l nextpnr.log ${{NEXTPNR_OPTS:-}}
+                     echo \"placed and routed out.asc (soft top, no pins); export with the board shell for out.bin\"
+"
+                )
+            };
+            format!(
+                r#"# {board}: Project IceStorm flow — yosys synth_ice40 → nextpnr-ice40 → icepack.
+for tool in yosys nextpnr-ice40 icepack; do
+    command -v "$tool" >/dev/null || {{ echo "missing $tool — {tools_note}"; exit 1; }}
+done
+yosys -q -l yosys.log -p "read_verilog -sv {sources}; synth_ice40 -dsp -top {top} ${{YOSYS_SYNTH_OPTS:-}} -json out.json"
+{pnr}"#
+            )
+        }
+        LatticeFamily::Ecp5 => {
+            let lpf = if board_shell {
+                "--lpf constraints.lpf"
+            } else {
+                "--lpf-allow-unconstrained"
+            };
+            let idcode = board
+                .idcode()
+                .map(|c| format!(" --idcode {c}"))
+                .unwrap_or_default();
+            format!(
+                r#"# {board}: Project Trellis flow — yosys synth_ecp5 → nextpnr-ecp5 → ecppack.
+for tool in yosys nextpnr-ecp5 ecppack; do
+    command -v "$tool" >/dev/null || {{ echo "missing $tool — {tools_note}"; exit 1; }}
+done
+yosys -q -l yosys.log -p "read_verilog -sv {sources}; synth_ecp5 -abc9 -top {top} ${{YOSYS_SYNTH_OPTS:-}} -json out.json"
+nextpnr-ecp5 --{device} --package {package} {lpf} --json out.json     --textcfg out.config --freq {freq} -l nextpnr.log ${{NEXTPNR_OPTS:-}}
+ecppack --compress{idcode} out.config out.bit
+echo "wrote out.bit"
+"#
+            )
+        }
+    }
 }
 
 /// openXC7: yosys → nextpnr-xilinx → fasm2frames → xc7frames2bit.
@@ -163,21 +238,22 @@ echo "wrote out.bit"
     )
 }
 
-fn emit_xc7_program_sh(board: Xc7Board) -> String {
+/// `openFPGALoader` for any board preset: `loader` is its `-b` name,
+/// `image` the bitstream `synth.sh` writes.
+fn emit_program_sh(loader: &str, image: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
 # Generated by rlx-fpga — do not hand-edit.
 cd "$(dirname "$0")"
-# Load out.bit into SRAM (lost on power-off). FLASH=1 writes the SPI flash instead.
-[ -f out.bit ] || {{ echo "out.bit missing — run ./synth.sh first"; exit 1; }}
+# Load {image} into SRAM (lost on power-off). FLASH=1 writes the SPI flash instead.
+[ -f {image} ] || {{ echo "{image} missing — run ./synth.sh first"; exit 1; }}
 if [ "${{FLASH:-0}}" = "1" ]; then
-    openFPGALoader -b {loader} --write-flash out.bit
+    openFPGALoader -b {loader} --write-flash {image}
 else
-    openFPGALoader -b {loader} out.bit
+    openFPGALoader -b {loader} {image}
 fi
-"#,
-        loader = board.loader_board()
+"#
     )
 }
 
@@ -219,7 +295,8 @@ def load_mem(path):
 def find_port():
     from serial.tools import list_ports
 
-    # Digilent boards: FTDI FT2232, UART on the second interface.
+    # FTDI bridges: FT2232 (Digilent boards, iCEBreaker) put the UART on
+    # the second interface; the FT231X (ULX3S) has only one.
     ftdi = sorted(p.device for p in list_ports.comports() if p.vid == 0x0403)
     if not ftdi:
         sys.exit("no FTDI serial port found; pass --port")
@@ -307,8 +384,10 @@ fn emit_export_md(model: &Model, cfg: &FpgaExportConfig) -> String {
 bash synth.sh
 ```
 
-Generic target produces `out.json` only. Board targets (`ecp5`, `ice40`, …)
-run place-and-route when the open toolchain is on `PATH`.
+Generic target produces `out.json` only. Board targets (`xc7:<board>`,
+`lattice:<board>`, `ecp5`, `ice40`) run place-and-route when the open
+toolchain is on `PATH`; board presets also write `program.sh` and
+`run_uart.py` (UART host link).
 
 ## Parity
 
@@ -361,6 +440,7 @@ fn emit_constraints(hw: &HwTarget) -> Option<(String, String)> {
         HwTarget::Xilinx7 {
             board: Some(board), ..
         } => Some(("constraints.xdc".into(), emit_xc7_xdc(*board))),
+        HwTarget::Lattice(board) => Some(emit_lattice_constraints(*board)),
         HwTarget::Xilinx7 { .. } => Some((
             "constraints.xdc".into(),
             r#"# Stub Xilinx XDC — map soft ports to board pins.
@@ -391,4 +471,48 @@ fn emit_xc7_xdc(board: Xc7Board) -> String {
         pin(&format!("led[{i}]"), l);
     }
     s
+}
+
+/// Pin constraints for a Lattice board (`board_top` ports): a PCF for
+/// iCE40, an LPF for ECP5.
+fn emit_lattice_constraints(board: LatticeBoard) -> (String, String) {
+    let p = board.pins();
+    let mut pins = vec![
+        ("clk".to_string(), p.clk),
+        ("rst_btn".to_string(), p.rst),
+        ("uart_rx".to_string(), p.uart_rx),
+        ("uart_tx".to_string(), p.uart_tx),
+    ];
+    for (i, l) in p.leds.iter().enumerate() {
+        pins.push((format!("led[{i}]"), l));
+    }
+    match board.family() {
+        LatticeFamily::Ice40 => {
+            let mut s = format!("# {board} — board_top pins. Generated by rlx-fpga.\n");
+            for (port, loc) in &pins {
+                s.push_str(&format!("set_io {port} {loc}\n"));
+            }
+            ("constraints.pcf".into(), s)
+        }
+        LatticeFamily::Ecp5 => {
+            let mut s = format!(
+                "# {board} — board_top pins. Generated by rlx-fpga.\n\
+                 BLOCK RESETPATHS;\nBLOCK ASYNCPATHS;\n\
+                 FREQUENCY PORT \"clk\" {} MHZ;\n",
+                p.clk_mhz
+            );
+            for (port, loc) in &pins {
+                let pull = if port == "rst_btn" || port == "uart_rx" {
+                    " PULLMODE=UP"
+                } else {
+                    ""
+                };
+                s.push_str(&format!(
+                    "LOCATE COMP \"{port}\" SITE \"{loc}\";\n\
+                     IOBUF PORT \"{port}\" IO_TYPE=LVCMOS33{pull};\n"
+                ));
+            }
+            ("constraints.lpf".into(), s)
+        }
+    }
 }

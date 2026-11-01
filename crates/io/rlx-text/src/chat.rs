@@ -14,7 +14,7 @@
 //! convention).
 
 use anyhow::{Context, Result, anyhow};
-use minijinja::value::Object;
+use minijinja::value::{Enumerator, Object};
 use minijinja::{Environment, Error as JinjaError, ErrorKind, State, Value};
 use rlx_gguf::{GgufFile, MetaValue};
 use serde_json::Value as JsonValue;
@@ -136,6 +136,20 @@ impl GettableValue {
 }
 
 impl Object for GettableValue {
+    // A wrapped dict has to list its keys. minijinja's default enumerator for
+    // a map-shaped object is *empty*, so every wrapped message was falsy and
+    // iterated nothing: Qwen3.5's `{% if loop.previtem and … %}` never opened
+    // the `<|im_start|>user` turn around a tool result, and
+    // `{% for name in tool_call.arguments %}` rendered no parameters.
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        match &self.0 {
+            JsonValue::Object(map) => {
+                Enumerator::Values(map.keys().map(|k| Value::from(k.as_str())).collect())
+            }
+            _ => Enumerator::NonEnumerable,
+        }
+    }
+
     fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
         match &self.0 {
             JsonValue::Object(map) => {
@@ -153,6 +167,16 @@ impl Object for GettableValue {
         name: &str,
         args: &[Value],
     ) -> Result<Value, JinjaError> {
+        // Python dict methods that templates call: d1/LFM2 iterate tool-call
+        // arguments with `for k, v in args.items()`.
+        if let ("items" | "keys" | "values", JsonValue::Object(map)) = (name, &self.0) {
+            let entry = |(k, v): (&String, &JsonValue)| match name {
+                "items" => Value::from(vec![Value::from(k.as_str()), Self::from_json(v.clone())]),
+                "keys" => Value::from(k.as_str()),
+                _ => Self::from_json(v.clone()),
+            };
+            return Ok(Value::from(map.iter().map(entry).collect::<Vec<_>>()));
+        }
         if name != "get" {
             return Err(JinjaError::new(
                 ErrorKind::UnknownMethod,
@@ -173,14 +197,61 @@ impl Object for GettableValue {
         })
     }
 
+    // `{{ tool_call.arguments }}` prints the dict the way HF's
+    // `apply_chat_template` (Python `str()`) does, which is the prompt the model
+    // was trained on. It used to print `{...}`, dropping every argument.
     fn render(self: &Arc<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.0 {
-            JsonValue::String(s) => write!(f, "{s}"),
-            JsonValue::Number(n) => write!(f, "{n}"),
-            JsonValue::Bool(b) => write!(f, "{b}"),
-            JsonValue::Null => write!(f, "null"),
-            JsonValue::Array(_) => write!(f, "[...]"),
-            JsonValue::Object(_) => write!(f, "{{...}}"),
+        f.write_str(&python_repr(&self.0))
+    }
+}
+
+/// Python's `repr()` of a JSON value: `{'city': 'Paris', 'ok': True}`.
+fn python_repr(v: &JsonValue) -> String {
+    match v {
+        JsonValue::String(s) => {
+            let quote = if s.contains('\'') && !s.contains('"') {
+                '"'
+            } else {
+                '\''
+            };
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push(quote);
+            for c in s.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if c == quote => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.push(quote);
+            out
+        }
+        JsonValue::Number(n) => n.to_string(),
+        JsonValue::Bool(true) => "True".into(),
+        JsonValue::Bool(false) => "False".into(),
+        JsonValue::Null => "None".into(),
+        JsonValue::Array(items) => {
+            let parts: Vec<String> = items.iter().map(python_repr).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        JsonValue::Object(map) => {
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}: {}",
+                        python_repr(&JsonValue::String(k.clone())),
+                        python_repr(v)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", parts.join(", "))
         }
     }
 }
@@ -274,6 +345,19 @@ fn build_env(source: String) -> Result<Environment<'static>> {
             Err(JinjaError::new(ErrorKind::InvalidOperation, msg))
         },
     );
+    // Llama 3.x, Granite and Mistral Small templates stamp today's date with
+    // `strftime_now(fmt)` when the caller passes no `date_string`; without it
+    // they fail to render at all.
+    env.add_function(
+        "strftime_now",
+        |fmt: String| -> Result<String, JinjaError> {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            Ok(strftime_utc(&fmt, secs))
+        },
+    );
     // Poolside / Unsloth Jinja uses Python str methods (`.strip()`, `.rstrip()`,
     // …). MiniJinja does not expose those on builtins — bridge the common ones.
     env.set_unknown_method_callback(hf_string_method_callback);
@@ -319,6 +403,86 @@ fn build_env(source: String) -> Result<Environment<'static>> {
     env.add_template_owned(TEMPLATE_NAME, source)
         .context("compiling chat template")?;
     Ok(env)
+}
+
+/// Python's `strftime` for the specifiers chat templates use, in UTC (this
+/// crate has no time-zone database). Unknown specifiers are kept verbatim.
+fn strftime_utc(fmt: &str, unix_secs: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    const DAYS: [&str; 7] = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ];
+    let days = unix_secs.div_euclid(86_400);
+    let secs = unix_secs.rem_euclid(86_400);
+    let (hour, minute, second) = (secs / 3600, secs % 3600 / 60, secs % 60);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy_mar = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy_mar + 2) / 153;
+    let day = doy_mar - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    const CUM: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let yday = CUM[month as usize - 1] + day + i64::from(leap && month > 2);
+    let weekday = (days + 3).rem_euclid(7) as usize; // 1970-01-01 was a Thursday
+    let month_name = MONTHS[month as usize - 1];
+    let hour12 = if hour % 12 == 0 { 12 } else { hour % 12 };
+
+    let mut out = String::with_capacity(fmt.len() + 16);
+    let mut chars = fmt.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(&year.to_string()),
+            Some('y') => out.push_str(&format!("{:02}", year.rem_euclid(100))),
+            Some('m') => out.push_str(&format!("{month:02}")),
+            Some('d') => out.push_str(&format!("{day:02}")),
+            Some('e') => out.push_str(&format!("{day:>2}")),
+            Some('j') => out.push_str(&format!("{yday:03}")),
+            Some('B') => out.push_str(month_name),
+            Some('b') | Some('h') => out.push_str(&month_name[..3]),
+            Some('A') => out.push_str(DAYS[weekday]),
+            Some('a') => out.push_str(&DAYS[weekday][..3]),
+            Some('H') => out.push_str(&format!("{hour:02}")),
+            Some('I') => out.push_str(&format!("{hour12:02}")),
+            Some('M') => out.push_str(&format!("{minute:02}")),
+            Some('S') => out.push_str(&format!("{second:02}")),
+            Some('p') => out.push_str(if hour < 12 { "AM" } else { "PM" }),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
 }
 
 /// Python string methods that HF chat templates call, bridged onto MiniJinja.
@@ -982,5 +1146,87 @@ mod tests {
             .expect("renders");
         assert!(out.contains("<|im_start|>system\nBe brief."), "{out}");
         assert!(out.contains("<|im_start|>user\nhi"), "{out}");
+    }
+
+    #[test]
+    fn wrapped_messages_are_truthy_and_iterable() {
+        // Qwen3.5's tool-result turn: the opener only renders when the previous
+        // message tests true, and tool-call arguments are iterated by key.
+        let source = "\
+{%- for m in messages %}\
+{%- if m.role == 'tool' %}\
+{%- if loop.previtem and loop.previtem.role != 'tool' %}<|im_start|>user{% endif %}\
+\n<tool_response>{{ m.content }}</tool_response>\
+{%- else %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endif %}\
+{%- if m.args %}{% for k in m.args %}<{{ k }}={{ m.args[k] }}>{% endfor %}{% endif %}\
+{%- endfor %}";
+        let out = ChatTemplate::from_source(source)
+            .expect("compiles")
+            .render_json_with_options(
+                &[
+                    serde_json::json!({"role": "assistant", "content": "", "args": {"q": "x"}}),
+                    serde_json::json!({"role": "tool", "content": "ok"}),
+                ],
+                ChatRenderOptions::default(),
+            )
+            .expect("renders");
+        assert!(out.contains("<|im_start|>user\n<tool_response>ok"), "{out}");
+        assert!(out.contains("<q=x>"), "{out}");
+    }
+
+    fn render_one(source: &str, message: serde_json::Value) -> String {
+        ChatTemplate::from_source(source)
+            .expect("compiles")
+            .render_json_with_options(&[message], ChatRenderOptions::default())
+            .expect("renders")
+    }
+
+    #[test]
+    fn wrapped_dicts_have_python_dict_methods() {
+        // d1 / LFM2: `for arg_name, arg_value in func_args.items()`.
+        let msg = serde_json::json!({"role": "assistant", "args": {"city": "Paris", "n": 2}});
+        let m = "messages[0].args";
+        let items = format!("{{% for k, v in {m}.items() %}}{{{{k}}}}={{{{v}}}};{{% endfor %}}");
+        assert_eq!(render_one(&items, msg.clone()), "city=Paris;n=2;");
+        let keys = format!("{{{{ {m}.keys()|join(',') }}}}");
+        assert_eq!(render_one(&keys, msg.clone()), "city,n");
+        let values = format!("{{{{ {m}.values()|join(',') }}}}");
+        assert_eq!(render_one(&values, msg), "Paris,2");
+    }
+
+    #[test]
+    fn printing_a_dict_matches_python_str() {
+        let msg = serde_json::json!({"role": "assistant",
+            "args": {"city": "Paris", "ok": true, "none": null, "tags": ["a", "it's"]}});
+        assert_eq!(
+            render_one("{{ messages[0].args }}", msg),
+            r#"{'city': 'Paris', 'none': None, 'ok': True, 'tags': ['a', "it's"]}"#
+        );
+    }
+
+    #[test]
+    fn strftime_now_and_loop_controls_are_available() {
+        let msg = serde_json::json!({"role": "user", "content": "hi"});
+        let date = render_one("{{ strftime_now('%Y-%m-%d') }}", msg.clone());
+        assert_eq!(date.len(), 10, "{date}");
+        let out = render_one(
+            "{% for m in messages %}{% if true %}{% break %}{% endif %}x{% endfor %}y",
+            msg,
+        );
+        assert_eq!(out, "y");
+    }
+
+    #[test]
+    fn strftime_utc_known_dates() {
+        // 2024-02-29 13:05:09 UTC, a Thursday (leap day).
+        let t = 1_709_211_909;
+        assert_eq!(strftime_utc("%d %b %Y", t), "29 Feb 2024");
+        assert_eq!(
+            strftime_utc("%A %B %e, %y %j", t),
+            "Thursday February 29, 24 060"
+        );
+        assert_eq!(strftime_utc("%H:%M:%S %I%p %%", t), "13:05:09 01PM %");
+        assert_eq!(strftime_utc("%Y-%m-%d %a", 0), "1970-01-01 Thu");
+        assert_eq!(strftime_utc("%Y-%m-%d", 951_782_400), "2000-02-29");
     }
 }

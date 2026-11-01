@@ -25,6 +25,60 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ### Added
 
+- `rlx-libm`: `tanhf`, glibc's. Since 2.41 that is CORE-MATH's, correctly
+  rounded, and `tanh` in double rounded once matches it on all 2^32 inputs
+  (checked against glibc 2.43). `reference::tanhf` uses it off Apple; it was
+  musl's.
+- `rlx-libm`: a `wasm-glibc` feature. On wasm32 it defines `expf`, `logf`,
+  `log1pf`, `tanhf`, `sinf`, `cosf`, `exp`, `log`, `log2`, `pow`, `sin`,
+  `cos`, `tan`, `expm1`, `log1p`, `hypot` and `erfc` with the glibc ports,
+  replacing compiler-builtins' weak musl definitions for the whole binary, so
+  std's float math in every crate rounds as on Linux. Each port was checked
+  against glibc 2.43 on x86-64: the f32 ones on all 2^32 inputs, the f64 ones
+  on 3.2·10^8 samples each, with 0 mismatches. Without it, std math on wasm
+  differed from glibc on up to 13% of inputs (`hypot`).
+- `rlx-cpu`: a simd128 GEMM for wasm32 (no BLAS there). A 4 × 8 tile of C
+  stays in registers, and B is packed into 8-column panels. Each element is
+  still summed over `k` in order from the same start value, so results are
+  bit-identical to the scalar fallback loops; only speed changes. Transposed-B
+  products (attention `Q·Kᵀ`) run 4.5× faster, plain `A·B` 1.2×. Products with
+  fewer than 8 rows keep the old row-streaming loop.
+- `rlx-text`: `tool_plan`, which works out from the request text which tools a
+  chat request needs and checks each round of tool calls against that plan. The
+  host lists its tools with the phrases that call for each (`ToolIntent`), plus
+  any tool whose result a step needs first.
+  - `plan` turns a request into ordered steps; a step's prerequisite is planned
+    ahead of it.
+  - `ToolPlan::hint` is a prompt block that lists each step as a call the model
+    can copy.
+  - `ToolPlan::review_round` returns the planned calls the model skipped and
+    the calls to hold back because an input isn't in yet.
+  - `ToolPlan::follow_up` tells the model to make the held-back calls once
+    their inputs arrive.
+  - Triggers match whole words. `#n` stands for any number, and `+`, `*`, `×`
+    and `%` read as "plus", "times", "times" and "percent".
+  - A trigger doesn't count when a negator comes up to four words before it
+    ("don't check my calendar", "without looking at my calendar").
+  - `ToolIntent::unless` lists phrases that cancel an intent: "I'm in Paris,
+    what's the weather here?" doesn't need the user's location.
+  - `DirectAnswer` marks questions the model should answer from what it
+    knows (translations, arithmetic, "who wrote …"). `plan_with` collects
+    them, `review_round` returns the unplanned calls to tools they rule out
+    (`RoundReview::drop`), and `ToolPlan::direct_note` tells the model to
+    answer directly.
+
+  Small models need this on multi-part requests. Qwen3.5-0.8B answered "check
+  my calendar and tell me the time" with only the clock, and searched for the
+  literal words "my city".
+- `rlx-libm`: `log1pf` (glibc's, which is CORE-MATH's correctly rounded one
+  since 2.41: `log1p` in double rounded once, plus a 9-entry table for the
+  inputs where that double-rounds; 0 mismatches against glibc 2.43 over all
+  2^32 inputs) and `reference::log1pf`.
+- `rlx-ir`: a `parity` feature. Spectral windows and the exact-rDFT matrices
+  are host-built constants; under `parity` their cos / sin come from
+  `rlx_libm::reference`, so a wasm build (std there is musl, which differs
+  from Apple on 6768 of 524799 Hann-window arguments) bakes the platform
+  reference's bits. Off: std, as before.
 - `rlx-spectral`: spectral front-ends in pure Rust, generic over precision
   (`Float`: f32, f64): `FftPlan` (Stockham radix 8/4/2/3/5, Bluestein for other
   primes) and `RealFftPlan`; Hann / Hamming / Povey windows; framing
@@ -372,6 +426,53 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ### Fixed
 
+- `rlx-cpu` on wasm / riscv: GELU, bias-GELU, SiLU, the fast `exp` / `tanh`,
+  softmax and LayerNorm now compute exactly what the x86-64 AVX2+FMA kernels
+  compute: the same fused multiply-adds, eight-lane reductions folded in the
+  kernels' order, and the kernels' own tails. A wasm run of these ops now
+  equals the Linux x86-64 run bit for bit; before, it matched on 25–96% of
+  elements. The new mirrors (`avx2_mirror`) are tested against the AVX2 kernels
+  on x86-64.
+- `rlx-cpu` on wasm: f32 fused multiply-adds are now exact. compiler-builtins'
+  software `fmaf` rounds twice when the result is a float subnormal (wrong on
+  half of the constructed cases), and it is slow. The replacement `fmaf` uses
+  double arithmetic, a TwoSum correction at float midpoints, and explicit
+  rounding on the 2^-149 grid; it is checked against hardware FMA. A 4-lane
+  simd128 version takes that slow path only for midpoint or subnormal lanes.
+  End to end, a 12-layer transformer forward costs the same as with the
+  previous inexact loops (27.5 vs 27.9 ms).
+- `rlx-wgpu`: an `m <= 4` f32 matmul now rounds like every other matmul
+  kernel. `matmul_gemv` split K eight ways and added the partial sums, so up
+  to four rows came out a few ULP away from the same rows at `m >= 5`
+  (`matmul.wgsl`) and from Metal's CoopF32, which both sum K in order. Native
+  Metal takes CoopF32 for these shapes; a browser has no cooperative matrix
+  and fell to the split gemv, so a model gave different numbers in Chrome
+  than natively (`rlx-bcgfm`'s squeeze-excite `[N, 42]·[42, 10]`: 7531 of
+  20480 features bit-identical, now all 20480). The default gemv is now one
+  thread per column with K in order (`RLX_WGPU_GEMV_COLS=64`, four loads in
+  flight per step); the split forms (32 / 16 / 8) are used under
+  `set_fast_math(true)` or when pinned. Test:
+  `rlx-wgpu/tests/matmul_gemv_in_order.rs` (fails with the old form pinned).
+
+- `rlx-text`: chat templates now see `loop.previtem` / `loop.nextitem`
+  (minijinja's `adjacent_loop_items` feature), and a message passed to a
+  template tests true and iterates its keys. Before, every message object
+  enumerated as empty, so it tested false: Qwen3.5's
+  `{% if loop.previtem and loop.previtem.role != "tool" %}` never opened the
+  `<|im_start|>user` turn around a tool result (the model read the result as
+  part of its own reply), and `{% for name in tool_call.arguments %}` rendered
+  no parameters.
+- `rlx-text`: more Hugging Face chat templates render. Checked against every
+  GGUF template on the dev machine: all 11 distinct ones render, and the 9 with
+  a tool section render a full tool round.
+  - Dict arguments support Python's `.items()`, `.keys()` and `.values()`.
+    d1 / LFM2 templates iterate tool-call arguments that way and failed to
+    render any tool round.
+  - Printing a dict gives Python's `str()` form, `{'city': 'Paris'}`, which
+    matches HF's `apply_chat_template`. It used to print `{...}`.
+  - `strftime_now(fmt)` exists (UTC). Llama 3.x, Granite and Mistral Small
+    templates call it when no `date_string` is passed.
+  - `{% break %}` and `{% continue %}` compile (minijinja's `loop_controls`).
 - Metal: `sdpa_prefill_fa3_d64` (opt-in, `RLX_METAL_PREFILL_FA3=1`, or
   `=64` for 64 query rows per threadgroup) is the head_dim-64 FA2 prefill
   kernel reworked:

@@ -26,13 +26,18 @@
 //! `Transpose`.
 
 pub mod exec_cpu;
+pub mod host;
+pub mod linalg;
 pub mod plan;
 
 #[cfg(target_arch = "wasm32")]
 pub mod exec_gl;
 
 pub use exec_cpu::run_cpu;
-pub use plan::{Act, Bin, Cmp, LeafSource, Plan, Red, Step, build_plan, supported_ops};
+pub use linalg::LinalgOp;
+pub use plan::{
+    Act, Bin, Cmp, LeafSource, Plan, Red, ScatterRed, Step, build_plan, runnable_ops, supported_ops,
+};
 
 /// Error type for planning / execution.
 #[derive(Debug, Clone)]

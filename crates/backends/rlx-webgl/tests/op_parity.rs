@@ -473,3 +473,93 @@ fn gather_complex() {
     };
     assert_eq!(webgl, cpu, "C64 Gather webgl vs cpu mismatch");
 }
+
+/// Inputs for `act` that stay inside its domain and off its kinks: positive for
+/// Log/Sqrt/Rsqrt, |x| < π/2 for Tan, and no `.5` ties or exact integers for
+/// the rounding family, so the reference and the shader cannot pick sides.
+fn act_domain(act: Activation) -> Vec<f32> {
+    match act {
+        Activation::Log | Activation::Sqrt | Activation::Rsqrt => {
+            f32s(&[3, 5], |i| 0.25 + i as f32 * 0.37)
+        }
+        Activation::Tan => f32s(&[3, 5], |i| i as f32 * 0.2 - 1.4),
+        _ => f32s(&[3, 5], |i| i as f32 * 0.53 - 3.9),
+    }
+}
+
+/// Every activation, forward and `ActivationBackward`, against the CPU backend.
+#[test]
+fn every_activation_forward_and_backward() {
+    for act in Activation::ALL {
+        let xs = act_domain(act);
+        let dys = f32s(&[3, 5], |i| 0.3 + (i as f32 * 0.7).sin());
+
+        let mut g = Graph::new("act_all");
+        let x = g.input("x", shape2(3, 5));
+        let y = g.activation(act, x, shape2(3, 5));
+        g.set_outputs(vec![y]);
+        parity(g, &[("x", &xs)]);
+
+        let mut g = Graph::new("act_all_bwd");
+        let x = g.input("x", shape2(3, 5));
+        let dy = g.input("dy", shape2(3, 5));
+        let dx = g.activation_backward(act, x, dy);
+        g.set_outputs(vec![dx]);
+        if CPU_DECOMPOSES_BACKWARD.contains(&act) {
+            // No rlx-cpu kernel: check against rlxsl's derivative.
+            let plan = rlx_webgl::build_plan(&g).expect("plan");
+            let got = rlx_webgl::run_cpu(&plan, &[("x", &xs), ("dy", &dys)]).expect("run_cpu");
+            for (i, (&xv, &dv)) in xs.iter().zip(&dys).enumerate() {
+                let want = dv * rlxsl::eval_activation_grad(act, xv);
+                let gv = got[0][i];
+                assert!(
+                    (want - gv).abs() <= 1e-4 * (1.0 + want.abs()),
+                    "{act:?}' at {xv}: rlxsl={want} webgl={gv}"
+                );
+            }
+        } else {
+            parity(g, &[("x", &xs), ("dy", &dys)]);
+        }
+    }
+}
+
+/// Activations whose backward rlx-cpu decomposes at the AD level (no
+/// `ActivationBackward` kernel to compare against).
+const CPU_DECOMPOSES_BACKWARD: [Activation; 6] = [
+    Activation::Erf,
+    Activation::HardSwish,
+    Activation::HardSigmoid,
+    Activation::Mish,
+    Activation::Softsign,
+    Activation::LogSigmoid,
+];
+
+/// Training through every activation: autodiff (and its decompositions) on
+/// WebGL against the CPU backend.
+#[test]
+fn every_activation_trains() {
+    for act in Activation::ALL {
+        let xs = act_domain(act);
+        let mut g = Graph::new("act_train");
+        let x = g.param("x", shape2(3, 5));
+        let y = g.activation(act, x, shape2(3, 5));
+        let sq = g.mul(y, y);
+        let loss = g.sum(sq, vec![0, 1], false);
+        g.set_outputs(vec![loss]);
+        let bwd = rlx_autodiff::grad_with_loss(&g, &[x]);
+
+        let mut sess = rlx_runtime::Session::new(rlx_runtime::Device::Cpu).compile(bwd.clone());
+        sess.set_param("x", &xs);
+        let reference = sess.run(&[("d_output", &[1.0])]);
+        let plan = rlx_webgl::build_plan(&bwd).expect("plan");
+        let got = rlx_webgl::run_cpu(&plan, &[("d_output", &[1.0]), ("x", &xs)]).expect("run_cpu");
+        for (r, gv) in reference.iter().zip(&got) {
+            for (a, b) in r.iter().zip(gv) {
+                assert!(
+                    (a - b).abs() <= 2e-4 * (1.0 + a.abs()),
+                    "{act:?}: ref={a} webgl={b}"
+                );
+            }
+        }
+    }
+}

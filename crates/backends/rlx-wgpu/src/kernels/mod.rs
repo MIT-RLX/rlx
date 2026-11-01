@@ -68,7 +68,7 @@ pub const MAXPOOL3D_BWD_WGSL: &str = include_str!("maxpool3d_backward.wgsl");
 pub const CONV3D_BWD_INPUT_WGSL: &str = include_str!("conv3d_backward_input.wgsl");
 pub const CONV3D_BWD_WEIGHT_WGSL: &str = include_str!("conv3d_backward_weight.wgsl");
 pub const LAYERNORM_WGSL: &str = include_str!("layernorm.wgsl");
-pub const GROUP_NORM_WGSL: &str = include_str!("group_norm.wgsl");
+pub const GROUP_NORM_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/group_norm.wgsl"));
 pub const RMS_NORM_BWD_WGSL: &str = include_str!("rms_norm_backward.wgsl");
 pub const LAYER_NORM_BWD_WGSL: &str = include_str!("layer_norm_backward.wgsl");
 pub const CUMSUM_BWD_WGSL: &str = include_str!("cumsum_backward.wgsl");
@@ -131,8 +131,27 @@ pub const IM2COL2D_WGSL: &str = include_str!("im2col2d.wgsl");
 pub const POOL1D_WGSL: &str = include_str!("pool1d.wgsl");
 pub const POOL3D_WGSL: &str = include_str!("pool3d.wgsl");
 pub const CONV1D_WGSL: &str = include_str!("conv1d.wgsl");
-pub const CONV3D_WGSL: &str = include_str!("conv3d.wgsl");
-pub const CONV3D_CTILE_WGSL: &str = include_str!("conv3d_ctile.wgsl");
+pub const CONV3D_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/conv3d.wgsl"));
+pub const CONV3D_CTILE_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/conv3d_ctile.wgsl"));
+/// `conv3d_ctile.wgsl` writing its output to binding 2 (see [`two_window_kernel`]).
+pub const CONV3D_CTILE_SPLIT_WGSL: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/conv3d_ctile_split.wgsl"));
+/// `copy.wgsl` from binding 0 into binding 2: a copy between stripes.
+pub const COPY_TWO_WINDOW_WGSL: &str = r#"
+struct Params { n: u32, in_off: u32, out_off: u32, _p0: u32, _p1: u32, _p2: u32, _p3: u32, _p4: u32, };
+@group(0) @binding(0) var<storage, read_write> arena: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> dst: array<f32>;
+@compute @workgroup_size(64)
+fn copy(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ngs: vec3<u32>) {
+    let i = gid.x + gid.y * ngs.x * 64u;
+    if (i >= params.n) { return; }
+    dst[params.out_off + i] = arena[params.in_off + i];
+}
+"#;
+/// `group_norm.wgsl` writing (and reading back) its output in binding 2.
+pub const GROUP_NORM_SPLIT_WGSL: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/group_norm_split.wgsl"));
 pub const CONV_TRANSPOSE3D_WGSL: &str = include_str!("conv_transpose3d.wgsl");
 pub const GROUP_NORM_BWD_WGSL: &str = include_str!("group_norm_backward.wgsl");
 pub const AXIAL_ROPE2D_WGSL: &str = include_str!("axial_rope2d.wgsl");
@@ -681,8 +700,19 @@ pub struct GroupNormParams {
     pub num_groups: u32,
     pub c: u32,
     pub hw: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
+    /// Activation applied in the write-back: `0` none, else
+    /// `opcode_relu_first + 1` — see `fold_norm_activation`.
+    pub act: u32,
+    /// Workgroups per group; above 1 the split kernels run
+    /// ([`group_norm_split_kernels`]).
+    pub chunks: u32,
+    /// Nonzero: the output is its own binding ([`two_window_kernel`]),
+    /// `out_off` relative to it. Not read by the shaders.
+    pub split: u32,
+    /// Bit 0: the input is half-packed, bit 1: the output
+    /// (`unfuse::pack_half_activations`). Selects the pipeline's `IN_HALF` /
+    /// `OUT_HALF` overrides; not read by the shaders.
+    pub half: u32,
 }
 
 /// Layout for LayerNorm / RmsNorm.
@@ -2168,8 +2198,18 @@ pub struct Conv3dParams {
     /// and the full-size `Add` that consumed it.
     pub bias_off: u32,
     pub has_bias: u32,
-    pub _p1: u32,
-    pub _p2: u32,
+    /// Activation applied in the store: `0` none, else
+    /// `opcode_relu_first + 1` — see `fold_conv_activation`.
+    pub act: u32,
+    /// LeakyReLU's slope (f32 bits) when `act == unfuse::LEAKY_ACT`.
+    pub alpha: u32,
+    /// Nonzero: the output is its own binding ([`two_window_kernel`]),
+    /// `out_off` relative to it. Not read by the shaders.
+    pub split: u32,
+    /// Bit 0: the input is half-packed, bit 1: the output
+    /// (`unfuse::pack_half_activations`). Selects the pipeline's `IN_HALF` /
+    /// `OUT_HALF` overrides; not read by the shaders.
+    pub half: u32,
 }
 
 /// Lazy-init container for a compute pipeline + its bind-group layout.
@@ -2753,6 +2793,7 @@ static ROUND_TO_FORMAT: OnceLock<Kernel> = OnceLock::new();
 static DOUBLE_SINGLE: OnceLock<Kernel> = OnceLock::new();
 static LAYERNORM: OnceLock<Kernel> = OnceLock::new();
 static GROUP_NORM: OnceLock<Kernel> = OnceLock::new();
+static GROUP_NORM_SPLIT: OnceLock<[Kernel; 3]> = OnceLock::new();
 static RMS_NORM_BWD: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD_PARAM: OnceLock<Kernel> = OnceLock::new();
 static LAYER_NORM_BWD_INPUT: OnceLock<Kernel> = OnceLock::new();
@@ -2823,6 +2864,10 @@ static POOL3D: OnceLock<Kernel> = OnceLock::new();
 static CONV1D: OnceLock<Kernel> = OnceLock::new();
 static CONV3D: OnceLock<Kernel> = OnceLock::new();
 static CONV3D_CTILE: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_CTILE_W2: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_CTILE_W4: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_CTILE_W4C8: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_ARGMAX: OnceLock<Kernel> = OnceLock::new();
 static CONV_TRANSPOSE3D: OnceLock<Kernel> = OnceLock::new();
 static SCATTER_ADD: OnceLock<Kernel> = OnceLock::new();
 static TOPK: OnceLock<Kernel> = OnceLock::new();
@@ -2869,20 +2914,26 @@ pub fn matmul_kernel(device: &wgpu::Device) -> &'static Kernel {
 /// `matmul_gemv` with `cols` columns per 256-thread workgroup and K split
 /// `256 / cols` ways inside it. The shipped shader is the `cols = 32` case.
 ///
+/// `cols = 64` is the exact form: a 64-thread workgroup, one thread per
+/// column, K summed in order (`KSPLIT = 1`), so it rounds like `matmul.wgsl`
+/// and CoopF32. The split forms (32 / 16 / 8) add K in a different order.
+///
 /// Fewer columns per workgroup means `n / cols` more workgroups: at a narrow
 /// output (`n = 1024`, decode down/o projections) the 32-column form launches
 /// 32 workgroups — ~1.6 per M4 Pro core — and runs at ~60 GB/s while the wide
 /// `n = 6144` projection reaches ~150. Same single-pass reduction, no scratch.
 pub fn matmul_gemv_kernel_cols(device: &wgpu::Device, cols: u32) -> &'static Kernel {
+    static V64: OnceLock<Kernel> = OnceLock::new();
     static V16: OnceLock<Kernel> = OnceLock::new();
     static V8: OnceLock<Kernel> = OnceLock::new();
     let (cell, label) = match cols {
+        64 => (&V64, "rlx-wgpu matmul_gemv exact"),
         16 => (&V16, "rlx-wgpu matmul_gemv c16"),
         8 => (&V8, "rlx-wgpu matmul_gemv c8"),
         _ => return matmul_gemv_kernel(device),
     };
     cell.get_or_init(|| {
-        let ksplit = 256 / cols;
+        let ksplit = if cols == 64 { 1 } else { 256 / cols };
         let src = MATMUL_GEMV_WGSL
             .replace(
                 "const COLS: u32 = 32u;",
@@ -2908,15 +2959,18 @@ pub fn matmul_gemv_kernel_cols(device: &wgpu::Device, cols: u32) -> &'static Ker
 }
 
 /// Columns per workgroup for a decode GEMV of output width `n`.
-/// `RLX_WGPU_GEMV_COLS` (32 / 16 / 8) pins it.
+///
+/// 64, the in-order form, unless fast math is on
+/// ([`crate::device::set_fast_math`]), which takes the faster 32-column
+/// split-K form. `RLX_WGPU_GEMV_COLS` (64 / 32 / 16 / 8) pins it.
 pub fn gemv_cols_for(n: u32) -> u32 {
     if let Some(c) = rlx_ir::env::var("RLX_WGPU_GEMV_COLS").and_then(|v| v.parse::<u32>().ok())
-        && matches!(c, 8 | 16 | 32)
+        && matches!(c, 8 | 16 | 32 | 64)
     {
         return c;
     }
     let _ = n;
-    32
+    if crate::device::fast_math() { 32 } else { 64 }
 }
 
 /// `m ≤ 4` matrix-vector product (decode) — see `matmul_gemv.wgsl`.
@@ -3644,9 +3698,173 @@ pub fn round_to_format_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn layernorm_kernel(device: &wgpu::Device) -> &'static Kernel {
     LAYERNORM.get_or_init(|| build_kernel(device, "rlx-wgpu layernorm", LAYERNORM_WGSL, "norm"))
 }
+/// A conv3d (`conv3d_ctile*`, `conv3d_argmax`), group-norm or `copy` entry point
+/// whose output is its own binding: binding 0 the window holding the input
+/// (and the staged weights), 1 the parameters, 2 the output's window. For an
+/// arena striped past one storage binding, where an op's input and output lie
+/// in different stripes and no single window holds both. The two windows are
+/// disjoint ranges of the arena, so both may be writable storage.
+pub fn two_window_kernel(device: &wgpu::Device, entry: &'static str) -> &'static Kernel {
+    static KERNELS: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<&'static str, &'static Kernel>>,
+    > = OnceLock::new();
+    let map = KERNELS.get_or_init(Default::default);
+    let mut map = map.lock().unwrap();
+    map.entry(entry).or_insert_with(|| {
+        let src = if entry == "copy" {
+            COPY_TWO_WINDOW_WGSL
+        } else if entry.starts_with("group_norm") {
+            GROUP_NORM_SPLIT_WGSL
+        } else {
+            CONV3D_CTILE_SPLIT_WGSL
+        };
+        let module = kernel_module(device, "rlx-wgpu two-window", src);
+        let storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let entry_of = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty,
+            count: None,
+        };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rlx-wgpu two-window"),
+            entries: &[
+                entry_of(0, storage),
+                entry_of(
+                    1,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                entry_of(2, storage),
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rlx-wgpu two-window"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Box::leak(Box::new(Kernel { pipeline, bgl }))
+    })
+}
+
+/// A conv3d or group-norm entry point for half-packed activations
+/// (`unfuse::pack_half_activations`): the pipeline's `IN_HALF` / `OUT_HALF`
+/// overrides from `half` (bit 0 / bit 1), on one binding (`arena` + uniform)
+/// or two windows (`two`, [`two_window_kernel`]'s layout). The same shader
+/// source; the compiler folds the branches away.
+pub fn half_kernel(
+    device: &wgpu::Device,
+    entry: &'static str,
+    two: bool,
+    half: u32,
+) -> &'static Kernel {
+    type Key = (&'static str, bool, u32);
+    static KERNELS: OnceLock<std::sync::Mutex<std::collections::HashMap<Key, &'static Kernel>>> =
+        OnceLock::new();
+    let map = KERNELS.get_or_init(Default::default);
+    let mut map = map.lock().unwrap();
+    map.entry((entry, two, half)).or_insert_with(|| {
+        let norm = entry.starts_with("group_norm");
+        let src = match (norm, two) {
+            (true, true) => GROUP_NORM_SPLIT_WGSL,
+            (true, false) => GROUP_NORM_WGSL,
+            (false, true) => CONV3D_CTILE_SPLIT_WGSL,
+            (false, false) => CONV3D_CTILE_WGSL,
+        };
+        let module = kernel_module(device, "rlx-wgpu half", src);
+        let storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let entry_of = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty,
+            count: None,
+        };
+        let uniform = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let entries = [
+            entry_of(0, storage),
+            entry_of(1, uniform),
+            entry_of(2, storage),
+        ];
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rlx-wgpu half"),
+            entries: if two { &entries[..] } else { &entries[..2] },
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rlx-wgpu half"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let constants = [
+            ("IN_HALF", f64::from(half & 1)),
+            ("OUT_HALF", f64::from((half >> 1) & 1)),
+        ];
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &constants,
+                ..Default::default()
+            },
+            cache: None,
+        });
+        Box::leak(Box::new(Kernel { pipeline, bgl }))
+    })
+}
+
 pub fn group_norm_kernel(device: &wgpu::Device) -> &'static Kernel {
     GROUP_NORM
         .get_or_init(|| build_kernel(device, "rlx-wgpu group_norm", GROUP_NORM_WGSL, "group_norm"))
+}
+/// `group_norm.wgsl`'s split form — partial, apply, head — for a norm whose
+/// `GroupNormParams::chunks > 1`; same bind-group layout as [`group_norm_kernel`].
+pub fn group_norm_split_kernels(device: &wgpu::Device) -> &'static [Kernel; 3] {
+    GROUP_NORM_SPLIT.get_or_init(|| {
+        [
+            build_kernel(
+                device,
+                "rlx-wgpu group_norm_partial",
+                GROUP_NORM_WGSL,
+                "group_norm_partial",
+            ),
+            build_kernel(
+                device,
+                "rlx-wgpu group_norm_apply",
+                GROUP_NORM_WGSL,
+                "group_norm_apply",
+            ),
+            build_kernel(
+                device,
+                "rlx-wgpu group_norm_head",
+                GROUP_NORM_WGSL,
+                "group_norm_head",
+            ),
+        ]
+    })
 }
 pub fn rms_norm_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
     RMS_NORM_BWD.get_or_init(|| {
@@ -4249,6 +4467,48 @@ pub fn conv3d_ctile_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu conv3d_ctile",
             CONV3D_CTILE_WGSL,
             "conv3d_ctile",
+        )
+    })
+}
+pub fn conv3d_ctile_w2_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_CTILE_W2.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_ctile_w2",
+            CONV3D_CTILE_WGSL,
+            "conv3d_ctile_w2",
+        )
+    })
+}
+pub fn conv3d_ctile_w4_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_CTILE_W4.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_ctile_w4",
+            CONV3D_CTILE_WGSL,
+            "conv3d_ctile_w4",
+        )
+    })
+}
+pub fn conv3d_ctile_w4c8_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_CTILE_W4C8.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_ctile_w4c8",
+            CONV3D_CTILE_WGSL,
+            "conv3d_ctile_w4c8",
+        )
+    })
+}
+/// A 1×1×1 conv3d and the argmax over its output channels in one pass
+/// (`Conv3dParams::act == ARGMAX_ACT`; see `unfuse::fold_conv_argmax`).
+pub fn conv3d_argmax_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_ARGMAX.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_argmax",
+            CONV3D_CTILE_WGSL,
+            "conv3d_argmax",
         )
     })
 }

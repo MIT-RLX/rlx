@@ -103,14 +103,26 @@ fn f16_shadow_arena_size(plan: &MemoryPlan) -> usize {
 /// 64 on discrete wgpu so long-wave plans do not snap into multi-×4 GiB OOM).
 pub const SHARD_STAGE_RESERVE: usize = 768 * 1024 * 1024;
 
-/// Effective stage reserve (see [`SHARD_STAGE_RESERVE`]).
+/// The stage reserve on a 32-bit target (the browser). Its whole logical
+/// arena must stay below 2 GiB ([`WEIGHT_BUF_TAG`] is bit 31), and 768 MiB a
+/// stripe did not leave room: MindGrab's 1.29 GB plan under a 1 GiB binding
+/// snapped to 4.03 GB of stripes and the compile panicked. 64 MiB is what the
+/// ≤ 2 GiB-buffer adapters already get (`compile`'s scratch tail).
+pub const WASM_STAGE_RESERVE: usize = 64 * 1024 * 1024;
+
+/// Effective stage reserve (see [`SHARD_STAGE_RESERVE`], [`WASM_STAGE_RESERVE`]).
 pub fn shard_stage_reserve() -> usize {
+    let default = if cfg!(target_pointer_width = "32") {
+        WASM_STAGE_RESERVE
+    } else {
+        SHARD_STAGE_RESERVE
+    };
     if let Some(raw) = rlx_ir::env::var("RLX_WGPU_SHARD_STAGE_MIB") {
         if let Ok(mib) = raw.parse::<usize>() {
             return (mib.max(1) * 1024 * 1024).min(SHARD_STAGE_RESERVE);
         }
     }
-    SHARD_STAGE_RESERVE
+    default
 }
 
 /// Device shard capacity, honouring `RLX_WGPU_SHARD_CAP_MIB`.
@@ -138,6 +150,17 @@ pub fn effective_shard_cap(device: &wgpu::Device) -> usize {
         return forced.min(device_cap).max(256);
     }
     device_cap
+}
+
+/// An activation's slot in the f32-uniform arena: four bytes an element, or
+/// two for a half-packed one (`unfuse::pack_half_activations`), in words.
+fn act_slot_bytes(node: &rlx_ir::Node) -> usize {
+    let ne = node.shape.num_elements().unwrap_or(0).max(1);
+    if crate::unfuse::is_half(node) {
+        (ne * 2).div_ceil(4) * 4
+    } else {
+        ne * 4
+    }
 }
 
 /// Re-place unique buffer slots so no slot crosses a shard boundary.
@@ -885,7 +908,11 @@ impl Arena {
         // does NOT shrink the arena (the planner aliases the persistent packed
         // weights onto low offsets and leaves an activation at the high offset),
         // so we re-plan without params to actually compact it.
-        let mut new_plan = rlx_compile::memory::plan_memory_f32_uniform_no_params(graph, 16);
+        let mut new_plan = if crate::unfuse::half_packed() {
+            rlx_compile::memory::plan_memory_hybrid_no_params(graph, 16)
+        } else {
+            rlx_compile::memory::plan_memory_f32_uniform_no_params(graph, 16)
+        };
         let walign = 256usize; // storage-buffer offset alignment for windowed binds
         let a = 16usize;
         let mut weight_offsets: HashMap<NodeId, usize> = HashMap::new();
@@ -1070,12 +1097,11 @@ impl Arena {
                     next.push(id);
                     continue;
                 };
-                let ne = graph.node(id).shape.num_elements().unwrap_or(0).max(1);
                 new_plan.assignments.insert(
                     id,
                     rlx_opt::memory::BufferSlot {
                         offset: root_slot.offset + off,
-                        size: ne * 4,
+                        size: act_slot_bytes(graph.node(id)),
                     },
                 );
             }
@@ -1087,16 +1113,16 @@ impl Arena {
             {
                 continue;
             }
-            let ne = node.shape.num_elements().unwrap_or(0).max(1);
+            let bytes = act_slot_bytes(node);
             tail = tail.div_ceil(a) * a;
             new_plan.assignments.insert(
                 node.id,
                 rlx_opt::memory::BufferSlot {
                     offset: tail,
-                    size: ne * 4,
+                    size: bytes,
                 },
             );
-            tail += ne * 4;
+            tail += bytes;
         }
         new_plan.arena_size = tail;
         if rlx_ir::env::flag("RLX_WGPU_DEBUG") {
@@ -1389,6 +1415,20 @@ impl Arena {
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("rlx-wgpu weight→arena copy"),
         });
+        self.encode_weight_to_act(&mut enc, src_tagged, dst_off, bytes);
+        queue.submit(std::iter::once(enc.finish()));
+    }
+
+    /// [`Self::copy_weight_to_act`] into `enc`, between compute passes: the
+    /// queue orders it with the dispatches around it, so the host does not
+    /// wait (in the browser, where it cannot).
+    pub fn encode_weight_to_act(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        src_tagged: usize,
+        dst_off: usize,
+        bytes: usize,
+    ) {
         let mut done = 0usize;
         while done < bytes {
             let (src_buf, src_local) = self.resolve_w(src_tagged + done);
@@ -1409,7 +1449,6 @@ impl Arena {
             );
             done += chunk;
         }
-        queue.submit(std::iter::once(enc.finish()));
     }
 
     pub fn resolve_act(&self, global_off: usize) -> (&wgpu::Buffer, usize) {
@@ -2337,4 +2376,54 @@ mod tests {
         };
         assert_eq!(f16_shadow_arena_size(&plan), 24);
     }
+}
+
+/// The arena `graph` plans to on this backend — the passes `compile` runs
+/// before planning, then its planner — without a device — and the scratch
+/// tail every compile reserves (at least 64 MiB).
+///
+/// Compared with [`arena_binding_limit`], it says whether a compile would keep
+/// the arena in one storage binding. Past that the arena is striped and any
+/// op whose operands span two stripes runs on the host, much slower.
+pub fn planned_arena_bytes(graph: Graph) -> usize {
+    let (g, plan) = planned(graph);
+    plan.arena_size + crate::backend::compute_scratch_bytes(&g).div_ceil(16) * 16
+}
+
+/// The largest single tensor's slot [`planned_arena_bytes`] would give it: an
+/// arena past one binding is striped, and each tensor must fit a stripe.
+pub fn planned_largest_tensor_bytes(graph: Graph) -> usize {
+    let (g, plan) = planned(graph);
+    g.nodes()
+        .iter()
+        .filter(|n| !matches!(n.op, rlx_ir::Op::Param { .. }))
+        .filter_map(|n| plan.assignments.get(&n.id).map(|a| a.size))
+        .max()
+        .unwrap_or(0)
+}
+
+fn planned(graph: Graph) -> (Graph, MemoryPlan) {
+    let g = crate::unfuse::unfuse(graph);
+    let g = crate::unfuse::collapse_reshapes(g);
+    let g = crate::unfuse::fold_expand_into_binary(g);
+    let g = crate::unfuse::maybe_pack_half(g);
+    let plan = if crate::unfuse::half_packed() {
+        plan_hybrid(&g, 16)
+    } else {
+        plan_f32_uniform(&g, 16)
+    };
+    crate::unfuse::set_half_packed(false);
+    (g, plan)
+}
+
+/// The largest arena this device holds in one storage binding: its
+/// `maxStorageBufferBindingSize` (and `maxBufferSize`), and in wasm below the
+/// 2 GiB of [`WEIGHT_BUF_TAG`]. `None` before the device is up.
+pub fn arena_binding_limit() -> Option<u64> {
+    let l = crate::device::wgpu_device()?.device.limits();
+    Some(
+        l.max_storage_buffer_binding_size
+            .min(l.max_buffer_size)
+            .min(WEIGHT_BUF_TAG as u64),
+    )
 }

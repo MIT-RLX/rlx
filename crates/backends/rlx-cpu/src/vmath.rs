@@ -33,14 +33,14 @@ pub fn vmath_accurate() -> bool {
 // The accurate scalar tier outside Accelerate: rlx-libm's reference ports
 // for parity (feature `parity`), rlx-cpu's `fastmath` otherwise.
 #[inline(always)]
-fn acc_expf(x: f32) -> f32 {
+pub(crate) fn acc_expf(x: f32) -> f32 {
     #[cfg(feature = "parity")]
     return rlx_libm::reference::expf(x);
     #[cfg(not(feature = "parity"))]
     crate::fastmath::exp(x)
 }
 #[inline(always)]
-fn acc_tanhf(x: f32) -> f32 {
+pub(crate) fn acc_tanhf(x: f32) -> f32 {
     #[cfg(feature = "parity")]
     return rlx_libm::reference::tanhf(x);
     #[cfg(not(feature = "parity"))]
@@ -267,7 +267,7 @@ pub(crate) fn tanh_poly(x: f32) -> f32 {
 }
 
 /// Portable fast `exp` over a slice. Auto-vectorizes; see [`exp_poly`].
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn vvexpf_poly(y: &mut [f32], x: &[f32]) {
     for (yi, &xi) in y.iter_mut().zip(x.iter()) {
         *yi = exp_poly(xi);
@@ -295,7 +295,12 @@ pub fn vvexpf_fast(y: &mut [f32], x: &[f32]) {
         // Was `vvexpf`, i.e. a libm `expf` CALL PER ELEMENT — which is both
         // slow and unvectorizable, so a pre-AVX2 x86 (every Atom through
         // Tremont) got no SIMD at all on the hottest activation primitive.
+        #[cfg(target_arch = "x86_64")]
         vvexpf_poly(y, x);
+        // wasm / riscv: the AVX2 kernel's arithmetic, so they round like
+        // Linux x86-64.
+        #[cfg(not(target_arch = "x86_64"))]
+        crate::avx2_mirror::vvexpf(y, x, acc_expf);
     }
 }
 
@@ -668,9 +673,13 @@ pub fn vvtanhf_fast(y: &mut [f32], x: &[f32]) {
         }
         // Same `(e^2x − 1) / (e^2x + 1)` form as `vvtanhf_avx2`, over the
         // auto-vectorizing `exp_poly` instead of a libm `tanhf` per element.
+        #[cfg(target_arch = "x86_64")]
         for (yi, &xi) in y.iter_mut().zip(x.iter()) {
             *yi = tanh_poly(xi);
         }
+        // wasm / riscv: the AVX2 kernel's arithmetic.
+        #[cfg(not(target_arch = "x86_64"))]
+        crate::avx2_mirror::vvtanhf(y, x, acc_tanhf);
     }
 }
 
@@ -998,7 +1007,7 @@ fn vvrsqrtf_neon(y: &mut [f32], x: &[f32]) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn vvexpf_avx2(y: &mut [f32], x: &[f32]) {
+pub(crate) unsafe fn vvexpf_avx2(y: &mut [f32], x: &[f32]) {
     use crate::kernels::avx2_exp8;
     use std::arch::x86_64::*;
     let n = x.len();
@@ -1016,7 +1025,7 @@ unsafe fn vvexpf_avx2(y: &mut [f32], x: &[f32]) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn vvtanhf_avx2(y: &mut [f32], x: &[f32]) {
+pub(crate) unsafe fn vvtanhf_avx2(y: &mut [f32], x: &[f32]) {
     use crate::kernels::avx2_exp8;
     use std::arch::x86_64::*;
     let n = x.len();

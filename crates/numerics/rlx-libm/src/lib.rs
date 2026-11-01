@@ -39,6 +39,8 @@ pub use fma::fma_emulated;
 mod expm1_log1p;
 mod sin;
 mod tables;
+#[cfg(all(feature = "wasm-glibc", target_arch = "wasm32"))]
+mod wasm_glibc;
 pub use complex::{cexp, csqrt, hypot};
 pub use erfc::erfc;
 #[doc(hidden)]
@@ -697,6 +699,38 @@ pub fn sincosf(y: f32) -> (f32, f32) {
     (nan, nan)
 }
 
+/// glibc's `tanhf`: CORE-MATH's since 2.41, correctly rounded, and `tanh` in
+/// double rounded once lands on it everywhere. Checked against glibc 2.43 on
+/// every one of the 2^32 inputs: 0 mismatches.
+pub fn tanhf(x: f32) -> f32 {
+    libm_crate::tanh(x as f64) as f32
+}
+
+/// glibc's `log1pf`. Since 2.41 that is CORE-MATH's, correctly rounded, so
+/// any correctly rounded `log1pf` is it: `log1p` in double, rounded once,
+/// except on 9 inputs where the double's error straddles a float rounding
+/// boundary. Those take glibc 2.43's (correct) value from a table, as
+/// CORE-MATH handles its own hard cases. Checked against glibc 2.43 on every
+/// one of the 2^32 inputs: 0 mismatches.
+pub fn log1pf(x: f32) -> f32 {
+    const HARD: [(u32, u32); 9] = [
+        (0x3540_0003, 0x353f_ffff),
+        (0x3710_001b, 0x370f_fff3),
+        (0x3efd_81ad, 0x3ecd_eee1),
+        (0x4107_8feb, 0x400f_e5e7),
+        (0x65d8_90d3, 0x4254_d1f9),
+        (0x6f31_a8ec, 0x4284_5a89),
+        (0xb53f_fffd, 0xb540_0001),
+        (0xb70f_ffe5, 0xb710_000d),
+        (0xbb0e_c8c4, 0xbb0e_f0a5),
+    ];
+    let bits = x.to_bits();
+    if let Some(&(_, y)) = HARD.iter().find(|&&(h, _)| h == bits) {
+        return f32::from_bits(y);
+    }
+    log1p(x as f64) as f32
+}
+
 /// glibc `expf` (`e_expf.c`, the `-mfma` x86-64 variant: gcc fuses each
 /// multiply into the add that consumes it). `2^(i/32)` is entry `4i` of the
 /// double `exp` table, which carries `2^(j/128)` with the same rounding.
@@ -808,18 +842,17 @@ pub mod reference {
     pub fn logf(x: f32) -> f32 {
         if APPLE { x.ln() } else { super::logf(x) }
     }
+    /// `log1pf(x)`.
+    pub fn log1pf(x: f32) -> f32 {
+        if APPLE { x.ln_1p() } else { super::log1pf(x) }
+    }
     /// `expf(x)`.
     pub fn expf(x: f32) -> f32 {
         if APPLE { x.exp() } else { super::expf(x) }
     }
-    /// `tanhf(x)`: the platform's with `libm` on Apple, else musl's (the
-    /// pure-Rust `libm` crate; rlx-libm has no glibc port of it).
+    /// `tanhf(x)`.
     pub fn tanhf(x: f32) -> f32 {
-        if APPLE {
-            x.tanh()
-        } else {
-            libm_crate::tanhf(x)
-        }
+        if APPLE { x.tanh() } else { super::tanhf(x) }
     }
     /// `(sin(x), cos(x))` from one call: Apple's `__sincos_stret` (what
     /// clang turns an adjacent `sin` + `cos` into, so macOS-built C such as
@@ -874,6 +907,88 @@ mod tests {
         while i < (1u64 << 32) {
             let x = f32::from_bits(i as u32);
             let (a, b) = (super::reference::expf(x), x.exp());
+            if a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()) {
+                bad.push((x, a, b));
+            }
+            i += 257;
+        }
+        assert!(
+            bad.is_empty(),
+            "{} mismatches, first {:?}",
+            bad.len(),
+            bad.first()
+        );
+    }
+
+    /// The 9 inputs where `log1p` in double rounds to the wrong float, against
+    /// glibc (correctly rounded since 2.41). The 257-stride sweep misses them.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn log1pf_hard_cases_are_glibcs() {
+        for b in [
+            0x3540_0003u32,
+            0x3710_001b,
+            0x3efd_81ad,
+            0x4107_8feb,
+            0x65d8_90d3,
+            0x6f31_a8ec,
+            0xb53f_fffd,
+            0xb70f_ffe5,
+            0xbb0e_c8c4,
+        ] {
+            let x = f32::from_bits(b);
+            assert_eq!(
+                super::log1pf(x).to_bits(),
+                x.ln_1p().to_bits(),
+                "log1pf({x:e})"
+            );
+            assert_ne!(
+                (super::log1p(x as f64) as f32).to_bits(),
+                x.ln_1p().to_bits(),
+                "{b:#x} is not hard"
+            );
+        }
+    }
+
+    /// `tanhf` against the platform's (glibc 2.43's on Linux, where the port
+    /// was also checked on all 2^32 inputs) on every 257th bit pattern.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(not(target_vendor = "apple"), feature = "libm")
+    ))]
+    #[test]
+    fn reference_tanhf_is_the_platform_tanhf() {
+        let mut bad = Vec::new();
+        let mut i: u64 = 0;
+        while i < (1u64 << 32) {
+            let x = f32::from_bits(i as u32);
+            let (a, b) = (super::reference::tanhf(x), x.tanh());
+            if a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()) {
+                bad.push((x, a, b));
+            }
+            i += 257;
+        }
+        assert!(
+            bad.is_empty(),
+            "{} mismatches, first {:?}",
+            bad.len(),
+            bad.first()
+        );
+    }
+
+    /// `log1pf` against the platform's (glibc 2.43's on Linux, where the port
+    /// was also checked on all 2^32 inputs) on every 257th bit pattern.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(not(target_vendor = "apple"), feature = "libm")
+    ))]
+    #[test]
+    fn reference_log1pf_is_the_platform_log1pf() {
+        let mut bad = Vec::new();
+        let mut i: u64 = 0;
+        while i < (1u64 << 32) {
+            let x = f32::from_bits(i as u32);
+            let (a, b) = (super::reference::log1pf(x), x.ln_1p());
             if a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()) {
                 bad.push((x, a, b));
             }

@@ -300,6 +300,7 @@ pub(crate) fn compile_conv3d(
                 src: node_offset(arena, node.inputs[0]),
                 weight: node_offset(arena, node.inputs[1]),
                 dst: node_offset(arena, node.id),
+                bias: node.inputs.get(2).map(|&b| node_offset(arena, b)),
                 n,
                 c_in,
                 d,
@@ -1051,6 +1052,7 @@ pub(crate) fn exec_conv3d(t: &Thunk, base: *mut u8) {
         src,
         weight,
         dst,
+        bias,
         n,
         c_in,
         d,
@@ -1080,7 +1082,7 @@ pub(crate) fn exec_conv3d(t: &Thunk, base: *mut u8) {
     unsafe {
         execute_conv3d_forward_f32(
             *src, *weight, *dst, *n, *c_in, *d, *h, *w, *c_out, *d_out, *h_out, *w_out, *kd, *kh,
-            *kw, *sd, *sh, *sw, *pd, *ph, *pw, *dd, *dh, *dw, *groups, base,
+            *kw, *sd, *sh, *sw, *pd, *ph, *pw, *dd, *dh, *dw, *groups, base, *bias,
         );
     }
 }
@@ -2090,6 +2092,7 @@ pub unsafe fn execute_conv3d_forward_f32(
     dw: u32,
     groups: u32,
     base: *mut u8,
+    bias: Option<usize>,
 ) {
     let n = n as usize;
     let c_in = c_in as usize;
@@ -2117,9 +2120,10 @@ pub unsafe fn execute_conv3d_forward_f32(
     let inp = sl(src, base, n * c_in * d * h * w);
     let wt = sl(weight, base, c_out * c_in_per_g * kd * kh * kw);
     let out = sl_mut(dst, base, n * c_out * d_out * h_out * w_out);
+    let bias = bias.map(|b| sl(b, base, c_out));
     crate::conv_fwd::conv3d_forward_ncdhw_f32(
         inp, wt, out, n, c_in, d, h, w, c_out, d_out, h_out, w_out, kd, kh, kw, sd, sh, sw, pd, ph,
-        pw, dd, dh, dw, groups,
+        pw, dd, dh, dw, groups, bias,
     );
 }
 

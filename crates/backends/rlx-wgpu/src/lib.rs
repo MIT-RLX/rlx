@@ -94,6 +94,7 @@ pub fn is_available() -> bool {
     device::wgpu_device().is_some()
 }
 
+pub use buffer::{arena_binding_limit, planned_arena_bytes, planned_largest_tensor_bytes};
 #[cfg(target_arch = "wasm32")]
 pub use device::init_wgpu_device;
 pub use device::{is_vulkan_available, select_vulkan_backend, wgpu_device};

@@ -39,6 +39,7 @@ members = [
     # Microcontroller backend
     "crates/backends/rlx-cortexm",     # ARMv7E-M (Cortex-M4/M7) INT8 kernels — nRF52840 etc.
     "crates/backends/rlx-cortexm/trainer",  # Native fp32 trainer that emits the INT8 model_weights.rs
+    "crates/backends/rlx-mcu",         # no_std int8/int4 kernels + in-place model files for speech models on MCUs
 
     # FPGA backend
     "crates/backends/rlx-fpga",        # IR → Verilog → bitstream (per-graph datapath, integer-only Q0.31 requant)
@@ -217,6 +218,7 @@ rlx-compile = { path = "crates/core/rlx-compile", version = "0.2.19" }
 rlx-coreml = { path = "crates/backends/rlx-coreml", version = "0.2.19" }
 rlx-cortexm = { path = "crates/backends/rlx-cortexm", version = "0.2.19" }
 rlx-cortexm-trainer = { path = "crates/backends/rlx-cortexm/trainer", version = "0.2.19" }
+rlx-mcu = { path = "crates/backends/rlx-mcu", version = "0.2.19", default-features = false }
 rlx-cpu = { path = "crates/backends/rlx-cpu", version = "0.2.19" }
 rlx-cuda = { path = "crates/backends/rlx-cuda", version = "0.2.19" }
 rlx-dduf = { path = "crates/io/rlx-dduf", version = "0.2.19" }

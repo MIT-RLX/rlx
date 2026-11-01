@@ -16,8 +16,10 @@ use core::fmt;
 #[cfg(feature = "std")]
 use std::path::PathBuf;
 
+use crate::board::ShellBoard;
 #[cfg(feature = "std")]
 use crate::from_graph::FromGraphOptions;
+use crate::lattice::{LatticeBoard, LatticeFamily};
 #[cfg(feature = "std")]
 use crate::legalize::{ExportQuantMode, LegalizeOptions};
 use crate::tune::{OptTarget, Tune};
@@ -53,6 +55,10 @@ pub enum HwTarget {
         part: String,
         board: Option<Xc7Board>,
     },
+    /// A Lattice board preset (iCE40 or ECP5): the open Yosys / nextpnr
+    /// flow for its device, a UART host-link `board_top`, real pin
+    /// constraints and an `openFPGALoader` `program.sh`.
+    Lattice(LatticeBoard),
 }
 
 impl HwTarget {
@@ -93,9 +99,34 @@ impl HwTarget {
         }
     }
 
+    /// Lattice board preset (iCE40 / ECP5, pins + UART host link).
+    pub fn lattice_board(board: LatticeBoard) -> Self {
+        Self::Lattice(board)
+    }
+
+    /// The Lattice board preset, when one is set.
+    pub fn lattice(&self) -> Option<LatticeBoard> {
+        match self {
+            Self::Lattice(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// The board the UART host-link shell is generated for: any board
+    /// preset, Xilinx or Lattice.
+    pub fn shell_board(&self) -> Option<ShellBoard> {
+        match self {
+            Self::Xilinx7 { board: Some(b), .. } => Some(b.shell()),
+            Self::Lattice(b) => Some(b.shell()),
+            _ => None,
+        }
+    }
+
     /// Parse CLI / config strings: `generic`, `ecp5`, `ecp5:25k:CABGA381`,
-    /// `ice40`, `ice40:up5k:sg48`, `xilinx7:xc7a35tcsg324-1`, or an openXC7
-    /// board `xc7:arty-a7-35` / `xc7:basys3` / `xc7:nexys-a7-100`.
+    /// `ice40`, `ice40:up5k:sg48`, `xilinx7:xc7a35tcsg324-1`, an openXC7
+    /// board `xc7:arty-a7-35` / `xc7:basys3` / `xc7:nexys-a7-100`, or a
+    /// Lattice board `lattice:icebreaker` / `ice40:icebreaker` /
+    /// `ecp5:ulx3s-85f` (`lattice:ulx3s-12f` … `-85f`).
     pub fn parse(s: &str) -> Result<Self, String> {
         let s = s.trim();
         let lower = s.to_ascii_lowercase();
@@ -107,6 +138,30 @@ impl HwTarget {
                 let mut parts = s.split(':');
                 let kind = parts.next().unwrap_or("").to_ascii_lowercase();
                 match kind.as_str() {
+                    "lattice" => {
+                        let arg = parts.next().unwrap_or("");
+                        LatticeBoard::parse(arg).map(Self::Lattice).ok_or_else(|| {
+                            format!(
+                                "unknown Lattice board {arg:?}; expected one of {}",
+                                LatticeBoard::ALL.map(LatticeBoard::name).join(", ")
+                            )
+                        })
+                    }
+                    // `ecp5:<board>` / `ice40:<board>`: a preset of that family.
+                    "ecp5" | "ice40"
+                        if let Some(b) = parts.clone().next().and_then(LatticeBoard::parse) =>
+                    {
+                        let want = if kind == "ecp5" {
+                            LatticeFamily::Ecp5
+                        } else {
+                            LatticeFamily::Ice40
+                        };
+                        if b.family() == want {
+                            Ok(Self::Lattice(b))
+                        } else {
+                            Err(format!("{b} is not an {kind} board"))
+                        }
+                    }
                     "ecp5" => {
                         let device = parts.next().unwrap_or("25k").to_string();
                         let package = parts.next().unwrap_or("CABGA381").to_string();
@@ -133,7 +188,7 @@ impl HwTarget {
                     }
                     _ => Err(format!(
                         "unknown HwTarget {s:?}; expected generic | ecp5[:device:pkg] | \
-                         ice40[:device:pkg] | xc7:<board|part>"
+                         ice40[:device:pkg] | xc7:<board|part> | lattice:<board>"
                     )),
                 }
             }
@@ -148,6 +203,7 @@ impl HwTarget {
             Self::Ice40 { device, package } => format!("ice40_{device}_{package}"),
             Self::Xilinx7 { board: Some(b), .. } => format!("xc7_{}", b.name()),
             Self::Xilinx7 { part, .. } => format!("xilinx7_{part}"),
+            Self::Lattice(b) => format!("lattice_{}", b.name()),
         }
     }
 
@@ -168,6 +224,16 @@ impl fmt::Display for HwTarget {
                 board: Some(b),
             } => write!(f, "xilinx7 {part} ({b}, openXC7)"),
             Self::Xilinx7 { part, .. } => write!(f, "xilinx7 {part} (openXC7)"),
+            Self::Lattice(b) => write!(
+                f,
+                "lattice {} {} {} ({b})",
+                match b.family() {
+                    LatticeFamily::Ice40 => "ice40",
+                    LatticeFamily::Ecp5 => "ecp5",
+                },
+                b.device(),
+                b.package()
+            ),
         }
     }
 }

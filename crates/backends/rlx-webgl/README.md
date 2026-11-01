@@ -50,40 +50,64 @@ supported_ops())`. So coverage is two layers:
 
 **Native kernels** (`supported_ops()` — what the executor runs directly):
 
-- **Leaves**: `Input`, `Param`, `Constant`, `Cast` (f32), `StopGradient`
+- **Leaves**: `Input`, `Param`, `Constant` (any dtype, decoded by value — e.g. the I64 index tables legalization builds), `Cast` (f32), `StopGradient`
 - **Linear**: `MatMul`
-- **Element-wise** (broadcasting via an inserted gather): `Binary{Add,Sub,Mul,Div,Max,Min,Pow}`, `Compare{Eq,Ne,Lt,Le,Gt,Ge}`, `Where`
-- **Activations** (forward + `ActivationBackward`/`ReluBackward`): `Relu, Neg, Exp, Log, Sqrt, Rsqrt, Sigmoid, Tanh, Abs, Sin, Cos, Silu`
+- **Element-wise** (broadcasting via an inserted gather): `Binary{Add,Sub,Mul,Div,Max,Min,Pow,Mod,BitAnd,BitOr,BitXor,Shl,Shr,Atan2}`, `Compare{Eq,Ne,Lt,Le,Gt,Ge}`, `Where`
+- **Activations** — all 29 (`Activation::ALL`), forward + `ActivationBackward`/`ReluBackward`; `Round` is half-to-even with a straight-through gradient, `Sign(0) = 0`
 - **Reductions**: `Reduce{Sum,Mean,Max,Min,Prod}`, `Softmax` (last axis), `Cumsum` (last axis, via triangular matmul), `ArgMax`/`ArgMin`
-- **Normalization**: `LayerNorm`, `RmsNorm` (last axis)
+- **Sorting**: `Sort`, `ArgSort` (any axis, stable), `TopK` (largest, ties → smaller index) — one fragment per output finds the element of its rank
+- **Normalization**: `LayerNorm`, `RmsNorm` (last axis), `LayerNorm2d` (over channels: transpose + LayerNorm)
 - **Positional**: `Rope` (NeoX half-split, full + partial)
-- **Structural**: `Reshape`, `Transpose`, `Expand`, `Narrow`, `Reverse`, `Concat`, `Gather` (runtime indices, embedding-style)
-- **Conv/pool (NCHW, forward)**: `Conv` (groups = 1, via im2col-gather + matmul), `Im2Col`, `Pool` (Max/Avg, via reduce-with-window-groups)
+- **Structural**: `Reshape`, `Transpose`, `Expand`, `Narrow`, `Reverse`, `Concat`, `Gather` (runtime indices, embedding-style), `Interpolate3d` (nearest)
+- **Runtime-index gather/scatter**: `GatherElements`, `GatherNd` (incl. `batch_dims`), `ScatterNd`, `ScatterElements` (reductions none/add/mul/max/min), `ScatterAdd` (any axis). Negative indices count from the end. WebGL has no atomics, so a scatter runs one fragment per *output* that folds in the updates landing on it, in index order (`none` = last write wins, as on rlx-cpu)
+- **Conv/pool (NCHW)**: `Conv` (groups = 1 via im2col-gather + matmul; grouped/depthwise via gather-multiply-reduce), `Im2Col`, `Pool` (Max/Avg, via reduce-with-window-groups)
+- **3-D conv (NCDHW)**: `Conv3d` (same two forms; an ungrouped conv with ≥ 4 output channels runs up to 16 channels per fragment into up to four RGBA scratch targets (multiple render targets) with its weights regrouped into RGBA texels, so each input tap is fetched once per 16 channels: 3.5–3.8× on 3×3×3 volume models, identical outputs; an `Activation` that is the conv's (or a `GroupNorm`'s) only reader is applied as it writes instead of as its own pass, `RLX_WEBGL_NO_FOLD_ACT=1` to keep it apart; `tests/gl_conv_parity.rs` checks the shaders in a browser), `ConvTranspose3d` (gather form, strided/dilated/output-padded/grouped)
+- **FFT**: `Fft` along the last axis, F32/F64 2N-block or interleaved C64, every `FftNorm`, any length, O(N log N): power-of-two lengths run `log₂ N` radix-2 Stockham passes (one butterfly per output lane), other lengths Bluestein (a power-of-two FFT convolution). Twiddles, chirp and filter spectrum are computed in f64 on the host, so no shader evaluates `sin`/`cos`; error matches rlx-cpu's (≈1e-7 of peak), and intermediates stay ≤ 4096 lanes wide
+- **RNG**: `RngUniform`, `RngNormal` — counter-based and keyed by the node, so the planner computes them with the default RNG policy (what an rlx-cpu session uses) and uploads a constant; a session-level RNG policy change does not reach WebGL
+- **Linalg** (host-staged, f64): `Cholesky`, `TriangularSolve`, `DenseSolve`, `BatchedDenseSolve`, `Det`, `LogDet`. Factorizations are sequential, so the GL executor reads the operands back, solves on the host, and uploads the result
 
 **Lowered to the above by the legalization passes** (no native kernel needed):
 `GroupNorm`, `BatchNormInference`, `SoftmaxCrossEntropy`, `DotGeneral`,
-non-last-axis / multi-axis `Reduce`, control flow (`If`/`While`), fused & RNN
-ops (`GatedDeltaNet`/`Lstm`/`Gru`/`Rnn`/`Mamba2`/`SelectiveScan`/`Fused*`/…),
-and the dedicated `*Backward` ops for the supported forward ops
+`Pad`, `Slice` (incl. negative / strided steps), `Roll`, `Clamp`, `Tile`,
+`Trilu`, `CumProd`, `CumMax`, `Histogram`, `ResizeNearest2x`,
+`ConvTranspose1d`/`2d`, `LoraMatMul`, non-last-axis / multi-axis `Reduce`,
+control flow (`If`/`While`), fused & RNN ops
+(`GatedDeltaNet`/`Lstm`/`Gru`/`Rnn`/`Mamba2`/`SelectiveScan`/`Fused*`/…), and
+the dedicated `*Backward` ops for the supported forward ops
 (`LayerNormBackward*`, `RmsNormBackward*`, `GroupNormBackward*`, `RopeBackward`,
-`MaxPool2dBackward`, `CumsumBackward`, `GatherBackward`,
-`SoftmaxCrossEntropyBackward`, …) → so those training graphs work without
-per-op backward kernels.
+`MaxPool2dBackward`, `CumsumBackward`, `GatherBackward`, `Conv*Backward*`,
+`SoftmaxCrossEntropyBackward`, …) → so those training graphs (conv nets
+included) work without per-op backward kernels.
 
-**Not yet supported** (clear planning error): `Conv` with groups > 1,
-`ConvTranspose2d`, and **conv `weight`/`input` backward** (its decomposition
-mixes flattened-concat patch layouts the flat executor doesn't yet handle — conv
-*forward* + `Im2Col` do work); `ScatterAdd`; `TopK`/`Sample`; RNG; quantized I/O
-(`QMatMul`/`Dequant*`); complex (`C64`); `Custom`/`Fft`/splat.
+**Host fallback** (`host.rs`, `Step::Host`): any op left after legalization
+that rlx-cpu runs is executed *by* rlx-cpu — a one-node graph compiled once,
+its operands encoded to their real dtypes (int8, I64, f64, C64, …). That covers
+`Sample`, `Quantize`/`Dequantize`, `QMatMul`/`QConv2d`, `DequantMatMul` and the
+other quantized matmuls, `Svd`/`Qr`/`Eigh`, registered (non-collective)
+`Custom` ops, complex helpers, `LogMel`/`WelchPeaks`, the SPD ops, and splatting
+(after `rlx_splat::register()`, as on the CPU). It matches rlx-cpu by
+construction, but on the GL path each such op is a GPU → host → GPU round trip,
+and integer values ride f32 slots (exact below 2²⁴). rlx-cpu is built without
+BLAS here, so the same pure-Rust code runs natively and in wasm (rlx-web links
+rlx-cpu already). `runnable_ops()` — native ∪ host — is what the runtime's
+`Device::OpenGl` claims; legalization still lowers against `supported_ops()`, so
+an op with a WebGL lowering keeps it.
 
 Status: the planner + numerics for the native kernels **and** the legalized
-composites are **verified natively** against RLX's CPU backend (27 tests in
-`tests/{cpu_parity,op_parity,composite_parity,dataflow_parity,ops2_parity}.rs` —
-incl. LayerNorm/RmsNorm, GroupNorm/BatchNorm via lowering, LayerNorm backward,
-Cumsum/Concat/Pool/Conv2d, Im2Col, ArgMax/ArgMin, runtime Gather, RoPE). WebGL
-execution is compile-verified and browser-validated via `rlx-web`
-(`just serve-web --webgl`).
+composites are **verified natively** against RLX's CPU backend
+(`tests/{cpu_parity,op_parity,composite_parity,dataflow_parity,ops2_parity,ops3_parity,host_fallback_parity}.rs`;
+activation derivatives rlx-cpu has no kernel for are checked against rlxsl's
+auto-differentiated gradient). The GLSL is compiled by the browser at
+`GlBackend::new`, so it is validated in-browser via `rlx-web`
+(`just serve-web --webgl`), not by the native tests.
 
 ## License
 
 MIT OR Apache-2.0.
+
+## Profiling
+
+Set `globalThis.__rlxWebglProfile = true` in the page or worker that runs a
+plan: every step is then followed by `gl.finish()` and the run logs its time
+by step kind to the console. The waits themselves cost, so rank the steps
+rather than quoting the totals.

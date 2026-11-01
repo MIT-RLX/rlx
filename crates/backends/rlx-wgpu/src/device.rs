@@ -316,7 +316,9 @@ static FAST_MATH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// WGSL operators instead of rlxsl's correctly-rounded helpers. Native `/` may
 /// be 2.5 ULP off and Metal's `sqrt` is often 1 ULP off, so results stop
 /// matching the CPU bit for bit. `fmod` stays exact (a fast one is wrong by
-/// whole multiples, not ULPs). Off by default.
+/// whole multiples, not ULPs). It also lets an `m <= 4` matmul split K across
+/// threads (`matmul_gemv`'s 32-column form), which adds K in a different order
+/// from every other matmul kernel. Off by default.
 ///
 /// Kernels are built once per process, so call this before the first
 /// compile; a later call does not rebuild kernels that already exist.

@@ -76,15 +76,67 @@ pub fn expand_cpu_nop_fused(g: Graph) -> Graph {
     let nodes: Vec<rlx_ir::Node> = g.nodes().to_vec();
     for node in &nodes {
         let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
-        let new_id = if INLINED_HERE.contains(&node.op.kind()) {
-            inline_unfused(&mut out, &node.op, &new_inputs, &node.shape)
-        } else {
-            out.add_node(node.op.clone(), new_inputs, node.shape.clone())
-        };
+        let new_id =
+            if let Some(id) = fold_conv3d_bias(&mut out, &node.op, &new_inputs, &node.shape) {
+                id
+            } else if INLINED_HERE.contains(&node.op.kind()) {
+                inline_unfused(&mut out, &node.op, &new_inputs, &node.shape)
+            } else {
+                out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+            };
         id_map.insert(node.id, new_id);
     }
     out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
     out
+}
+
+/// A 3-D `FusedConvBiasAct` (no residual) as a **3-input** `Op::Conv3d`
+/// whose thunk adds the bias in its store, then its activation, if any.
+///
+/// Expanded the generic way it is `conv → Reshape(bias) → Expand → Add`, and
+/// the `Expand` of a parameter is precomputed and held for the whole run: one
+/// output-sized tensor per convolution. A 10-layer MeshNet over a 164×164×224
+/// crop planned a 2.4 GB arena that way, against ~0.25 GB of activations.
+/// The wgpu backend folds the same way (`fold_conv_bias_into_conv3d`).
+///
+/// Backend-private, as there: `Op::Conv3d` is two inputs in the IR contract,
+/// and this graph exists only between here and `compile_thunks`.
+fn fold_conv3d_bias(
+    out: &mut Graph,
+    op: &Op,
+    inputs: &[NodeId],
+    shape: &rlx_ir::Shape,
+) -> Option<NodeId> {
+    let Op::FusedConvBiasAct {
+        kernel_size,
+        stride,
+        padding,
+        dilation,
+        groups,
+        activation,
+        has_residual: false,
+    } = op
+    else {
+        return None;
+    };
+    if kernel_size.len() != 3 || inputs.len() != 3 {
+        return None;
+    }
+    let a3 = |v: &Vec<usize>| [v[0], v[1], v[2]];
+    let conv = out.add_node(
+        Op::Conv3d {
+            stride: a3(stride),
+            padding: a3(padding),
+            dilation: a3(dilation),
+            groups: *groups,
+        },
+        inputs.to_vec(),
+        shape.clone(),
+    );
+    Some(match activation {
+        Some(a) => out.add_node(Op::Activation(*a), vec![conv], shape.clone()),
+        None => conv,
+    })
 }
 
 fn inline_unfused(out: &mut Graph, op: &Op, inputs: &[NodeId], shape: &rlx_ir::Shape) -> NodeId {
@@ -209,6 +261,46 @@ mod tests {
                 .iter()
                 .any(|n| matches!(n.op, Op::ElementwiseRegion { .. })),
             "BatchElementwiseRegion should become ElementwiseRegion slices"
+        );
+    }
+
+    #[test]
+    fn a_3d_conv_bias_folds_into_the_conv() {
+        let mut g = Graph::new("fcba3");
+        let x = const_f32(&mut g, &[1.0; 8], &[1, 1, 2, 2, 2]);
+        let w = const_f32(&mut g, &[2.0], &[1, 1, 1, 1, 1]);
+        let b = const_f32(&mut g, &[0.5], &[1]);
+        let y = g.add_node(
+            Op::FusedConvBiasAct {
+                kernel_size: vec![1, 1, 1],
+                stride: vec![1, 1, 1],
+                padding: vec![0, 0, 0],
+                dilation: vec![1, 1, 1],
+                groups: 1,
+                activation: Some(Activation::Relu),
+                has_residual: false,
+            },
+            vec![x, w, b],
+            Shape::new(&[1, 1, 2, 2, 2], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        let out = prepare_graph_for_thunks(g);
+        let conv = out
+            .nodes()
+            .iter()
+            .find(|n| matches!(n.op, Op::Conv3d { .. }))
+            .expect("a Conv3d");
+        assert_eq!(conv.inputs.len(), 3, "the bias rides on the conv");
+        assert!(
+            !out.nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::Expand { .. })),
+            "no bias-sized Expand"
+        );
+        assert!(
+            out.nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::Activation(Activation::Relu)))
         );
     }
 

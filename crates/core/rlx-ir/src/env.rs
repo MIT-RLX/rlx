@@ -44,16 +44,22 @@ thread_local! {
 /// The thread-scoped value of `key`, if this thread has one: `Some(None)` is
 /// a scoped removal.
 fn scoped_value(key: &str) -> Option<Option<String>> {
-    SCOPED.with(|s| {
-        let s = s.borrow();
-        if s.is_empty() {
-            return None;
-        }
-        s.iter()
-            .rev()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.clone())
-    })
+    // `try_with`: a read from a destructor that runs during thread-local
+    // teardown (a cached compiled graph whose backend drop reads a setting
+    // at process exit) finds no scoped overrides instead of panicking.
+    SCOPED
+        .try_with(|s| {
+            let s = s.borrow();
+            if s.is_empty() {
+                return None;
+            }
+            s.iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
+        .ok()
+        .flatten()
 }
 
 /// Override `key` on **this thread only** until the guard drops.

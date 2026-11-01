@@ -16,11 +16,8 @@ use crate::prelude::*;
 
 use core::fmt;
 
-/// UART baud rate of the emitted host link.
-pub const UART_BAUD: u32 = 115_200;
-
-/// Byte the host sends before each input vector.
-pub const UART_SYNC: u8 = 0xA5;
+use crate::board::ShellBoard;
+pub use crate::board::{UART_BAUD, UART_SYNC};
 
 /// Board pin assignment (LVCMOS33 throughout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,9 +130,23 @@ impl Xc7Board {
         }
     }
 
+    /// What the UART shell needs.
+    pub fn shell(self) -> ShellBoard {
+        let p = self.pins();
+        ShellBoard {
+            name: self.name(),
+            flow: "openXC7",
+            clk_mhz: p.clk_mhz,
+            core_khz: p.clk_mhz * 1000,
+            pll: None,
+            rst_active_low: p.rst_active_low,
+            led_active_low: false,
+        }
+    }
+
     /// UART bit period in board clocks.
     pub fn clks_per_bit(self) -> u32 {
-        (self.pins().clk_mhz * 1_000_000).div_ceil(UART_BAUD)
+        self.shell().clks_per_bit()
     }
 }
 

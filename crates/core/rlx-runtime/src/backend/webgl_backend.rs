@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use super::*;
 use rlx_ir::OpKind;
-use rlx_webgl::{Plan, build_plan, supported_ops};
+use rlx_webgl::{Plan, build_plan, runnable_ops};
 use std::collections::HashMap;
 
 pub struct WebglBackend;
@@ -17,7 +17,9 @@ struct WebglExecutable {
 
 impl Backend for WebglBackend {
     fn supported_ops(&self) -> &'static [OpKind] {
-        supported_ops()
+        // Native kernels plus the rlx-cpu host fallback (`build_plan` still
+        // lowers natively whatever it can).
+        runnable_ops()
     }
 
     fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {

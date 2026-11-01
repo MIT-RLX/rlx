@@ -13,6 +13,14 @@
 // coalesced row segment) per k, and the eight partial sums meet in shared
 // memory. Up to four A rows share each B load.
 //
+// That split adds K in a different order from `matmul.wgsl` and the CoopF32
+// kernels (both a plain in-order sum), so it is only used in fast mode.
+// By default the host builds this shader with COLS = 64 and KSPLIT = 1
+// (`matmul_gemv_kernel_cols(64)`): one thread per output column, K in order.
+// That makes an m <= 4 product bit-identical to the same product at m >= 5,
+// and to native Metal (CoopF32) when it runs where there is no cooperative
+// matrix (a browser).
+//
 // Pure WGSL — no extensions, no subgroup ops.
 
 struct Params {
@@ -108,7 +116,32 @@ fn matmul_gemv(
     for (var i: u32 = 0u; i < MAX_M; i = i + 1u) {
         acc[i] = 0.0;
     }
-    if (col_ok) {
+    if (col_ok && KSPLIT == 1u) {
+        // In-order form: four B loads in flight per step, the sums still
+        // taken k = 0, 1, 2, ... one at a time.
+        let k4 = params.k & ~3u;
+        for (var k: u32 = 0u; k < k4; k = k + 4u) {
+            let b0 = arena[b_base + k * params.n + col];
+            let b1 = arena[b_base + (k + 1u) * params.n + col];
+            let b2 = arena[b_base + (k + 2u) * params.n + col];
+            let b3 = arena[b_base + (k + 3u) * params.n + col];
+            for (var i: u32 = 0u; i < rows; i = i + 1u) {
+                let ar = a_base + i * params.k + k;
+                var v = acc[i];
+                v = v + arena[ar] * b0;
+                v = v + arena[ar + 1u] * b1;
+                v = v + arena[ar + 2u] * b2;
+                v = v + arena[ar + 3u] * b3;
+                acc[i] = v;
+            }
+        }
+        for (var k: u32 = k4; k < params.k; k = k + 1u) {
+            let b = arena[b_base + k * params.n + col];
+            for (var i: u32 = 0u; i < rows; i = i + 1u) {
+                acc[i] = acc[i] + arena[a_base + i * params.k + k] * b;
+            }
+        }
+    } else if (col_ok) {
         for (var k: u32 = ks; k < params.k; k = k + KSPLIT) {
             let b = arena[b_base + k * params.n + col];
             for (var i: u32 = 0u; i < rows; i = i + 1u) {
@@ -124,8 +157,11 @@ fn matmul_gemv(
 
     if (ks == 0u && col_ok) {
         for (var i: u32 = 0u; i < rows; i = i + 1u) {
-            var v = 0.0;
-            for (var s: u32 = 0u; s < KSPLIT; s = s + 1u) {
+            // Seeded with the first partial, not 0.0: at KSPLIT = 1 the
+            // result is then exactly the in-order sum (`0.0 + -0.0` would
+            // turn a negative zero positive).
+            var v = partial[i][lid.x];
+            for (var s: u32 = 1u; s < KSPLIT; s = s + 1u) {
                 v = v + partial[s * MAX_M + i][lid.x];
             }
             if (params.has_bias != 0u) {

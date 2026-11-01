@@ -565,6 +565,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_HYBRID_K` | Bisect | Bool | Tooling | Override the k dimension in the hybrid dequant-matmul parity test |
 | `RLX_HYBRID_M` | Bisect | Bool | Tooling | Override the hybrid-split m dimension (default 96) |
 | `RLX_ICB_TRACE` | Bisect | Bool | Tooling | Trace indirect-command-buffer construction |
+| `RLX_ICESTORM_IMAGE` | Internal | String | Tooling | Container image for the opt-in iCE40 (IceStorm) bitstream test (rlx-fpga) |
 | `RLX_IMP_DBG` | Bisect | Bool | Tooling | Print per-op decisions during ONNX import |
 | `RLX_IQ_TEST_DIR` | Bisect | Path | Tooling | Directory holding the IQ/TQ test GGUFs |
 | `RLX_IR_DUMP` | Bisect | Bool | Tooling | Write a full pipeline IR dump to this path prefix or directory |
@@ -623,6 +624,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_TEST_DOCKER` | Internal | Bool | Tooling | rlx-capi binding tests: run languages without a local toolchain in containers aliases: `RLX_TEST_DOTNET_DOCKER` |
 | `RLX_TRACE_PERFETTO` | Bisect | Bool | Tooling | Write a Perfetto trace to this path |
 | `RLX_TRACE_THUNK` | Bisect | Bool | Tooling | Print each CPU thunk as it executes |
+| `RLX_TRELLIS_IMAGE` | Internal | String | Tooling | Container image for the opt-in ECP5 (Trellis) bitstream test (rlx-fpga) |
 | `RLX_UMAP_CUDA_FUSED_KNN` | Bisect | Bool | Tooling | Use the fused GPU kNN path in UMAP |
 | `RLX_USE_ICB` | Bisect | Bool | Tooling | Opt in to Metal indirect command buffers |
 | `RLX_WARN_SLOW_DECODE` | Internal | Bool | Runtime | Warn once when an LM runner has no cached decode and re-prefills the whole context per token |

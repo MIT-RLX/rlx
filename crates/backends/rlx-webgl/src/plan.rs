@@ -6,6 +6,8 @@
 //! (gather / reduce groups) precomputed in plain Rust so the CPU and WebGL
 //! executors run byte-for-byte the same lowering.
 
+use crate::host::HostOp;
+use crate::linalg::LinalgOp;
 use crate::{Result, WebglError};
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, ReduceOp};
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, OpKind};
@@ -34,6 +36,39 @@ pub enum Act {
     GeluApprox,
     /// `ln(1 + eˣ)`, as `max(x, 0) + ln(1 + e^-|x|)` so it never overflows.
     Softplus,
+    Tan,
+    Atan,
+    /// Round half to even; straight-through gradient (`1`).
+    Round,
+    Floor,
+    Ceil,
+    /// `sign(0) = 0`.
+    Sign,
+    /// `x > 0 ? x : eˣ − 1` (α = 1).
+    Elu,
+    /// Abramowitz–Stegun 7.1.26, as `Gelu` uses.
+    Erf,
+    /// `x · clamp(x + 3, 0, 6) / 6`.
+    HardSwish,
+    /// `clamp(x / 6 + 0.5, 0, 1)`.
+    HardSigmoid,
+    /// `x · tanh(softplus(x))`.
+    Mish,
+    /// `x / (1 + |x|)`.
+    Softsign,
+    /// `min(x, 0) − ln(1 + e^-|x|)`.
+    LogSigmoid,
+}
+
+/// How [`Step::ScatterRuntime`] folds an update into its output element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScatterRed {
+    /// Overwrite (the last update in index order wins).
+    Replace,
+    Add,
+    Mul,
+    Max,
+    Min,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +221,8 @@ pub enum Step {
     },
     /// Embedding-style gather with a runtime index tensor:
     /// `out[o] = table[base[o] + round(indices[which[o]]) * axis_stride]`.
+    /// With `wrap > 0` a negative index counts from the end (`+ wrap`) and the
+    /// result is clamped to `[0, wrap)` (ONNX `GatherElements`, as rlx-cpu).
     GatherRuntime {
         out: usize,
         table: usize,
@@ -193,6 +230,41 @@ pub enum Step {
         which: Vec<u32>,
         base: Vec<u32>,
         axis_stride: u32,
+        wrap: u32,
+    },
+    /// Scatter with a runtime index tensor, one output element per fragment
+    /// (WebGL has no atomics, so each output gathers the updates that land on
+    /// it): `out[o]` starts at `data[o]` (or 0 without `data`), then for
+    /// `j in 0..count`, every `updates[ubase[o] + j·ustride]` whose index
+    /// `round(indices[ibase[o] + j·istride])` (negative `+ wrap`) equals
+    /// `key[o]` is folded in by `red`, in `j` order. `ibase[o] = PAD` = none.
+    ScatterRuntime {
+        out: usize,
+        data: Option<usize>,
+        updates: usize,
+        indices: usize,
+        ibase: Vec<u32>,
+        ubase: Vec<u32>,
+        key: Vec<u32>,
+        count: usize,
+        istride: usize,
+        ustride: usize,
+        wrap: u32,
+        red: ScatterRed,
+    },
+    /// Stable sort along one axis of `src` viewed as `[outer, len, inner]`,
+    /// keeping the first `k` positions: output `[outer, k, inner]` holds the
+    /// values (or f32 indices) of rank `0..k`. Rank = number of elements that
+    /// sort before (ties: smaller index first) — `Sort`/`ArgSort`/`TopK`.
+    SortAxis {
+        out: usize,
+        src: usize,
+        outer: usize,
+        len: usize,
+        inner: usize,
+        k: usize,
+        descending: bool,
+        indices: bool,
     },
     /// Standalone complex `Op::Cast` lane-move on the f32-uniform arena
     /// (real↔C64, real↔C128, C64↔C128). Representation:
@@ -225,6 +297,42 @@ pub enum Step {
         n_a: usize,
         n_b: usize,
     },
+    /// One radix-2 Stockham pass of a power-of-two FFT of length `n` over
+    /// every row (one fragment per output lane). Output element `k`, with
+    /// `j = (k / 2ns)·ns + k mod ns`: `x[j] ± w · x[j + n/2]`, `+` in the first
+    /// `ns` of each `2ns` block, `w = tw[ns − 1 + k mod ns]` (complex, from the
+    /// host-computed table). Passes run `ns = 1, 2, …, n/2` and leave the result
+    /// in natural order. Rows are 2N-block (`[re… | im…]`) when `*_block`,
+    /// else interleaved; `scale` multiplies the output.
+    FftStage {
+        out: usize,
+        src: usize,
+        tw: usize,
+        n: usize,
+        ns: usize,
+        in_block: bool,
+        out_block: bool,
+        scale: f32,
+    },
+    /// An op with no WebGL lowering, run on rlx-cpu (see [`crate::host`]):
+    /// operand slots in, output slot out, read and written linearly.
+    Host {
+        out: usize,
+        inputs: Vec<usize>,
+        op: std::sync::Arc<HostOp>,
+    },
+    /// Dense linear algebra on `batch` `[n, n]` matrices (and `[n, nrhs]`
+    /// right-hand sides): run on the host by both executors — see
+    /// [`crate::linalg`].
+    Linalg {
+        out: usize,
+        a: usize,
+        b: Option<usize>,
+        n: usize,
+        nrhs: usize,
+        batch: usize,
+        op: LinalgOp,
+    },
     /// Host/transport custom op (`collective.*`): the single f32 `input` is
     /// staged to a registered CPU kernel via
     /// `rlx_cpu::op_registry::run_f32_custom_op_host`. There is no GPU/GLSL
@@ -237,6 +345,296 @@ pub enum Step {
         name: String,
         attrs: Vec<u8>,
     },
+    /// NCDHW 3-D convolution computed directly, one output element per
+    /// fragment summing its `cin/groups · kD·kH·kW` taps, plus `bias[co]`
+    /// when given. Weight `[cout, cin/groups, kD, kH, kW]`.
+    Conv3d {
+        out: usize,
+        x: usize,
+        w: usize,
+        bias: Option<usize>,
+        n: usize,
+        cin: usize,
+        din: [usize; 3],
+        cout: usize,
+        dout: [usize; 3],
+        k: [usize; 3],
+        stride: [usize; 3],
+        pad: [usize; 3],
+        dil: [usize; 3],
+        groups: usize,
+        /// applied to each output element as it is written (`fold_activations`)
+        act: Option<Act>,
+    },
+    /// ArgMax / ArgMin along the middle axis of `src` viewed as
+    /// `[outer, len, inner]` → `[outer, inner]` f32 indices (first extreme
+    /// wins), positions computed rather than read from a table.
+    ArgAxis {
+        out: usize,
+        src: usize,
+        outer: usize,
+        len: usize,
+        inner: usize,
+        is_max: bool,
+    },
+    /// A 1×1×1 convolution and the argmax over its output channels in one
+    /// pass: `out[n, p] = argmax_co (bias[co] + Σ_ci w[co, ci] · x[n, ci, p])`.
+    /// The per-class scores — classes × voxels — are never stored
+    /// (`fuse_conv1_argmax`).
+    Conv1ArgMax {
+        out: usize,
+        x: usize,
+        w: usize,
+        bias: Option<usize>,
+        n: usize,
+        cin: usize,
+        cout: usize,
+        spatial: usize,
+    },
+    /// GroupNorm on `[n, c, spatial]`: each group's `c/groups` channels are
+    /// one contiguous run; `(x − mean)/√(var + eps) · gamma[c] + beta[c]`.
+    GroupNorm {
+        out: usize,
+        x: usize,
+        gamma: usize,
+        beta: usize,
+        n: usize,
+        c: usize,
+        groups: usize,
+        spatial: usize,
+        eps: f32,
+        /// applied to each output element as it is written (`fold_activations`)
+        act: Option<Act>,
+    },
+    /// Numpy broadcasting by arithmetic: output element at coordinates `c`
+    /// (in `out_dims`) reads `src[Σ c[k] · in_strides[k]]`, a stride 0 on a
+    /// broadcast axis. At most [`BROADCAST_RANK`] axes.
+    Broadcast {
+        out: usize,
+        src: usize,
+        out_dims: Vec<usize>,
+        in_strides: Vec<usize>,
+    },
+    /// Every element of `out` = the one element of `src` (a scalar
+    /// broadcast: a table would hold one index per output element).
+    Splat {
+        out: usize,
+        src: usize,
+    },
+    /// `out = src`, element for element (a Reshape whose texture shape
+    /// changes).
+    Copy {
+        out: usize,
+        src: usize,
+    },
+    /// Two tensors joined along one axis, each viewed as `[outer, len]` with
+    /// `len` the axis times everything after it: output row `o` is `a`'s row
+    /// then `b`'s. (More inputs chain.)
+    Concat {
+        out: usize,
+        a: usize,
+        b: usize,
+        outer: usize,
+        a_len: usize,
+        b_len: usize,
+    },
+    /// NCDHW max / average pooling (`nc` = batch × channels); padding is
+    /// skipped by a max and counts as zero in an average (rlx-cpu's
+    /// `count_include_pad`).
+    Pool3d {
+        out: usize,
+        src: usize,
+        nc: usize,
+        din: [usize; 3],
+        dout: [usize; 3],
+        k: [usize; 3],
+        stride: [usize; 3],
+        pad: [usize; 3],
+        is_max: bool,
+    },
+    /// NCDHW nearest-neighbour resize: `src = min(dst · in / out, in − 1)`.
+    Resize3d {
+        out: usize,
+        src: usize,
+        nc: usize,
+        din: [usize; 3],
+        dout: [usize; 3],
+    },
+}
+
+impl Step {
+    /// The slot this step writes.
+    pub fn out(&self) -> usize {
+        match self {
+            Step::Leaf { out, .. }
+            | Step::Unary { out, .. }
+            | Step::ActBack { out, .. }
+            | Step::Binary { out, .. }
+            | Step::Compare { out, .. }
+            | Step::Where { out, .. }
+            | Step::MatMul { out, .. }
+            | Step::Gather { out, .. }
+            | Step::Reduce { out, .. }
+            | Step::Softmax { out, .. }
+            | Step::LayerNorm { out, .. }
+            | Step::RmsNorm { out, .. }
+            | Step::ArgReduce { out, .. }
+            | Step::GatherRuntime { out, .. }
+            | Step::ScatterRuntime { out, .. }
+            | Step::SortAxis { out, .. }
+            | Step::ComplexCast { out, .. }
+            | Step::BinaryC64 { out, .. }
+            | Step::FftStage { out, .. }
+            | Step::Host { out, .. }
+            | Step::Linalg { out, .. }
+            | Step::Custom { out, .. }
+            | Step::Conv3d { out, .. }
+            | Step::ArgAxis { out, .. }
+            | Step::Conv1ArgMax { out, .. }
+            | Step::GroupNorm { out, .. }
+            | Step::Copy { out, .. }
+            | Step::Splat { out, .. }
+            | Step::Broadcast { out, .. }
+            | Step::Concat { out, .. }
+            | Step::Pool3d { out, .. }
+            | Step::Resize3d { out, .. } => *out,
+        }
+    }
+
+    /// The slots this step reads — what the GL executor frees a texture
+    /// after the last of.
+    pub fn reads(&self) -> Vec<usize> {
+        match self {
+            Step::Leaf { .. } => vec![],
+            Step::Unary { a, .. } | Step::Softmax { a, .. } => vec![*a],
+            Step::ActBack { x, dy, .. } => vec![*x, *dy],
+            Step::Binary { a, b, .. }
+            | Step::Compare { a, b, .. }
+            | Step::BinaryC64 { a, b, .. } => {
+                vec![*a, *b]
+            }
+            Step::MatMul { a, b, .. } => vec![*a, *b],
+            Step::Where { cond, a, b, .. } => vec![*cond, *a, *b],
+            Step::Gather { src, .. }
+            | Step::Reduce { src, .. }
+            | Step::ArgReduce { src, .. }
+            | Step::SortAxis { src, .. }
+            | Step::ComplexCast { src, .. }
+            | Step::ArgAxis { src, .. }
+            | Step::Copy { src, .. }
+            | Step::Splat { src, .. }
+            | Step::Broadcast { src, .. }
+            | Step::Pool3d { src, .. }
+            | Step::Resize3d { src, .. } => vec![*src],
+            Step::Concat { a, b, .. } => vec![*a, *b],
+            Step::LayerNorm { x, gamma, beta, .. }
+            | Step::RmsNorm { x, gamma, beta, .. }
+            | Step::GroupNorm { x, gamma, beta, .. } => vec![*x, *gamma, *beta],
+            Step::GatherRuntime { table, indices, .. } => vec![*table, *indices],
+            Step::ScatterRuntime {
+                data,
+                updates,
+                indices,
+                ..
+            } => {
+                let mut v = vec![*updates, *indices];
+                v.extend(data);
+                v
+            }
+            Step::FftStage { src, tw, .. } => vec![*src, *tw],
+            Step::Host { inputs, .. } => inputs.clone(),
+            Step::Linalg { a, b, .. } => {
+                let mut v = vec![*a];
+                v.extend(b);
+                v
+            }
+            Step::Custom { input, .. } => vec![*input],
+            Step::Conv3d { x, w, bias, .. } | Step::Conv1ArgMax { x, w, bias, .. } => {
+                let mut v = vec![*x, *w];
+                v.extend(bias);
+                v
+            }
+        }
+    }
+
+    /// Rewrite every slot this step reads ([`Step::reads`]) through `f`.
+    pub fn remap_reads(&mut self, f: impl Fn(usize) -> usize) {
+        let g = |s: &mut usize| *s = f(*s);
+        match self {
+            Step::Leaf { .. } => {}
+            Step::Unary { a, .. } | Step::Softmax { a, .. } => g(a),
+            Step::ActBack { x, dy, .. } => {
+                g(x);
+                g(dy);
+            }
+            Step::Binary { a, b, .. }
+            | Step::Compare { a, b, .. }
+            | Step::BinaryC64 { a, b, .. }
+            | Step::MatMul { a, b, .. }
+            | Step::Concat { a, b, .. } => {
+                g(a);
+                g(b);
+            }
+            Step::Where { cond, a, b, .. } => {
+                g(cond);
+                g(a);
+                g(b);
+            }
+            Step::Gather { src, .. }
+            | Step::Reduce { src, .. }
+            | Step::ArgReduce { src, .. }
+            | Step::SortAxis { src, .. }
+            | Step::ComplexCast { src, .. }
+            | Step::ArgAxis { src, .. }
+            | Step::Copy { src, .. }
+            | Step::Splat { src, .. }
+            | Step::Broadcast { src, .. }
+            | Step::Pool3d { src, .. }
+            | Step::Resize3d { src, .. } => g(src),
+            Step::LayerNorm { x, gamma, beta, .. }
+            | Step::RmsNorm { x, gamma, beta, .. }
+            | Step::GroupNorm { x, gamma, beta, .. } => {
+                g(x);
+                g(gamma);
+                g(beta);
+            }
+            Step::GatherRuntime { table, indices, .. } => {
+                g(table);
+                g(indices);
+            }
+            Step::ScatterRuntime {
+                data,
+                updates,
+                indices,
+                ..
+            } => {
+                g(updates);
+                g(indices);
+                if let Some(d) = data {
+                    g(d);
+                }
+            }
+            Step::FftStage { src, tw, .. } => {
+                g(src);
+                g(tw);
+            }
+            Step::Host { inputs, .. } => inputs.iter_mut().for_each(g),
+            Step::Linalg { a, b, .. } => {
+                g(a);
+                if let Some(b) = b {
+                    g(b);
+                }
+            }
+            Step::Custom { input, .. } => g(input),
+            Step::Conv3d { x, w, bias, .. } | Step::Conv1ArgMax { x, w, bias, .. } => {
+                g(x);
+                g(w);
+                if let Some(b) = bias {
+                    g(b);
+                }
+            }
+        }
+    }
 }
 
 /// A lowered graph ready for either executor.
@@ -260,6 +658,7 @@ pub(crate) const PAD: u32 = u32::MAX;
 /// Mirrors the `Backend::supported_ops` convention used by the native backends.
 pub fn supported_ops() -> &'static [OpKind] {
     &[
+        OpKind::GroupNorm,
         OpKind::Input,
         OpKind::Param,
         OpKind::Constant,
@@ -289,10 +688,31 @@ pub fn supported_ops() -> &'static [OpKind] {
         OpKind::Concat,
         OpKind::Pool,
         OpKind::Conv,
+        OpKind::Conv3d,
+        OpKind::ConvTranspose3d,
         OpKind::Im2Col,
         OpKind::ArgMax,
         OpKind::ArgMin,
         OpKind::Gather,
+        OpKind::GatherElements,
+        OpKind::GatherNd,
+        OpKind::ScatterAdd,
+        OpKind::ScatterNd,
+        OpKind::ScatterElements,
+        OpKind::Sort,
+        OpKind::ArgSort,
+        OpKind::TopK,
+        OpKind::LayerNorm2d,
+        OpKind::Interpolate3d,
+        OpKind::Fft,
+        OpKind::RngUniform,
+        OpKind::RngNormal,
+        OpKind::Cholesky,
+        OpKind::TriangularSolve,
+        OpKind::DenseSolve,
+        OpKind::BatchedDenseSolve,
+        OpKind::Det,
+        OpKind::LogDet,
         OpKind::Rope,
         // Host/transport custom ops (`collective.*`). Kept in the supported set
         // so legalization preserves the node; `lower` restricts to the
@@ -300,6 +720,24 @@ pub fn supported_ops() -> &'static [OpKind] {
         // only — see `exec_cpu`).
         OpKind::Custom,
     ]
+}
+
+/// Every op a WebGL plan can run: the native set ([`supported_ops`]) plus
+/// what rlx-cpu runs, which the planner hands to the host fallback
+/// ([`crate::host`]). What a runtime backend should claim. Legalization still
+/// lowers against [`supported_ops`] alone, so an op with a native lowering
+/// (`GroupNorm`, `Pad`, …) keeps it even though rlx-cpu also claims it.
+pub fn runnable_ops() -> &'static [OpKind] {
+    static OPS: std::sync::OnceLock<Vec<OpKind>> = std::sync::OnceLock::new();
+    OPS.get_or_init(|| {
+        let mut v = supported_ops().to_vec();
+        v.extend(
+            rlx_cpu::SUPPORTED_OPS
+                .iter()
+                .filter(|k| !supported_ops().contains(k)),
+        );
+        v
+    })
 }
 
 /// `collective.*` op names this backend host-delegates (mirrors
@@ -314,38 +752,6 @@ pub(crate) const COLLECTIVE_OPS: &[&str] = &[
     "collective.copy_to_parallel",
     "collective.reduce_from_parallel",
 ];
-
-/// Per-output groups for ArgMax/ArgMin: `groups[o*axsz + p]` = src linear index
-/// of axis position `p` for output element `o` (axis-ordered, so the winning `p`
-/// is the index to emit).
-fn arg_groups(in_dims: &[usize], out_dims: &[usize], axis: usize, keep_dim: bool) -> Vec<u32> {
-    let axsz = in_dims[axis];
-    let in_strides = strides(in_dims);
-    let n_out = total(out_dims);
-    let mut groups = vec![0u32; n_out * axsz];
-    for o in 0..n_out {
-        let oc = unravel(o, out_dims);
-        let mut ic = vec![0usize; in_dims.len()];
-        if keep_dim {
-            for (k, &c) in oc.iter().enumerate() {
-                ic[k] = if k == axis { 0 } else { c };
-            }
-        } else {
-            let mut j = 0;
-            for (k, slot) in ic.iter_mut().enumerate() {
-                if k != axis {
-                    *slot = oc[j];
-                    j += 1;
-                }
-            }
-        }
-        for p in 0..axsz {
-            ic[axis] = p;
-            groups[o * axsz + p] = ravel(&ic, &in_strides) as u32;
-        }
-    }
-    groups
-}
 
 /// Normalize a possibly-negative axis and require it to be the last one.
 fn require_last_axis(axis: i32, rank: usize, op: &str) -> Result<()> {
@@ -376,7 +782,19 @@ fn map_act(a: Activation) -> Result<Act> {
         Activation::Gelu => Act::Gelu,
         Activation::GeluApprox => Act::GeluApprox,
         Activation::Softplus => Act::Softplus,
-        other => return Err(WebglError(format!("activation {other:?} not supported"))),
+        Activation::Tan => Act::Tan,
+        Activation::Atan => Act::Atan,
+        Activation::Round => Act::Round,
+        Activation::Floor => Act::Floor,
+        Activation::Ceil => Act::Ceil,
+        Activation::Sign => Act::Sign,
+        Activation::Elu => Act::Elu,
+        Activation::Erf => Act::Erf,
+        Activation::HardSwish => Act::HardSwish,
+        Activation::HardSigmoid => Act::HardSigmoid,
+        Activation::Mish => Act::Mish,
+        Activation::Softsign => Act::Softsign,
+        Activation::LogSigmoid => Act::LogSigmoid,
     })
 }
 
@@ -437,6 +855,320 @@ pub(crate) fn rows_cols(dims: &[usize]) -> (usize, usize) {
     (rows, cols)
 }
 
+/// FFT of length `n` along each of `rows` rows of `src` into `out`, output
+/// scaled by `scale`. `block` = 2N-block layout (else interleaved), used for
+/// both the input and the output.
+///
+/// A power-of-two `n` is `log₂ n` [`Step::FftStage`] passes. Any other `n` is
+/// Bluestein: `X_k = c_k · Σ_m (x_m c_m) · b_{k−m}` with the chirp
+/// `c_m = e^{σπi m²/n}`, `b_m = c̄_m` — a length-`M` (power of two ≥ 2n − 1)
+/// circular convolution done as FFT · (host-precomputed FFT of `b`) · IFFT.
+/// Every constant (twiddles, chirp, filter spectrum) is computed in f64 on the
+/// host, so the shaders evaluate no `sin`/`cos`. O(n log n) per row.
+#[allow(clippy::too_many_arguments)]
+fn emit_fft(
+    b: &mut Builder,
+    src: usize,
+    out: usize,
+    rows: usize,
+    n: usize,
+    block: bool,
+    inverse: bool,
+    scale: f64,
+) {
+    let sign = if inverse { 1.0 } else { -1.0 };
+    if n <= 1 {
+        // Length-1 transforms are the identity (every norm scales by 1).
+        b.emit(Step::Gather {
+            out,
+            src,
+            idx: (0..(rows * 2 * n) as u32).collect(),
+        });
+        return;
+    }
+    if n.is_power_of_two() {
+        fft_passes(b, src, out, rows, n, (block, block), sign, scale as f32);
+        return;
+    }
+    let m = (2 * n - 1).next_power_of_two();
+    let lane = |k: usize, c: usize| if block { c * n + k } else { 2 * k + c };
+    // x zero-padded to M, interleaved.
+    let x = fft_slot(b, rows * m);
+    b.emit(Step::Gather {
+        out: x,
+        src,
+        idx: (0..rows * 2 * m)
+            .map(|i| {
+                let (r, k, c) = (i / (2 * m), i / 2 % m, i % 2);
+                if k < n {
+                    (r * 2 * n + lane(k, c)) as u32
+                } else {
+                    PAD
+                }
+            })
+            .collect(),
+    });
+    // e^{σπi k²/n}, with k² mod 2n keeping the angle small.
+    let chirp = |k: usize| {
+        let th = sign * std::f64::consts::PI * ((k * k) % (2 * n)) as f64 / n as f64;
+        (th.cos(), th.sin())
+    };
+    let cmul = |b: &mut Builder, a: usize, c: Vec<f32>| {
+        let cs = fft_slot(b, m);
+        b.emit(Step::Leaf {
+            out: cs,
+            src: LeafSource::Const(c),
+        });
+        let o = fft_slot(b, rows * m);
+        b.emit(Step::BinaryC64 {
+            out: o,
+            a,
+            b: cs,
+            op: Bin::Mul,
+            n: rows * m,
+            n_a: rows * m,
+            n_b: m,
+        });
+        o
+    };
+    let pre = (0..m)
+        .flat_map(|k| {
+            let (c, s) = if k < n { chirp(k) } else { (0.0, 0.0) };
+            [c as f32, s as f32]
+        })
+        .collect();
+    let xc = cmul(b, x, pre);
+    let xf = fft_slot(b, rows * m);
+    fft_passes(b, xc, xf, rows, m, (false, false), -1.0, 1.0);
+    // FFT of b (b_k = c̄_k for |k| < n, circularly), pre-divided by M for the
+    // unnormalized inverse below.
+    let mut filt = vec![(0f64, 0f64); m];
+    for k in 0..n {
+        let (c, s) = chirp(k);
+        filt[k] = (c, -s);
+        filt[(m - k) % m] = (c, -s);
+    }
+    host_fft(&mut filt, -1.0);
+    let spec = filt
+        .iter()
+        .flat_map(|&(re, im)| [(re / m as f64) as f32, (im / m as f64) as f32])
+        .collect();
+    let y = cmul(b, xf, spec);
+    let conv = fft_slot(b, rows * m);
+    fft_passes(b, y, conv, rows, m, (false, false), 1.0, 1.0);
+    let post = (0..m)
+        .flat_map(|k| {
+            let (c, s) = if k < n { chirp(k) } else { (0.0, 0.0) };
+            [(c * scale) as f32, (s * scale) as f32]
+        })
+        .collect();
+    let z = cmul(b, conv, post);
+    // First n of each row, back to the op's layout.
+    b.emit(Step::Gather {
+        out,
+        src: z,
+        idx: (0..rows * 2 * n)
+            .map(|i| {
+                let (r, l) = (i / (2 * n), i % (2 * n));
+                let (k, c) = if block {
+                    (l % n, l / n)
+                } else {
+                    (l / 2, l % 2)
+                };
+                (r * 2 * m + 2 * k + c) as u32
+            })
+            .collect(),
+    });
+}
+
+/// The `log₂ n` Stockham passes of a power-of-two FFT (`sign` −1 forward,
+/// +1 inverse), reading `layout.0`, writing `layout.1` (true = 2N-block);
+/// intermediates are interleaved.
+#[allow(clippy::too_many_arguments)]
+fn fft_passes(
+    b: &mut Builder,
+    src: usize,
+    out: usize,
+    rows: usize,
+    n: usize,
+    layout: (bool, bool),
+    sign: f64,
+    scale: f32,
+) {
+    // Twiddles of every pass: entry `ns − 1 + j` = e^{σπi j/ns}, j < ns.
+    let mut tw = Vec::with_capacity(2 * n);
+    let mut ns = 1;
+    while ns < n {
+        for j in 0..ns {
+            let th = sign * std::f64::consts::PI * j as f64 / ns as f64;
+            tw.extend([th.cos() as f32, th.sin() as f32]);
+        }
+        ns *= 2;
+    }
+    tw.resize(2 * n, 0.0);
+    let tw_slot = fft_slot(b, n);
+    b.emit(Step::Leaf {
+        out: tw_slot,
+        src: LeafSource::Const(tw),
+    });
+    let (mut cur, mut ns) = (src, 1);
+    while ns < n {
+        let last = 2 * ns == n;
+        let dst = if last { out } else { fft_slot(b, rows * n) };
+        b.emit(Step::FftStage {
+            out: dst,
+            src: cur,
+            tw: tw_slot,
+            n,
+            ns,
+            in_block: ns == 1 && layout.0,
+            out_block: last && layout.1,
+            scale: if last { scale } else { 1.0 },
+        });
+        cur = dst;
+        ns *= 2;
+    }
+}
+
+/// Lower `node` to a [`Step::Host`] (rlx-cpu runs it), if rlx-cpu can.
+fn emit_host(
+    b: &mut Builder,
+    graph: &Graph,
+    node: &rlx_ir::Node,
+    out: usize,
+    inputs: Vec<usize>,
+) -> Result<()> {
+    let kind = node.op.kind();
+    if !rlx_cpu::SUPPORTED_OPS.contains(&kind) {
+        return Err(WebglError(format!("op {kind:?} not supported on WebGL")));
+    }
+    let shapes: Vec<rlx_ir::Shape> = node
+        .inputs
+        .iter()
+        .map(|&i| graph.node(i).shape.clone())
+        .collect();
+    b.emit(Step::Host {
+        out,
+        inputs,
+        op: std::sync::Arc::new(HostOp::new(&node.op, &shapes, &node.shape)),
+    });
+    Ok(())
+}
+
+/// A slot of `count` complex values (interleaved f32 lanes) for FFT
+/// intermediates. Every FFT step addresses them linearly, so rows are capped at
+/// 4096 lanes rather than one transform wide: a long transform's rows would
+/// otherwise reach `MAX_TEXTURE_SIZE` (Bluestein pads to 2× the length).
+fn fft_slot(b: &mut Builder, count: usize) -> usize {
+    // Largest power of two ≤ 2048 dividing `count` (every count here is a
+    // multiple of the power-of-two transform length).
+    let cols = 1usize << count.trailing_zeros().min(11);
+    b.alloc_lanes(&[count / cols, cols], 2)
+}
+
+/// In-place iterative radix-2 FFT in f64 (power-of-two length), for the
+/// plan-time Bluestein filter spectrum.
+fn host_fft(a: &mut [(f64, f64)], sign: f64) {
+    let n = a.len();
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            a.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        let th = sign * std::f64::consts::TAU / len as f64;
+        for start in (0..n).step_by(len) {
+            for k in 0..len / 2 {
+                let (wr, wi) = ((th * k as f64).cos(), (th * k as f64).sin());
+                let (ur, ui) = a[start + k];
+                let (vr, vi) = a[start + k + len / 2];
+                let (tr, ti) = (vr * wr - vi * wi, vr * wi + vi * wr);
+                a[start + k] = (ur + tr, ui + ti);
+                a[start + k + len / 2] = (ur - tr, ui - ti);
+            }
+        }
+        len *= 2;
+    }
+}
+
+/// Axis `a` of a rank-`rank` tensor, negative counting from the end.
+fn norm_axis(a: i32, rank: usize) -> Result<usize> {
+    let r = rank as i32;
+    let ax = if a < 0 { a + r } else { a };
+    if ax < 0 || ax >= r {
+        return Err(WebglError(format!("axis {a} out of range for rank {rank}")));
+    }
+    Ok(ax as usize)
+}
+
+fn scatter_red(r: rlx_ir::op::ScatterNdReduction) -> ScatterRed {
+    use rlx_ir::op::ScatterNdReduction as R;
+    match r {
+        R::None => ScatterRed::Replace,
+        R::Add => ScatterRed::Add,
+        R::Mul => ScatterRed::Mul,
+        R::Max => ScatterRed::Max,
+        R::Min => ScatterRed::Min,
+    }
+}
+
+/// `nq` index tuples `idx [nq, k]` (k = `dims.len()`) → `[nq]` linear row
+/// numbers `Σ_m wrap(idx[q, m]) · Π dims[m+1..]`, a negative component counting
+/// from the end of its axis (ONNX GatherND / ScatterND, as rlx-cpu).
+fn linearize_tuples(b: &mut Builder, idx: usize, nq: usize, dims: &[usize]) -> usize {
+    let k = dims.len();
+    let n = nq * k;
+    let row_strides = strides(dims);
+    let leaf = |b: &mut Builder, f: &dyn Fn(usize) -> f32| {
+        let s = b.alloc(&[nq, k]);
+        b.emit(Step::Leaf {
+            out: s,
+            src: LeafSource::Const((0..n).map(f).collect()),
+        });
+        s
+    };
+    let zero = leaf(b, &|_| 0.0);
+    let axis_len = leaf(b, &|i| dims[i % k] as f32);
+    let stride = leaf(b, &|i| row_strides[i % k] as f32);
+    let bin = |b: &mut Builder, a: usize, c: usize, op: Bin| {
+        let s = b.alloc(&[nq, k]);
+        b.emit(Step::Binary {
+            out: s,
+            a,
+            b: c,
+            op,
+        });
+        s
+    };
+    let neg = b.alloc(&[nq, k]);
+    b.emit(Step::Compare {
+        out: neg,
+        a: idx,
+        b: zero,
+        cmp: Cmp::Lt,
+    });
+    let shift = bin(b, neg, axis_len, Bin::Mul);
+    let wrapped = bin(b, idx, shift, Bin::Add);
+    let scaled = bin(b, wrapped, stride, Bin::Mul);
+    let lin = b.alloc(&[nq]);
+    b.emit(Step::Reduce {
+        out: lin,
+        src: scaled,
+        groups: (0..n as u32).collect(),
+        fanin: k,
+        op: Red::Sum,
+    });
+    lin
+}
+
 fn total(dims: &[usize]) -> usize {
     if dims.is_empty() {
         1
@@ -467,6 +1199,63 @@ fn ravel(coords: &[usize], strides: &[usize]) -> usize {
     coords.iter().zip(strides).map(|(c, s)| c * s).sum()
 }
 
+/// A constant's bytes as the f32 values every slot holds: integer / bool /
+/// half / f64 constants (index tables built by legalization, e.g. `LowerSlice`'s
+/// I64 indices) are widened by value. C64 is already f32 lanes; C128 is
+/// re-laid as df64 lanes `[hi, lo]` per component.
+pub(crate) fn decode_const(bytes: &[u8], dt: DType) -> Vec<f32> {
+    fn le<const N: usize>(bytes: &[u8]) -> impl Iterator<Item = [u8; N]> + '_ {
+        bytes.as_chunks::<N>().0.iter().copied()
+    }
+    let half = |h: u16| -> f32 {
+        let (sign, exp, man) = (
+            (h >> 15) as u32,
+            ((h >> 10) & 0x1f) as i32,
+            (h & 0x3ff) as f32,
+        );
+        let v = match exp {
+            0 => man * 2f32.powi(-24),
+            31 if man == 0.0 => f32::INFINITY,
+            31 => f32::NAN,
+            e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
+        };
+        if sign == 1 { -v } else { v }
+    };
+    match dt {
+        DType::F64 => le::<8>(bytes)
+            .map(|c| f64::from_le_bytes(c) as f32)
+            .collect(),
+        DType::C128 => le::<8>(bytes)
+            .flat_map(|c| {
+                let v = f64::from_le_bytes(c);
+                let hi = v as f32;
+                [hi, (v - hi as f64) as f32]
+            })
+            .collect(),
+        DType::F16 => le::<2>(bytes)
+            .map(|c| half(u16::from_le_bytes(c)))
+            .collect(),
+        DType::BF16 => le::<2>(bytes)
+            .map(|c| f32::from_bits((u16::from_le_bytes(c) as u32) << 16))
+            .collect(),
+        DType::I8 => bytes.iter().map(|&b| b as i8 as f32).collect(),
+        DType::U8 | DType::Bool => bytes.iter().map(|&b| b as f32).collect(),
+        DType::I16 => le::<2>(bytes)
+            .map(|c| i16::from_le_bytes(c) as f32)
+            .collect(),
+        DType::I32 => le::<4>(bytes)
+            .map(|c| i32::from_le_bytes(c) as f32)
+            .collect(),
+        DType::U32 => le::<4>(bytes)
+            .map(|c| u32::from_le_bytes(c) as f32)
+            .collect(),
+        DType::I64 => le::<8>(bytes)
+            .map(|c| i64::from_le_bytes(c) as f32)
+            .collect(),
+        _ => decode_f32_le(bytes),
+    }
+}
+
 fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
     bytes
         .as_chunks::<4>()
@@ -474,6 +1263,48 @@ fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
         .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+/// `out[o] = Σ_r x[x_idx[o·red + r]] · w[w_idx[o·red + r]]` (`PAD` in `x_idx`
+/// reads zero): gather each output's window and its weights side by side,
+/// multiply, and sum the window. Grouped / transposed convs, where outputs do
+/// not share one `[patch, cout]` matmul.
+fn window_dot(
+    b: &mut Builder,
+    x: usize,
+    w: usize,
+    out: usize,
+    x_idx: Vec<u32>,
+    w_idx: Vec<u32>,
+    red: usize,
+) {
+    let len = x_idx.len();
+    let p_slot = b.alloc(&[len / red, red]);
+    b.emit(Step::Gather {
+        out: p_slot,
+        src: x,
+        idx: x_idx,
+    });
+    let w_slot = b.alloc(&[len / red, red]);
+    b.emit(Step::Gather {
+        out: w_slot,
+        src: w,
+        idx: w_idx,
+    });
+    let m_slot = b.alloc(&[len / red, red]);
+    b.emit(Step::Binary {
+        out: m_slot,
+        a: p_slot,
+        b: w_slot,
+        op: Bin::Mul,
+    });
+    b.emit(Step::Reduce {
+        out,
+        src: m_slot,
+        groups: (0..len as u32).collect(),
+        fanin: red,
+        op: Red::Sum,
+    });
 }
 
 /// Conv/pool spatial output size along one axis.
@@ -538,16 +1369,35 @@ const NATIVE_BACKWARD: &[OpKind] = &[OpKind::ReluBackward, OpKind::ActivationBac
 /// `*Backward` ops are decomposed into primitives
 /// ([`rlx_autodiff::decompose_backward_ops_except`]) and unsupported forward
 /// composites are rewritten into primitives
-/// ([`rlx_compile::rewrite_for_backend`]) — this lowers GroupNorm,
+/// ([`rlx_compile::rewrite_for_backend`]) — this lowers
 /// BatchNormInference, SoftmaxCrossEntropy, DotGeneral, control flow, fused /
 /// RNN ops and every `*Backward` op down to the small kernel set the WebGL
 /// executor implements. Then each remaining node is lowered to a [`Step`].
 pub fn build_plan(graph: &Graph) -> Result<Plan> {
-    let g = graph.clone();
+    let g = fold_conv3d_bias(graph.clone());
     let g = rlx_autodiff::decompose_backward_ops_except(g, NATIVE_BACKWARD);
     let g = rlx_fusion::unfuse_dit_modulation(g);
     let g = rlx_compile::rewrite_for_backend(g, supported_ops());
     lower(&g)
+}
+
+/// Most axes a [`Step::Broadcast`] takes (its shader's uniform arrays).
+pub const BROADCAST_RANK: usize = 8;
+
+/// `in_dims` broadcast to `out_dims` as per-output-axis strides into the
+/// input (numpy rules, right-aligned; 0 where the input is 1 or absent).
+fn broadcast_strides(in_dims: &[usize], out_dims: &[usize]) -> Vec<usize> {
+    let st = strides(in_dims);
+    let offset = out_dims.len() - in_dims.len();
+    (0..out_dims.len())
+        .map(|k| {
+            if k < offset || in_dims[k - offset] == 1 {
+                0
+            } else {
+                st[k - offset]
+            }
+        })
+        .collect()
 }
 
 /// Row-major broadcast index map: `out_idx → in_idx` for broadcasting `in_dims`
@@ -623,6 +1473,21 @@ impl Builder {
         if in_dims == out_dims {
             return src;
         }
+        if total(in_dims) == 1 {
+            let out = self.alloc(out_dims);
+            self.emit(Step::Splat { out, src });
+            return out;
+        }
+        if out_dims.len() <= BROADCAST_RANK && in_dims.len() <= out_dims.len() {
+            let out = self.alloc(out_dims);
+            self.emit(Step::Broadcast {
+                out,
+                src,
+                out_dims: out_dims.to_vec(),
+                in_strides: broadcast_strides(in_dims, out_dims),
+            });
+            return out;
+        }
         let idx = broadcast_idx(in_dims, out_dims);
         let out = self.alloc(out_dims);
         self.emit(Step::Gather { out, src, idx });
@@ -693,7 +1558,7 @@ fn lower(graph: &Graph) -> Result<Plan> {
             }),
             Op::Constant { data } => b.emit(Step::Leaf {
                 out,
-                src: LeafSource::Const(decode_f32_le(data)),
+                src: LeafSource::Const(decode_const(data, node_dt)),
             }),
             Op::Cast { to } => {
                 let dst = *to;
@@ -946,11 +1811,22 @@ fn lower(graph: &Graph) -> Result<Plan> {
                 }
             }
             Op::Reshape { .. } => {
-                b.emit(Step::Gather {
-                    out,
-                    src: input_slot(0)?,
-                    idx: identity(),
-                });
+                let src = input_slot(0)?;
+                if node_lane > 1 {
+                    b.emit(Step::Gather {
+                        out,
+                        src,
+                        idx: identity(),
+                    });
+                } else if rows_cols(&input_dims(0)?) == (r, c) {
+                    // same texture shape: the node *is* its input (the slot
+                    // allocated for it stays empty)
+                    id_info.insert(node.id, (src, dims.clone(), node_dt));
+                } else {
+                    // same elements, another shape: a linear copy (an
+                    // identity gather would upload an index per element)
+                    b.emit(Step::Copy { out, src });
+                }
             }
             Op::Transpose { perm } => {
                 // Lane-aware for complex: a complex element spans `node_lane`
@@ -1010,20 +1886,26 @@ fn lower(graph: &Graph) -> Result<Plan> {
                 // real/int/bool ⇒ the extra axis is a strict no-op. Mirrors the
                 // cuda/wgpu Expand fix, which appends the same lane axis to the
                 // expand dims/strides.
-                let idx = if node_lane > 1 {
-                    let mut in_lane = in_dims.clone();
-                    let mut out_lane = dims.clone();
-                    in_lane.push(node_lane);
-                    out_lane.push(node_lane);
-                    broadcast_idx(&in_lane, &out_lane)
+                let (mut in_l, mut out_l) = (in_dims.clone(), dims.clone());
+                if node_lane > 1 {
+                    in_l.push(node_lane);
+                    out_l.push(node_lane);
+                }
+                if out_l.len() <= BROADCAST_RANK {
+                    // by arithmetic: a table is one index per output element
+                    b.emit(Step::Broadcast {
+                        out,
+                        src: input_slot(0)?,
+                        in_strides: broadcast_strides(&in_l, &out_l),
+                        out_dims: out_l,
+                    });
                 } else {
-                    broadcast_idx(&in_dims, &dims)
-                };
-                b.emit(Step::Gather {
-                    out,
-                    src: input_slot(0)?,
-                    idx,
-                });
+                    b.emit(Step::Gather {
+                        out,
+                        src: input_slot(0)?,
+                        idx: broadcast_idx(&in_l, &out_l),
+                    });
+                }
             }
             Op::Narrow { axis, start, .. } => {
                 // Lane-aware for complex (see Transpose). `axis`/`start` stay in
@@ -1183,6 +2065,37 @@ fn lower(graph: &Graph) -> Result<Plan> {
                     b_batched: false,
                 });
             }
+            Op::Concat { axis } if node_lane == 1 => {
+                // Pairwise, by arithmetic: no index table or mask the size
+                // of the output (two of each per input otherwise).
+                let outer: usize = dims[..*axis].iter().product();
+                let row = |d: &[usize]| d[*axis..].iter().product::<usize>();
+                let (mut acc, mut acc_len) = (input_slot(0)?, row(&input_dims(0)?));
+                for ii in 1..node.inputs.len() {
+                    let b_len = row(&input_dims(ii)?);
+                    let last = ii + 1 == node.inputs.len();
+                    let dst = if last {
+                        out
+                    } else {
+                        let mut d = dims.clone();
+                        d[*axis] =
+                            (acc_len + b_len) / dims[*axis + 1..].iter().product::<usize>().max(1);
+                        b.alloc(&d)
+                    };
+                    b.emit(Step::Concat {
+                        out: dst,
+                        a: acc,
+                        b: input_slot(ii)?,
+                        outer,
+                        a_len: acc_len,
+                        b_len,
+                    });
+                    (acc, acc_len) = (dst, acc_len + b_len);
+                }
+                if node.inputs.len() == 1 {
+                    b.emit(Step::Copy { out, src: acc });
+                }
+            }
             Op::Concat { axis } => {
                 // Place each input into its slice of the output via a masked
                 // gather, then sum: out = Σ_k (mask_k ⊙ gather_k). Reuses the
@@ -1262,6 +2175,34 @@ fn lower(graph: &Graph) -> Result<Plan> {
                     out,
                     src,
                     idx: identity(),
+                });
+            }
+            Op::Pool {
+                kind,
+                kernel_size,
+                stride,
+                padding,
+            } if kernel_size.len() == 3 => {
+                let in_dims = input_dims(0)?;
+                if in_dims.len() != 5 || dims.len() != 5 {
+                    return Err(WebglError("3-D pool requires 5D NCDHW".into()));
+                }
+                let is_max = match kind {
+                    ReduceOp::Max => true,
+                    ReduceOp::Mean => false,
+                    other => return Err(WebglError(format!("3-D pool {other:?} not supported"))),
+                };
+                let a3 = |v: &Vec<usize>| [v[0], v[1], v[2]];
+                b.emit(Step::Pool3d {
+                    out,
+                    src: input_slot(0)?,
+                    nc: in_dims[0] * in_dims[1],
+                    din: [in_dims[2], in_dims[3], in_dims[4]],
+                    dout: [dims[2], dims[3], dims[4]],
+                    k: a3(kernel_size),
+                    stride: a3(stride),
+                    pad: a3(padding),
+                    is_max,
                 });
             }
             Op::Pool {
@@ -1479,6 +2420,129 @@ fn lower(graph: &Graph) -> Result<Plan> {
                     });
                 }
             }
+            Op::Conv3d {
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                // Direct: one output element per fragment summing its taps.
+                // (An im2col matrix for a volume is `cin·k³` times the volume:
+                // a 30-channel 3×3×3 layer over a 164×164×224 brain crop
+                // would be 4.9e9 entries.) input [N,Cin,D,H,W], weight
+                // [Cout,Cin/g,kD,kH,kW], out [N,Cout,Do,Ho,Wo]; an optional
+                // third input is a per-channel bias (`fold_conv3d_bias`).
+                let in_dims = input_dims(0)?;
+                let w_dims = input_dims(1)?;
+                if in_dims.len() != 5 || w_dims.len() != 5 || dims.len() != 5 {
+                    return Err(WebglError("conv3d requires 5D NCDHW".into()));
+                }
+                let g = *groups;
+                let (cin, cout) = (in_dims[1], w_dims[0]);
+                if g == 0 || cin % g != 0 || cout % g != 0 || w_dims[1] != cin / g {
+                    return Err(WebglError(format!(
+                        "conv3d groups={g}: cin {cin} / cout {cout} / weight {w_dims:?} do not divide"
+                    )));
+                }
+                let bias = if node.inputs.len() > 2 {
+                    Some(input_slot(2)?)
+                } else {
+                    None
+                };
+                b.emit(Step::Conv3d {
+                    out,
+                    x: input_slot(0)?,
+                    w: input_slot(1)?,
+                    bias,
+                    n: in_dims[0],
+                    cin,
+                    din: [in_dims[2], in_dims[3], in_dims[4]],
+                    cout,
+                    dout: [dims[2], dims[3], dims[4]],
+                    k: [w_dims[2], w_dims[3], w_dims[4]],
+                    stride: *stride,
+                    pad: *padding,
+                    dil: *dilation,
+                    groups: g,
+                    act: None,
+                });
+            }
+            Op::ConvTranspose3d {
+                stride,
+                padding,
+                dilation,
+                groups,
+                ..
+            } => {
+                // Gather form of the CPU scatter kernel: input [N,Cin,D,H,W],
+                // weight [Cin,Cout/g,kD,kH,kW], out [N,Cout,Do,Ho,Wo] (output
+                // padding is already folded into the output shape).
+                //   out[n,oc,o] = Σ_{ic∈grp(oc), t} x[n,ic,i] · w[ic, oc mod Cout/g, t]
+                // over taps with o + p − t·dil = i·s, 0 ≤ i < in.
+                let in_dims = input_dims(0)?;
+                let w_dims = input_dims(1)?;
+                if in_dims.len() != 5 || w_dims.len() != 5 || dims.len() != 5 {
+                    return Err(WebglError("conv_transpose3d requires 5D NCDHW".into()));
+                }
+                let g = *groups;
+                let (cin, cout) = (in_dims[1], dims[1]);
+                if g == 0
+                    || cin % g != 0
+                    || cout % g != 0
+                    || w_dims[0] != cin
+                    || w_dims[1] != cout / g
+                {
+                    return Err(WebglError(format!(
+                        "conv_transpose3d groups={g}: cin {cin} / cout {cout} / weight {w_dims:?} do not divide"
+                    )));
+                }
+                let (cin_g, cout_g) = (cin / g, cout / g);
+                let ks = [w_dims[2], w_dims[3], w_dims[4]];
+                let kvol = ks[0] * ks[1] * ks[2];
+                let red = cin_g * kvol;
+                let osp = [dims[2], dims[3], dims[4]];
+                let npos_n = osp[0] * osp[1] * osp[2];
+                let xs = strides(&in_dims);
+                let unravel3 =
+                    |p: usize, e: [usize; 3]| [p / (e[1] * e[2]), p / e[2] % e[1], p % e[2]];
+                let out_n = total(&dims);
+                let mut x_idx = vec![PAD; out_n * red];
+                let mut w_idx = vec![0u32; out_n * red];
+                for o in 0..out_n {
+                    let (n, oc, p) = (o / (cout * npos_n), o / npos_n % cout, o % npos_n);
+                    let op = unravel3(p, osp);
+                    let (grp, oc_off) = (oc / cout_g, oc % cout_g);
+                    for r in 0..red {
+                        let (ic, tl) = (grp * cin_g + r / kvol, r % kvol);
+                        let t = unravel3(tl, ks);
+                        w_idx[o * red + r] = ((ic * cout_g + oc_off) * kvol + tl) as u32;
+                        let mut lin = Some(n * xs[0] + ic * xs[1]);
+                        for a in 0..3 {
+                            let num = (op[a] + padding[a]).checked_sub(t[a] * dilation[a]);
+                            lin = match (lin, num) {
+                                (Some(l), Some(v))
+                                    if v % stride[a] == 0 && v / stride[a] < in_dims[a + 2] =>
+                                {
+                                    Some(l + v / stride[a] * xs[a + 2])
+                                }
+                                _ => None,
+                            };
+                        }
+                        if let Some(l) = lin {
+                            x_idx[o * red + r] = l as u32;
+                        }
+                    }
+                }
+                window_dot(
+                    &mut b,
+                    input_slot(0)?,
+                    input_slot(1)?,
+                    out,
+                    x_idx,
+                    w_idx,
+                    red,
+                );
+            }
             Op::Im2Col {
                 kernel_size,
                 stride,
@@ -1504,26 +2568,40 @@ fn lower(graph: &Graph) -> Result<Plan> {
                     idx,
                 });
             }
-            Op::ArgMax { axis, keep_dim } => {
-                let groups = arg_groups(&input_dims(0)?, &dims, *axis, *keep_dim);
-                let fanin = input_dims(0)?[*axis];
-                b.emit(Step::ArgReduce {
+            Op::ArgMax { axis, .. } | Op::ArgMin { axis, .. } => {
+                // The input viewed as [outer, len, inner]: positions are
+                // arithmetic, so no per-output index table (which, over a
+                // class axis of a volume, is classes × voxels entries).
+                let in_dims = input_dims(0)?;
+                b.emit(Step::ArgAxis {
                     out,
                     src: input_slot(0)?,
-                    groups,
-                    fanin,
-                    is_max: true,
+                    outer: in_dims[..*axis].iter().product(),
+                    len: in_dims[*axis],
+                    inner: in_dims[*axis + 1..].iter().product(),
+                    is_max: matches!(node.op, Op::ArgMax { .. }),
                 });
             }
-            Op::ArgMin { axis, keep_dim } => {
-                let groups = arg_groups(&input_dims(0)?, &dims, *axis, *keep_dim);
-                let fanin = input_dims(0)?[*axis];
-                b.emit(Step::ArgReduce {
+            Op::GroupNorm { num_groups, eps } => {
+                // [N, C, …] with the trailing axes as one contiguous run per
+                // channel: per (n, group) mean and variance, then the affine.
+                let in_dims = input_dims(0)?;
+                if in_dims.len() < 2 || *num_groups == 0 || in_dims[1] % num_groups != 0 {
+                    return Err(WebglError(format!(
+                        "group_norm: {num_groups} groups over {in_dims:?}"
+                    )));
+                }
+                b.emit(Step::GroupNorm {
                     out,
-                    src: input_slot(0)?,
-                    groups,
-                    fanin,
-                    is_max: false,
+                    x: input_slot(0)?,
+                    gamma: input_slot(1)?,
+                    beta: input_slot(2)?,
+                    n: in_dims[0],
+                    c: in_dims[1],
+                    groups: *num_groups,
+                    spatial: in_dims[2..].iter().product(),
+                    eps: *eps,
+                    act: None,
                 });
             }
             Op::Gather { axis } => {
@@ -1567,6 +2645,317 @@ fn lower(graph: &Graph) -> Result<Plan> {
                     which,
                     base,
                     axis_stride: (post * lane) as u32,
+                    wrap: 0,
+                });
+            }
+            Op::GatherElements { axis } => {
+                // out[o] = data[o with the axis coordinate replaced by idx[o]].
+                let d = input_dims(0)?;
+                let ax = norm_axis(*axis, d.len())?;
+                let ds = strides(&d);
+                let n = total(&dims);
+                let base = (0..n)
+                    .map(|o| {
+                        let c = unravel(o, &dims);
+                        (0..d.len())
+                            .filter(|&k| k != ax)
+                            .map(|k| c[k].min(d[k] - 1) * ds[k])
+                            .sum::<usize>() as u32
+                    })
+                    .collect();
+                b.emit(Step::GatherRuntime {
+                    out,
+                    table: input_slot(0)?,
+                    indices: input_slot(1)?,
+                    which: (0..n as u32).collect(),
+                    base,
+                    axis_stride: ds[ax] as u32,
+                    wrap: d[ax] as u32,
+                });
+            }
+            Op::GatherNd { batch_dims } => {
+                // data [B.., D_0..D_{k-1}, rest..], indices [B.., Q.., k]: each
+                // index tuple picks one `rest`-sized row.
+                let d = input_dims(0)?;
+                let id = input_dims(1)?;
+                let bd = (*batch_dims).max(0) as usize;
+                let k = *id
+                    .last()
+                    .ok_or_else(|| WebglError("gather_nd: scalar indices".into()))?;
+                let tuples = total(&id[..id.len() - 1]);
+                let rest = total(&d[bd + k..]);
+                let per_batch = tuples / total(&d[..bd]).max(1);
+                let batch_stride = total(&d[bd..]);
+                let lin = linearize_tuples(&mut b, input_slot(1)?, tuples, &d[bd..bd + k]);
+                let n = total(&dims);
+                b.emit(Step::GatherRuntime {
+                    out,
+                    table: input_slot(0)?,
+                    indices: lin,
+                    which: (0..n).map(|o| (o / rest) as u32).collect(),
+                    base: (0..n)
+                        .map(|o| ((o / rest / per_batch) * batch_stride + o % rest) as u32)
+                        .collect(),
+                    axis_stride: rest as u32,
+                    wrap: 0,
+                });
+            }
+            Op::ScatterAdd { axis } => {
+                // inputs [updates, indices]: out[.., idx[j], ..] += updates[.., j, ..].
+                let u = input_dims(0)?;
+                let ax = *axis;
+                let (a_len, j) = (dims[ax], u[ax]);
+                let post = total(&dims[ax + 1..]);
+                let n = total(&dims);
+                b.emit(Step::ScatterRuntime {
+                    out,
+                    data: None,
+                    updates: input_slot(0)?,
+                    indices: input_slot(1)?,
+                    ibase: vec![0; n],
+                    ubase: (0..n)
+                        .map(|o| ((o / (a_len * post)) * j * post + o % post) as u32)
+                        .collect(),
+                    key: (0..n).map(|o| ((o / post) % a_len) as u32).collect(),
+                    count: j,
+                    istride: 1,
+                    ustride: post,
+                    wrap: 0,
+                    red: ScatterRed::Add,
+                });
+            }
+            Op::ScatterNd { reduction } => {
+                // inputs [data, indices [Q.., k], updates [Q.., rest..]].
+                let id = input_dims(1)?;
+                let k = *id
+                    .last()
+                    .ok_or_else(|| WebglError("scatter_nd: scalar indices".into()))?;
+                let nq = total(&id[..id.len() - 1]);
+                let rest = total(&dims[k..]);
+                let lin = linearize_tuples(&mut b, input_slot(1)?, nq, &dims[..k]);
+                let n = total(&dims);
+                b.emit(Step::ScatterRuntime {
+                    out,
+                    data: Some(input_slot(0)?),
+                    updates: input_slot(2)?,
+                    indices: lin,
+                    ibase: vec![0; n],
+                    ubase: (0..n).map(|o| (o % rest) as u32).collect(),
+                    key: (0..n).map(|o| (o / rest) as u32).collect(),
+                    count: nq,
+                    istride: 1,
+                    ustride: rest,
+                    wrap: 0,
+                    red: scatter_red(*reduction),
+                });
+            }
+            Op::ScatterElements { axis, reduction } => {
+                // inputs [data, indices, updates]; indices/updates share shape `u`.
+                // out[c] gathers every update in its axis line whose index is c[axis].
+                let u = input_dims(1)?;
+                let ax = norm_axis(*axis, dims.len())?;
+                let us = strides(&u);
+                let n = total(&dims);
+                let mut ibase = vec![PAD; n];
+                let mut key = vec![0u32; n];
+                for o in 0..n {
+                    let c = unravel(o, &dims);
+                    key[o] = c[ax] as u32;
+                    if (0..dims.len()).all(|k| k == ax || c[k] < u[k]) {
+                        ibase[o] = (0..dims.len())
+                            .filter(|&k| k != ax)
+                            .map(|k| c[k] * us[k])
+                            .sum::<usize>() as u32;
+                    }
+                }
+                b.emit(Step::ScatterRuntime {
+                    out,
+                    data: Some(input_slot(0)?),
+                    updates: input_slot(2)?,
+                    indices: input_slot(1)?,
+                    ubase: ibase.clone(),
+                    ibase,
+                    key,
+                    count: u[ax],
+                    istride: us[ax],
+                    ustride: us[ax],
+                    wrap: dims[ax] as u32,
+                    red: scatter_red(*reduction),
+                });
+            }
+            Op::Sort { axis, descending } | Op::ArgSort { axis, descending } => {
+                let d = input_dims(0)?;
+                let ax = *axis;
+                b.emit(Step::SortAxis {
+                    out,
+                    src: input_slot(0)?,
+                    outer: total(&d[..ax]),
+                    len: d[ax],
+                    inner: total(&d[ax + 1..]),
+                    k: d[ax],
+                    descending: *descending,
+                    indices: matches!(node.op, Op::ArgSort { .. }),
+                });
+            }
+            Op::LayerNorm2d { eps } => {
+                // Normalize over channels at each (n, h, w): move C last, run
+                // the last-axis LayerNorm, move it back.
+                let (n, c) = (dims[0], dims[1]);
+                let sp = total(&dims[2..]);
+                let rows = n * sp;
+                let to_last = (0..rows * c)
+                    .map(|i| {
+                        let (r, ci) = (i / c, i % c);
+                        ((r / sp * c + ci) * sp + r % sp) as u32
+                    })
+                    .collect();
+                let x_t = b.alloc(&[rows, c]);
+                b.emit(Step::Gather {
+                    out: x_t,
+                    src: input_slot(0)?,
+                    idx: to_last,
+                });
+                let y_t = b.alloc(&[rows, c]);
+                b.emit(Step::LayerNorm {
+                    out: y_t,
+                    x: x_t,
+                    gamma: input_slot(1)?,
+                    beta: input_slot(2)?,
+                    rows,
+                    cols: c,
+                    eps: *eps,
+                });
+                let back = (0..rows * c)
+                    .map(|o| {
+                        let (ni, ci, si) = (o / (c * sp), o / sp % c, o % sp);
+                        ((ni * sp + si) * c + ci) as u32
+                    })
+                    .collect();
+                b.emit(Step::Gather {
+                    out,
+                    src: y_t,
+                    idx: back,
+                });
+            }
+            Op::Interpolate3d { .. } => {
+                // Nearest: src = min(floor(dst · in / out), in − 1) per axis,
+                // computed per fragment (a table would be one index per
+                // output voxel).
+                let d = input_dims(0)?;
+                b.emit(Step::Resize3d {
+                    out,
+                    src: input_slot(0)?,
+                    nc: d[0] * d[1],
+                    din: [d[2], d[3], d[4]],
+                    dout: [dims[2], dims[3], dims[4]],
+                });
+            }
+            Op::Fft { inverse, norm, .. } => {
+                // Rows are `[re… | im…]` (F32/F64 2N-block) or interleaved
+                // `[re, im]` pairs (C64); see `emit_fft`.
+                let (n, block) = match input_dt(0)? {
+                    DType::C64 => (*dims.last().unwrap_or(&0), false),
+                    DType::F32 | DType::F64 => (dims.last().unwrap_or(&0) / 2, true),
+                    other => return Err(WebglError(format!("fft of {other:?} not supported"))),
+                };
+                let rows = total(&dims) * node_lane / (2 * n).max(1);
+                let scale = norm.output_scale(n, *inverse);
+                emit_fft(&mut b, input_slot(0)?, out, rows, n, block, *inverse, scale);
+            }
+            Op::RngUniform {
+                low,
+                high,
+                key,
+                op_seed,
+            } => {
+                // Counter-based and keyed by the node, so the values are fixed
+                // by the graph: computed here with the default RNG policy (the
+                // one an rlx-cpu session uses) and uploaded as a constant.
+                let mut v = vec![0f32; total(&dims)];
+                rlx_ir::fill_uniform_like(
+                    &mut v,
+                    *low,
+                    *high,
+                    rlx_ir::RngOptions::default(),
+                    *key,
+                    *op_seed,
+                );
+                b.emit(Step::Leaf {
+                    out,
+                    src: LeafSource::Const(v),
+                });
+            }
+            Op::RngNormal {
+                mean,
+                scale,
+                key,
+                op_seed,
+            } => {
+                let mut v = vec![0f32; total(&dims)];
+                rlx_ir::fill_normal_like(
+                    &mut v,
+                    *mean,
+                    *scale,
+                    rlx_ir::RngOptions::default(),
+                    *key,
+                    *op_seed,
+                );
+                b.emit(Step::Leaf {
+                    out,
+                    src: LeafSource::Const(v),
+                });
+            }
+            Op::Cholesky
+            | Op::Det
+            | Op::LogDet
+            | Op::TriangularSolve { .. }
+            | Op::DenseSolve
+            | Op::BatchedDenseSolve => {
+                let a_dims = input_dims(0)?;
+                let n = *a_dims.last().unwrap_or(&0);
+                let batch = total(&a_dims) / (n * n).max(1);
+                let rhs = matches!(
+                    node.op,
+                    Op::TriangularSolve { .. } | Op::DenseSolve | Op::BatchedDenseSolve
+                );
+                let op = match node.op {
+                    Op::Cholesky => LinalgOp::Cholesky,
+                    Op::Det => LinalgOp::Det,
+                    Op::LogDet => LinalgOp::LogDet,
+                    Op::TriangularSolve { lower, transpose } => {
+                        LinalgOp::TriSolve { lower, transpose }
+                    }
+                    _ => LinalgOp::Solve,
+                };
+                b.emit(Step::Linalg {
+                    out,
+                    a: input_slot(0)?,
+                    b: if rhs { Some(input_slot(1)?) } else { None },
+                    n,
+                    nrhs: if rhs {
+                        total(&dims) / (batch * n).max(1)
+                    } else {
+                        0
+                    },
+                    batch,
+                    op,
+                });
+            }
+            Op::TopK { k } => {
+                // Indices of the k largest along the last axis, sorted.
+                let d = input_dims(0)?;
+                let len = *d
+                    .last()
+                    .ok_or_else(|| WebglError("topk: scalar input".into()))?;
+                b.emit(Step::SortAxis {
+                    out,
+                    src: input_slot(0)?,
+                    outer: total(&d) / len.max(1),
+                    len,
+                    inner: 1,
+                    k: *k,
+                    descending: true,
+                    indices: true,
                 });
             }
             Op::Rope {
@@ -1724,27 +3113,30 @@ fn lower(graph: &Graph) -> Result<Plan> {
                 // f32 input, host-delegated). Any other custom op name is
                 // rejected — rlx-webgl has no other host kernels and is f32-only.
                 if !COLLECTIVE_OPS.contains(&name.as_str()) {
-                    return Err(WebglError(format!(
-                        "custom op {name:?} not supported on WebGL (only collective.* ops)"
-                    )));
-                }
-                if *num_inputs != 1 {
+                    // Registered (non-collective) custom ops run their rlx-cpu kernel.
+                    let ins = (0..node.inputs.len())
+                        .map(input_slot)
+                        .collect::<Result<_>>()?;
+                    emit_host(&mut b, graph, node, out, ins)?;
+                } else if *num_inputs != 1 {
                     return Err(WebglError(format!(
                         "collective op {name:?} expects 1 input, graph has {num_inputs}"
                     )));
+                } else {
+                    b.emit(Step::Custom {
+                        out,
+                        input: input_slot(0)?,
+                        name: name.clone(),
+                        attrs: attrs.clone(),
+                    });
                 }
-                b.emit(Step::Custom {
-                    out,
-                    input: input_slot(0)?,
-                    name: name.clone(),
-                    attrs: attrs.clone(),
-                });
             }
-            other => {
-                return Err(WebglError(format!(
-                    "op {:?} not supported on WebGL",
-                    other.kind()
-                )));
+            // No WebGL lowering: run the op on rlx-cpu.
+            _ => {
+                let ins = (0..node.inputs.len())
+                    .map(input_slot)
+                    .collect::<Result<_>>()?;
+                emit_host(&mut b, graph, node, out, ins)?;
             }
         }
     }
@@ -1767,14 +3159,253 @@ fn lower(graph: &Graph) -> Result<Plan> {
         slot_origin: b.slot_origin,
         outputs,
     };
+    fuse_conv1_argmax(&mut plan);
+    drop_unwritten_slots(&mut plan);
     widen_tall_slots(&mut plan);
+    alias_copies(&mut plan);
+    fold_activations(&mut plan);
+    drop_unwritten_slots(&mut plan);
     Ok(plan)
+}
+
+/// A 3-D `FusedConvBiasAct` (no residual) as a three-input `Op::Conv3d` —
+/// the bias added by the conv kernel — then its activation, if any.
+///
+/// Legalized the generic way it becomes `conv → Reshape(bias) → Expand →
+/// Add`, and the `Expand` is a gather with one index per output element: as
+/// large as the activation itself, per layer. Backend-private like rlx-cpu's
+/// and wgpu's folds: `Op::Conv3d` is two inputs in the IR contract, and this
+/// graph only goes on to the planner.
+fn fold_conv3d_bias(g: Graph) -> Graph {
+    let is_target = |n: &rlx_ir::Node| {
+        matches!(&n.op, Op::FusedConvBiasAct { kernel_size, has_residual: false, .. } if kernel_size.len() == 3)
+            && n.inputs.len() == 3
+    };
+    if !g.nodes().iter().any(is_target) {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        let ins: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let id = match &node.op {
+            Op::FusedConvBiasAct {
+                stride,
+                padding,
+                dilation,
+                groups,
+                activation,
+                ..
+            } if is_target(node) => {
+                let a3 = |v: &Vec<usize>| [v[0], v[1], v[2]];
+                let conv = out.add_node(
+                    Op::Conv3d {
+                        stride: a3(stride),
+                        padding: a3(padding),
+                        dilation: a3(dilation),
+                        groups: *groups,
+                    },
+                    ins,
+                    node.shape.clone(),
+                );
+                match activation {
+                    Some(a) => out.add_node(Op::Activation(*a), vec![conv], node.shape.clone()),
+                    None => conv,
+                }
+            }
+            _ => out.add_node(node.op.clone(), ins, node.shape.clone()),
+        };
+        id_map.insert(node.id, id);
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+/// A 1×1×1, unpadded, ungrouped [`Step::Conv3d`] read only by an argmax over
+/// its channels becomes one [`Step::Conv1ArgMax`]: a segmentation head's
+/// class scores (104 classes over a 6-million-voxel crop is 6.2e8 values,
+/// past any texture) are never stored.
+fn fuse_conv1_argmax(plan: &mut Plan) {
+    let mut readers = vec![0usize; plan.slot_dims.len()];
+    for step in &plan.steps {
+        for s in step.reads() {
+            readers[s] += 1;
+        }
+    }
+    // the conv's place takes the fused step; the argmax's is dropped
+    let mut fused: Vec<(usize, Step)> = Vec::new();
+    let mut drop = vec![false; plan.steps.len()];
+    for (ai, step) in plan.steps.iter().enumerate() {
+        let Step::ArgAxis {
+            out,
+            src,
+            outer,
+            len,
+            inner,
+            is_max: true,
+        } = *step
+        else {
+            continue;
+        };
+        if readers[src] != 1 || plan.outputs.contains(&src) {
+            continue;
+        }
+        let Some(ci) = plan.steps[..ai].iter().rposition(|s| s.out() == src) else {
+            continue;
+        };
+        if let Step::Conv3d {
+            x,
+            w,
+            bias,
+            n,
+            cin,
+            din,
+            cout,
+            dout,
+            k: [1, 1, 1],
+            stride: [1, 1, 1],
+            pad: [0, 0, 0],
+            groups: 1,
+            ..
+        } = plan.steps[ci]
+            && din == dout
+            && (outer, len, inner) == (n, cout, din.iter().product())
+        {
+            fused.push((
+                ci,
+                Step::Conv1ArgMax {
+                    out,
+                    x,
+                    w,
+                    bias,
+                    n,
+                    cin,
+                    cout,
+                    spatial: inner,
+                },
+            ));
+            drop[ai] = true;
+        }
+    }
+    for (i, s) in fused {
+        plan.steps[i] = s;
+    }
+    let mut i = 0;
+    plan.steps.retain(|_| {
+        i += 1;
+        !drop[i - 1]
+    });
+}
+
+/// Drop a [`Step::Copy`] whose source is laid out as its output — a Reshape
+/// between shapes whose rows differ but which widening gave one layout (a
+/// group norm's `[n, groups, …]` view of a volume) — and read the source
+/// instead. Every slot is written once, so the source holds the same values
+/// wherever the copy was read. MindGrab copied each activation twice a layer
+/// (50 copies of a 1 GB texture, 6% of a run).
+fn alias_copies(plan: &mut Plan) {
+    let mut to: Vec<usize> = (0..plan.slot_dims.len()).collect();
+    plan.steps.retain(|step| match step {
+        Step::Copy { out, src }
+            if plan.slot_dims[*out] == plan.slot_dims[*src]
+                && plan.slot_len[*out] == plan.slot_len[*src]
+                && !plan.outputs.contains(out) =>
+        {
+            to[*out] = to[*src];
+            false
+        }
+        _ => true,
+    });
+    for step in &mut plan.steps {
+        step.remap_reads(|s| to[s]);
+    }
+}
+
+/// Fold a `Unary` into the `Conv3d` or `GroupNorm` that writes its input,
+/// when it is that slot's only reader, the slot is not an output and the two
+/// slots are laid out alike: the producer applies the activation as it
+/// writes (`act`) straight into the `Unary`'s slot, and a full-size pass per
+/// layer is gone — brainchop's MeshNets have one after every conv or norm.
+/// `RLX_WEBGL_NO_FOLD_ACT=1` keeps them separate.
+fn fold_activations(plan: &mut Plan) {
+    if rlx_ir::env::flag("RLX_WEBGL_NO_FOLD_ACT") {
+        return;
+    }
+    let mut reads = vec![0usize; plan.slot_dims.len()];
+    for step in &plan.steps {
+        for r in step.reads() {
+            reads[r] += 1;
+        }
+    }
+    let mut writer = vec![usize::MAX; plan.slot_dims.len()];
+    for (i, step) in plan.steps.iter().enumerate() {
+        writer[step.out()] = i;
+    }
+    let mut gone = vec![false; plan.steps.len()];
+    for i in 0..plan.steps.len() {
+        let Step::Unary { out: u, a, act } = plan.steps[i] else {
+            continue;
+        };
+        let p = writer[a];
+        if p == usize::MAX
+            || reads[a] != 1
+            || plan.outputs.contains(&a)
+            || plan.slot_dims[a] != plan.slot_dims[u]
+            || plan.slot_len[a] != plan.slot_len[u]
+        {
+            continue;
+        }
+        match &mut plan.steps[p] {
+            Step::Conv3d {
+                out, act: f @ None, ..
+            }
+            | Step::GroupNorm {
+                out, act: f @ None, ..
+            } => {
+                *out = u;
+                *f = Some(act);
+                gone[i] = true;
+            }
+            _ => {}
+        }
+    }
+    let mut i = 0;
+    plan.steps.retain(|_| {
+        i += 1;
+        !gone[i - 1]
+    });
+}
+
+/// Size zero for a slot no step writes — a Reshape's alias, a fused conv's
+/// scores — so it neither counts toward [`Plan::largest_texture`] nor gets
+/// a buffer in the CPU executor.
+fn drop_unwritten_slots(plan: &mut Plan) {
+    let mut written = vec![false; plan.slot_dims.len()];
+    for step in &plan.steps {
+        written[step.out()] = true;
+    }
+    for (s, w) in written.into_iter().enumerate() {
+        if !w {
+            plan.slot_dims[s] = (0, 0);
+            plan.slot_len[s] = 0;
+        }
+    }
 }
 
 /// A slot taller than this is laid out wide instead, when it can be.
 const TALL_ROWS: usize = 8192;
 /// Column count of a widened slot.
 const WIDE_COLS: usize = 8192;
+/// Widest a widened slot gets (desktop `MAX_TEXTURE_SIZE`).
+const MAX_COLS: usize = 16384;
+
+/// The `MAX_TEXTURE_SIZE` plans are laid out for: `RLX_WEBGL_MAX_TEXTURE`,
+/// else a desktop's 16384. Below 16384 (4096–8192 on some phones) every
+/// width above shrinks to it, so a tensor that fits `side²` texels gets a
+/// texture of at most `side` a side.
+pub fn max_texture() -> usize {
+    rlx_ir::env::parse_or("RLX_WEBGL_MAX_TEXTURE", MAX_COLS).max(1)
+}
 
 /// Lay out tall slots (`rows > TALL_ROWS`) as `ceil(n / WIDE_COLS) × WIDE_COLS`.
 ///
@@ -1789,6 +3420,9 @@ const WIDE_COLS: usize = 8192;
 /// form a group, and a tall group is widened together unless a member is
 /// produced or read by a row kernel.
 fn widen_tall_slots(plan: &mut Plan) {
+    let side = max_texture();
+    let (tall_rows, wide_cols, max_cols) =
+        (TALL_ROWS.min(side), WIDE_COLS.min(side), MAX_COLS.min(side));
     let n = plan.slot_dims.len();
     let mut parent: Vec<usize> = (0..n).collect();
     fn find(p: &mut [usize], mut x: usize) -> usize {
@@ -1807,11 +3441,32 @@ fn widen_tall_slots(plan: &mut Plan) {
     let mut pinned = vec![false; n];
     for step in &plan.steps {
         match step {
+            // read and written by linear index
             Step::Leaf { .. }
+            | Step::Conv3d { .. }
+            | Step::ArgAxis { .. }
+            | Step::Conv1ArgMax { .. }
+            | Step::GroupNorm { .. }
+            | Step::Copy { .. }
+            | Step::Splat { .. }
+            | Step::Broadcast { .. }
+            | Step::Concat { .. }
+            | Step::Pool3d { .. }
+            | Step::Resize3d { .. }
             | Step::Gather { .. }
             | Step::Reduce { .. }
             | Step::ArgReduce { .. }
-            | Step::GatherRuntime { .. } => {}
+            | Step::GatherRuntime { .. }
+            | Step::SortAxis { .. }
+            | Step::FftStage { .. }
+            | Step::Host { .. }
+            | Step::Linalg { .. } => {}
+            // `data` is read at the output's own texel.
+            Step::ScatterRuntime { out, data, .. } => {
+                if let Some(d) = data {
+                    union(&mut parent, *out, *d);
+                }
+            }
             Step::Unary { out, a, .. } => union(&mut parent, *out, *a),
             Step::ActBack { out, x, dy, .. } => {
                 union(&mut parent, *out, *x);
@@ -1871,13 +3526,16 @@ fn widen_tall_slots(plan: &mut Plan) {
         let len = plan.slot_len[s];
         let ok = group_ok.entry(r).or_insert(true);
         *ok &= !pinned[s] && *group_len.entry(r).or_insert(len) == len;
-        *group_tall.entry(r).or_insert(false) |= plan.slot_dims[s].0 > TALL_ROWS;
+        *group_tall.entry(r).or_insert(false) |= plan.slot_dims[s].0 > tall_rows;
     }
     for s in 0..n {
         let r = find(&mut parent, s);
         if group_ok[&r] && group_tall[&r] {
             let len = plan.slot_len[s];
-            let cols = len.clamp(1, WIDE_COLS);
+            // past WIDE_COLS² elements (a 30-channel activation of a brain
+            // crop is 1.8e8) the rows would overflow instead: square up to
+            // MAX_COLS wide
+            let cols = len.clamp(1, wide_cols.max(len.div_ceil(wide_cols).min(max_cols)));
             plan.slot_dims[s] = (len.div_ceil(cols), cols);
         }
     }

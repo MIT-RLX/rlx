@@ -24,7 +24,7 @@ use anyhow::{Context, Result, anyhow};
 use crate::archive::{Seekable, ZipEntry, list_zip, prepare_seekable};
 use crate::dtype::DType;
 use crate::pickle::TensorMeta;
-use crate::{index_torch_zip, read_torch_tensor};
+use crate::{index_torch_zip, read_torch_tensor, read_torch_tensor_from};
 
 /// A tensor materialized from a `.pt` checkpoint as contiguous f32.
 #[derive(Debug, Clone)]
@@ -69,6 +69,11 @@ enum Store {
     /// Legacy: one sequential stream with no index, so there is nothing to
     /// seek to and the storages are held decoded.
     Legacy(HashMap<String, Vec<u8>>),
+    /// A modern ZIP already in memory ([`PtModel::from_bytes`]).
+    Bytes {
+        data: Vec<u8>,
+        entries: HashMap<String, ZipEntry>,
+    },
 }
 
 impl PtModel {
@@ -104,6 +109,37 @@ impl PtModel {
             tensors,
             store: Store::Zip {
                 source,
+                entries: storages,
+            },
+        })
+    }
+
+    /// Index a modern (ZIP) checkpoint held in memory: one fetched over the
+    /// network in a browser, where there is no file to open. A gzip-wrapped
+    /// one is unwrapped first. The legacy container is read from a file only
+    /// ([`Self::open`]).
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
+        let data = if data.starts_with(&[0x1f, 0x8b]) {
+            use std::io::Read;
+            let mut out = Vec::new();
+            flate2::read::MultiGzDecoder::new(data.as_slice())
+                .read_to_end(&mut out)
+                .context("gunzipping the checkpoint")?;
+            out
+        } else {
+            data
+        };
+        if crate::legacy::looks_legacy(&data[..data.len().min(4)]) {
+            anyhow::bail!("a legacy (pre-1.6) checkpoint can only be read from a file");
+        }
+        let mut cur = std::io::Cursor::new(data.as_slice());
+        let entries = list_zip(&mut cur, 0, data.len() as u64)
+            .context("reading the bytes as a torch.save zip")?;
+        let (tensors, storages) = index_torch_zip(&mut cur, &entries)?;
+        Ok(Self {
+            tensors,
+            store: Store::Bytes {
+                data,
                 entries: storages,
             },
         })
@@ -151,6 +187,10 @@ impl PtModel {
         let data = match &self.store {
             Store::Zip { source, entries } => read_torch_tensor(source.path(), meta, entries)
                 .with_context(|| format!("reading tensor {name:?}"))?,
+            Store::Bytes { data, entries } => {
+                read_torch_tensor_from(&mut std::io::Cursor::new(data.as_slice()), meta, entries)
+                    .with_context(|| format!("reading tensor {name:?}"))?
+            }
             Store::Legacy(blobs) => {
                 let raw = blobs.get(&meta.storage_key).ok_or_else(|| {
                     anyhow!("missing storage {:?} for tensor {name:?}", meta.storage_key)
@@ -317,6 +357,24 @@ mod tests {
         assert_eq!(t.shape, vec![2, 2]);
         assert_eq!(t.dtype, DType::F32);
         assert_eq!(t.data, vals);
+    }
+
+    #[test]
+    fn reads_the_same_from_bytes() {
+        let vals = vec![1.0f32, -2.0, 3.5, 4.0];
+        let f = write_pt(&vals);
+        let bytes = std::fs::read(f.path()).unwrap();
+        let m = PtModel::from_bytes(bytes.clone()).unwrap();
+        assert_eq!(m.names(), vec!["w".to_string()]);
+        assert_eq!(
+            m.tensor("w").unwrap().data,
+            PtModel::open(f.path()).unwrap().tensor("w").unwrap().data
+        );
+        // gzip-wrapped, as some hosts serve it
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&bytes).unwrap();
+        let m = PtModel::from_bytes(gz.finish().unwrap()).unwrap();
+        assert_eq!(m.tensor("w").unwrap().data, vals);
     }
 
     #[test]

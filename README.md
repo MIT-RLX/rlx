@@ -158,6 +158,7 @@ For those, depend on the standalone crates directly — they're not
 exposed through the prelude:
 
 - `rlx-cortexm` — `no_std` ARMv7E-M INT8 kernels.
+- `rlx-mcu` — `no_std` int8/int4 kernels, in-place model files and paged weights for speech models on MCUs.
 - `rlx-fpga` — IR → SystemVerilog → bitstream (first-class export via
   `rlx_runtime::export` / `pyrlx.export_fpga` under the `fpga` feature);
   `no_std` + `alloc` without its default `std` feature.
@@ -610,6 +611,7 @@ backends/  — one crate per hardware target
   rlx-gpu-kernels    shared CUDA/HIP C++ kernel sources (NVRTC / hipRTC)
   rlx-gpu-dispatch   shape-keyed kernel-variant dispatch table shared by all GPU backends
   rlx-cortexm-trainer  native fp32 trainer that emits rlx-cortexm's INT8 weights
+  rlx-mcu            no_std int8/int4 kernels + in-place model files for speech models on MCUs
 
 io/  — model + weight loading, conversion, packaging
   rlx-gguf           standalone GGUF v1/2/3 parser + dequant (every llama.cpp scheme)

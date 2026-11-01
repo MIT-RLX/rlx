@@ -137,6 +137,12 @@ pub mod hwprofile_select;
 // Depends on `hwprofile_select::device_vram_bytes`, so it carries the same gate.
 #[cfg(feature = "hwprofile")]
 pub mod arena_budget;
+pub mod binding_limit;
+#[cfg(feature = "opengl")]
+pub use binding_limit::webgl_texture_side;
+pub use binding_limit::{
+    binding_arena_bytes, binding_largest_tensor_bytes, device_binding_limit, device_stripe_reserve,
+};
 pub mod jacfwd;
 pub mod kernel_trace;
 pub mod kv_cache;

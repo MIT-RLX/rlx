@@ -97,6 +97,7 @@ use `ExportQuantMode::Fp4` on an f32 MatMul instead.
 
 `HwTarget::Generic` (default): soft-port `top.sv` only — preferred for ASIC.  
 `Ecp5` / `Ice40` / `Xilinx7 { board: None }`: same RTL + `board_top.sv` pin wrapper + stub constraints.
+Board presets (`Xilinx7 { board: Some(_) }`, `Lattice(_)`): a UART host-link `board_top`, real constraints, `program.sh`, `run_uart.py`.
 
 ### openXC7 boards (`HwTarget::xc7_board`, `--hw xc7:<board>`)
 
@@ -132,6 +133,41 @@ docker run --rm --platform linux/amd64 -v "$PWD":/work -v ~/.cache/rlx-fpga/chip
 `tests/xc7_uart.rs` drives this link in simulation — RTL, and the
 `synth_xilinx` netlist against Yosys's Xilinx cell models — and compares
 the replies with `rlx_fpga::reference`.
+
+### Lattice boards (`HwTarget::lattice_board`, `--hw lattice:<board>`)
+
+iCE40 and ECP5 through the open Yosys / nextpnr flows. Presets:
+`icebreaker` (iCE40UP5K-SG48, 12 MHz), `ulx3s-12f` / `-25f` / `-45f` /
+`-85f` (ECP5, CABGA381, 25 MHz oscillator). `ice40:icebreaker` and
+`ecp5:ulx3s-85f` parse too. A device token (`ecp5:45k:CABGA381`) still means
+the part-only target. The export adds the same files as an openXC7 board:
+
+| File | Role |
+|------|------|
+| `board_top.sv` | power-on reset + **UART host link** (115200 8N1); on ECP5 boards an `EHXPLLL` from the oscillator to a 12.5 MHz design clock (only under `SYNTHESIS`, so RTL simulation runs at the testbench clock) |
+| `constraints.pcf` / `.lpf` | clock / reset / UART / LED pins from `icebreaker.pcf` / `ulx3s_v20.lpf` |
+| `synth.sh` | iCE40: `yosys synth_ice40 -dsp` → `nextpnr-ice40` → `icepack` → `out.bin`; ECP5: `yosys synth_ecp5 -abc9` → `nextpnr-ecp5` → `ecppack` → `out.bit` (`--idcode` for the 12F) |
+| `program.sh` | `openFPGALoader -b icebreaker` / `-b ulx3s` (`FLASH=1` writes SPI flash) |
+| `run_uart.py` | host side, as for openXC7 boards |
+
+Why the ECP5 PLL: at 25 MHz the shared Q0.31 requantize (four chained
+`MULT18X18D`s plus a carry chain, in one cycle) reaches 24 MHz post-route,
+and nextpnr refuses the design. At 12.5 MHz it passes with margin
+(22.6 MHz for MNIST TinyConv).
+
+No local install? The `hdlc/impl` containers run the generated script:
+
+```sh
+docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work hdlc/impl:icestorm bash ./synth.sh    # iCE40
+docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work hdlc/impl:prjtrellis bash ./synth.sh  # ECP5
+```
+
+`tests/lattice_docker.rs` (`--ignored`) does exactly this for the iCEBreaker
+and the ULX3S-85F and requires a bitstream plus post-route fmax ≥ the design
+clock. `tests/lattice_uart.rs` drives the UART link in simulation (RTL, then
+the `synth_ice40` / `synth_ecp5` netlist against Yosys's cell models) and
+compares the replies with `rlx_fpga::reference`. The ECP5 netlist case
+synthesizes with `-nodsp`, because Yosys ships `MULT18X18D` only as a black box.
 
 ### RTL simulation parity
 

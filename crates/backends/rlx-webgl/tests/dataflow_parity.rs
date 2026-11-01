@@ -240,3 +240,299 @@ fn gelu_and_softplus() {
         parity(g, &[("x", &xs)]);
     }
 }
+
+fn conv3d_case(pad: usize, stride: usize, dil: usize, groups: usize) {
+    // input [2,4,4,5,5], weight [6,4/g,2,3,3].
+    let (n, cin, d, h, w) = (2usize, 4usize, 4usize, 5usize, 5usize);
+    let (cout, kd, kh, kw) = (6usize, 2usize, 3usize, 3usize);
+    let xs = f32s(n * cin * d * h * w, |i| (i as f32 * 0.29).sin());
+    let ws = f32s(cout * (cin / groups) * kd * kh * kw, |i| {
+        0.05 * (i as f32 % 13.0) - 0.3
+    });
+    let mut g = Graph::new("conv3d");
+    let x = g.input("x", sh(&[n, cin, d, h, w]));
+    let weight = g.input("w", sh(&[cout, cin / groups, kd, kh, kw]));
+    let y = g.conv3d(
+        x,
+        weight,
+        [stride, stride, stride],
+        [pad, pad, pad],
+        [dil, dil, dil],
+        groups,
+    );
+    g.set_outputs(vec![y]);
+    parity(g, &[("x", &xs), ("w", &ws)]);
+}
+
+#[test]
+fn conv3d_no_pad() {
+    conv3d_case(0, 1, 1, 1);
+}
+
+#[test]
+fn conv3d_padded_strided() {
+    conv3d_case(1, 2, 1, 1);
+}
+
+#[test]
+fn conv3d_dilated() {
+    conv3d_case(1, 1, 2, 1);
+}
+
+#[test]
+fn conv3d_grouped() {
+    conv3d_case(1, 1, 1, 2);
+}
+
+/// ConvTranspose3d (also the Conv3d input-gradient after decomposition):
+/// strided, padded, dilated, with output padding, plain and grouped.
+fn conv_transpose3d_case(groups: usize, dil: usize) {
+    let (n, cin, d, h, w) = (2usize, 4usize, 3usize, 3usize, 4usize);
+    let (cout, k) = (6usize, 3usize);
+    let xs = f32s(n * cin * d * h * w, |i| (i as f32 * 0.31).cos());
+    let ws = f32s(cin * (cout / groups) * k * k * k, |i| {
+        0.03 * (i as f32 % 17.0) - 0.25
+    });
+    let mut g = Graph::new("conv_transpose3d");
+    let x = g.input("x", sh(&[n, cin, d, h, w]));
+    let weight = g.input("w", sh(&[cin, cout / groups, k, k, k]));
+    let y = g.conv_transpose3d(
+        x,
+        weight,
+        [2, 1, 2],
+        [1, 0, 1],
+        [dil, dil, dil],
+        [1, 0, 1],
+        groups,
+    );
+    g.set_outputs(vec![y]);
+    parity(g, &[("x", &xs), ("w", &ws)]);
+}
+
+#[test]
+fn conv_transpose3d() {
+    conv_transpose3d_case(1, 1);
+}
+
+#[test]
+fn conv_transpose3d_grouped_dilated() {
+    conv_transpose3d_case(2, 2);
+}
+
+/// A segmentation head as rlx-segment builds it: a biased dilated 3-D conv
+/// (`FusedConvBiasAct`, rank 5) + GELU, a group norm over channels, then a
+/// biased 1×1×1 conv to classes and the argmax over them. Folded and fused,
+/// the plan holds no index table the size of an activation, and the class
+/// scores never get a slot of their own.
+#[test]
+fn conv3d_head_folds_and_fuses() {
+    use rlx_ir::op::Activation;
+    let (n, cin, d, h, w, mid, classes) = (1usize, 2usize, 5usize, 4usize, 6usize, 3usize, 4usize);
+    let xs = f32s(n * cin * d * h * w, |i| (i as f32 * 0.37).sin());
+    let w1 = f32s(mid * cin * 27, |i| 0.07 * (i as f32 % 11.0) - 0.3);
+    let b1 = [0.1f32, -0.2, 0.05];
+    let w2 = f32s(classes * mid, |i| 0.3 * (i as f32 % 5.0) - 0.6);
+    let b2 = [0.0f32, 0.2, -0.1, 0.05];
+    let (ones, zeros) = (vec![1.0f32; mid], vec![0.0f32; mid]);
+    let mut g = Graph::new("head");
+    let x = g.input("x", sh(&[n, cin, d, h, w]));
+    let wa = g.input("w1", sh(&[mid, cin, 3, 3, 3]));
+    let ba = g.input("b1", sh(&[mid]));
+    let wb = g.input("w2", sh(&[classes, mid, 1, 1, 1]));
+    let bb = g.input("b2", sh(&[classes]));
+    let gm = g.input("g", sh(&[mid]));
+    let bt = g.input("b", sh(&[mid]));
+    let conv = |g: &mut Graph, x, wt, b, c, k: usize, p: usize, dil: usize| {
+        g.add_node(
+            Op::FusedConvBiasAct {
+                kernel_size: vec![k; 3],
+                stride: vec![1; 3],
+                padding: vec![p; 3],
+                dilation: vec![dil; 3],
+                groups: 1,
+                activation: None,
+                has_residual: false,
+            },
+            vec![x, wt, b],
+            sh(&[n, c, d, h, w]),
+        )
+    };
+    let y = conv(&mut g, x, wa, ba, mid, 3, 2, 2);
+    let y = g.activation(Activation::Gelu, y, sh(&[n, mid, d, h, w]));
+    let flat = g.reshape(
+        y,
+        vec![n as i64, mid as i64, (d * h * w) as i64, 1],
+        sh(&[n, mid, d * h * w, 1]),
+    );
+    let y = g.group_norm(flat, gm, bt, mid, 1e-5);
+    let y = g.reshape(
+        y,
+        vec![n as i64, mid as i64, d as i64, h as i64, w as i64],
+        sh(&[n, mid, d, h, w]),
+    );
+    let y = conv(&mut g, y, wb, bb, classes, 1, 0, 1);
+    let lab = g.argmax(y, 1, false, sh(&[n, d, h, w]));
+    g.set_outputs(vec![lab]);
+    let inputs: [(&str, &[f32]); 7] = [
+        ("x", &xs),
+        ("w1", &w1),
+        ("b1", &b1),
+        ("w2", &w2),
+        ("b2", &b2),
+        ("g", &ones),
+        ("b", &zeros),
+    ];
+    parity(g.clone(), &inputs);
+
+    let plan = rlx_webgl::build_plan(&g).expect("plan");
+    let act = n * mid * d * h * w;
+    for s in &plan.steps {
+        if let rlx_webgl::plan::Step::Gather { idx, .. } = s {
+            assert!(
+                idx.len() < act,
+                "an activation-sized index table: {}",
+                idx.len()
+            );
+        }
+    }
+    assert!(
+        plan.steps
+            .iter()
+            .any(|s| matches!(s, rlx_webgl::plan::Step::Conv1ArgMax { .. })),
+        "head not fused"
+    );
+    assert!(
+        !plan
+            .steps
+            .iter()
+            .any(|s| matches!(s, rlx_webgl::plan::Step::ArgAxis { .. }))
+    );
+}
+
+/// 3-D max and average pooling (SynthStrip's 2×2×2 downsampling, and a
+/// padded, overlapping case), then a three-input concat on channels.
+#[test]
+fn pool3d_and_channel_concat() {
+    let (n, c, d, h, w) = (2usize, 3usize, 4usize, 6usize, 4usize);
+    let xs = f32s(n * c * d * h * w, |i| (i as f32 * 0.61).sin());
+    for (kind, k, s, p) in [
+        (ReduceOp::Max, 2, 2, 0),
+        (ReduceOp::Max, 3, 1, 1),
+        (ReduceOp::Mean, 3, 2, 1),
+    ] {
+        let o = |l: usize| (l + 2 * p - k) / s + 1;
+        let mut g = Graph::new("pool3d");
+        let x = g.input("x", sh(&[n, c, d, h, w]));
+        let y = g.add_node(
+            Op::Pool {
+                kind,
+                kernel_size: vec![k; 3],
+                stride: vec![s; 3],
+                padding: vec![p; 3],
+            },
+            vec![x],
+            sh(&[n, c, o(d), o(h), o(w)]),
+        );
+        g.set_outputs(vec![y]);
+        parity(g, &[("x", &xs)]);
+    }
+    let a = f32s(n * 2 * d * h * w, |i| i as f32);
+    let b = f32s(n * 1 * d * h * w, |i| -(i as f32));
+    let mut g = Graph::new("cat3");
+    let xa = g.input("a", sh(&[n, 2, d, h, w]));
+    let xb = g.input("b", sh(&[n, 1, d, h, w]));
+    let xc = g.input("c", sh(&[n, c, d, h, w]));
+    let y = g.concat(vec![xa, xb, xc], 1, sh(&[n, 3 + c, d, h, w]));
+    g.set_outputs(vec![y]);
+    parity(g, &[("a", &a), ("b", &b), ("c", &xs)]);
+}
+
+/// A Reshape between two tall shapes (rows over `TALL_ROWS`) that widening
+/// lays out alike needs no copy: the plan reads the source instead.
+#[test]
+fn reshape_between_widened_layouts_aliases() {
+    use rlx_ir::op::Activation;
+    let n = 18000 * 3;
+    let xs = f32s(n, |i| (i as f32 * 0.013).sin());
+    let mut g = Graph::new("reshape_wide");
+    let x = g.input("x", sh(&[18000, 3]));
+    let a = g.add_node(Op::Activation(Activation::Relu), vec![x], sh(&[18000, 3]));
+    let r = g.reshape(a, vec![9000, 6], sh(&[9000, 6]));
+    let y = g.add_node(Op::Activation(Activation::Sigmoid), vec![r], sh(&[9000, 6]));
+    g.set_outputs(vec![y]);
+    let plan = rlx_webgl::build_plan(&g).expect("plan");
+    assert!(
+        !plan
+            .steps
+            .iter()
+            .any(|s| matches!(s, rlx_webgl::Step::Copy { .. })),
+        "a copy between identical layouts survived"
+    );
+    parity(g, &[("x", &xs)]);
+}
+
+/// MeshNet's layers: a biased conv then an activation, and an instance norm
+/// over the flattened volume, reshaped back, then an activation. Both
+/// activations are applied by the step writing their input (`act`), so the
+/// plan has no `Unary` left — unless the conv has a second reader. Tall
+/// enough (over `TALL_ROWS` rows) that the flattened and the volume layouts
+/// both widen alike, as a brain's do, and the reshapes are aliases.
+#[test]
+fn activations_fold_into_conv_and_group_norm() {
+    use rlx_ir::op::Activation;
+    let (ci, co, d) = (2usize, 3usize, [64usize, 48, 6]);
+    let sp = d.iter().product::<usize>();
+    let xs = f32s(ci * sp, |i| (i as f32 * 0.37).sin());
+    let ws = f32s(co * ci * 27, |i| (i as f32 * 0.11).cos() * 0.3);
+    let bs = f32s(co, |i| i as f32 * 0.1 - 0.1);
+    let vol = sh(&[1, co, d[0], d[1], d[2]]);
+    for both in [false, true] {
+        let mut g = Graph::new("meshnet_layer");
+        let x = g.input("x", sh(&[1, ci, d[0], d[1], d[2]]));
+        let w = g.input("w", sh(&[co, ci, 3, 3, 3]));
+        let b = g.input("b", sh(&[co]));
+        let y = g.add_node(
+            Op::FusedConvBiasAct {
+                kernel_size: vec![3; 3],
+                stride: vec![1; 3],
+                padding: vec![1; 3],
+                dilation: vec![1; 3],
+                groups: 1,
+                activation: None,
+                has_residual: false,
+            },
+            vec![x, w, b],
+            vol.clone(),
+        );
+        let a = g.add_node(Op::Activation(Activation::Elu), vec![y], vol.clone());
+        let flat = sh(&[1, co, sp, 1]);
+        let f = g.reshape(a, vec![1, co as i64, sp as i64, 1], flat.clone());
+        let gamma = g.input("g", sh(&[co]));
+        let beta = g.input("bt", sh(&[co]));
+        let n = g.group_norm(f, gamma, beta, co, 1e-5);
+        let r = g.reshape(
+            n,
+            vec![1, co as i64, d[0] as i64, d[1] as i64, d[2] as i64],
+            vol.clone(),
+        );
+        let out = g.add_node(Op::Activation(Activation::Gelu), vec![r], vol.clone());
+        g.set_outputs(if both { vec![out, y] } else { vec![out] });
+        let plan = rlx_webgl::build_plan(&g).expect("plan");
+        let unary = plan
+            .steps
+            .iter()
+            .filter(|s| matches!(s, rlx_webgl::Step::Unary { .. }))
+            .count();
+        assert_eq!(
+            unary,
+            usize::from(both),
+            "both={both}: {unary} Unary steps left"
+        );
+        let gs = f32s(co, |i| 1.0 + i as f32 * 0.2);
+        let bts = f32s(co, |i| i as f32 * 0.05);
+        parity(
+            g,
+            &[("x", &xs), ("w", &ws), ("b", &bs), ("g", &gs), ("bt", &bts)],
+        );
+    }
+}

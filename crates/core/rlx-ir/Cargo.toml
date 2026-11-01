@@ -20,6 +20,7 @@ aes = "0.9.1"
 # Float math `core` lacks (sqrt/sin/floor/…) for the `no_std` subset only;
 # under `std` the inherent methods are used.
 libm = "0.2"
+rlx-libm = { workspace = true, optional = true }
 
 [features]
 default = ["std"]
@@ -33,6 +34,10 @@ serialize = ["std", "dep:serde", "dep:serde_json", "dep:bincode"]
 # set can cover all of it instead of the handful a test author thought of.
 # Off by default: it is test scaffolding, not part of the IR surface.
 test-support = ["std"]
+# Host-built constants (spectral windows, the exact-rDFT matrices) take their
+# cos / sin from rlx-libm's reference libm instead of std's, so a wasm build
+# (std = musl there) bakes the same bits as a native one. Off: std.
+parity = ["std", "dep:rlx-libm"]
 # No Apple frameworks: the BNNS samplers / fully-connected layer (Accelerate)
 # compile to their non-macOS stubs. Additive, so it wins under unification.
 pure-rust = []

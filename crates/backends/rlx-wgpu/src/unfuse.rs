@@ -61,8 +61,628 @@ impl DecomposePolicy for WgpuPolicy {
 }
 
 pub fn unfuse(graph: Graph) -> Graph {
-    let g = fold_conv_bias_into_conv3d(expand_unsupported_fusions(graph));
+    unfuse_with(graph, true)
+}
+
+/// [`unfuse`], with the activation folds or without. Without, a rank-5
+/// `FusedConvBiasAct` carrying an activation is expanded as well: `compile`
+/// retries this way when a folded node would be replayed on the host (see
+/// [`is_folded`]).
+pub fn unfuse_with(graph: Graph, folds: bool) -> Graph {
+    let g = if folds {
+        fold_conv_argmax(fold_norm_activation(fold_conv_activation(graph)))
+    } else {
+        graph
+    };
+    let g = fold_conv_bias_into_conv3d(expand_unsupported_fusions(g, folds));
     rlx_unfuse::unfuse(g, &WgpuPolicy)
+}
+
+/// Whether [`pack_half_activations`] runs (`RLX_WGPU_HALF_ACTIVATIONS=1`):
+/// off under the switches that pick conv kernels without a packed store
+/// (`RLX_WGPU_CONV3D_NO_C8`, `_W2`, `_NO_W2`, `_SCALAR`) or a norm without the
+/// split (`RLX_WGPU_GROUP_NORM_ONE_WG` is fine — both read and write halves).
+pub fn half_activations() -> bool {
+    rlx_ir::env::flag("RLX_WGPU_HALF_ACTIVATIONS")
+        && ![
+            "RLX_WGPU_CONV3D_NO_C8",
+            "RLX_WGPU_CONV3D_W2",
+            "RLX_WGPU_CONV3D_NO_W2",
+            "RLX_WGPU_CONV3D_SCALAR",
+        ]
+        .iter()
+        .any(|k| rlx_ir::env::flag(k))
+}
+
+/// Store a conv or norm activation as f16, two to an arena word, when every
+/// reader is a kernel that loads halves: a conv3d (`conv3d_ctile*`,
+/// `conv3d_argmax`) reading it as its input, a group norm, or a `Reshape`
+/// that is itself packed. The node's dtype becomes `F16`, which the hybrid
+/// planner sizes at two bytes; the math stays f32 (each load widens, each
+/// store rounds). Half the activation memory and traffic: a MeshNet's
+/// largest tensors fit a smaller storage binding.
+///
+/// Packed producers: an ungrouped conv with more than four output channels
+/// (`conv3d_ctile_w4c8`, which stores pairs — so an even `w_out`), not a
+/// [`CONV3D_ARGMAX`]; a group norm over an even `h·w` (a group starts on a
+/// word). A norm's input and output are packed together or not at all: an
+/// in-place norm (input and output one slot) must read what it writes.
+/// Never a graph output, and nothing past an `Input` or `Param`.
+pub fn pack_half_activations(g: Graph) -> Graph {
+    use std::collections::HashSet;
+    let mut readers: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for n in g.nodes() {
+        for &i in &n.inputs {
+            readers.entry(i).or_default().push(n.id);
+        }
+    }
+    let f32_static = |n: &rlx_ir::Node| {
+        n.shape.dtype() == rlx_ir::DType::F32 && n.shape.num_elements().is_some()
+    };
+    let conv_producer = |n: &rlx_ir::Node| {
+        let Some((_, _, _, groups, act, _)) = conv3d_geometry(&n.op) else {
+            return false;
+        };
+        n.shape.rank() == 5
+            && groups <= 1
+            && act != ARGMAX_ACT
+            && n.shape.dim(1).unwrap_static() > 4
+            && n.shape.dim(4).unwrap_static() % 2 == 0
+    };
+    let norm = |n: &rlx_ir::Node| {
+        group_norm_act(&n.op).is_some() && {
+            let d = n.shape.dims();
+            n.shape.rank() == 4 && (d[2].unwrap_static() * d[3].unwrap_static()) % 2 == 0
+        }
+    };
+    let reshape = |n: &rlx_ir::Node| matches!(n.op, Op::Reshape { .. });
+    let mut packed: HashSet<NodeId> = g
+        .nodes()
+        .iter()
+        .filter(|n| f32_static(n) && !g.outputs.contains(&n.id))
+        .filter(|n| conv_producer(n) || norm(n) || reshape(n))
+        .map(|n| n.id)
+        .collect();
+    // drop what breaks a rule until nothing does
+    loop {
+        let before = packed.len();
+        let snapshot: Vec<NodeId> = packed.iter().copied().collect();
+        for id in snapshot {
+            let n = g.node(id);
+            let reads_ok = readers.get(&id).is_some_and(|rs| {
+                rs.iter().all(|&r| {
+                    let rn = g.node(r);
+                    let as_input = rn.inputs.first() == Some(&id) && !rn.inputs[1..].contains(&id);
+                    as_input
+                        && ((conv3d_geometry(&rn.op).is_some_and(|c| c.3 <= 1)
+                            && rn.shape.rank() >= 4)
+                            || packed.contains(&r)
+                            || (group_norm_act(&rn.op).is_some() && packed.contains(&r)))
+                })
+            });
+            let input_ok = if reshape(n) || norm(n) {
+                packed.contains(&n.inputs[0])
+            } else {
+                true
+            };
+            if !reads_ok || !input_ok {
+                packed.remove(&id);
+            }
+        }
+        // a norm reading a packed tensor but not packed itself: unpack its input
+        for n in g.nodes() {
+            if group_norm_act(&n.op).is_some() && !packed.contains(&n.id) {
+                packed.remove(&n.inputs[0]);
+            }
+        }
+        if packed.len() == before {
+            break;
+        }
+    }
+    // a packed reshape needs a packed producer under it (checked above via
+    // input_ok); a lone reshape chain over nothing packed is gone by now
+    if packed.is_empty() {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        let ins: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let shape = if packed.contains(&node.id) {
+            node.shape.clone().with_dtype(rlx_ir::DType::F16)
+        } else {
+            node.shape.clone()
+        };
+        id_map.insert(node.id, out.add_node(node.op.clone(), ins, shape));
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+thread_local! {
+    /// Set while compiling a graph [`pack_half_activations`] packed: its
+    /// `F16` activations are two halves to an arena word (the hybrid planner's
+    /// two bytes), not the f32-widened `F16` of other graphs.
+    static HALF_PACKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark (or clear) the graph being compiled as half-packed.
+pub fn set_half_packed(on: bool) {
+    HALF_PACKED.with(|h| h.set(on));
+}
+
+/// Whether the graph being compiled is half-packed.
+pub fn half_packed() -> bool {
+    HALF_PACKED.with(|h| h.get())
+}
+
+/// A tensor [`pack_half_activations`] packed: two halves to an arena word.
+pub fn is_half(node: &rlx_ir::Node) -> bool {
+    half_packed() && node.shape.dtype() == rlx_ir::DType::F16
+}
+
+/// Run [`pack_half_activations`] when it is on and the graph is all f32 —
+/// no `F16`/`BF16` tensor whose (widened) storage the packed reading would
+/// misread — and record whether it packed anything ([`half_packed`]).
+pub fn maybe_pack_half(g: Graph) -> Graph {
+    set_half_packed(false);
+    if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+        eprintln!("[rlx-wgpu] half activations: {}", half_activations());
+    }
+    if !half_activations()
+        || g.nodes()
+            .iter()
+            .any(|n| matches!(n.shape.dtype(), rlx_ir::DType::F16 | rlx_ir::DType::BF16))
+    {
+        return g;
+    }
+    let g = pack_half_activations(g);
+    let n = g
+        .nodes()
+        .iter()
+        .filter(|n| n.shape.dtype() == rlx_ir::DType::F16)
+        .count();
+    if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+        eprintln!("[rlx-wgpu] half-packed {n} activations");
+    }
+    set_half_packed(n > 0);
+    g
+}
+
+/// A node only this backend's GPU kernels run: a rank-5 `FusedConvBiasAct`
+/// with an activation, a [`CONV3D_LEAKY`] or a [`GROUP_NORM_ACT`]. The host
+/// replay (`Step::HostOp`, rlx-cpu's single-op evaluator) knows none of them
+/// — it ran the first as a 2-D conv and the others not at all, and the labels
+/// of a striped arena (a 1 GiB storage binding) came back wrong.
+pub fn is_folded(node: &rlx_ir::Node) -> bool {
+    match &node.op {
+        Op::FusedConvBiasAct {
+            activation: Some(_),
+            ..
+        } => node.shape.rank() == 5,
+        Op::Custom { name, .. } => {
+            name == CONV3D_LEAKY || name == GROUP_NORM_ACT || name == CONV3D_ARGMAX
+        }
+        _ => false,
+    }
+}
+
+/// `Op::Custom` name of a rank-5 `FusedConvBiasAct` (same inputs, same
+/// output) whose store applies LeakyReLU, `max(v, α·v)`; see
+/// [`fold_conv_activation`]. Attrs: stride, padding, dilation (3 each),
+/// groups, α bits.
+pub const CONV3D_LEAKY: &str = "rlx_wgpu.conv3d_leaky";
+
+/// `(stride, padding, dilation, groups, act, α)` of a convolution the conv3d
+/// shaders run: `Op::Conv3d`, a rank-5 `FusedConvBiasAct` (its activation as
+/// `opcode_relu_first + 1`, `0` for none) or a [`CONV3D_LEAKY`]
+/// (`act == LEAKY_ACT`).
+#[allow(clippy::type_complexity)]
+pub fn conv3d_geometry(op: &Op) -> Option<([usize; 3], [usize; 3], [usize; 3], usize, u32, f32)> {
+    let a3 = |v: &[usize]| [v[0], v[1], v[2]];
+    match op {
+        Op::Conv3d {
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => Some((*stride, *padding, *dilation, *groups, 0, 0.0)),
+        Op::FusedConvBiasAct {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+            activation,
+            has_residual: false,
+        } if kernel_size.len() == 3 => Some((
+            a3(stride),
+            a3(padding),
+            a3(dilation),
+            *groups,
+            activation.map_or(0, |a| a.opcode_relu_first() + 1),
+            0.0,
+        )),
+        Op::Custom { name, attrs, .. } if name == CONV3D_LEAKY || name == CONV3D_ARGMAX => {
+            let w: Vec<u32> = attrs
+                .chunks_exact(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            let u = |i: usize| w[i] as usize;
+            Some((
+                [u(0), u(1), u(2)],
+                [u(3), u(4), u(5)],
+                [u(6), u(7), u(8)],
+                u(9),
+                if name == CONV3D_ARGMAX {
+                    ARGMAX_ACT
+                } else {
+                    LEAKY_ACT
+                },
+                w.get(10).map_or(0.0, |&b| f32::from_bits(b)),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// `Conv3dParams::act` for LeakyReLU, slope in `Conv3dParams::alpha`.
+pub const LEAKY_ACT: u32 = 0xFFFF;
+
+/// `Conv3dParams::act` of a [`CONV3D_ARGMAX`]: the store writes the index of
+/// the largest output channel, not the channels.
+pub const ARGMAX_ACT: u32 = 0xFFFE;
+
+/// `Op::Custom` name of a 1×1×1 conv3d (a rank-5 `FusedConvBiasAct`'s or a
+/// `Conv3d`'s inputs) and the `ArgMax` over its channels that was its only
+/// reader; the output is the argmax's. Attrs as [`CONV3D_LEAKY`]'s, without α.
+/// See [`fold_conv_argmax`].
+pub const CONV3D_ARGMAX: &str = "rlx_wgpu.conv3d_argmax";
+
+/// A scalar `Op::Constant`'s value.
+fn scalar_constant(g: &Graph, id: NodeId) -> Option<f32> {
+    match &g.node(id).op {
+        Op::Constant { data } if data.len() == 4 => {
+            Some(f32::from_le_bytes(data[..4].try_into().unwrap()))
+        }
+        _ => None,
+    }
+}
+
+/// Fold the activation reading a rank-5 `FusedConvBiasAct` (no activation,
+/// no residual, not a graph output) into it:
+///
+/// * an [`Op::Activation`], the conv's only reader, becomes the conv's own
+///   activation;
+/// * LeakyReLU spelled `max(y, α·y)` (SynthStrip's: a `Mul` by a scalar
+///   constant, the conv's only readers being that and the `Max`) becomes a
+///   [`CONV3D_LEAKY`].
+///
+/// The conv3d shaders apply it in their store (`Conv3dParams::act`) with the
+/// same arithmetic as the kernels it replaces — the generated
+/// `rlx_activation_apply` of the unary kernel, or a `*` and a `max` — so the
+/// result is bit-identical, and a full-size read and write per layer (two for
+/// LeakyReLU) is gone: 17% of a 256^3 brainchop MeshNet's GPU time, a third
+/// of MindGrab's.
+fn fold_conv_activation(g: Graph) -> Graph {
+    if rlx_ir::env::flag("RLX_WGPU_NO_FOLD_CONV_ACT") {
+        return g;
+    }
+    let mut readers: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for n in g.nodes() {
+        for &i in &n.inputs {
+            readers.entry(i).or_default().push(n.id);
+        }
+    }
+    let readers_of = |id: NodeId| readers.get(&id).map_or(&[][..], |v| v.as_slice());
+    let foldable = |id: NodeId| {
+        let n = g.node(id);
+        matches!(
+            n.op,
+            Op::FusedConvBiasAct {
+                activation: None,
+                has_residual: false,
+                ..
+            }
+        ) && n.shape.rank() == 5
+            && n.inputs.len() == 3
+            && !g.outputs.contains(&id)
+    };
+    enum Fold {
+        Act(rlx_ir::op::Activation),
+        Leaky(f32),
+    }
+    // conv id -> (its activation, the node now produced by the conv), and
+    // the nodes folded away -> the conv standing in for them
+    let mut folds: HashMap<NodeId, Fold> = HashMap::new();
+    let mut gone: HashMap<NodeId, NodeId> = HashMap::new();
+    for n in g.nodes() {
+        if !foldable(n.id) {
+            continue;
+        }
+        match readers_of(n.id) {
+            [r] => {
+                let r = g.node(*r);
+                if let Op::Activation(a) = r.op
+                    && r.shape == n.shape
+                {
+                    folds.insert(n.id, Fold::Act(a));
+                    gone.insert(r.id, n.id);
+                }
+            }
+            [a, b] => {
+                use rlx_ir::op::BinaryOp;
+                let is = |id: NodeId, op: BinaryOp| {
+                    matches!(g.node(id).op, Op::Binary(o) if o == op) && g.node(id).shape == n.shape
+                };
+                let (mul, max) = if is(*a, BinaryOp::Mul) {
+                    (*a, *b)
+                } else {
+                    (*b, *a)
+                };
+                if !(is(mul, BinaryOp::Mul) && is(max, BinaryOp::Max)) {
+                    continue;
+                }
+                let mi = &g.node(mul).inputs;
+                let alpha = if mi[0] == n.id {
+                    scalar_constant(&g, mi[1])
+                } else {
+                    scalar_constant(&g, mi[0])
+                };
+                let xi = &g.node(max).inputs;
+                let pairs = (xi[0] == n.id && xi[1] == mul) || (xi[1] == n.id && xi[0] == mul);
+                if let Some(alpha) = alpha
+                    && pairs
+                    && readers_of(mul) == [max]
+                    && !g.outputs.contains(&mul)
+                {
+                    folds.insert(n.id, Fold::Leaky(alpha));
+                    gone.insert(mul, n.id);
+                    gone.insert(max, n.id);
+                }
+            }
+            _ => {}
+        }
+    }
+    if folds.is_empty() {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        if let Some(conv) = gone.get(&node.id) {
+            // the conv now produces this node's value
+            id_map.insert(node.id, id_map[conv]);
+            continue;
+        }
+        let ins: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let op = match (folds.get(&node.id), &node.op) {
+            (Some(Fold::Act(a)), Op::FusedConvBiasAct { .. }) => {
+                let mut op = node.op.clone();
+                if let Op::FusedConvBiasAct { activation, .. } = &mut op {
+                    *activation = Some(*a);
+                }
+                op
+            }
+            (Some(Fold::Leaky(alpha)), op) => {
+                let (s, p, d, groups, ..) = conv3d_geometry(op).unwrap();
+                Op::Custom {
+                    name: CONV3D_LEAKY.to_string(),
+                    num_inputs: 3,
+                    attrs: s
+                        .iter()
+                        .chain(&p)
+                        .chain(&d)
+                        .map(|&v| v as u32)
+                        .chain([groups as u32, alpha.to_bits()])
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect(),
+                }
+            }
+            _ => node.op.clone(),
+        };
+        let nid = out.add_node(op, ins, node.shape.clone());
+        id_map.insert(node.id, nid);
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+/// Fold an `ArgMax` over the channels of a 1×1×1 conv3d (stride 1, no
+/// padding, ungrouped, no activation; a rank-5 `FusedConvBiasAct` or a
+/// `Conv3d`) that is the conv's only reader into a [`CONV3D_ARGMAX`]: one
+/// pass computes each voxel's logits and keeps the index of the largest. A
+/// segmentation net's class logits are never stored — for a 104-class
+/// brainchop model, a tensor of 104 channels over the volume, most of its
+/// arena, written and read back once. `RLX_WGPU_NO_FOLD_CONV_ARGMAX` turns it
+/// off.
+fn fold_conv_argmax(g: Graph) -> Graph {
+    if rlx_ir::env::flag("RLX_WGPU_NO_FOLD_CONV_ARGMAX") {
+        return g;
+    }
+    let mut readers: HashMap<NodeId, usize> = HashMap::new();
+    for n in g.nodes() {
+        for &i in &n.inputs {
+            *readers.entry(i).or_default() += 1;
+        }
+    }
+    let pointwise = |id: NodeId| {
+        let n = g.node(id);
+        let w = &g.node(*n.inputs.get(1)?).shape;
+        let plain = match &n.op {
+            Op::Conv3d { .. } => n.inputs.len() == 2,
+            Op::FusedConvBiasAct {
+                activation: None,
+                has_residual: false,
+                ..
+            } => n.inputs.len() == 3,
+            _ => false,
+        };
+        let (s, p, _, groups, ..) = conv3d_geometry(&n.op)?;
+        (plain
+            && n.shape.rank() == 5
+            && w.rank() == 5
+            && (2..5).all(|a| w.dim(a).is_static() && w.dim(a).unwrap_static() == 1)
+            && s == [1; 3]
+            && p == [0; 3]
+            && groups <= 1
+            && readers.get(&id) == Some(&1)
+            && !g.outputs.contains(&id))
+        .then_some(())
+    };
+    let folds: HashMap<NodeId, NodeId> = g
+        .nodes()
+        .iter()
+        .filter(|n| {
+            matches!(n.op, Op::ArgMax { axis: 1, .. })
+                && n.shape.rank() == 4
+                && pointwise(n.inputs[0]).is_some()
+        })
+        .map(|n| (n.id, n.inputs[0]))
+        .collect();
+    if folds.is_empty() {
+        return g;
+    }
+    let convs: std::collections::HashSet<NodeId> = folds.values().copied().collect();
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        if convs.contains(&node.id) {
+            continue;
+        }
+        let nid = match folds.get(&node.id) {
+            Some(&conv) => {
+                let c = g.node(conv);
+                let (s, p, d, groups, ..) = conv3d_geometry(&c.op).unwrap();
+                let ins: Vec<NodeId> = c.inputs.iter().map(|i| id_map[i]).collect();
+                out.add_node(
+                    Op::Custom {
+                        name: CONV3D_ARGMAX.to_string(),
+                        num_inputs: ins.len() as u32,
+                        attrs: s
+                            .iter()
+                            .chain(&p)
+                            .chain(&d)
+                            .map(|&v| v as u32)
+                            .chain([groups.max(1) as u32])
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect(),
+                    },
+                    ins,
+                    node.shape.clone(),
+                )
+            }
+            None => {
+                let ins: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+                out.add_node(node.op.clone(), ins, node.shape.clone())
+            }
+        };
+        id_map.insert(node.id, nid);
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+/// `Op::Custom` name of an `Op::GroupNorm` (same inputs, same output) that
+/// applies an activation in its write-back; see [`fold_norm_activation`].
+pub const GROUP_NORM_ACT: &str = "rlx_wgpu.group_norm_act";
+
+/// `(num_groups, eps, activation)` of a group norm: an `Op::GroupNorm`, or a
+/// [`GROUP_NORM_ACT`] node (attrs: `num_groups`, `eps` bits, opcode).
+pub fn group_norm_act(op: &Op) -> Option<(usize, f32, Option<rlx_ir::op::Activation>)> {
+    match op {
+        Op::GroupNorm { num_groups, eps } => Some((*num_groups, *eps, None)),
+        Op::Custom { name, attrs, .. } if name == GROUP_NORM_ACT => {
+            let w = |i: usize| u32::from_le_bytes(attrs[4 * i..4 * i + 4].try_into().unwrap());
+            let act = rlx_ir::op::Activation::ALL
+                .into_iter()
+                .find(|a| a.opcode_relu_first() == w(2))
+                .expect("rlx-wgpu: GROUP_NORM_ACT carries a known activation");
+            Some((w(0) as usize, f32::from_bits(w(1)), Some(act)))
+        }
+        _ => None,
+    }
+}
+
+/// Fold an [`Op::Activation`] into the `Op::GroupNorm` it reads — directly
+/// or through one `Reshape` (an instance norm over a volume runs on it
+/// flattened) — when the norm and the reshape have no other reader and are
+/// not graph outputs. The norm becomes a [`GROUP_NORM_ACT`] whose write-back
+/// applies the activation, so a full-size read and write is gone per norm;
+/// MindGrab has one after each of its 17 norms.
+fn fold_norm_activation(g: Graph) -> Graph {
+    if rlx_ir::env::flag("RLX_WGPU_NO_FOLD_NORM_ACT") {
+        return g;
+    }
+    let mut readers: HashMap<NodeId, usize> = HashMap::new();
+    for n in g.nodes() {
+        for &i in &n.inputs {
+            *readers.entry(i).or_default() += 1;
+        }
+    }
+    let sole = |id: NodeId| readers.get(&id) == Some(&1) && !g.outputs.contains(&id);
+    // norm id -> (activation, the node standing in for the activation)
+    let mut folds: HashMap<NodeId, (rlx_ir::op::Activation, NodeId)> = HashMap::new();
+    for n in g.nodes() {
+        let Op::Activation(a) = n.op else { continue };
+        let x = n.inputs[0];
+        let (norm, stand_in) = match g.node(x).op {
+            Op::Reshape { .. } => (g.node(x).inputs[0], x),
+            _ => (x, x),
+        };
+        let Op::GroupNorm { .. } = g.node(norm).op else {
+            continue;
+        };
+        if sole(x)
+            && (norm == x || sole(norm))
+            && n.shape.num_elements() == g.node(norm).shape.num_elements()
+        {
+            folds.insert(norm, (a, stand_in));
+        }
+    }
+    if folds.is_empty() {
+        return g;
+    }
+    let skip: HashMap<NodeId, NodeId> = g
+        .nodes()
+        .iter()
+        .filter_map(|n| match n.op {
+            Op::Activation(_) => {
+                let x = n.inputs[0];
+                let norm = match g.node(x).op {
+                    Op::Reshape { .. } => g.node(x).inputs[0],
+                    _ => x,
+                };
+                folds.get(&norm).filter(|f| f.1 == x).map(|_| (n.id, x))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        if let Some(&x) = skip.get(&node.id) {
+            // the norm (or its reshape) now produces the activation's value
+            id_map.insert(node.id, id_map[&x]);
+            continue;
+        }
+        let ins: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let op = match (&node.op, folds.get(&node.id)) {
+            (Op::GroupNorm { num_groups, eps }, Some(&(a, _))) => Op::Custom {
+                name: GROUP_NORM_ACT.to_string(),
+                num_inputs: 3,
+                attrs: [*num_groups as u32, eps.to_bits(), a.opcode_relu_first()]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            },
+            _ => node.op.clone(),
+        };
+        let nid = out.add_node(op, ins, node.shape.clone());
+        id_map.insert(node.id, nid);
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
 }
 
 /// Rewrite a 3-D [`Op::FusedConvBiasAct`] into an [`Op::Conv3d`] that keeps the
@@ -144,7 +764,7 @@ fn fold_conv_bias_into_conv3d(g: Graph) -> Graph {
 /// rather than running. (CUDA and ROCm share the claim without the assert and
 /// silently compute a 2-D convolution instead.) Sending other ranks back to
 /// primitives lets them run on `conv3d.wgsl`.
-fn expand_unsupported_fusions(g: Graph) -> Graph {
+fn expand_unsupported_fusions(g: Graph, folds: bool) -> Graph {
     // Rank-5 with no activation and no residual is lowered natively — the
     // conv3d shaders apply the bias in their store. Expanding it instead costs
     // a full-size `Expand` of the bias and a full-size `Add` per convolution:
@@ -156,6 +776,11 @@ fn expand_unsupported_fusions(g: Graph) -> Graph {
                 has_residual: false,
                 ..
             } => n.shape.rank() != 5 || n.inputs.len() != 3,
+            // ... and so is rank 5 carrying `fold_conv_activation`'s activation.
+            Op::FusedConvBiasAct {
+                has_residual: false,
+                ..
+            } if n.shape.rank() == 5 => !folds || n.inputs.len() != 3,
             Op::FusedConvBiasAct { .. } => n.shape.rank() != 4,
             _ => false,
         }

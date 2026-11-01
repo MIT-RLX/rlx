@@ -19,14 +19,13 @@ rlx-autodiff = { workspace = true }
 rlx-compile = { workspace = true }
 rlx-fusion = { workspace = true }
 
-# Host/transport `collective.*` ops delegate to the one shared CPU kernel via
-# `rlx_cpu::op_registry::run_f32_custom_op_host`. This is NATIVE-only: the
-# collective transport (rlx-driver ProcessGroup) uses std::net TCP sockets,
-# which don't exist on wasm32/browser — so rlx-cpu is not pulled into the wasm
-# build (and the CPU executor errors on a collective there). `default-features
-# = false` drops the platform BLAS link (collectives don't GEMM).
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.19", default-features = false }
+# Host fallback (`host.rs`): ops with no WebGL lowering run on rlx-cpu, which
+# is also what `collective.*` ops delegate to. `default-features = false` drops
+# the platform BLAS, so rlx-cpu's pure-Rust paths run — identically on native
+# and wasm (rlx-web already links rlx-cpu for its CPU device). The collective
+# transport itself (rlx-driver TCP) still exists only off wasm.
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.19", default-features = false, features = ["splat"] }
+half = "2"
 
 # WebGL2 runtime — wasm only.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -45,6 +44,7 @@ web-sys = { version = "0.3.95", features = [
     "WebGlUniformLocation",
     "WebGlVertexArrayObject",
     "Window",
+    "console",
 ] }
 
 [dev-dependencies]
@@ -54,11 +54,19 @@ web-sys = { version = "0.3.95", features = [
 # published manifest, so this never resolves against crates.io and needs no
 # per-release pin bump.
 rlx-runtime = { path = "../../core/rlx-runtime" }
+# The canonical activation derivatives (rlxsl auto-differentiates the forward),
+# the reference for the ActivationBackward kinds rlx-cpu decomposes at AD.
+rlxsl = { workspace = true }
 
 # Native-only: registers the `collective.*` op extensions + CPU kernels so the
 # exec_cpu `Op::Custom` host-delegate can be tested end-to-end without a network
 # (the copy_to_parallel kernel is a pure identity copy, needs no process group).
 # Path-only test dep — stripped from the published manifest.
+# In-browser tests of the GL shaders themselves (`tests/gl_conv_parity.rs`):
+# `wasm-pack`-free, run with wasm-bindgen-test-runner (see that file).
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 rlx-collectives = { path = "../../core/rlx-collectives" }
 

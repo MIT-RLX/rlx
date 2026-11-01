@@ -37,7 +37,11 @@ pub fn collect_board_shell(model: &Model, hw: &HwTarget, io: &IoConfig) -> Optio
             board: Some(board), ..
         } => Some(Artifact {
             rel_path: "board_top.sv".into(),
-            content: crate::codegen::uart::emit_uart_board_top(model, io, *board),
+            content: crate::codegen::uart::emit_uart_board_top(model, io, board.shell()),
+        }),
+        HwTarget::Lattice(board) => Some(Artifact {
+            rel_path: "board_top.sv".into(),
+            content: crate::codegen::uart::emit_uart_board_top(model, io, board.shell()),
         }),
         HwTarget::Xilinx7 { board: None, .. } => Some(Artifact {
             rel_path: "board_top.sv".into(),

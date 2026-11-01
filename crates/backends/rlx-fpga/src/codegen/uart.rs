@@ -19,11 +19,11 @@
 #[allow(unused_imports)]
 use crate::prelude::*;
 
+use crate::board::{Pll, ShellBoard, UART_BAUD, UART_SYNC};
 use crate::codegen::io_ports::{primary_out_len, sanitize_port};
 use crate::codegen::relu::bits_for;
 use crate::export_config::IoConfig;
 use crate::model::Model;
-use crate::xc7::{UART_BAUD, UART_SYNC, Xc7Board};
 
 /// `uart_rx` / `uart_tx`: 8N1, `CLKS_PER_BIT` clocks per bit.
 pub const UART_PRIMITIVES: &str = r#"// uart_rx — 8N1 receiver; 2-FF synchronizer, mid-bit sampling.
@@ -142,9 +142,8 @@ pub fn uart_supported(io: &IoConfig) -> Result<(), String> {
 
 /// `board_top` for an openXC7 board: power-on reset + UART host link around
 /// the soft `top`. Includes the UART primitives so the file is self-contained.
-pub fn emit_uart_board_top(model: &Model, io: &IoConfig, board: Xc7Board) -> String {
+pub fn emit_uart_board_top(model: &Model, io: &IoConfig, board: ShellBoard) -> String {
     let n = &io.names;
-    let pins = board.pins();
     let in_len = model.input_len.max(1);
     let in_ab = bits_for(in_len);
     let out_len = primary_out_len(model).max(1);
@@ -152,7 +151,7 @@ pub fn emit_uart_board_top(model: &Model, io: &IoConfig, board: Xc7Board) -> Str
     let send_pred = io.output.wants_pred_port();
     let send_mem = io.output.wants_memory();
     let reply_bytes = usize::from(send_pred) + if send_mem { out_len } else { 0 };
-    let rst_expr = if pins.rst_active_low {
+    let rst_expr = if board.rst_active_low {
         "~rst_btn"
     } else {
         "rst_btn"
@@ -249,7 +248,7 @@ pub fn emit_uart_board_top(model: &Model, io: &IoConfig, board: Xc7Board) -> Str
 
     format!(
         r#"// ─────────────────────────────────────────────────────────────────
-// board_top — {board} (openXC7) UART host link over soft `top` ({model})
+// board_top — {board} ({flow}) UART host link over soft `top` ({model})
 // ─────────────────────────────────────────────────────────────────
 // {baud} 8N1. Host sends 0x{sync:02X} + {in_len} input bytes; FPGA replies
 // with {reply_bytes} byte(s): {reply_desc}.
@@ -268,27 +267,28 @@ module board_top #(
     localparam int OUT_LEN   = {out_len};
     localparam logic [7:0] SYNC = 8'h{sync:02X};
 
+{clock}
     // Power-on reset (FPGA flops load their init value at configuration),
-    // OR'd with the synchronized board button.
+    // OR'd with the synchronized board button and held until the clock is up.
     logic [15:0] por = 16'hFFFF;
     logic [1:0]  btn_s = 2'b00;
-    always_ff @(posedge clk) begin
+    always_ff @(posedge core_clk) begin
         por   <= {{por[14:0], 1'b0}};
         btn_s <= {{btn_s[0], {rst_expr}}};
     end
     logic rst;
-    assign rst = por[15] | btn_s[1];
+    assign rst = por[15] | btn_s[1] | ~clk_ok;
 
     logic       rx_valid;
     logic [7:0] rx_data;
     uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_rx (
-        .clk(clk), .rst(rst), .rx(uart_rx), .valid(rx_valid), .data(rx_data)
+        .clk(core_clk), .rst(rst), .rx(uart_rx), .valid(rx_valid), .data(rx_data)
     );
     logic       tx_send;
     logic [7:0] tx_byte;
     logic       tx_busy;
     uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (
-        .clk(clk), .rst(rst), .send(tx_send), .data(tx_byte), .busy(tx_busy), .tx(uart_tx)
+        .clk(core_clk), .rst(rst), .send(tx_send), .data(tx_byte), .busy(tx_busy), .tx(uart_tx)
     );
     // `tx_send` is registered, so `busy` rises a cycle after it.
     logic tx_free;
@@ -301,7 +301,7 @@ module board_top #(
     logic signed [7:0] in_din;
 {out_decls}{sideband_decls}
     top u_top (
-        .{clk}(clk), .{rst}(rst), .{start}(start), .{done}(done),
+        .{clk}(core_clk), .{rst}(rst), .{start}(start), .{done}(done),
         .{in_addr}(in_addr), .{in_we}(in_we), .{in_din}(in_din){out_conns}{sideband_conns}
     );
 
@@ -312,7 +312,7 @@ module board_top #(
     logic [{in_msb}:0] idx;
     logic [{out_msb}:0] oidx;
 {pred_q_decl}
-    always_ff @(posedge clk) begin
+    always_ff @(posedge core_clk) begin
         tx_send <= 1'b0;
         in_we   <= 1'b0;
         if (rst) begin
@@ -353,11 +353,14 @@ module board_top #(
         end
     end
 
-    assign led = {{{led_pred}, hs == H_RUN, hs == H_SYNC}};
+    assign led = {led_inv}{{{led_pred}, hs == H_RUN, hs == H_SYNC}};
 endmodule  // board_top
 
 {prims}"#,
-        board = board.name(),
+        board = board.name,
+        flow = board.flow,
+        led_inv = if board.led_active_low { "~" } else { "" },
+        clock = clock_section(&board),
         model = model.name,
         baud = UART_BAUD,
         sync = UART_SYNC,
@@ -378,4 +381,48 @@ endmodule  // board_top
         in_din = n.in_din,
         prims = UART_PRIMITIVES,
     )
+}
+
+/// `core_clk` and `clk_ok` for `board_top`: the oscillator itself, or a PLL
+/// output once locked. The PLL is instantiated only under `SYNTHESIS`
+/// (Yosys defines it); in RTL simulation the testbench clock is the design
+/// clock.
+fn clock_section(board: &ShellBoard) -> String {
+    match board.pll {
+        None => {
+            "    logic core_clk, clk_ok;\n    assign core_clk = clk;\n    assign clk_ok = 1'b1;\n"
+                .to_string()
+        }
+        Some(Pll::Ecp5 {
+            clki_div,
+            clkfb_div,
+            clkop_div,
+            clkop_cphase,
+        }) => format!(
+            r#"    // {board_mhz} MHz oscillator -> {core} MHz design clock (ECP5 EHXPLLL).
+    logic core_clk, clk_ok;
+`ifdef SYNTHESIS
+    (* FREQUENCY_PIN_CLKI="{board_mhz}" *)
+    (* FREQUENCY_PIN_CLKOP="{core}" *)
+    (* ICP_CURRENT="12" *) (* LPF_RESISTOR="8" *) (* MFG_ENABLE_FILTEROPAMP="1" *) (* MFG_GMCREF_SEL="2" *)
+    EHXPLLL #(
+        .PLLRST_ENA("DISABLED"), .INTFB_WAKE("DISABLED"), .STDBY_ENABLE("DISABLED"),
+        .DPHASE_SOURCE("DISABLED"), .OUTDIVIDER_MUXA("DIVA"), .OUTDIVIDER_MUXB("DIVB"),
+        .OUTDIVIDER_MUXC("DIVC"), .OUTDIVIDER_MUXD("DIVD"),
+        .CLKI_DIV({clki_div}), .CLKOP_ENABLE("ENABLED"), .CLKOP_DIV({clkop_div}),
+        .CLKOP_CPHASE({clkop_cphase}), .CLKOP_FPHASE(0), .FEEDBK_PATH("CLKOP"), .CLKFB_DIV({clkfb_div})
+    ) u_pll (
+        .RST(1'b0), .STDBY(1'b0), .CLKI(clk), .CLKOP(core_clk), .CLKFB(core_clk),
+        .PHASESEL0(1'b0), .PHASESEL1(1'b0), .PHASEDIR(1'b1), .PHASESTEP(1'b1),
+        .PHASELOADREG(1'b1), .PLLWAKESYNC(1'b0), .ENCLKOP(1'b0), .LOCK(clk_ok)
+    );
+`else
+    assign core_clk = clk;
+    assign clk_ok = 1'b1;
+`endif
+"#,
+            board_mhz = board.clk_mhz,
+            core = board.core_mhz_str(),
+        ),
+    }
 }

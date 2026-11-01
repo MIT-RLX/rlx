@@ -16,7 +16,7 @@ documentation.workspace = true
 rlx-runtime  = { workspace = true }
 rlx-gguf     = { workspace = true }
 anyhow       = "1"
-minijinja    = { version = "2.24", default-features = false, features = ["builtins", "macros", "serde"] }
+minijinja    = { version = "2.24", default-features = false, features = ["builtins", "macros", "serde", "adjacent_loop_items", "loop_controls"] }  # loop.previtem/nextitem: Qwen3.5 tool turns; {% break %}/{% continue %}
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
 
