@@ -11,6 +11,12 @@
 //! multiply and one add per term, in `k` order, from the same starting value
 //! as the scalar fallback in `blas.rs`, so the result is bit-identical to it;
 //! only the speed changes (wasm SIMD arithmetic is IEEE per lane).
+//!
+//! Built with relaxed-simd on an engine whose `relaxed_madd` is a real fused
+//! multiply-add ([`crate::avx2_mirror::simd::fused`]), each term is one
+//! hardware FMA instead: every element of C is then the in-order FMA chain
+//! (as on the GPU kernels), and the multiply-add pair becomes one
+//! instruction.
 
 use core::arch::wasm32::*;
 
@@ -51,6 +57,59 @@ pub(crate) unsafe fn sgemm(
     c: *mut f32,
     ldc: usize,
 ) {
+    #[cfg(target_feature = "relaxed-simd")]
+    if crate::avx2_mirror::simd::fused() {
+        unsafe {
+            sgemm_with::<true>(
+                m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
+            )
+        };
+        return;
+    }
+    unsafe {
+        sgemm_with::<false>(
+            m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
+        )
+    };
+}
+
+/// One term of an element's sum: `s + a·b`, fused when `HW`.
+#[inline(always)]
+fn term<const HW: bool>(s: f32, a: f32, b: f32) -> f32 {
+    if HW {
+        crate::avx2_mirror::fmaf(a, b, s)
+    } else {
+        s + a * b
+    }
+}
+
+/// [`term`] on four lanes.
+#[inline(always)]
+fn term4<const HW: bool>(s: v128, a: v128, b: v128) -> v128 {
+    #[cfg(target_feature = "relaxed-simd")]
+    if HW {
+        return f32x4_relaxed_madd(a, b, s);
+    }
+    f32x4_add(s, f32x4_mul(a, b))
+}
+
+/// [`sgemm`]; `HW`: every term one fused multiply-add.
+#[allow(clippy::too_many_arguments)]
+unsafe fn sgemm_with<const HW: bool>(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: *const f32,
+    lda: usize,
+    trans_a: bool,
+    b: *const f32,
+    ldb: usize,
+    trans_b: bool,
+    beta: f32,
+    c: *mut f32,
+    ldc: usize,
+) {
     let mode = if !trans_a && !trans_b {
         Mode::Accumulate
     } else {
@@ -59,7 +118,7 @@ pub(crate) unsafe fn sgemm(
     // A few rows of an untransposed product: the fallback's i→p→j loop
     // streams whole rows of B and is faster than packing them (decode-shaped
     // m = 1 ran at 0.7x through the tiles).
-    if matches!(mode, Mode::Accumulate) && m < PACK_MIN_M {
+    if matches!(mode, Mode::Accumulate) && m < PACK_MIN_M && !HW {
         unsafe {
             crate::blas::sgemm_loops(
                 m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
@@ -86,7 +145,36 @@ pub(crate) unsafe fn sgemm(
             *a.add(i * lda + p)
         }
     };
-    let k_ = Tile {
+    // ... and its fused form: the same i→p→j stream, one FMA per term.
+    if matches!(mode, Mode::Accumulate) && m < PACK_MIN_M {
+        let n4 = n / 4 * 4;
+        for i in 0..m {
+            let crow = unsafe { c.add(i * ldc) };
+            for p in 0..k {
+                let av = alpha * unsafe { *a.add(i * lda + p) };
+                if av == 0.0 {
+                    continue;
+                }
+                let (sv, brow) = (f32x4_splat(av), unsafe { b.add(p * ldb) });
+                let mut j = 0;
+                while j < n4 {
+                    unsafe {
+                        let cj = crow.add(j) as *mut v128;
+                        v128_store(
+                            cj,
+                            term4::<HW>(v128_load(cj), sv, v128_load(brow.add(j) as *const v128)),
+                        );
+                    }
+                    j += 4;
+                }
+                for j in n4..n {
+                    unsafe { *crow.add(j) = term::<HW>(*crow.add(j), av, *brow.add(j)) };
+                }
+            }
+        }
+        return;
+    }
+    let k_ = Tile::<_, HW> {
         k,
         alpha,
         beta,
@@ -139,7 +227,7 @@ pub(crate) unsafe fn sgemm(
                     for p in 0..k {
                         let av = alpha * at(i, p);
                         if av != 0.0 {
-                            s += av * bt(p, j);
+                            s = term::<HW>(s, av, bt(p, j));
                         }
                     }
                     unsafe { *cp = s };
@@ -147,7 +235,7 @@ pub(crate) unsafe fn sgemm(
                 Mode::Scale => {
                     let mut s = 0f32;
                     for p in 0..k {
-                        s += at(i, p) * bt(p, j);
+                        s = term::<HW>(s, at(i, p), bt(p, j));
                     }
                     unsafe { *cp = finish(alpha, beta, s, *cp) };
                 }
@@ -167,7 +255,7 @@ fn finish(alpha: f32, beta: f32, acc: f32, c: f32) -> f32 {
     }
 }
 
-struct Tile<'a, A: Fn(usize, usize) -> f32> {
+struct Tile<'a, A: Fn(usize, usize) -> f32, const HW: bool> {
     k: usize,
     alpha: f32,
     beta: f32,
@@ -177,7 +265,7 @@ struct Tile<'a, A: Fn(usize, usize) -> f32> {
     ldc: usize,
 }
 
-impl<A: Fn(usize, usize) -> f32> Tile<'_, A> {
+impl<A: Fn(usize, usize) -> f32, const HW: bool> Tile<'_, A, HW> {
     /// Rows `i..i+R`, columns `j0..j0+8`, B rows at `bp + p·bs`.
     #[inline(always)]
     unsafe fn run<const R: usize>(&self, i: usize, j0: usize, bp: *const f32, bs: usize) {
@@ -215,8 +303,8 @@ impl<A: Fn(usize, usize) -> f32> Tile<'_, A> {
                     Mode::Scale => av,
                 };
                 let s = f32x4_splat(av);
-                acc[r][0] = f32x4_add(acc[r][0], f32x4_mul(s, b0));
-                acc[r][1] = f32x4_add(acc[r][1], f32x4_mul(s, b1));
+                acc[r][0] = term4::<HW>(acc[r][0], s, b0);
+                acc[r][1] = term4::<HW>(acc[r][1], s, b1);
             }
         }
         for r in 0..R {
@@ -311,7 +399,7 @@ mod tests {
                             want.as_mut_ptr(),
                             ldc,
                         );
-                        super::sgemm(
+                        super::sgemm_with::<false>(
                             m,
                             n,
                             k,
@@ -341,5 +429,108 @@ mod tests {
             }
         }
         assert_eq!(cases, 8 * 4 * 5);
+    }
+
+    /// With relaxed-simd on a fusing engine: every element is the in-order
+    /// chain of fused multiply-adds (the scalar reference below, through the
+    /// exact `fmaf`), from the fallback's start value and with its zero-skip.
+    #[cfg(target_feature = "relaxed-simd")]
+    #[test]
+    fn fused_gemm_is_the_in_order_fma_chain() {
+        assert!(
+            crate::avx2_mirror::simd::fused(),
+            "node's V8 fuses relaxed_madd on arm64"
+        );
+        let fma = crate::avx2_mirror::fmaf;
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / 8_388_608.0) - 1.0
+        };
+        let mut cases = 0;
+        for &(m, n, k) in &[
+            (1, 8, 1),
+            (1, 2303, 768),
+            (3, 7, 5),
+            (5, 17, 33),
+            (8, 24, 9),
+            (9, 24, 0),
+            (40, 77, 64),
+            (13, 1, 9),
+        ] {
+            for (ta, tb) in [(false, false), (true, false), (false, true), (true, true)] {
+                for (alpha, beta) in [(1.0f32, 0.0f32), (1.0, 1.0), (-1.25, 0.75)] {
+                    let (lda, ldb, ldc) = (
+                        if ta { m + 3 } else { k + 2 },
+                        if tb { k + 1 } else { n + 5 },
+                        n + 4,
+                    );
+                    let a: Vec<f32> = (0..lda * if ta { k } else { m })
+                        .map(|i| if i % 11 == 0 { 0.0 } else { rnd() })
+                        .collect();
+                    let b: Vec<f32> = (0..ldb * if tb { n } else { k })
+                        .map(|_| rnd() * 3.0)
+                        .collect();
+                    let c0: Vec<f32> = (0..ldc * m).map(|_| rnd()).collect();
+                    let at = |i: usize, p: usize| if ta { a[p * lda + i] } else { a[i * lda + p] };
+                    let bt = |p: usize, j: usize| if tb { b[j * ldb + p] } else { b[p * ldb + j] };
+                    let mut got = c0.clone();
+                    unsafe {
+                        super::sgemm(
+                            m,
+                            n,
+                            k,
+                            alpha,
+                            a.as_ptr(),
+                            lda,
+                            ta,
+                            b.as_ptr(),
+                            ldb,
+                            tb,
+                            beta,
+                            got.as_mut_ptr(),
+                            ldc,
+                        )
+                    };
+                    for i in 0..m {
+                        for j in 0..n {
+                            let old = c0[i * ldc + j];
+                            let want = if !ta && !tb {
+                                let mut s = if beta == 0.0 {
+                                    0.0
+                                } else if beta != 1.0 {
+                                    old * beta
+                                } else {
+                                    old
+                                };
+                                for p in 0..k {
+                                    let av = alpha * at(i, p);
+                                    if av != 0.0 {
+                                        s = fma(av, bt(p, j), s);
+                                    }
+                                }
+                                s
+                            } else {
+                                let mut s = 0f32;
+                                for p in 0..k {
+                                    s = fma(at(i, p), bt(p, j), s);
+                                }
+                                super::finish(alpha, beta, s, old)
+                            };
+                            let g = got[i * ldc + j];
+                            assert_eq!(
+                                g.to_bits(),
+                                want.to_bits(),
+                                "m{m} n{n} k{k} ta{ta} tb{tb} a{alpha} b{beta} at ({i},{j}): {g} vs {want}"
+                            );
+                        }
+                    }
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 8 * 4 * 3);
     }
 }

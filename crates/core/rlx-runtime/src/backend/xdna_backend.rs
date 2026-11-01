@@ -495,8 +495,7 @@ fn build_chain(graph: &Graph, bf16: bool) -> Result<XdnaChainExec, String> {
         constants,
         params: Vec::new(),
         typed_params: Vec::new(),
-        cache: std::collections::HashMap::new(),
-        lru: Vec::new(),
+        pool: register_pool(),
         bf16,
         // Concurrent NPU hardware contexts are limited per process (see
         // `rlx_xdna::npu_gemm::max_contexts`); keep an LRU pool of open sub-exec
@@ -515,6 +514,57 @@ struct ChainStep {
     is_matmul: bool,
 }
 
+/// A chain's open step executables. `npu` steps hold an NPU hardware context
+/// (at most `max_contexts()` per process, so they are evicted LRU and
+/// re-opened from the cached xclbin); `host` steps hold none and stay.
+#[derive(Default)]
+struct ChainPool {
+    npu: std::collections::HashMap<usize, Box<dyn ExecutableGraph>>,
+    lru: Vec<usize>,
+    host: std::collections::HashMap<usize, Box<dyn ExecutableGraph>>,
+}
+
+type SharedPool = std::sync::Arc<std::sync::Mutex<ChainPool>>;
+
+/// Every live chain's pool. The NPU context budget is process-wide, and a
+/// compiled graph keeps its contexts while it is cached (a training loop
+/// compiles a forward graph and a gradient graph), so a chain that needs a
+/// context may close another chain's least-recently-used one.
+static POOLS: std::sync::Mutex<Vec<std::sync::Weak<std::sync::Mutex<ChainPool>>>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn register_pool() -> SharedPool {
+    let pool = SharedPool::default();
+    let mut all = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|w| w.strong_count() > 0);
+    all.push(std::sync::Arc::downgrade(&pool));
+    pool
+}
+
+/// Close one idle NPU context held by a chain other than `me`. A pool in use
+/// (locked) is skipped. Returns whether one was closed.
+fn evict_other_chain(me: &SharedPool) -> bool {
+    let all: Vec<SharedPool> = POOLS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    for p in all {
+        if std::sync::Arc::ptr_eq(&p, me) {
+            continue;
+        }
+        if let Ok(mut g) = p.try_lock()
+            && !g.lru.is_empty()
+        {
+            let victim = g.lru.remove(0);
+            g.npu.remove(&victim); // Drop closes the hw context
+            return true;
+        }
+    }
+    false
+}
+
 /// Runs a topo-ordered chain of per-node execs, threading intermediates by name.
 /// Sub-execs (each an NPU hardware context) are built LAZILY at run and kept in a
 /// bounded LRU pool — evicted contexts re-open cheaply from the cached xclbin
@@ -529,8 +579,9 @@ struct XdnaChainExec {
     constants: Vec<(String, Vec<f32>)>,
     params: Vec<(String, Vec<f32>)>,
     typed_params: Vec<(String, Vec<u8>, rlx_ir::DType)>,
-    cache: std::collections::HashMap<usize, Box<dyn ExecutableGraph>>,
-    lru: Vec<usize>,
+    /// Open step executables, shared with the process-wide registry so another
+    /// chain can close this one's idle NPU contexts when it needs one.
+    pool: std::sync::Arc<std::sync::Mutex<ChainPool>>,
     /// MatMul steps use the bf16 microkernel (`Precision::BF16`), else int8.
     bf16: bool,
     cap: usize,
@@ -541,7 +592,9 @@ impl ExecutableGraph for XdnaChainExec {
     fn set_param(&mut self, name: &str, data: &[f32]) {
         self.params.retain(|(n, _)| n != name);
         self.params.push((name.to_string(), data.to_vec()));
-        for ex in self.cache.values_mut() {
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        let pool = &mut *pool;
+        for ex in pool.npu.values_mut().chain(pool.host.values_mut()) {
             ex.set_param(name, data);
         }
     }
@@ -549,7 +602,9 @@ impl ExecutableGraph for XdnaChainExec {
         self.typed_params.retain(|(n, _, _)| n != name);
         self.typed_params
             .push((name.to_string(), data.to_vec(), dtype));
-        for ex in self.cache.values_mut() {
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        let pool = &mut *pool;
+        for ex in pool.npu.values_mut().chain(pool.host.values_mut()) {
             ex.set_param_typed(name, data, dtype);
         }
     }
@@ -568,25 +623,35 @@ impl ExecutableGraph for XdnaChainExec {
             map.entry(nm.clone()).or_insert_with(|| d.clone());
         }
         let steps = self.steps.clone();
+        let pool_arc = self.pool.clone();
+        let mut pool = pool_arc.lock().unwrap_or_else(|e| e.into_inner());
         for step in &steps {
-            // Ensure this step's exec (NPU context) is open — build lazily, evicting
-            // the LRU context if the pool is full.
-            if !self.cache.contains_key(&step.node_idx) {
-                // The budget is process-wide: contexts held by other compiled
-                // graphs count too, so evict this chain's idle ones until the
-                // new one fits (or there is nothing of ours left to evict).
-                while self.cache.len() >= self.cap
+            // Ensure this step's exec is open — build lazily; NPU contexts are
+            // capped process-wide, so evict LRU (ours first, then another
+            // chain's idle ones) until the new one fits.
+            let open =
+                pool.npu.contains_key(&step.node_idx) || pool.host.contains_key(&step.node_idx);
+            if !open {
+                while pool.npu.len() >= self.cap
                     || rlx_xdna::npu_gemm::open_contexts() >= rlx_xdna::npu_gemm::max_contexts()
                 {
-                    if self.lru.is_empty() {
+                    if pool.lru.is_empty() {
+                        if evict_other_chain(&pool_arc) {
+                            continue;
+                        }
                         break;
                     }
-                    let victim = self.lru.remove(0);
-                    self.cache.remove(&victim); // Drop closes the hw context
+                    let victim = pool.lru.remove(0);
+                    pool.npu.remove(&victim); // Drop closes the hw context
                 }
                 let node = &self.graph.nodes()[step.node_idx];
+                let before = rlx_xdna::npu_gemm::open_contexts();
                 let mut ex: Box<dyn ExecutableGraph> = if step.is_matmul {
                     build_matmul_node_exec(&self.graph, node, self.bf16)
+                        .or_else(|e| {
+                            note_host_fallback(&node.op, e.lines().next().unwrap_or(""));
+                            build_host_exec(&self.graph, step.node_idx)
+                        })
                         .unwrap_or_else(|e| panic!("XdnaBackend chain matmul: {e}"))
                 } else {
                     build_node_exec(&self.graph, step.node_idx)
@@ -598,10 +663,16 @@ impl ExecutableGraph for XdnaChainExec {
                 for (nm, d, dt) in &self.typed_params {
                     ex.set_param_typed(nm, d, *dt);
                 }
-                self.cache.insert(step.node_idx, ex);
+                if rlx_xdna::npu_gemm::open_contexts() > before {
+                    pool.npu.insert(step.node_idx, ex);
+                } else {
+                    pool.host.insert(step.node_idx, ex);
+                }
             }
-            self.lru.retain(|&x| x != step.node_idx);
-            self.lru.push(step.node_idx);
+            if pool.npu.contains_key(&step.node_idx) {
+                pool.lru.retain(|&x| x != step.node_idx);
+                pool.lru.push(step.node_idx);
+            }
 
             let sub_in: Vec<(&str, &[f32])> = step
                 .input_names
@@ -613,7 +684,11 @@ impl ExecutableGraph for XdnaChainExec {
                     (nm.as_str(), t.as_slice())
                 })
                 .collect();
-            let exec = self.cache.get_mut(&step.node_idx).unwrap();
+            let pool = &mut *pool;
+            let exec = match pool.npu.get_mut(&step.node_idx) {
+                Some(e) => e,
+                None => pool.host.get_mut(&step.node_idx).expect("step exec built"),
+            };
             let out = exec.run(&sub_in).into_iter().next().unwrap_or_default();
             drop(sub_in);
             map.insert(step.out_name.clone(), out);
@@ -625,12 +700,195 @@ impl ExecutableGraph for XdnaChainExec {
     }
 }
 
+/// Bytes of AIE tile data memory a single-buffer copy kernel may use for its
+/// double-buffered input + output (64 KB per tile, minus stack and slack).
+const TILE_COPY_BUDGET: usize = 48 * 1024;
+
+/// Pure index remaps (no arithmetic): what the host may run when the NPU's
+/// copy kernels cannot take the node — too large for one tile (they stage the
+/// whole tensor in tile memory) or a configuration they do not cover
+/// (multi-axis reverse / tile / expand). The NPU shares DRAM with the CPU, so
+/// on the host these are memory copies, not transfers.
+fn is_data_movement(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Narrow { .. }
+            | Op::Slice { .. }
+            | Op::Reverse { .. }
+            | Op::Tile { .. }
+            | Op::Expand { .. }
+            | Op::Pad { .. }
+            | Op::Transpose { .. }
+            | Op::Concat { .. }
+            | Op::Reshape { .. }
+            | Op::Gather { .. }
+            | Op::Trilu { .. }
+            | Op::Where
+    )
+}
+
+/// One graph node run by the CPU backend on the host, inside an NPU chain.
+/// Bit-exact with `Device::Cpu`. Inputs are threaded by name like every other
+/// chain step.
+struct XdnaHostOpExec {
+    exe: crate::CompiledGraph,
+    inputs: Vec<String>,
+}
+unsafe impl Send for XdnaHostOpExec {}
+
+impl ExecutableGraph for XdnaHostOpExec {
+    fn set_param(&mut self, _name: &str, _data: &[f32]) {}
+    fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        let feed: Vec<(&str, &[f32])> = self
+            .inputs
+            .iter()
+            .map(|n| {
+                let d = inputs
+                    .iter()
+                    .find(|(k, _)| k == n)
+                    .map(|(_, d)| *d)
+                    .unwrap_or_else(|| panic!("XdnaBackend: host step input '{n}' not provided"));
+                (n.as_str(), d)
+            })
+            .collect();
+        self.exe.run(&feed)
+    }
+}
+
+/// Build a host step for `node_id`: the node alone over named inputs, compiled
+/// for `Device::Cpu`.
+fn build_host_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGraph>, String> {
+    let node = &graph.nodes()[node_id];
+    let mut g = Graph::new("xdna-host-step");
+    let mut names: Vec<String> = Vec::new();
+    let mut ids = Vec::new();
+    let mut seen: std::collections::HashMap<String, rlx_ir::NodeId> =
+        std::collections::HashMap::new();
+    for &id in &node.inputs {
+        let name = node_ref(graph, id);
+        let nid = *seen.entry(name.clone()).or_insert_with(|| {
+            names.push(name.clone());
+            g.input(&name, graph.node(id).shape.clone())
+        });
+        ids.push(nid);
+    }
+    let out = g.add_node(node.op.clone(), ids, node.shape.clone());
+    g.set_outputs(vec![out]);
+    let exe = crate::Session::new(crate::Device::Cpu).compile(g);
+    Ok(Box::new(XdnaHostOpExec { exe, inputs: names }))
+}
+
+/// NumPy broadcast of `x` (shape `from`) to `to`, on the host.
+fn broadcast_host(x: &[f32], from: &[usize], to: &[usize]) -> Vec<f32> {
+    let n: usize = to.iter().product();
+    let r = to.len();
+    let mut f = vec![1usize; r];
+    f[r - from.len()..].copy_from_slice(from);
+    // Source strides, 0 on broadcast axes.
+    let mut stride = vec![0usize; r];
+    let mut acc = 1;
+    for i in (0..r).rev() {
+        stride[i] = if f[i] == 1 { 0 } else { acc };
+        acc *= f[i];
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut idx = vec![0usize; r];
+    for _ in 0..n {
+        let src: usize = idx.iter().zip(&stride).map(|(i, s)| i * s).sum();
+        out.push(x[src]);
+        for ax in (0..r).rev() {
+            idx[ax] += 1;
+            if idx[ax] < to[ax] {
+                break;
+            }
+            idx[ax] = 0;
+        }
+    }
+    out
+}
+
+/// Note, once per op kind, that the host runs it inside the NPU chain.
+fn note_host_fallback(op: &Op, why: &str) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let kind = format!("{:?}", op.kind());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&kind) {
+        eprintln!("[rlx-xdna] {kind} runs on the host for this configuration: {why}");
+        seen.push(kind);
+    }
+}
+
+/// A data-movement node the NPU copy kernels can take: it fits one tile, and
+/// any axis pattern is the single-axis form they implement.
+fn npu_copy_fits(graph: &Graph, node: &rlx_ir::Node) -> bool {
+    let elems = |id: rlx_ir::NodeId| -> usize {
+        graph
+            .node(id)
+            .shape
+            .dims()
+            .iter()
+            .map(|d| match d {
+                rlx_ir::shape::Dim::Static(v) => *v,
+                _ => usize::MAX / 16,
+            })
+            .product()
+    };
+    let n_in: usize = node.inputs.iter().map(|&i| elems(i)).sum();
+    let n_out = elems(node.id);
+    if (n_in + n_out).saturating_mul(4 * 2) > TILE_COPY_BUDGET {
+        return false;
+    }
+    let in_dims: Vec<usize> = node
+        .inputs
+        .first()
+        .map(|&i| {
+            graph
+                .node(i)
+                .shape
+                .dims()
+                .iter()
+                .map(|d| d.unwrap_static())
+                .collect()
+        })
+        .unwrap_or_default();
+    match &node.op {
+        Op::Reverse { axes } => axes.len() == 1,
+        Op::Tile { reps } => reps.iter().filter(|&&r| r != 1).count() == 1,
+        Op::Expand { target_shape } => {
+            (0..in_dims.len())
+                .filter(|&i| in_dims[i] == 1 && target_shape.get(i).is_some_and(|&t| t > 1))
+                .count()
+                == 1
+        }
+        _ => true,
+    }
+}
+
+/// An NPU kernel for the node when one covers it, else a host step (see
+/// [`build_host_exec`]): a configuration the kernels do not implement, or a
+/// kernel that does not fit tile memory, costs speed, not the graph.
+fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGraph>, String> {
+    match build_npu_node_exec(graph, node_id) {
+        Ok(e) => Ok(e),
+        Err(why) => {
+            note_host_fallback(&graph.nodes()[node_id].op, why.lines().next().unwrap_or(""));
+            build_host_exec(graph, node_id)
+        }
+    }
+}
+
 /// Build a compile-on-demand executable for ONE compute node — emit its AIE-MLIR
 /// kernel (pure Rust), compile via native aiecc, open a persistent NPU context.
 /// Inputs are resolved by [`node_ref`] (graph Input/Param name, or `n{id}` for an
 /// intermediate produced by an earlier node in a [`XdnaChainExec`]). Needs
 /// `AIECC` + `PEANO`.
-fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGraph>, String> {
+fn build_npu_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGraph>, String> {
+    if is_data_movement(&graph.nodes()[node_id].op)
+        && !npu_copy_fits(graph, &graph.nodes()[node_id])
+    {
+        return build_host_exec(graph, node_id);
+    }
     let tc = rlx_xdna::toolchain::toolchain()?;
     let (aiecc, peano) = (tc.aiecc_str(), tc.peano_str());
 
@@ -974,11 +1232,23 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
                 &format!("bin_{}", aop.name()),
             )?;
             let io = NpuIo::open("", &xclbin, &insts, n).map_err(|e| e.0)?;
+            let sdims = |id: rlx_ir::NodeId| -> Vec<usize> {
+                graph
+                    .node(id)
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static())
+                    .collect()
+            };
             Ok(Box::new(XdnaBinExec {
                 io,
                 a_name: x_name,
                 b_name,
                 n,
+                a_dims: sdims(node.inputs[0]),
+                b_dims: sdims(node.inputs[1]),
+                out_dims: dims.clone(),
             }))
         }
         Op::Reduce { op, axes, .. } => {
@@ -1805,6 +2075,12 @@ struct XdnaBinExec {
     a_name: String,
     b_name: String,
     n: usize,
+    /// Operand shapes and the output shape: an operand smaller than the
+    /// output is broadcast (NumPy rules) on the host before the NPU kernel,
+    /// which works on equal-length operands.
+    a_dims: Vec<usize>,
+    b_dims: Vec<usize>,
+    out_dims: Vec<usize>,
 }
 unsafe impl Send for XdnaBinExec {}
 impl ExecutableGraph for XdnaBinExec {
@@ -1818,7 +2094,19 @@ impl ExecutableGraph for XdnaBinExec {
                 .unwrap_or_else(|| panic!("XdnaBackend: binary input '{name}' not provided"))
         };
         let (a, b) = (get(&self.a_name), get(&self.b_name));
-        assert_eq!(a.len(), self.n);
+        let (ab, bb);
+        let a = if a.len() == self.n {
+            a
+        } else {
+            ab = broadcast_host(a, &self.a_dims, &self.out_dims);
+            &ab
+        };
+        let b = if b.len() == self.n {
+            b
+        } else {
+            bb = broadcast_host(b, &self.b_dims, &self.out_dims);
+            &bb
+        };
         let out = self
             .io
             .run2(as_i32(a), as_i32(b))
@@ -2078,8 +2366,27 @@ fn matmul_node_setup(graph: &Graph, mm: &rlx_ir::graph::Node) -> Result<MatmulSe
             .map(|d| d.unwrap_static())
             .ok_or_else(|| "matmul operands must be rank-2 static shapes".into())
     };
-    let (m, k) = (dim(&act.shape, 0)?, dim(&act.shape, 1)?);
-    let n = dim(&mm.shape, 1)?;
+    // `[..., m, k] · [k, n]`: the leading activation axes fold into `m` (the
+    // data is row-major, so this is exact). A batched weight (rank > 2) is a
+    // batched product the GEMM kernel does not do; the chain runs it on the
+    // host.
+    let (ar, wr) = (act.shape.rank(), wt.shape.rank());
+    if wr != 2 || ar < 2 {
+        return Err(format!(
+            "batched matmul (activation rank {ar}, weight rank {wr}); the NPU GEMM takes a 2-D weight"
+        ));
+    }
+    let k = dim(&act.shape, ar - 1)?;
+    let m = (0..ar - 1)
+        .map(|i| dim(&act.shape, i))
+        .product::<Result<usize, String>>()?;
+    let n = dim(&wt.shape, 1)?;
+    if dim(&wt.shape, 0)? != k {
+        return Err(format!(
+            "matmul inner dims differ ({k} vs {})",
+            dim(&wt.shape, 0)?
+        ));
+    }
 
     Ok(MatmulSetup {
         aiecc,

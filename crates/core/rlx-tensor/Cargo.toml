@@ -52,6 +52,10 @@ eval-blas = ["eval", "rlx-runtime/blas-accelerate"]
 ndarray = ["dep:ndarray"]
 eval-cuda = ["eval", "rlx-runtime/cuda"]
 eval-rocm = ["eval", "rlx-runtime/rocm"]
+# AMD XDNA (Ryzen AI NPU) and native Vulkan, for `.on(Device::Xdna | Device::Vulkan)`
+# and `Func::train_step_*_on` there.
+eval-xdna = ["eval", "rlx-runtime/xdna"]
+eval-vulkan = ["eval", "rlx-runtime/vulkan"]
 # Training: a `Func::train_step` that runs value+grad and applies an
 # `rlx_optim` optimizer to the bound params. Implies autodiff + eval.
 optim = ["autodiff", "eval", "dep:rlx-optim"]

@@ -174,7 +174,7 @@ impl Lanes for f32 {
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-mod simd {
+pub(crate) mod simd {
     use core::arch::wasm32::*;
 
     /// Exact `a·b + c` per lane. The product of two floats is exact in a
@@ -261,12 +261,47 @@ mod simd {
         demote(sl, sh)
     }
 
+    /// Whether `f32x4.relaxed_madd` is fused here, i.e. one IEEE fused
+    /// multiply-add (V8 on an FMA3 x86 or on arm64), rather than the
+    /// multiply-then-add the relaxed-SIMD spec also allows. Decided once, on
+    /// a product that only a fused multiply-add keeps, and on a subnormal
+    /// result (no flush to zero).
+    #[cfg(target_feature = "relaxed-simd")]
+    pub(crate) fn fused() -> bool {
+        static FUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FUSED.get_or_init(|| {
+            use std::hint::black_box as bb;
+            let (up, dn) = (1.0 + f32::EPSILON, 1.0 - f32::EPSILON);
+            let cases = [
+                (up, dn, -1.0f32),
+                (
+                    up * 2f32.powi(-75),
+                    dn * 2f32.powi(-75),
+                    f32::from_bits(0x0012_3457),
+                ),
+                (
+                    -up * 2f32.powi(-75),
+                    dn * 2f32.powi(-75),
+                    f32::from_bits(0x0040_0001),
+                ),
+            ];
+            cases.iter().all(|&(a, b, c)| {
+                let r =
+                    f32x4_relaxed_madd(bb(f32x4_splat(a)), bb(f32x4_splat(b)), bb(f32x4_splat(c)));
+                f32x4_extract_lane::<0>(r).to_bits() == super::fmaf(a, b, c).to_bits()
+            })
+        })
+    }
+
     /// Eight lanes (one AVX register) as two `v128`, so each step of a
     /// kernel's dependency chain has two vectors in flight and one test.
+    /// `HW`: the fused multiply-add is `relaxed_madd` (only built with
+    /// relaxed-simd, and only chosen when [`fused`] holds); otherwise the
+    /// exact emulation.
     #[derive(Clone, Copy)]
-    pub(crate) struct X2(v128, v128);
+    pub(crate) struct X2<const HW: bool>(v128, v128);
 
-    impl super::Lanes for X2 {
+    impl<const HW: bool> super::Lanes for X2<HW> {
         const W: usize = 8;
         #[inline(always)]
         fn splat(x: f32) -> Self {
@@ -306,6 +341,13 @@ mod simd {
         }
         #[inline(always)]
         fn fmadd(self, b: Self, c: Self) -> Self {
+            #[cfg(target_feature = "relaxed-simd")]
+            if HW {
+                return X2(
+                    f32x4_relaxed_madd(self.0, b.0, c.0),
+                    f32x4_relaxed_madd(self.1, b.1, c.1),
+                );
+            }
             let (l0, h0) = sums(self.0, b.0, c.0);
             let (l1, h1) = sums(self.1, b.1, c.1);
             if v128_any_true(v128_or(
@@ -417,7 +459,19 @@ mod simd {
 
 /// The widest [`Lanes`] on this target.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-type Wide = simd::X2;
+type Wide = simd::X2<false>;
+
+/// `$f::<lanes>(args)` with the hardware fused multiply-add when this build
+/// has relaxed-simd and the engine fuses it, else with [`Wide`].
+macro_rules! wide {
+    ($f:ident($($a:expr),* $(,)?)) => {{
+        #[cfg(all(target_arch = "wasm32", target_feature = "relaxed-simd"))]
+        if simd::fused() {
+            return $f::<simd::X2<true>>($($a),*);
+        }
+        $f::<Wide>($($a),*)
+    }};
+}
 #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 type Wide = f32;
 
@@ -520,7 +574,7 @@ fn by_lanes<V: Lanes>(data: &mut [f32], f: impl Fn(V) -> V, tail: impl Fn(f32) -
 
 /// `gelu_inplace_avx2`.
 pub(crate) fn gelu_inplace(data: &mut [f32]) {
-    by_lanes::<Wide>(data, gelu_lane, scalar_gelu);
+    wide!(by_lanes(data, gelu_lane, scalar_gelu))
 }
 
 /// `bias_gelu_avx2`: the bias added per row, the 8-lane body per row.
@@ -530,28 +584,32 @@ pub(crate) fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
         for (v, &b) in row[..body].iter_mut().zip(bias) {
             *v += b;
         }
-        by_lanes::<Wide>(&mut row[..body], gelu_lane, scalar_gelu);
+        bias_gelu_body(&mut row[..body]);
         for (v, &b) in row[body..].iter_mut().zip(&bias[body..n]) {
             *v = scalar_gelu(*v + b);
         }
     }
 }
 
+fn bias_gelu_body(body: &mut [f32]) {
+    wide!(by_lanes(body, gelu_lane, scalar_gelu))
+}
+
 /// `silu_inplace_avx2`.
 pub(crate) fn silu_inplace(data: &mut [f32]) {
-    by_lanes::<Wide>(data, silu_lane, |x| x / (1.0 + (-x).exp()));
+    wide!(by_lanes(data, silu_lane, |x: f32| x / (1.0 + (-x).exp())))
 }
 
 /// `vvexpf_avx2`, with the caller's tail function.
 pub(crate) fn vvexpf(y: &mut [f32], x: &[f32], tail: impl Fn(f32) -> f32) {
     y.copy_from_slice(x);
-    by_lanes::<Wide>(y, exp_lane, tail);
+    wide!(by_lanes(y, exp_lane, tail))
 }
 
 /// `vvtanhf_avx2`, with the caller's tail function.
 pub(crate) fn vvtanhf(y: &mut [f32], x: &[f32], tail: impl Fn(f32) -> f32) {
     y.copy_from_slice(x);
-    by_lanes::<Wide>(y, tanh_lane, tail);
+    wide!(by_lanes(y, tanh_lane, tail))
 }
 
 /// Eight lanes as `8 / W` vectors.
@@ -585,7 +643,7 @@ impl<V: Lanes> Acc8<V> {
 
 /// `softmax_rows_avx2`.
 pub(crate) fn softmax_rows(data: &mut [f32], rows: usize, cols: usize) {
-    softmax_rows_with::<Wide>(data, rows, cols);
+    wide!(softmax_rows_with(data, rows, cols))
 }
 
 fn softmax_rows_with<V: Lanes>(data: &mut [f32], rows: usize, cols: usize) {
@@ -630,7 +688,7 @@ pub(crate) fn layer_norm_row(
     h: usize,
     eps: f32,
 ) {
-    layer_norm_row_with::<Wide>(input, gamma, beta, output, h, eps);
+    wide!(layer_norm_row_with(input, gamma, beta, output, h, eps))
 }
 
 fn layer_norm_row_with<V: Lanes>(
@@ -876,11 +934,21 @@ mod simd_tests {
         let r = super::simd::fma_f32x4(v(a), v(b), v(c));
         let mut out = [0f32; 4];
         unsafe { r.store(out.as_mut_ptr()) };
+        x2_agrees::<false>(a, b, c, out);
+        #[cfg(target_feature = "relaxed-simd")]
+        if super::simd::fused() {
+            x2_agrees::<true>(a, b, c, out);
+        }
+        out
+    }
+
+    fn x2_agrees<const HW: bool>(a: [f32; 4], b: [f32; 4], c: [f32; 4], out: [f32; 4]) {
+        let v = |x: [f32; 4]| f32x4(x[0], x[1], x[2], x[3]);
         for half in 0..2 {
             let x2 = |x: [f32; 4], benign: f32| unsafe {
                 let mut t = [benign; 8];
                 v(x).store(t.as_mut_ptr().add(4 * half));
-                super::simd::X2::load(t.as_ptr())
+                super::simd::X2::<HW>::load(t.as_ptr())
             };
             let mut wide = [0f32; 8];
             unsafe {
@@ -892,12 +960,19 @@ mod simd_tests {
                 let w = wide[4 * half + l];
                 assert!(
                     w.to_bits() == out[l].to_bits() || (w.is_nan() && out[l].is_nan()),
-                    "X2 fma half {half} lane {l}: {w} vs {}",
+                    "X2<{HW}> fma half {half} lane {l}: {w} vs {}",
                     out[l]
                 );
             }
         }
-        out
+    }
+
+    /// Node's V8 fuses `relaxed_madd` on this machine (arm64): the build with
+    /// relaxed-simd must actually take the hardware path here.
+    #[cfg(target_feature = "relaxed-simd")]
+    #[test]
+    fn relaxed_madd_is_fused_here() {
+        assert!(super::simd::fused());
     }
 
     #[test]
@@ -1039,6 +1114,11 @@ mod simd_tests {
     #[test]
     fn simd128_mirrors_are_the_scalar_mirrors() {
         mirrors_match::<v128>("v128");
-        mirrors_match::<super::simd::X2>("x2");
+        mirrors_match::<super::simd::X2<false>>("x2");
+        // the hardware fused multiply-add, where the engine has one
+        #[cfg(target_feature = "relaxed-simd")]
+        if super::simd::fused() {
+            mirrors_match::<super::simd::X2<true>>("x2 relaxed");
+        }
     }
 }

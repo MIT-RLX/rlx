@@ -37,6 +37,16 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
   against glibc 2.43 on x86-64: the f32 ones on all 2^32 inputs, the f64 ones
   on 3.2·10^8 samples each, with 0 mismatches. Without it, std math on wasm
   differed from glibc on up to 13% of inputs (`hypot`).
+- `rlx-cpu` on wasm built with relaxed-simd: the hardware fused multiply-add.
+  `f32x4.relaxed_madd` may be fused or not depending on the engine, so a
+  startup probe checks it against the exact `fmaf` on a double-rounding case
+  and on subnormal results. When it is fused, the AVX2 mirrors use it: same
+  bits, and faster than even the old inexact loops (GELU 0.85 ns per element vs
+  16 ns emulated, LayerNorm 0.32 vs 2.3, softmax 0.65 vs 9.3). The GEMM also
+  uses it, so each element of C becomes the in-order FMA chain the GPU kernels
+  compute: 1.2–1.9× over the simd128 tiles (`Aᵀ·B` 46 GF/s, `A·Bᵀ` 54). When
+  it is not fused, nothing changes. Tests cover both paths, including a mutation
+  check of each.
 - `rlx-cpu`: a simd128 GEMM for wasm32 (no BLAS there). A 4 × 8 tile of C
   stays in registers, and B is packed into 8-column panels. Each element is
   still summed over `k` in order from the same start value, so results are

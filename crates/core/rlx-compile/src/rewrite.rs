@@ -14,6 +14,7 @@ use rlx_fusion::fusion::UnfuseElementwiseRegions;
 use rlx_fusion::lower_attention::LowerAttention;
 use rlx_fusion::lower_axial_rope2d::LowerAxialRope2d;
 use rlx_fusion::lower_backward_ops::LowerBackwardOps;
+use rlx_fusion::lower_conv_im2col::LowerConvIm2col;
 use rlx_fusion::lower_conv_transpose2d::LowerConvTranspose2d;
 use rlx_fusion::lower_cumulative::LowerCumulative;
 use rlx_fusion::lower_dot_general::LowerDotGeneral;
@@ -296,6 +297,16 @@ pub fn rewrite_for_backend_with_config(
             // made the whole Real-CUGAN family (four of them per model)
             // Metal/CUDA-only.
             apply(&mut graph, &mut changed, &LowerConvTranspose2d);
+        }
+        if bad.contains(&OpKind::Conv)
+            && supported.contains(&OpKind::Im2Col)
+            && supported.contains(&OpKind::MatMul)
+        {
+            // A GEMM engine with no convolution kernel (the XDNA NPU): a
+            // convolution there is im2col → matmul (depthwise: im2col →
+            // multiply → sum). Runs after `LowerConvTranspose2d`, which emits
+            // `Conv`, so transposed convolutions reach the NPU too.
+            apply(&mut graph, &mut changed, &LowerConvIm2col);
         }
         if bad.contains(&OpKind::Pad) {
             // Every backend except Metal/CUDA (which claim `OpKind::Pad`) lowers
