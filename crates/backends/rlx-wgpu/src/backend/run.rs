@@ -2252,8 +2252,8 @@ impl WgpuExecutable {
                                         let zk = gather_backward_zero_kernel(&dev.device);
                                         pass.set_pipeline(&zk.pipeline);
                                         pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                        let (gx, _, _) = dispatch_dims(total, 256);
-                                        pass.dispatch_workgroups(gx, 1, 1);
+                                        let (gx, gy, gz) = dispatch_dims(total, 256);
+                                        pass.dispatch_workgroups(gx, gy, gz);
                                     }
                                     let ak = gather_backward_acc_kernel(&dev.device);
                                     pass.set_pipeline(&ak.pipeline);
@@ -3175,6 +3175,31 @@ impl WgpuExecutable {
                                             * params.h_out
                                             * params.w_out.div_ceil(4)
                                     };
+                                    // a 2-D 3×3 (`conv3d_k3_c8`): the weights
+                                    // in workgroup memory, a row's inputs read
+                                    // once for its three taps; 2.5-8× the
+                                    // eight-channel tile on FastSurfer's layers.
+                                    // `RLX_WGPU_CONV3D_NO_K3=1` for that tile.
+                                    // Workgroups are whole: the channel tile
+                                    // is the workgroup's, not the thread's.
+                                    // (and always for a folded input PReLU or
+                                    // `max`: no other kernel applies them)
+                                    let k3 = params.in_prelu != 0
+                                        || params.res_max != 0
+                                        || (c8
+                                            && params.is_k3()
+                                            && params.act != crate::unfuse::ARGMAX_ACT
+                                            && params.act != crate::unfuse::TOPK_ACT
+                                            && !rlx_ir::env::flag("RLX_WGPU_CONV3D_NO_K3"));
+                                    let k3_total = || {
+                                        params.c_out.div_ceil(8)
+                                            * (n_s
+                                                * params.d_out
+                                                * params.h_out
+                                                * params.w_out.div_ceil(4))
+                                            .div_ceil(64)
+                                            * 64
+                                    };
                                     let (ck, total) = if params.half != 0 {
                                         // half-packed input or output
                                         // (`pack_half_activations`): the
@@ -3192,6 +3217,10 @@ impl WgpuExecutable {
                                         };
                                         if params.act == crate::unfuse::ARGMAX_ACT {
                                             (k("conv3d_argmax"), n_s * spatial)
+                                        } else if params.act == crate::unfuse::TOPK_ACT {
+                                            (k("conv3d_topk"), n_s * spatial)
+                                        } else if k3 {
+                                            (k("conv3d_k3_c8"), k3_total())
                                         } else if params.c_out > 4 {
                                             (k("conv3d_ctile_w4c8"), w4_total(8))
                                         } else {
@@ -3203,6 +3232,8 @@ impl WgpuExecutable {
                                             |e| crate::kernels::two_window_kernel(&dev.device, e);
                                         if params.act == crate::unfuse::ARGMAX_ACT {
                                             (k("conv3d_argmax"), n_s * spatial)
+                                        } else if params.act == crate::unfuse::TOPK_ACT {
+                                            (k("conv3d_topk"), n_s * spatial)
                                         } else if w2 {
                                             (
                                                 k("conv3d_ctile_w2"),
@@ -3216,16 +3247,29 @@ impl WgpuExecutable {
                                                 k("conv3d_ctile"),
                                                 n_s * params.c_out.div_ceil(4) * spatial,
                                             )
+                                        } else if k3 {
+                                            (k("conv3d_k3_c8"), k3_total())
                                         } else if c8 {
                                             (k("conv3d_ctile_w4c8"), w4_total(8))
                                         } else {
                                             (k("conv3d_ctile_w4"), w4_total(4))
                                         }
+                                    } else if params.act == crate::unfuse::TOPK_ACT {
+                                        // `CONV3D_TOPK`: one thread a voxel
+                                        (
+                                            crate::kernels::conv3d_topk_kernel(&dev.device),
+                                            n_s * spatial,
+                                        )
                                     } else if params.act == crate::unfuse::ARGMAX_ACT {
                                         // `fold_conv_argmax`: one thread a voxel
                                         (
                                             crate::kernels::conv3d_argmax_kernel(&dev.device),
                                             n_s * spatial,
+                                        )
+                                    } else if tiled && k3 {
+                                        (
+                                            crate::kernels::conv3d_k3_c8_kernel(&dev.device),
+                                            k3_total(),
                                         )
                                     } else if tiled && c8 {
                                         (
@@ -4334,7 +4378,15 @@ impl WgpuExecutable {
                     //   integer number of GGUF blocks — flat pack is block-linear
                     //   over n*k, so unaligned k makes row slices invalid and used
                     //   to force the host D2H/H2D fallback for *all* m>1 (very slow).
-                    let use_gemv = if !crate::gguf_gpu::gemv_supports_scheme(*scheme_id) {
+                    // Block FP8 past a few rows prefers scratch + matmul
+                    // (`gemv_takes`) — when there is scratch and a contiguous
+                    // in-arena weight for it; otherwise the GEMV stays.
+                    let scratch_ok = self.dequant_scratch_off > 0
+                        && !self.arena.is_sharded()
+                        && !crate::buffer::is_weight_off(*w_byte_off as usize);
+                    let use_gemv = if !crate::gguf_gpu::gemv_supports_scheme(*scheme_id)
+                        || (!crate::gguf_gpu::gemv_takes(*scheme_id, mm, kk, nn) && scratch_ok)
+                    {
                         false
                     } else if mm == 1 || *scheme_id == 24 {
                         true
@@ -6096,18 +6148,18 @@ const ATTENTION_COOP_MAX_ROWS: u32 = 16_384;
 
 fn gguf_step_is_gpu_only(step: &Step, active_extent: Option<(usize, usize)>) -> bool {
     let Step::DequantMatmulGguf {
-        m, k, scheme_id, ..
+        m, k, n, scheme_id, ..
     } = step
     else {
         return false;
     };
-    if !crate::gguf_gpu::gemv_supports_scheme(*scheme_id) {
-        return false;
-    }
     let m = match active_extent {
         Some((a, u)) if u > 0 => (*m as usize * a).div_ceil(u).min(*m as usize),
         _ => *m as usize,
     };
+    if !crate::gguf_gpu::gemv_takes(*scheme_id, m, *k as usize, *n as usize) {
+        return false;
+    }
     let block = crate::gguf_host::scheme_from_id(*scheme_id).gguf_block_size() as usize;
     m == 1 || *scheme_id == 24 || (*k as usize).is_multiple_of(block.max(1))
 }

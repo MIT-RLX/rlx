@@ -14870,6 +14870,8 @@ pub struct Kernels {
     /// RLX_METAL_Q8_0_SG_DISABLE.
     pub q6k_mv_f32_sg: ComputePipelineState,
     pub q8_0_mv_f32_sg: ComputePipelineState,
+    /// Simdgroup-cooperative `Fp8E4m3B128` decode GEMV (HF fp8 blocks).
+    pub fp8b128_mv_f32_sg: ComputePipelineState,
     /// Simdgroup-cooperative Q4_0 / Q4_1 (32 threads → 4 rows) and Q3_K (one
     /// row per simdgroup) decode GEMVs — same simd_sum treatment as Q4_K/Q6_K,
     /// replacing the one-thread-per-row kernels. Off: RLX_METAL_Q40_SG_DISABLE /
@@ -15585,6 +15587,7 @@ impl Kernels {
             q6k_mv_f32: pipeline("q6k_mv_f32"),
             q6k_mv_f32_sg: pipeline("q6k_mv_f32_sg"),
             q8_0_mv_f32_sg: pipeline("q8_0_mv_f32_sg"),
+            fp8b128_mv_f32_sg: pipeline("fp8b128_mv_f32_sg"),
             q4_0_mv_f32_sg: pipeline("q4_0_mv_f32_sg"),
             q4_1_mv_f32_sg: pipeline("q4_1_mv_f32_sg"),
             q3k_mv_f32_sg: pipeline("q3k_mv_f32_sg"),

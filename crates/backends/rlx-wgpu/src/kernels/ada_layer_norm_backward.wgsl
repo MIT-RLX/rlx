@@ -57,7 +57,7 @@ fn ada_layer_norm_backward(
     let nx = params.mod_rows * params.seq_per_mod * inner;
     let mod_len = params.mod_rows * inner;
     let mod_base = m * inner;
-    let n_inv = 1.0 / f32(inner);
+    let n_inv = epi_div_rn(1.0, f32(inner));
     let eps = bitcast<f32>(params.eps_bits);
     let do_ln = params.layer_norm != 0u;
 
@@ -107,9 +107,9 @@ fn ada_layer_norm_backward(
                 i += bsz;
             }
             let sum_sq = wg_sum(tid, local_sq, bsz);
-            inv = inverseSqrt(sum_sq * n_inv + eps);
+            inv = epi_rsqrt_rn(sum_sq * n_inv + eps);
         } else {
-            inv = inverseSqrt(sum_x2 * n_inv + eps);
+            inv = epi_rsqrt_rn(sum_x2 * n_inv + eps);
         }
 
         var local_sy: f32 = 0.0;
@@ -151,4 +151,71 @@ fn ada_layer_norm_backward(
         }
         workgroupBarrier();
     }
+}
+
+// `rlxsl::exact`'s correctly-rounded helpers, verbatim (`rlx_*` → `epi_*`): the
+// builtin `/`, `inverseSqrt` and `exp` round by the compiler's math mode, so
+// native wgpu (Apple fast math) and a browser (safe math) disagreed.
+fn epi_div_rn(a: f32, b: f32) -> f32 {
+    let k = abs(a / b) < 0x1p-100f;
+    let a2 = select(a, a * 0x1p64f, k);
+    let q = a2 / b;
+    let ok = q != 0.0 && abs(q) <= 0x1.fffffep+127f;
+    var c = select(q, q + fma(-b, q, a2) / b, ok);
+    // The step rounds its correction before adding it, so near a midpoint
+    // `c` depends on the first quotient. Move to the neighbour on the
+    // quotient's side when the quotient lies past their midpoint (ties to
+    // even): `r = a - b·c` is exact, and `r - b·u/2` has the sign of
+    // `a - b·(c + n)/2`.
+    if (ok && c != 0.0 && abs(c) < 0x1.fffffep+127f) {
+        let r = fma(-b, c, a2);
+        if (r != 0.0) {
+            let up = (r > 0.0) == (b > 0.0);
+            let cb = bitcast<u32>(c);
+            let nb = select(cb - 1u, cb + 1u, up == (c > 0.0));
+            let n = bitcast<f32>(nb);
+            let t = fma(-b, (n - c) * 0.5, r);
+            if ((t != 0.0 && ((t > 0.0) == (b > 0.0)) == up) || (t == 0.0 && (nb & 1u) == 0u)) {
+                c = n;
+            }
+        }
+    }
+    return select(c, c * 0x1p-64f, k);
+}
+
+fn epi_sqrt_rn(x: f32) -> f32 {
+    let bx = bitcast<u32>(x);
+    if ((bx & 0x7fffffffu) == 0u) { return x; }
+    if (bx >= 0x7f800000u) {
+        // +inf stays; negatives and NaN are NaN. The NaN is built from `bx`:
+        // a constant NaN (or inf) is a shader-creation error in Chrome.
+        return select(bitcast<f32>((bx & 0u) | 0x7fc00000u), x, bx == 0x7f800000u);
+    }
+    var s = x;
+    var back = 1.0;
+    if (x < 0x1p-60f) {
+        s = x * 0x1p100f;
+        back = 0x1p-50f;
+    } else if (x > 0x1p60f) {
+        s = x * 0x1p-100f;
+        back = 0x1p50f;
+    }
+    var y = sqrt(s);
+    for (var i = 0u; i < 4u; i++) {
+        let r = fma(-y, y, s);
+        if (r < 0.0) {
+            let lo = bitcast<f32>(bitcast<u32>(y) - 1u);
+            let u = y - lo;
+            if (fma(-lo, lo, s) + r + 0.5 * u * u < 0.0) { y = lo; } else { break; }
+        } else {
+            let hi = bitcast<f32>(bitcast<u32>(y) + 1u);
+            let u = hi - y;
+            if (fma(-hi, hi, s) + r + 0.5 * u * u > 0.0) { y = hi; } else { break; }
+        }
+    }
+    return y * back;
+}
+
+fn epi_rsqrt_rn(x: f32) -> f32 {
+    return epi_div_rn(1.0, epi_sqrt_rn(x));
 }

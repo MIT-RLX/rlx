@@ -973,6 +973,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn leaky_relu_slopes_past_zero_to_one() {
+        // `max(x, a·x)` picks the wrong side for these: x where x ≥ 0, else a·x
+        for (slope, want) in [
+            ("2.0", [-4.0f32, -2.0, 0.0, 3.0]),
+            ("-0.5", [1.0, 0.5, 0.0, 3.0]),
+        ] {
+            let ir = LRELU_IR.replace("0.1", slope);
+            let out = run_ir(&ir, &[], ("x", vec![-2.0, -1.0, 0.0, 3.0]));
+            for (g, w) in out.iter().zip(want) {
+                assert!(
+                    (g - w).abs() < 1e-6,
+                    "leaky_relu {slope}: {out:?} vs {want:?}"
+                );
+            }
+        }
+    }
+
+    // nn.PReLU(num_parameters=3) over [1, 3, 2]: one slope a channel
+    const PRELU_IR: &str = r#"{
+      "format": "rlx-torch-ir", "version": 1, "model_name": "pr",
+      "inputs": [{"id": "x", "shape": [1, 3, 2], "dtype": "f32"}],
+      "weights": [{"id": "p_w", "key": "prelu_w", "shape": [3], "dtype": "f32", "kind": "param"}],
+      "nodes": [{"id": "pr", "op": "aten.prelu.default",
+                 "args": [{"ref": "x"}, {"ref": "p_w"}], "out": {"shape": [1, 3, 2], "dtype": "f32"}}],
+      "outputs": [{"ref": "pr", "shape": [1, 3, 2], "dtype": "f32"}]
+    }"#;
+
+    #[test]
+    fn prelu_per_channel_and_single_slope() {
+        let x = vec![-2.0, 1.0, -1.0, 0.0, -4.0, 5.0];
+        // channels' slopes 0.25, -1, 2.5
+        let out = run_ir(
+            PRELU_IR,
+            &[("prelu_w", vec![0.25, -1.0, 2.5])],
+            ("x", x.clone()),
+        );
+        let want = [-0.5f32, 1.0, 1.0, 0.0, -10.0, 5.0];
+        for (g, w) in out.iter().zip(want) {
+            assert!((g - w).abs() < 1e-6, "prelu {out:?} vs {want:?}");
+        }
+        // nn.PReLU(): one slope
+        let ir = PRELU_IR.replace(
+            r#""shape": [3], "dtype": "f32", "kind""#,
+            r#""shape": [1], "dtype": "f32", "kind""#,
+        );
+        let out = run_ir(&ir, &[("prelu_w", vec![0.25])], ("x", x));
+        let want = [-0.5f32, 1.0, -0.25, 0.0, -1.0, 5.0];
+        for (g, w) in out.iter().zip(want) {
+            assert!((g - w).abs() < 1e-6, "prelu one slope {out:?} vs {want:?}");
+        }
+    }
+
     const HSWISH_IR: &str = r#"{
       "format": "rlx-torch-ir", "version": 1, "model_name": "hw",
       "inputs": [{"id": "x", "shape": [4], "dtype": "f32"}], "weights": [],

@@ -633,6 +633,25 @@ const IQ4NL_LEVELS = array<f32, 16>(
     1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0,
 );
 
+// One OCP FP8 code by building its f32 bits — exact, no exp2: E4M3
+// (`Fp8E4m3B128`; only S.1111.111 is NaN) or E5M2 (`Fp8E5m2B128`; IEEE-like
+// inf / NaN at exponent 31), like the CPU codec.
+fn fp8_dec(c: u32, e5: bool) -> f32 {
+    var v: f32;
+    if (e5) {
+        let e = (c >> 2u) & 31u;
+        let m = c & 3u;
+        v = select(bitcast<f32>(((e + 112u) << 23u) | (m << 21u)), f32(m) * 1.52587890625e-05, e == 0u);
+        if (e == 31u) { v = bitcast<f32>(select(0x7FC00000u, 0x7F800000u, m == 0u)); }
+    } else {
+        let e = (c >> 3u) & 15u;
+        let m = c & 7u;
+        v = select(bitcast<f32>(((e + 120u) << 23u) | (m << 20u)), f32(m) * 0.001953125, e == 0u);
+        if ((c & 0x7Fu) == 0x7Fu) { v = bitcast<f32>(0x7FC00000u); }
+    }
+    return select(v, -v, (c & 0x80u) != 0u);
+}
+
 // Sub-block `s` of weight row `j` (`nsb` sub-blocks per row) into `q`;
 // returns (a, c).
 fn b32_levels(j: u32, s: u32, nsb: u32, q: ptr<function, array<f32, 32>>) -> vec2<f32> {
@@ -647,6 +666,19 @@ fn b32_levels(j: u32, s: u32, nsb: u32, q: ptr<function, array<f32, 32>>) -> vec
             }
         }
         return vec2<f32>(f16_at(off), 0.0);
+    }
+    if (id == 30u || id == 31u) {
+        // Fp8E4m3B128 / Fp8E5m2B128: f32 scale | 128 codes (132 bytes); sub-block s is
+        // codes 32·(s % 4).. of block s / 4, w = scale · decode(code).
+        let off = (j * (nsb / 4u) + s / 4u) * 132u;
+        let qs = off + 4u + (s % 4u) * 32u;
+        for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+            let word = read_w4(qs + w * 4u);
+            for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+                (*q)[w * 4u + i] = fp8_dec((word >> (i * 8u)) & 0xFFu, id == 31u);
+            }
+        }
+        return vec2<f32>(bitcast<f32>(read_w4(off)), 0.0);
     }
     if (id == 25u) {
         // Q2_0: f16 d | 32 bytes of 2-bit codes per 128 weights, LSB-first,

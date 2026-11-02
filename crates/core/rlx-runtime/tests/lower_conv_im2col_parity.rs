@@ -11,7 +11,6 @@
 
 use rlx_fusion::LowerConvIm2col;
 use rlx_fusion::pass::Pass;
-use rlx_ir::infer::GraphExt;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 

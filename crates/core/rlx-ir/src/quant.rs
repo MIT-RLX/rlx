@@ -162,6 +162,17 @@ pub enum QuantScheme {
     /// It has no shared `gpu_dequant_scheme_id`: rlx-cpu and rlx-wgpu (under
     /// a backend-local id) read it, other backends reject it.
     GgufBF16,
+    /// FP8 **E4M3** weights with one f32 scale per 128 elements along K —
+    /// the HF `fp8` / DeepSeek-V3 / Qwen3-FP8 block layout (128×128 blocks
+    /// repeat their scale down the rows; per-channel and per-tensor scales
+    /// repeat it along K). Each 132-byte block is `f32 scale | 128 codes`,
+    /// row-major `[out, in]` like a GGUF block quant, so it rides that path
+    /// ([`Self::is_gguf`]); it is not a GGML type. `w = decode(code)·scale`.
+    /// Pack and dequant: [`crate::lowp_codec::fp8_b128`].
+    Fp8E4m3B128,
+    /// [`Self::Fp8E4m3B128`] with FP8 **E5M2** codes (wider range, one
+    /// mantissa bit fewer). Same 132-byte block.
+    Fp8E5m2B128,
 }
 
 /// Single source of truth for GGUF → GPU `dequant_gguf` scheme ids.
@@ -252,6 +263,7 @@ impl QuantScheme {
             Self::GgufG8_0 => 40,   // 16 bytes / 32 elems × 8 = 4.0 bpe
             Self::GgufPtq1_0 => 17, // 28 bytes / 128 elems × 8 = 1.75 bpe
             Self::GgufBF16 => 160,
+            Self::Fp8E4m3B128 | Self::Fp8E5m2B128 => 82, // 132 / 128 × 8 = 8.25 bpe
         }
     }
 
@@ -299,6 +311,8 @@ impl QuantScheme {
         // without them reads the weights as zeros and degrades the model
         // silently rather than failing.
         (GgufPtq1_0, 29),
+        (Fp8E4m3B128, 30),
+        (Fp8E5m2B128, 31),
     }
 
     /// True if this scheme requires a per-block scale tensor on the side.
@@ -413,6 +427,7 @@ impl QuantScheme {
             Self::GgufG8_0 => 32,
             Self::GgufPtq1_0 => 128,
             Self::GgufBF16 => 1,
+            Self::Fp8E4m3B128 | Self::Fp8E5m2B128 => 128,
             _ => 0,
         }
     }
@@ -451,6 +466,7 @@ impl QuantScheme {
             Self::GgufG8_0 => 16,   // 4 bf16 scales + 32×2-bit codes (32 elems)
             Self::GgufPtq1_0 => 28, // 24B qs + 2B qh base-3 trits + f16 scale (128 elems)
             Self::GgufBF16 => 2,
+            Self::Fp8E4m3B128 | Self::Fp8E5m2B128 => 132, // f32 scale + 128 FP8 codes
             _ => 0,
         }
     }
@@ -493,6 +509,8 @@ impl QuantScheme {
                 | Self::GgufG8_0
                 | Self::GgufPtq1_0
                 | Self::GgufBF16
+                | Self::Fp8E4m3B128
+                | Self::Fp8E5m2B128
         )
     }
 }
@@ -543,6 +561,8 @@ impl core::fmt::Display for QuantScheme {
             Self::GgufG8_0 => write!(f, "gguf_g8_0"),
             Self::GgufPtq1_0 => write!(f, "gguf_ptq1_0"),
             Self::GgufBF16 => write!(f, "gguf_bf16"),
+            Self::Fp8E4m3B128 => write!(f, "fp8e4m3_b128"),
+            Self::Fp8E5m2B128 => write!(f, "fp8e5m2_b128"),
         }
     }
 }
@@ -1030,7 +1050,9 @@ mod tests {
     #[test]
     fn gpu_dequant_scheme_id_is_stable() {
         use QuantScheme::*;
-        assert_eq!(QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS.len(), 30);
+        assert_eq!(QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS.len(), 32);
+        assert_eq!(Fp8E4m3B128.gpu_dequant_scheme_id(), Some(30));
+        assert_eq!(Fp8E5m2B128.gpu_dequant_scheme_id(), Some(31));
         for &(scheme, id) in QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS {
             assert_eq!(scheme.gpu_dequant_scheme_id(), Some(id), "{scheme:?}");
             assert_eq!(

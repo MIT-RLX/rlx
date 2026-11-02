@@ -446,6 +446,39 @@ where
     Err(DeviceFallbackError { attempts })
 }
 
+/// The local devices worth training (or batch-inferring) `graph` on at once:
+/// one backend per physical unit, so they do not compete for the same chip —
+/// the native GPU API over portable ones (wgpu / Vulkan / GL / DX / WebGPU on
+/// the same adapter), Metal over MLX — plus the CPU. NPUs (`Ane`, `Xdna`) are
+/// left out: their per-shape kernel compiles and host fallbacks make them a
+/// poor default for a whole training graph; name them explicitly to use them.
+/// Backends that run every op of `graph` natively come first. Never empty.
+pub fn training_devices(available: &[Device], graph: &Graph) -> Vec<Device> {
+    let native = crate::devices_for(graph);
+    let portable = |d: &Device| {
+        matches!(
+            d,
+            Device::Gpu | Device::Vulkan | Device::OpenGl | Device::DirectX | Device::WebGpu
+        )
+    };
+    let has_native_gpu = available
+        .iter()
+        .any(|d| !matches!(d, Device::Cpu | Device::Ane | Device::Xdna) && !portable(d));
+    let mut ds: Vec<Device> = available
+        .iter()
+        .copied()
+        .filter(|d| !matches!(d, Device::Ane | Device::Xdna))
+        .filter(|d| !(has_native_gpu && portable(d)))
+        .filter(|d| !(*d == Device::Mlx && available.contains(&Device::Metal)))
+        .collect();
+    ds.sort_by_key(|d| !native.contains(d));
+    if ds.is_empty() {
+        vec![crate::fastest_device()]
+    } else {
+        ds
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

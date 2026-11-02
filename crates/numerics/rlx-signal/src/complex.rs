@@ -78,9 +78,16 @@ pub fn radd(x: f64, z: C) -> C {
 /// `*` and `**2` loops (AVX2/FMA3 dispatch) are fused, as on macOS.
 pub const BASELINE_FUSED: bool = cfg!(target_vendor = "apple");
 
+/// [`BASELINE_FUSED`] at run time: false on Apple targets too once
+/// `rlx_libm::platform::use_linux_reference` asked for the Linux reference.
+#[inline(always)]
+pub fn baseline_fused() -> bool {
+    rlx_libm::platform::apple_reference()
+}
+
 #[inline(always)]
 fn fma_b(a: f64, b: f64, c: f64) -> f64 {
-    if BASELINE_FUSED {
+    if baseline_fused() {
         a.mul_add(b, c)
     } else {
         a * b + c
@@ -128,25 +135,29 @@ pub fn div(a: C, b: C) -> C {
     }
 }
 
-/// `np.exp(z)` → libm `cexp`: Apple's, or glibc's ([`rlx_libm::cexp`]) elsewhere.
+/// `np.exp(z)` → libm `cexp`: Apple's, or glibc's ([`rlx_libm::cexp`]) elsewhere
+/// (and on Apple targets under `rlx_libm::platform::use_linux_reference`).
 pub fn exp(z: C) -> C {
     #[cfg(target_vendor = "apple")]
-    // SAFETY: `cexp` is a pure libm function; `C` is `repr(C)` with the layout and
-    // calling convention of `double _Complex` (an HFA of two doubles).
-    return unsafe { cexp(z) };
-    #[cfg(not(target_vendor = "apple"))]
+    if rlx_libm::platform::apple_reference() {
+        // SAFETY: `cexp` is a pure libm function; `C` is `repr(C)` with the layout and
+        // calling convention of `double _Complex` (an HFA of two doubles).
+        return unsafe { cexp(z) };
+    }
     {
         let (re, im) = rlx_libm::cexp(z.re, z.im);
         C::new(re, im)
     }
 }
 
-/// `np.sqrt(z)` → libm `csqrt`: Apple's, or glibc's ([`rlx_libm::csqrt`]) elsewhere.
+/// `np.sqrt(z)` → libm `csqrt`: Apple's, or glibc's ([`rlx_libm::csqrt`]) elsewhere
+/// (and on Apple targets under `rlx_libm::platform::use_linux_reference`).
 pub fn sqrt(z: C) -> C {
     #[cfg(target_vendor = "apple")]
-    // SAFETY: as for `exp`.
-    return unsafe { csqrt(z) };
-    #[cfg(not(target_vendor = "apple"))]
+    if rlx_libm::platform::apple_reference() {
+        // SAFETY: as for `exp`.
+        return unsafe { csqrt(z) };
+    }
     {
         let (re, im) = rlx_libm::csqrt(z.re, z.im);
         C::new(re, im)

@@ -47,6 +47,11 @@ build-all:
 build-mlx:
     cargo build --release -p rlx-mlx
 
+# Move vendor/mlx to an upstream ref (default: newest release tag; `main` for
+# the tip) and re-apply rlx-mlx-sys/patches. `--build` builds rlx-mlx-sys after.
+update-mlx *ARGS:
+    {{justfile_directory()}}/crates/backends/rlx-mlx-sys/scripts/update-mlx.sh {{ARGS}}
+
 # Run rlx-mlx tests (matmul+add parity check, both eager and lazy modes).
 test-mlx:
     cargo test --release -p rlx-mlx

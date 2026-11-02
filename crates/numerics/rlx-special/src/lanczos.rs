@@ -75,7 +75,7 @@ pub fn lanczos_sum_exp_g_scaled(z: f64) -> f64 {
 /// second-order Horner in `x²` (plain `mulpd`/`addpd`, no `1/x` reversal), and above
 /// `lim` a plain Horner in `1/x`.
 fn sum(num: &[f64; 13], x: f64, lim: f64) -> f64 {
-    if cfg!(target_vendor = "apple") {
+    if rlx_libm::platform::apple_reference() {
         return evaluate_rational(num, &DENOM, x);
     }
     // coefficient pairs from the highest degree down, as `coeff[26]` lays them out

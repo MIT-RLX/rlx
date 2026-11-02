@@ -285,7 +285,7 @@ pub struct PeanoInstall {
 }
 
 /// Every mlir-aie install rlx can see on `host`, in the order it would pick
-/// them (see [`best_install`]).
+/// them (see `best_install`).
 pub fn installs(host: &Host) -> Vec<Install> {
     let mut v = discover(host);
     v.sort_by_key(rank);

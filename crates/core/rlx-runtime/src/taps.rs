@@ -64,6 +64,26 @@ pub fn with_tap<T>(tap: Rc<dyn GraphTap>, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// [`with_tap`] as a guard: `tap` observes every graph compiled on this
+/// thread until the returned scope drops. For a caller that compiles across
+/// an `await` (a browser's WebGPU run), where a closure cannot hold the scope;
+/// scopes must drop in reverse order of entry, as [`with_tap`]'s nest.
+pub fn enter(tap: Rc<dyn GraphTap>) -> TapScope {
+    STACK.with(|s| s.borrow_mut().push(tap));
+    TapScope(())
+}
+
+/// The scope [`enter`] opens; dropping it removes the tap.
+pub struct TapScope(());
+
+impl Drop for TapScope {
+    fn drop(&mut self) {
+        STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
 fn current() -> Option<Rc<dyn GraphTap>> {
     STACK.with(|s| s.borrow().last().cloned())
 }

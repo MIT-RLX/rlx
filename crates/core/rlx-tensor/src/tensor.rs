@@ -1154,8 +1154,10 @@ impl Tensor {
         // MLX backend crashes when asked to compile a constant-only trace.
         if let Some((bytes, DType::F32)) = self.constant_payload() {
             return bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| f32::from_le_bytes(c))
                 .collect();
         }
         let compiled = self.compiled_on(device);

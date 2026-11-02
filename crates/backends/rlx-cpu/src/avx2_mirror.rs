@@ -20,7 +20,7 @@
 //!
 //! Compiled everywhere so that x86-64 can test each mirror against its kernel.
 
-#![cfg_attr(any(target_arch = "aarch64", target_arch = "x86_64"), allow(dead_code))]
+#![cfg_attr(any(rlx_cpu_neon, rlx_cpu_x86), allow(dead_code))]
 
 use crate::kernels::scalar_gelu;
 
@@ -602,13 +602,21 @@ pub(crate) fn silu_inplace(data: &mut [f32]) {
 
 /// `vvexpf_avx2`, with the caller's tail function.
 pub(crate) fn vvexpf(y: &mut [f32], x: &[f32], tail: impl Fn(f32) -> f32) {
-    y.copy_from_slice(x);
+    // `vmath`'s in-place forms pass the same buffer as both: copying it onto
+    // itself is a `copy_nonoverlapping` of overlapping ranges.
+    if y.as_ptr() != x.as_ptr() {
+        y.copy_from_slice(x);
+    }
     wide!(by_lanes(y, exp_lane, tail))
 }
 
 /// `vvtanhf_avx2`, with the caller's tail function.
 pub(crate) fn vvtanhf(y: &mut [f32], x: &[f32], tail: impl Fn(f32) -> f32) {
-    y.copy_from_slice(x);
+    // `vmath`'s in-place forms pass the same buffer as both: copying it onto
+    // itself is a `copy_nonoverlapping` of overlapping ranges.
+    if y.as_ptr() != x.as_ptr() {
+        y.copy_from_slice(x);
+    }
     wide!(by_lanes(y, tanh_lane, tail))
 }
 
@@ -747,7 +755,7 @@ fn layer_norm_row_with<V: Lanes>(
     }
 }
 
-#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(test, any(rlx_cpu_neon, rlx_cpu_x86)))]
 mod native_fma_tests {
     /// [`super::fmaf`] against the hardware fused multiply-add, on random
     /// bit patterns and on constructed double-rounding cases in the normal and
@@ -798,7 +806,7 @@ mod native_fma_tests {
     }
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, rlx_cpu_x86))]
 mod tests {
     //! Each mirror against its AVX2 kernel, bit for bit, on lengths that leave
     //! every tail size and on inputs spanning the kernels' ranges (including

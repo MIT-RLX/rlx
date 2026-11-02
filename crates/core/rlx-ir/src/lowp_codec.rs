@@ -118,11 +118,14 @@ pub fn max_finite(fmt: ScaledFormat) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
-/// Decode a whole buffer of codes (1 code per byte) into f32.
+/// Decode a whole buffer of codes (1 code per byte) into f32. Goes through a
+/// 256-entry table built from [`decode`], so it is bit-identical to it and
+/// cheap enough for whole checkpoints.
 pub fn decode_slice(fmt: ScaledFormat, codes: &[u8], out: &mut [f32]) {
     debug_assert_eq!(codes.len(), out.len());
+    let table: [f32; 256] = core::array::from_fn(|c| decode(fmt, c as u8));
     for (o, &c) in out.iter_mut().zip(codes) {
-        *o = decode(fmt, c);
+        *o = table[c as usize];
     }
 }
 
@@ -147,6 +150,294 @@ pub fn e8m0_to_f32(byte: u8) -> f32 {
         return f32::NAN;
     }
     2f32.powi(byte as i32 - 127)
+}
+
+/// Which scale each element of a weight uses, for the scale layouts FP8
+/// checkpoints store beside their weights (HF `fp8` `weight_scale_inv`,
+/// compressed-tensors `weight_scale`).
+///
+/// The weight is `shape = [lead.., rows, cols]`. Its scale is one value
+/// (per-tensor), `[rows]` / `[lead.., rows, 1]` (per-channel), or a
+/// `[lead.., ceil(rows/b0), ceil(cols/b1)]` grid of `b0×b1` blocks
+/// (DeepSeek-V3 / Qwen3-FP8 use 128×128). Every case is one block grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScaleGrid {
+    /// Rows and columns of each matrix (a per-tensor scale folds every
+    /// leading dim into `rows`).
+    pub rows: usize,
+    pub cols: usize,
+    /// `[b0, b1]`: the block one scale covers.
+    pub block: [usize; 2],
+    /// `[ceil(rows/b0), ceil(cols/b1)]`: scales per matrix.
+    pub grid: [usize; 2],
+}
+
+impl ScaleGrid {
+    /// The grid for `shape` and `scale_shape`. `block` gives `[b0, b1]`
+    /// explicitly; `None` infers it per axis — 128 when that fits the grid
+    /// (the HF default), else `ceil(n / blocks)`.
+    pub fn new(
+        shape: &[usize],
+        scale_shape: &[usize],
+        block: Option<[usize; 2]>,
+    ) -> Result<Self, String> {
+        let bad = |why: &str| {
+            Err(format!(
+                "weight {shape:?} with scale {scale_shape:?}: {why}"
+            ))
+        };
+        let r = shape.len();
+        if scale_shape.iter().product::<usize>() == 1 {
+            let cols = shape.last().copied().unwrap_or(1);
+            let rows = shape[..r.saturating_sub(1)].iter().product();
+            return Ok(Self {
+                rows,
+                cols,
+                block: [rows.max(1), cols.max(1)],
+                grid: [1, 1],
+            });
+        }
+        if r < 2 {
+            return bad("only a per-tensor scale fits a rank < 2 weight");
+        }
+        // `[rows]` for a 2-D weight is per-channel: `[rows, 1]`.
+        let grid: Vec<usize> = if scale_shape.len() == 1 && r == 2 {
+            vec![scale_shape[0], 1]
+        } else {
+            scale_shape.to_vec()
+        };
+        if grid.len() != r || grid[..r - 2] != shape[..r - 2] {
+            return bad("scale rank / leading dims differ from the weight");
+        }
+        let (rows, cols) = (shape[r - 2], shape[r - 1]);
+        let (sr, sc) = (grid[r - 2], grid[r - 1]);
+        let infer = |n: usize, s: usize| -> Option<usize> {
+            if s == 0 || s > n {
+                return None;
+            }
+            if n.div_ceil(128) == s {
+                return Some(128);
+            }
+            let b = n.div_ceil(s);
+            (n.div_ceil(b) == s).then_some(b)
+        };
+        let (b0, b1) = match block {
+            Some([b0, b1]) if b0 > 0 && b1 > 0 => (b0, b1),
+            Some(_) => return bad("block size must be non-zero"),
+            None => match (infer(rows, sr), infer(cols, sc)) {
+                (Some(b0), Some(b1)) => (b0, b1),
+                _ => return bad("no block size tiles the weight into the scale grid"),
+            },
+        };
+        if rows.div_ceil(b0) != sr || cols.div_ceil(b1) != sc {
+            return bad(&format!("{b0}x{b1} blocks do not give a {sr}x{sc} grid"));
+        }
+        Ok(Self {
+            rows,
+            cols,
+            block: [b0, b1],
+            grid: [sr, sc],
+        })
+    }
+
+    /// Index into the scale tensor of element `(i, j)` of matrix `m`.
+    #[inline]
+    pub fn index(&self, m: usize, i: usize, j: usize) -> usize {
+        let [b0, b1] = self.block;
+        let [sr, sc] = self.grid;
+        m * sr * sc + (i / b0) * sc + j / b1
+    }
+}
+
+/// Multiply decoded weights by their stored scales, laid out as
+/// [`ScaleGrid`] describes.
+pub fn apply_weight_scales(
+    data: &mut [f32],
+    shape: &[usize],
+    scale: &[f32],
+    scale_shape: &[usize],
+    block: Option<[usize; 2]>,
+) -> Result<(), String> {
+    if data.len() != shape.iter().product::<usize>()
+        || scale.len() != scale_shape.iter().product::<usize>()
+    {
+        return Err(format!(
+            "weight {shape:?} with scale {scale_shape:?}: data does not match its shape"
+        ));
+    }
+    let g = ScaleGrid::new(shape, scale_shape, block)?;
+    if data.is_empty() {
+        return Ok(());
+    }
+    let [sr, sc] = g.grid;
+    let [b0, b1] = g.block;
+    for (mat, sm) in data
+        .chunks_exact_mut(g.rows * g.cols)
+        .zip(scale.chunks_exact(sr * sc))
+    {
+        for (i, row) in mat.chunks_exact_mut(g.cols).enumerate() {
+            let srow = &sm[(i / b0) * sc..][..sc];
+            for (j, v) in row.iter_mut().enumerate() {
+                *v *= srow[j / b1];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`QuantScheme::Fp8E4m3B128`](crate::quant::QuantScheme::Fp8E4m3B128) /
+/// [`QuantScheme::Fp8E5m2B128`](crate::quant::QuantScheme::Fp8E5m2B128):
+/// FP8 codes with one f32 scale per 128 elements along K, packed as 132-byte
+/// `f32 scale | 128 codes` blocks, row-major `[out, in]`.
+pub mod fp8_b128 {
+    use super::decode;
+    use crate::prelude::*;
+    use crate::quant::{QuantScheme, ScaledFormat};
+
+    /// Elements per block.
+    pub const QK: usize = 128;
+    /// Bytes per block: an f32 scale + [`QK`] codes.
+    pub const BLOCK_BYTES: usize = 4 + QK;
+
+    /// The element format of a block-FP8 scheme; `None` for any other.
+    pub const fn format(scheme: QuantScheme) -> Option<ScaledFormat> {
+        match scheme {
+            QuantScheme::Fp8E4m3B128 => Some(ScaledFormat::F8E4M3),
+            QuantScheme::Fp8E5m2B128 => Some(ScaledFormat::F8E5M2),
+            _ => None,
+        }
+    }
+
+    /// The block-FP8 scheme for OCP `fmt` (E4M3 / E5M2).
+    pub const fn scheme(fmt: ScaledFormat) -> Option<QuantScheme> {
+        match fmt {
+            ScaledFormat::F8E4M3 => Some(QuantScheme::Fp8E4m3B128),
+            ScaledFormat::F8E5M2 => Some(QuantScheme::Fp8E5m2B128),
+            _ => None,
+        }
+    }
+
+    /// Packed size of an `[n, k]` weight; `None` unless `k` is a multiple
+    /// of [`QK`].
+    pub fn packed_bytes(n: usize, k: usize) -> Option<usize> {
+        k.is_multiple_of(QK).then(|| n * (k / QK) * BLOCK_BYTES)
+    }
+
+    /// Pack FP8 `codes` (`[n, k]`, either format) with `scales` (`[n, k / QK]`,
+    /// one per row and block — a 128×128 grid repeats its value down 128 rows).
+    pub fn pack(codes: &[u8], scales: &[f32], n: usize, k: usize) -> Result<Vec<u8>, String> {
+        let bytes =
+            packed_bytes(n, k).ok_or_else(|| format!("fp8_b128: k={k} not a multiple of {QK}"))?;
+        let nb = k / QK;
+        if codes.len() != n * k || scales.len() != n * nb {
+            return Err(format!(
+                "fp8_b128: {} codes / {} scales for [{n}, {k}] (want {} / {})",
+                codes.len(),
+                scales.len(),
+                n * k,
+                n * nb
+            ));
+        }
+        let mut out = Vec::with_capacity(bytes);
+        for (q, s) in codes.as_chunks::<QK>().0.iter().zip(scales) {
+            out.extend_from_slice(&s.to_le_bytes());
+            out.extend_from_slice(q);
+        }
+        Ok(out)
+    }
+
+    /// Pack a checkpoint's FP8 weight — `codes` of `shape` (`[out, in]` or an
+    /// `[E, out, in]` expert stack) with its stored `scale` laid out as
+    /// [`super::ScaleGrid`] describes (`None`: no scale, i.e. 1) — as blocks.
+    /// `Ok(None)` when the layout can't be one scale per 128 along `in`: `in`
+    /// not a multiple of [`QK`], or a scale that changes inside a 128 run.
+    pub fn pack_scaled(
+        codes: &[u8],
+        shape: &[usize],
+        scale: Option<(&[f32], &[usize])>,
+        block: Option<[usize; 2]>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let (experts, n, k) = match *shape {
+            [n, k] => (1, n, k),
+            [e, n, k] => (e, n, k),
+            _ => return Ok(None),
+        };
+        if !k.is_multiple_of(QK) {
+            return Ok(None);
+        }
+        let (nb, rows) = (k / QK, experts * n);
+        let scales = match scale {
+            None => vec![1.0f32; rows * nb],
+            Some((scale, sshape)) => {
+                let g = super::ScaleGrid::new(shape, sshape, block)?;
+                if scale.len() != sshape.iter().product::<usize>() {
+                    return Err(format!(
+                        "fp8_b128: scale {sshape:?} holds {} values",
+                        scale.len()
+                    ));
+                }
+                if !(g.block[1].is_multiple_of(QK) || g.grid[1] == 1) {
+                    return Ok(None);
+                }
+                (0..rows * nb)
+                    .map(|t| {
+                        let (row, j) = (t / nb, (t % nb) * QK);
+                        // A per-tensor grid folds the experts into its rows.
+                        let (m, i) = if g.rows == n {
+                            (row / n, row % n)
+                        } else {
+                            (0, row)
+                        };
+                        scale[g.index(m, i, j)]
+                    })
+                    .collect()
+            }
+        };
+        pack(codes, &scales, rows, k).map(Some)
+    }
+
+    /// Dequantize one block of `fmt` codes into `out` (`decode(code) · scale`).
+    pub fn dequant_block(fmt: ScaledFormat, block: &[u8], out: &mut [f32]) {
+        let s = f32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+        for (o, &c) in out[..QK].iter_mut().zip(&block[4..BLOCK_BYTES]) {
+            *o = decode(fmt, c) * s;
+        }
+    }
+
+    /// Dequantize `n_elems` packed `fmt` elements to f32.
+    pub fn dequant(fmt: ScaledFormat, bytes: &[u8], n_elems: usize) -> Result<Vec<f32>, String> {
+        if !n_elems.is_multiple_of(QK) || bytes.len() != n_elems / QK * BLOCK_BYTES {
+            return Err(format!(
+                "fp8_b128: {} bytes for {n_elems} elements (want {})",
+                bytes.len(),
+                n_elems / QK * BLOCK_BYTES
+            ));
+        }
+        let table: [f32; 256] = core::array::from_fn(|c| decode(fmt, c as u8));
+        let mut out = vec![0f32; n_elems];
+        for (o, b) in out
+            .as_chunks_mut::<QK>()
+            .0
+            .iter_mut()
+            .zip(bytes.as_chunks::<BLOCK_BYTES>().0)
+        {
+            let s = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            for (v, &c) in o.iter_mut().zip(&b[4..]) {
+                *v = table[c as usize] * s;
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`dequant`] for a block-FP8 `scheme`; errors on any other scheme.
+    pub fn dequant_scheme(
+        scheme: QuantScheme,
+        bytes: &[u8],
+        n_elems: usize,
+    ) -> Result<Vec<f32>, String> {
+        let fmt = format(scheme).ok_or_else(|| format!("fp8_b128: {scheme} is not block FP8"))?;
+        dequant(fmt, bytes, n_elems)
+    }
 }
 
 #[cfg(test)]

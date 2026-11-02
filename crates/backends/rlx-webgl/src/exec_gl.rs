@@ -159,15 +159,31 @@ void main() {
 
 // Rows of `A` and of the output run over all batch blocks (`batch·m`); block
 // `p.y / uM` reads its own `k` rows of `B` when `uBBatched`, else the shared ones.
+// `uNatural`: every slot has its logical `rows × last-dim` layout, so texels
+// are elements; otherwise (a slot widened past the texture limit) the output
+// texel is a linear index and the operands are read by linear index.
 const FS_MATMUL: &str = r#"uniform highp sampler2D A; uniform highp sampler2D B; uniform int uK;
-uniform int uM; uniform int uBBatched;
+uniform int uM; uniform int uN; uniform int uBBatched;
+uniform int uNatural; uniform int uACols; uniform int uBCols; uniform int uOCols; uniform int uTotal;
 out vec4 o;
+// Element `i` of a slot laid out `cols` wide (any layout, see `widen_tall_slots`).
+float lin(highp sampler2D T, int i, int cols) { return texelFetch(T, ivec2(i % cols, i / cols), 0).r; }
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy); // x=col, y=row
-    int bRow0 = uBBatched != 0 ? (p.y / uM) * uK : 0;
     float s = 0.0;
-    for (int l = 0; l < uK; l++) {
-        s += texelFetch(A, ivec2(l, p.y), 0).r * texelFetch(B, ivec2(p.x, bRow0 + l), 0).r;
+    if (uNatural != 0) {
+        int bRow0 = uBBatched != 0 ? (p.y / uM) * uK : 0;
+        for (int l = 0; l < uK; l++) {
+            s += texelFetch(A, ivec2(l, p.y), 0).r * texelFetch(B, ivec2(p.x, bRow0 + l), 0).r;
+        }
+    } else {
+        int e = p.y * uOCols + p.x;
+        if (e >= uTotal) { o = vec4(0.0); return; }
+        int row = e / uN, col = e % uN;
+        int bRow0 = uBBatched != 0 ? (row / uM) * uK : 0;
+        for (int l = 0; l < uK; l++) {
+            s += lin(A, row * uK + l, uACols) * lin(B, (bRow0 + l) * uN + col, uBCols);
+        }
     }
     o = vec4(s, 0.0, 0.0, 1.0);
 }"#;
@@ -206,55 +222,76 @@ void main() {
     o = vec4(res, 0.0, 0.0, 1.0);
 }"#;
 
-const FS_SOFTMAX: &str = r#"uniform highp sampler2D A; uniform int uCols;
+// `uSlotCols`: the texture width of `A` and the output (they share a layout);
+// equal to `uCols` unless the slots were widened, when texels are read by
+// linear index.
+const FS_SOFTMAX: &str = r#"uniform highp sampler2D A; uniform int uCols; uniform int uSlotCols; uniform int uTotal;
 out vec4 o;
+// Element `i` of a slot laid out `cols` wide (any layout, see `widen_tall_slots`).
+float lin(highp sampler2D T, int i, int cols) { return texelFetch(T, ivec2(i % cols, i / cols), 0).r; }
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
+    int e = p.y * uSlotCols + p.x;
+    if (e >= uTotal) { o = vec4(0.0); return; }
+    int r0 = (e / uCols) * uCols;
     float m = -3.0e38;
-    for (int c = 0; c < uCols; c++) m = max(m, texelFetch(A, ivec2(c, p.y), 0).r);
+    for (int c = 0; c < uCols; c++) m = max(m, lin(A, r0 + c, uSlotCols));
     float sum = 0.0;
-    for (int c = 0; c < uCols; c++) sum += exp(texelFetch(A, ivec2(c, p.y), 0).r - m);
+    for (int c = 0; c < uCols; c++) sum += exp(lin(A, r0 + c, uSlotCols) - m);
     o = vec4(exp(texelFetch(A, p, 0).r - m) / sum, 0.0, 0.0, 1.0);
 }"#;
 
+// `uSlotCols` / `uGCols`: texture widths of `X` (and the output) and of
+// `G` / `B`; with natural layouts `uCols` and `uCols`.
 const FS_LAYERNORM: &str = r#"uniform highp sampler2D X; uniform highp sampler2D G; uniform highp sampler2D B;
-uniform int uCols; uniform float uEps;
+uniform int uCols; uniform float uEps; uniform int uSlotCols; uniform int uGCols; uniform int uTotal;
 out vec4 o;
+// Element `i` of a slot laid out `cols` wide (any layout, see `widen_tall_slots`).
+float lin(highp sampler2D T, int i, int cols) { return texelFetch(T, ivec2(i % cols, i / cols), 0).r; }
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
+    int e = p.y * uSlotCols + p.x;
+    if (e >= uTotal) { o = vec4(0.0); return; }
+    int r0 = (e / uCols) * uCols, c = e % uCols;
     float mean = 0.0;
-    for (int i = 0; i < uCols; i++) mean += texelFetch(X, ivec2(i, p.y), 0).r;
+    for (int i = 0; i < uCols; i++) mean += lin(X, r0 + i, uSlotCols);
     mean /= float(uCols);
     float var = 0.0;
     for (int i = 0; i < uCols; i++) {
-        float d = texelFetch(X, ivec2(i, p.y), 0).r - mean;
+        float d = lin(X, r0 + i, uSlotCols) - mean;
         var += d * d;
     }
     var /= float(uCols);
     float norm = (texelFetch(X, p, 0).r - mean) * inversesqrt(var + uEps);
-    float g = texelFetch(G, ivec2(p.x, 0), 0).r;
-    float b = texelFetch(B, ivec2(p.x, 0), 0).r;
+    float g = lin(G, c, uGCols);
+    float b = lin(B, c, uGCols);
     o = vec4(norm * g + b, 0.0, 0.0, 1.0);
 }"#;
 
+// Layout uniforms as in `FS_LAYERNORM`.
 const FS_RMSNORM: &str = r#"uniform highp sampler2D X; uniform highp sampler2D G; uniform highp sampler2D B;
-uniform int uCols; uniform float uEps;
+uniform int uCols; uniform float uEps; uniform int uSlotCols; uniform int uGCols; uniform int uTotal;
 out vec4 o;
+// Element `i` of a slot laid out `cols` wide (any layout, see `widen_tall_slots`).
+float lin(highp sampler2D T, int i, int cols) { return texelFetch(T, ivec2(i % cols, i / cols), 0).r; }
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
+    int e = p.y * uSlotCols + p.x;
+    if (e >= uTotal) { o = vec4(0.0); return; }
+    int r0 = (e / uCols) * uCols, c = e % uCols;
     float n_inv = 1.0 / float(uCols);
     // Two-pass: mean(x²) = mean((x-mean)^2) + mean^2. Matches the CPU oracle.
     float sum = 0.0;
-    for (int i = 0; i < uCols; i++) { sum += texelFetch(X, ivec2(i, p.y), 0).r; }
+    for (int i = 0; i < uCols; i++) { sum += lin(X, r0 + i, uSlotCols); }
     float mean = sum * n_inv;
     float dev = 0.0;
     for (int i = 0; i < uCols; i++) {
-        float d = texelFetch(X, ivec2(i, p.y), 0).r - mean;
+        float d = lin(X, r0 + i, uSlotCols) - mean;
         dev += d * d;
     }
     float norm = texelFetch(X, p, 0).r * inversesqrt(dev * n_inv + mean * mean + uEps);
-    float g = texelFetch(G, ivec2(p.x, 0), 0).r;
-    float b = texelFetch(B, ivec2(p.x, 0), 0).r;
+    float g = lin(G, c, uGCols);
+    float b = lin(B, c, uGCols);
     o = vec4(norm * g + b, 0.0, 0.0, 1.0);
 }"#;
 
@@ -1501,12 +1538,20 @@ impl GlBackend {
                     batch,
                     b_batched,
                 } => {
-                    let t = self.begin(&self.matmul, *n, batch * m)?;
+                    let ((or, oc), (_, ac), (_, bc)) = (dims(*out), dims(*a), dims(*b));
+                    let natural = oc == *n && or == batch * m && ac == *k && bc == *n;
+                    let t = self.begin(&self.matmul, oc, or)?;
                     self.bind_tex_unit(&self.matmul, "A", 0, self.tex(tex, *a)?);
                     self.bind_tex_unit(&self.matmul, "B", 1, self.tex(tex, *b)?);
                     self.set_i32(&self.matmul, "uK", *k as i32);
                     self.set_i32(&self.matmul, "uM", *m as i32);
+                    self.set_i32(&self.matmul, "uN", *n as i32);
                     self.set_i32(&self.matmul, "uBBatched", i32::from(*b_batched));
+                    self.set_i32(&self.matmul, "uNatural", i32::from(natural));
+                    self.set_i32(&self.matmul, "uACols", ac as i32);
+                    self.set_i32(&self.matmul, "uBCols", bc as i32);
+                    self.set_i32(&self.matmul, "uOCols", oc as i32);
+                    self.set_i32(&self.matmul, "uTotal", (batch * m * n) as i32);
                     self.draw();
                     tex[*out] = Some(t);
                 }
@@ -1546,9 +1591,12 @@ impl GlBackend {
                     tex[*out] = Some(t);
                 }
                 Step::Softmax { out, a, rows, cols } => {
-                    let t = self.begin(&self.softmax, *cols, *rows)?;
+                    let (or, oc) = dims(*out);
+                    let t = self.begin(&self.softmax, oc, or)?;
                     self.bind_tex_unit(&self.softmax, "A", 0, self.tex(tex, *a)?);
                     self.set_i32(&self.softmax, "uCols", *cols as i32);
+                    self.set_i32(&self.softmax, "uSlotCols", oc as i32);
+                    self.set_i32(&self.softmax, "uTotal", (rows * cols) as i32);
                     self.draw();
                     tex[*out] = Some(t);
                 }
@@ -1561,11 +1609,15 @@ impl GlBackend {
                     cols,
                     eps,
                 } => {
-                    let t = self.begin(&self.layernorm, *cols, *rows)?;
+                    let ((or, oc), (_, gc)) = (dims(*out), dims(*gamma));
+                    let t = self.begin(&self.layernorm, oc, or)?;
                     self.bind_tex_unit(&self.layernorm, "X", 0, self.tex(tex, *x)?);
                     self.bind_tex_unit(&self.layernorm, "G", 1, self.tex(tex, *gamma)?);
                     self.bind_tex_unit(&self.layernorm, "B", 2, self.tex(tex, *beta)?);
                     self.set_i32(&self.layernorm, "uCols", *cols as i32);
+                    self.set_i32(&self.layernorm, "uSlotCols", oc as i32);
+                    self.set_i32(&self.layernorm, "uGCols", gc as i32);
+                    self.set_i32(&self.layernorm, "uTotal", (rows * cols) as i32);
                     self.set_f32(&self.layernorm, "uEps", *eps);
                     self.draw();
                     tex[*out] = Some(t);
@@ -1579,11 +1631,15 @@ impl GlBackend {
                     cols,
                     eps,
                 } => {
-                    let t = self.begin(&self.rmsnorm, *cols, *rows)?;
+                    let ((or, oc), (_, gc)) = (dims(*out), dims(*gamma));
+                    let t = self.begin(&self.rmsnorm, oc, or)?;
                     self.bind_tex_unit(&self.rmsnorm, "X", 0, self.tex(tex, *x)?);
                     self.bind_tex_unit(&self.rmsnorm, "G", 1, self.tex(tex, *gamma)?);
                     self.bind_tex_unit(&self.rmsnorm, "B", 2, self.tex(tex, *beta)?);
                     self.set_i32(&self.rmsnorm, "uCols", *cols as i32);
+                    self.set_i32(&self.rmsnorm, "uSlotCols", oc as i32);
+                    self.set_i32(&self.rmsnorm, "uGCols", gc as i32);
+                    self.set_i32(&self.rmsnorm, "uTotal", (rows * cols) as i32);
                     self.set_f32(&self.rmsnorm, "uEps", *eps);
                     self.draw();
                     tex[*out] = Some(t);

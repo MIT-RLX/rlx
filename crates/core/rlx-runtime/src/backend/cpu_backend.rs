@@ -116,6 +116,7 @@ impl Backend for CpuBackend {
             plan,
             io_manifest,
             options.rng,
+            cfg.arena_alignment,
         ))
     }
 
@@ -189,7 +190,7 @@ impl Backend for CpuBackend {
         } else {
             None
         };
-        let exe = build_cpu_executable(exec_graph, plan, io_manifest, options.rng);
+        let exe = build_cpu_executable(exec_graph, plan, io_manifest, options.rng, alignment);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(t2) = t2 {
             eprintln!("[compile_lir] build_thunks={:?}", t2.elapsed());
@@ -203,8 +204,38 @@ fn build_cpu_executable(
     plan: MemoryPlan,
     io_manifest: cpu_low_precision::IoDtypeManifest,
     rng: rlx_ir::RngOptions,
+    alignment: usize,
 ) -> CpuExecutable {
-    let mut arena = Arena::from_plan(plan);
+    // Under a param-sharing scope, large weights live on pages shared with the
+    // scope's other executables; otherwise the plan's own arena.
+    let mut shared_present = std::collections::HashSet::new();
+    let shared = rlx_cpu::shared_params::scope()
+        .filter(|_| rlx_cpu::shared_params::SUPPORTED)
+        .and_then(|scope| {
+            let (plan, slots) = shared_weight_plan(&graph, &plan, alignment)?;
+            let keys: Vec<(String, u8, usize, usize)> = slots
+                .iter()
+                .map(|(name, nbytes, off)| (name.clone(), 0, *nbytes, *off))
+                .collect();
+            let (arena, present) = Arena::from_plan_shared(plan, &scope, &keys)?;
+            for ((name, _, _), here) in slots.iter().zip(present) {
+                if here {
+                    shared_present.insert(param_of_key(name).to_string());
+                }
+            }
+            if rlx_ir::env::flag("RLX_VERBOSE") {
+                eprintln!(
+                    "[rlx-cpu] shared weights: {} of {} mapped from another executable",
+                    shared_present.len(),
+                    slots.len()
+                );
+            }
+            Some(arena)
+        });
+    let mut arena = match shared {
+        Some(a) => a,
+        None => Arena::from_plan(plan),
+    };
     let mut input_ids = HashMap::new();
     let mut param_ids = HashMap::new();
     let mut node_dtypes: HashMap<NodeId, DType> = HashMap::new();
@@ -308,7 +339,153 @@ fn build_cpu_executable(
         moe_topk_capture: None,
         baseline_written: false,
         keep_ranges: None,
+        shared_present,
     }
+}
+
+/// Smallest weight worth a shared slot (each is rounded up to whole pages).
+const SHARED_WEIGHT_MIN: usize = 256 * 1024;
+
+/// Ops that only read their weight operand, so a weight they share across
+/// executables is never written through another's arena.
+fn reads_weight_only(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::MatMul
+            | Op::DotGeneral { .. }
+            | Op::Gather { .. }
+            | Op::DequantMatMul { .. }
+            | Op::DequantGroupedMatMul { .. }
+            | Op::GroupedMatMul
+            | Op::Transpose { .. }
+    )
+}
+
+/// The registry key of a shared weight: its name and dtype.
+fn shared_key(name: &str, dtype: DType) -> String {
+    format!("{name}\u{1f}{dtype:?}")
+}
+
+fn param_of_key(key: &str) -> &str {
+    key.split('\u{1f}').next().unwrap_or(key)
+}
+
+/// Re-lay `full` (a plan with params) for a shared-weight arena: activations
+/// planned without params, then the small params, then each large read-only
+/// weight on its own page-aligned slot. Returns the plan and the shared slots
+/// as `(key, bytes, offset)`, or `None` when there is nothing to share.
+fn shared_weight_plan(
+    graph: &Graph,
+    full: &MemoryPlan,
+    alignment: usize,
+) -> Option<(MemoryPlan, Vec<(String, usize, usize)>)> {
+    let views = memory::collect_view_aliases(graph);
+    // Every reader of a param, looking through views of it.
+    // A view that writes its root's slot in place (`KvAppend`,
+    // `DynamicUpdateSlice`) disqualifies the root like any other writer.
+    let mut readers_ok: HashMap<NodeId, bool> = HashMap::new();
+    for node in graph.nodes() {
+        if let Some(&(root, _)) = views.get(&node.id) {
+            if matches!(node.op, Op::KvAppend { .. } | Op::DynamicUpdateSlice { .. }) {
+                readers_ok.insert(root, false);
+            }
+            continue;
+        }
+        for &i in &node.inputs {
+            let root = views.get(&i).map_or(i, |&(r, _)| r);
+            if matches!(graph.node(root).op, Op::Param { .. }) {
+                *readers_ok.entry(root).or_insert(true) &= reads_weight_only(&node.op);
+            }
+        }
+    }
+    let is_output = |id: NodeId| {
+        graph
+            .outputs
+            .iter()
+            .any(|&o| views.get(&o).map_or(o, |&(r, _)| r) == id)
+    };
+    let shared: Vec<&rlx_ir::Node> = graph
+        .nodes()
+        .iter()
+        .filter(|n| matches!(n.op, Op::Param { .. }))
+        .filter(|n| {
+            full.assignments
+                .get(&n.id)
+                .is_some_and(|s| s.size >= SHARED_WEIGHT_MIN)
+        })
+        .filter(|n| readers_ok.get(&n.id).copied().unwrap_or(false) && !is_output(n.id))
+        .collect();
+    if shared.is_empty() {
+        return None;
+    }
+    // The shared weights go first, in name order, so every executable of the
+    // scope holding the same weights holds them at the same offsets. Kernels
+    // that key per-weight state on the arena offset (the dequant cache's f32
+    // copies of packed weights) then share it too, instead of keeping one per
+    // executable.
+    let mut shared = shared;
+    shared.sort_by(|a, b| match (&a.op, &b.op) {
+        (Op::Param { name: x }, Op::Param { name: y }) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    });
+    let page = rlx_cpu::shared_params::page_size();
+    let mut plan = memory::plan_memory_native_in_order_params(graph, alignment, false);
+    let mut slots = Vec::with_capacity(shared.len());
+    let mut weights_end = 0usize;
+    let mut placed = HashMap::new();
+    for node in &shared {
+        let size = full.assignments[&node.id].size;
+        let Op::Param { name } = &node.op else {
+            unreachable!()
+        };
+        slots.push((shared_key(name, node.shape.dtype()), size, weights_end));
+        placed.insert(
+            node.id,
+            memory::BufferSlot {
+                offset: weights_end,
+                size,
+            },
+        );
+        weights_end += size.next_multiple_of(page);
+    }
+    // Activations after them (a whole number of pages, so alignment holds).
+    for slot in plan.assignments.values_mut() {
+        slot.offset += weights_end;
+    }
+    plan.assignments.extend(placed);
+    let shared_ids: std::collections::HashSet<NodeId> = shared.iter().map(|n| n.id).collect();
+    let align = alignment.max(64);
+    let mut tail = plan.arena_size + weights_end;
+    for node in graph.nodes() {
+        if !matches!(node.op, Op::Param { .. }) || shared_ids.contains(&node.id) {
+            continue;
+        }
+        if let Some(slot) = full.assignments.get(&node.id) {
+            tail = tail.next_multiple_of(align);
+            plan.assignments.insert(
+                node.id,
+                memory::BufferSlot {
+                    offset: tail,
+                    size: slot.size,
+                },
+            );
+            tail += slot.size;
+        }
+    }
+    // Views of a param borrow its (moved) slot.
+    for (&view, &(root, off)) in &views {
+        if matches!(graph.node(root).op, Op::Param { .. })
+            && let (Some(r), Some(v)) = (plan.assignments.get(&root), full.assignments.get(&view))
+        {
+            let slot = memory::BufferSlot {
+                offset: r.offset + off,
+                size: v.size,
+            };
+            plan.assignments.insert(view, slot);
+        }
+    }
+    plan.arena_size = tail;
+    Some((plan, slots))
 }
 
 #[derive(Clone)]
@@ -365,6 +542,9 @@ struct CpuExecutable {
     /// graph node plus a sort, per training step); cleared whenever
     /// `arena_handles` changes, which is the only part of the set that can.
     keep_ranges: Option<Vec<(usize, usize)>>,
+    /// Params whose shared pages another executable had already filled
+    /// ([`rlx_cpu::shared_params`]), so binding them again is redundant.
+    shared_present: std::collections::HashSet<String>,
 }
 
 unsafe impl Send for CpuExecutable {}
@@ -693,6 +873,10 @@ impl CpuExecutable {
 }
 
 impl ExecutableGraph for CpuExecutable {
+    fn param_already_set(&self, name: &str) -> bool {
+        self.shared_present.contains(name)
+    }
+
     fn capabilities(&self) -> crate::ExecutableCapabilities {
         crate::ExecutableCapabilities {
             clone: true,
@@ -748,8 +932,13 @@ impl ExecutableGraph for CpuExecutable {
         // The bytes go in verbatim, and the signature carries no dtype to check
         // them against. A param that AMP rewrote to F16/BF16 would be silently
         // corrupted by F32 bytes, so refuse anything but F32 storage and let
-        // the caller take the whole-buffer path, which does convert.
-        if self.node_dtypes.get(&id).copied().unwrap_or(DType::F32) != DType::F32 {
+        // the caller take the whole-buffer path, which does convert. U8 is the
+        // exception: a packed quant blob is stored byte for byte, so a slot
+        // write of packed expert bytes (paged GGUF MoE) is exact.
+        if !matches!(
+            self.node_dtypes.get(&id).copied().unwrap_or(DType::F32),
+            DType::F32 | DType::U8
+        ) {
             return false;
         }
         // Bound to the PARAM, not to the arena: params sit in a shared buffer,

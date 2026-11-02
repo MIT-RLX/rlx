@@ -24,6 +24,8 @@ const MR: usize = 4;
 const NR: usize = 8;
 /// From this many rows an untransposed B is packed into the tiles' layout.
 const PACK_MIN_M: usize = 8;
+/// From this many columns a fused few-row product streams B rows.
+const STREAM_MIN_N: usize = 32;
 
 /// How the fallback it replaces starts and finishes each element.
 #[derive(Clone, Copy)]
@@ -73,14 +75,19 @@ pub(crate) unsafe fn sgemm(
     };
 }
 
-/// One term of an element's sum: `s + a·b`, fused when `HW`.
+/// One term of an element's sum: `s + a·b`, fused when `HW` (one lane of
+/// the hardware `relaxed_madd`: `HW` is only chosen where that is fused).
 #[inline(always)]
 fn term<const HW: bool>(s: f32, a: f32, b: f32) -> f32 {
+    #[cfg(target_feature = "relaxed-simd")]
     if HW {
-        crate::avx2_mirror::fmaf(a, b, s)
-    } else {
-        s + a * b
+        return f32x4_extract_lane::<0>(f32x4_relaxed_madd(
+            f32x4_splat(a),
+            f32x4_splat(b),
+            f32x4_splat(s),
+        ));
     }
+    s + a * b
 }
 
 /// [`term`] on four lanes.
@@ -146,7 +153,9 @@ unsafe fn sgemm_with<const HW: bool>(
         }
     };
     // ... and its fused form: the same i→p→j stream, one FMA per term.
-    if matches!(mode, Mode::Accumulate) && m < PACK_MIN_M {
+    // (Narrower rows go through the tiles: the stream's per-`k` store and
+    // reload of C is a dependency chain the tiles keep in registers.)
+    if matches!(mode, Mode::Accumulate) && m < PACK_MIN_M && n >= STREAM_MIN_N {
         let n4 = n / 4 * 4;
         for i in 0..m {
             let crow = unsafe { c.add(i * ldc) };
@@ -210,7 +219,12 @@ unsafe fn sgemm_with<const HW: bool>(
             _ => {}
         }
     }
-    // The last `n % 8` columns, one element at a time.
+    // The last `n % 8` columns (all of them when n < 8), four rows to a
+    // vector: rows `i0..i0+4` of `op(A)` packed per `k` (a short last group
+    // padded with zero rows that are never stored), every tail column's
+    // accumulator live at once so their `k` chains overlap. The fallback
+    // skips a zero `alpha·a` in `Accumulate`; here a lane keeps its old sum
+    // where that is zero.
     let bt = |p: usize, j: usize| unsafe {
         if trans_b {
             *b.add(j * ldb + p)
@@ -218,26 +232,52 @@ unsafe fn sgemm_with<const HW: bool>(
             *b.add(p * ldb + j)
         }
     };
-    for i in 0..m {
-        for j in full..n {
-            let cp = unsafe { c.add(i * ldc + j) };
-            match mode {
-                Mode::Accumulate => {
-                    let mut s = unsafe { *cp };
-                    for p in 0..k {
-                        let av = alpha * at(i, p);
-                        if av != 0.0 {
-                            s = term::<HW>(s, av, bt(p, j));
-                        }
-                    }
-                    unsafe { *cp = s };
+    let tail = n - full;
+    if tail > 0 {
+        let mut ap = vec![f32x4_splat(0.0); k];
+        for i0 in (0..m).step_by(4) {
+            let rows = (m - i0).min(4);
+            for (p, v) in ap.iter_mut().enumerate() {
+                let x: [f32; 4] =
+                    std::array::from_fn(|r| if r < rows { at(i0 + r, p) } else { 0.0 });
+                *v = f32x4(x[0], x[1], x[2], x[3]);
+                if let Mode::Accumulate = mode {
+                    *v = f32x4_mul(f32x4_splat(alpha), *v);
                 }
-                Mode::Scale => {
-                    let mut s = 0f32;
-                    for p in 0..k {
-                        s = term::<HW>(s, at(i, p), bt(p, j));
-                    }
-                    unsafe { *cp = finish(alpha, beta, s, *cp) };
+            }
+            let cp = |r: usize, t: usize| unsafe { c.add((i0 + r) * ldc + full + t) };
+            let mut acc = [f32x4_splat(0.0); NR - 1];
+            if let Mode::Accumulate = mode {
+                for (t, v) in acc[..tail].iter_mut().enumerate() {
+                    let x: [f32; 4] =
+                        std::array::from_fn(|r| if r < rows { unsafe { *cp(r, t) } } else { 0.0 });
+                    *v = f32x4(x[0], x[1], x[2], x[3]);
+                }
+            }
+            for (p, &av) in ap.iter().enumerate() {
+                let live = f32x4_ne(av, f32x4_splat(0.0));
+                for (t, v) in acc[..tail].iter_mut().enumerate() {
+                    let next = term4::<HW>(*v, av, f32x4_splat(bt(p, full + t)));
+                    *v = match mode {
+                        Mode::Accumulate => v128_bitselect(next, *v, live),
+                        Mode::Scale => next,
+                    };
+                }
+            }
+            for (t, v) in acc[..tail].iter().enumerate() {
+                let lanes = [
+                    f32x4_extract_lane::<0>(*v),
+                    f32x4_extract_lane::<1>(*v),
+                    f32x4_extract_lane::<2>(*v),
+                    f32x4_extract_lane::<3>(*v),
+                ];
+                for (r, &l) in lanes.iter().enumerate().take(rows) {
+                    unsafe {
+                        *cp(r, t) = match mode {
+                            Mode::Accumulate => l,
+                            Mode::Scale => finish(alpha, beta, l, *cp(r, t)),
+                        }
+                    };
                 }
             }
         }
@@ -371,7 +411,20 @@ mod tests {
                         .map(|i| if i % 11 == 0 { 0.0 } else { rnd() })
                         .collect();
                     let b: Vec<f32> = (0..ldb * if tb { n } else { k })
-                        .map(|_| rnd() * 3.0)
+                        // an infinity every 37th: a zero `alpha·a` that is not skipped turns an
+                        // infinite sum into NaN
+                        .enumerate()
+                        .map(|(i, _)| {
+                            if i % 37 == 5 {
+                                if i % 2 == 0 {
+                                    f32::INFINITY
+                                } else {
+                                    f32::NEG_INFINITY
+                                }
+                            } else {
+                                rnd() * 3.0
+                            }
+                        })
                         .collect();
                     let c0: Vec<f32> = (0..ldc * m)
                         .map(|i| {
@@ -471,7 +524,20 @@ mod tests {
                         .map(|i| if i % 11 == 0 { 0.0 } else { rnd() })
                         .collect();
                     let b: Vec<f32> = (0..ldb * if tb { n } else { k })
-                        .map(|_| rnd() * 3.0)
+                        // an infinity every 37th: a zero `alpha·a` that is not skipped turns an
+                        // infinite sum into NaN
+                        .enumerate()
+                        .map(|(i, _)| {
+                            if i % 37 == 5 {
+                                if i % 2 == 0 {
+                                    f32::INFINITY
+                                } else {
+                                    f32::NEG_INFINITY
+                                }
+                            } else {
+                                rnd() * 3.0
+                            }
+                        })
                         .collect();
                     let c0: Vec<f32> = (0..ldc * m).map(|_| rnd()).collect();
                     let at = |i: usize, p: usize| if ta { a[p * lda + i] } else { a[i * lda + p] };
@@ -520,9 +586,8 @@ mod tests {
                                 super::finish(alpha, beta, s, old)
                             };
                             let g = got[i * ldc + j];
-                            assert_eq!(
-                                g.to_bits(),
-                                want.to_bits(),
+                            assert!(
+                                g.to_bits() == want.to_bits() || (g.is_nan() && want.is_nan()),
                                 "m{m} n{n} k{k} ta{ta} tb{tb} a{alpha} b{beta} at ({i},{j}): {g} vs {want}"
                             );
                         }

@@ -3407,18 +3407,20 @@ pub fn max_texture() -> usize {
     rlx_ir::env::parse_or("RLX_WEBGL_MAX_TEXTURE", MAX_COLS).max(1)
 }
 
-/// Lay out tall slots (`rows > TALL_ROWS`) as `ceil(n / WIDE_COLS) × WIDE_COLS`.
+/// Lay out tall slots (`rows > TALL_ROWS`), and slots wider than a texture
+/// (`cols > MAX_COLS`, a long 1-D tensor), as `ceil(n / WIDE_COLS) × WIDE_COLS`.
 ///
 /// A slot is `rest × last_dim` texels, so a tensor with a short last axis —
 /// a conv weight `[cout, cin, 1, k]` is `cout·cin × k` — overflows WebGL's
 /// `MAX_TEXTURE_SIZE` (16384 on most desktops) long before it is large.
 ///
-/// Shape matters only to kernels that work on rows: matmul, softmax, the
-/// norms (and custom ops, unknown). Gather / reduce / leaf uploads address
-/// texels by linear index, and element-wise kernels need only that every
-/// operand shares the output's layout. So slots joined by element-wise steps
-/// form a group, and a tall group is widened together unless a member is
-/// produced or read by a row kernel.
+/// Matmul, softmax, the norms, gather, reduce and leaf uploads address texels
+/// by linear index (with each slot's own width), and element-wise kernels
+/// need only that every operand shares the output's layout (softmax and the
+/// norms read their input at the output's texel too). So slots joined that
+/// way form a group, and a tall group is widened together unless a member is
+/// produced or read by a kernel that needs its natural layout (the
+/// lane-packed complex ones, custom ops).
 fn widen_tall_slots(plan: &mut Plan) {
     let side = max_texture();
     let (tall_rows, wide_cols, max_cols) =
@@ -3481,15 +3483,11 @@ fn widen_tall_slots(plan: &mut Plan) {
                 union(&mut parent, *out, *a);
                 union(&mut parent, *out, *b);
             }
-            Step::MatMul { out, a, b, .. } => {
-                for s in [*out, *a, *b] {
-                    pinned[s] = true;
-                }
-            }
-            Step::Softmax { out, a, .. } => {
-                pinned[*out] = true;
-                pinned[*a] = true;
-            }
+            // read by linear index (each operand's own texture width)
+            Step::MatMul { .. } => {}
+            // the input is read at the output's texel, the row by index
+            Step::Softmax { out, a, .. } => union(&mut parent, *out, *a),
+            // likewise, and gamma / beta share one width
             Step::LayerNorm {
                 out,
                 x,
@@ -3504,9 +3502,8 @@ fn widen_tall_slots(plan: &mut Plan) {
                 beta,
                 ..
             } => {
-                for s in [*out, *x, *gamma, *beta] {
-                    pinned[s] = true;
-                }
+                union(&mut parent, *out, *x);
+                union(&mut parent, *gamma, *beta);
             }
             // Lane-packed complex kernels: keep their natural layout.
             Step::ComplexCast { out, .. } | Step::BinaryC64 { out, .. } => pinned[*out] = true,
@@ -3526,7 +3523,10 @@ fn widen_tall_slots(plan: &mut Plan) {
         let len = plan.slot_len[s];
         let ok = group_ok.entry(r).or_insert(true);
         *ok &= !pinned[s] && *group_len.entry(r).or_insert(len) == len;
-        *group_tall.entry(r).or_insert(false) |= plan.slot_dims[s].0 > tall_rows;
+        // tall, or a single row wider than a texture may be (a training
+        // graph's flat gradient vector is one `1 x n` row of millions)
+        let (rows, cols) = plan.slot_dims[s];
+        *group_tall.entry(r).or_insert(false) |= rows > tall_rows || cols > max_cols;
     }
     for s in 0..n {
         let r = find(&mut parent, s);

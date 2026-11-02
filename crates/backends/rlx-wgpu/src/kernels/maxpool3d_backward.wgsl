@@ -34,9 +34,15 @@ struct Params {
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1) var<uniform>              params: Params;
 
+// A large dispatch spills into y (`dispatch_dims`: past 65535 workgroups);
+// reading `gid.x` alone left all but the first row of workgroups repeating
+// the first — FastSurfer's full-size unpool at a batch of 4 and up.
 @compute @workgroup_size(256, 1, 1)
-fn maxpool3d_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn maxpool3d_backward(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) ngs: vec3<u32>,
+) {
+    let idx = gid.x + gid.y * ngs.x * 256u;
     let total = params.n * params.c * params.d * params.h * params.w;
     if (idx >= total) {
         return;

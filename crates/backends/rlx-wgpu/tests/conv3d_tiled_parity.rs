@@ -321,3 +321,80 @@ fn pointwise_conv_and_channel_argmax_fused() {
         );
     }
 }
+
+/// `CONV3D_TOPK`: a pointwise conv's `k` largest channels per voxel, their
+/// `k + 1`-th as a bound, and their indices — the same values as the plain
+/// conv's logits, ranked with the earlier channel first among equals.
+#[test]
+fn pointwise_conv_top_k() {
+    // c_out 11: a remainder tile; channel 6 a copy of channel 3, so they tie
+    let (c_in, c_out, dims, k) = (5, 11, [3, 5, 9], 4);
+    let per = dims.iter().product::<usize>();
+    let x = ramp(c_in * per, 13);
+    let mut w = ramp(c_out * c_in, 7);
+    let three = w[3 * c_in..4 * c_in].to_vec();
+    w[6 * c_in..7 * c_in].copy_from_slice(&three);
+    let mut b: Vec<f32> = (0..c_out).map(|i| 0.07 * i as f32 - 0.3).collect();
+    b[6] = b[3];
+    let sh = |d: &[usize]| Shape::new(d, DType::F32);
+    let vol = |c: usize| sh(&[1, c, dims[0], dims[1], dims[2]]);
+    let conv = |top: bool| {
+        let mut g = Graph::new("conv_topk");
+        let xi = g.input("x", vol(c_in));
+        let wi = g.input("w", sh(&[c_out, c_in, 1, 1, 1]));
+        let bi = g.input("b", sh(&[c_out]));
+        let y = if top {
+            let attrs: Vec<u8> = [1u32, 1, 1, 0, 0, 0, 1, 1, 1, 1, (k as f32).to_bits()]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            g.add_node(
+                Op::Custom {
+                    name: rlx_wgpu::unfuse::CONV3D_TOPK.to_string(),
+                    num_inputs: 3,
+                    attrs,
+                },
+                vec![xi, wi, bi],
+                vol(2 * k + 1),
+            )
+        } else {
+            g.add_node(
+                Op::FusedConvBiasAct {
+                    kernel_size: vec![1; 3],
+                    stride: vec![1; 3],
+                    padding: vec![0; 3],
+                    dilation: vec![1; 3],
+                    groups: 1,
+                    activation: None,
+                    has_residual: false,
+                },
+                vec![xi, wi, bi],
+                vol(c_out),
+            )
+        };
+        g.set_outputs(vec![y]);
+        g
+    };
+    let ins: Vec<(&str, &[f32])> = vec![("x", &x), ("w", &w), ("b", &b)];
+    let top = WgpuExecutable::compile(conv(true)).run(&ins).remove(0);
+    let z = WgpuExecutable::compile(conv(false)).run(&ins).remove(0);
+    for v in 0..per {
+        let mut order: Vec<usize> = (0..c_out).collect();
+        // stable: equals keep channel order
+        order.sort_by(|&a, &b| z[b * per + v].total_cmp(&z[a * per + v]));
+        for r in 0..=k {
+            assert_eq!(
+                top[r * per + v],
+                z[order[r] * per + v],
+                "value {r} at voxel {v}"
+            );
+        }
+        for r in 0..k {
+            assert_eq!(
+                top[(k + 1 + r) * per + v],
+                order[r] as f32,
+                "channel {r} at voxel {v}"
+            );
+        }
+    }
+}

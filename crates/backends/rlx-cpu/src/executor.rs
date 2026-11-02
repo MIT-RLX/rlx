@@ -645,11 +645,11 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                                 for ki in 0..s_k {
                                     let q_off = qi * head_dim;
                                     let k_off = ki * head_dim;
-                                    #[cfg(target_arch = "aarch64")]
+                                    #[cfg(rlx_cpu_neon)]
                                     let mut dot;
-                                    #[cfg(not(target_arch = "aarch64"))]
+                                    #[cfg(not(rlx_cpu_neon))]
                                     let mut dot = 0f32;
-                                    #[cfg(target_arch = "aarch64")]
+                                    #[cfg(rlx_cpu_neon)]
                                     unsafe {
                                         use std::arch::aarch64::*;
                                         let chunks = head_dim / 4;
@@ -664,7 +664,7 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                                             dot += q_head[q_off + d] * k_head[k_off + d];
                                         }
                                     }
-                                    #[cfg(not(target_arch = "aarch64"))]
+                                    #[cfg(not(rlx_cpu_neon))]
                                     {
                                         for d in 0..*head_dim {
                                             dot += q_head[q_off + d] * k_head[k_off + d];
@@ -753,7 +753,7 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                                     if sc > 1e-8 {
                                         let v_off = ki * head_dim;
                                         let o_off = qi * head_dim;
-                                        #[cfg(target_arch = "aarch64")]
+                                        #[cfg(rlx_cpu_neon)]
                                         unsafe {
                                             use std::arch::aarch64::*;
                                             let vsc = vdupq_n_f32(sc);
@@ -770,7 +770,7 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                                                 );
                                             }
                                         }
-                                        #[cfg(not(target_arch = "aarch64"))]
+                                        #[cfg(not(rlx_cpu_neon))]
                                         for d in 0..*head_dim {
                                             out_head[o_off + d] += sc * v_head[v_off + d];
                                         }

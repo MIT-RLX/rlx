@@ -254,3 +254,108 @@ fn one_residual_level_equals_plain_quantize() {
         );
     }
 }
+
+/// Element `(i, j)` of a `rows×cols` weight must be scaled by grid cell
+/// `(i / b0, j / b1)` — checked against the index math written out directly,
+/// on a ragged 128-block grid (edges are partial blocks), plus the
+/// per-tensor / per-channel / stacked (MoE bank) shapes and the error cases.
+#[test]
+fn apply_weight_scales_matches_block_index_math() {
+    use rlx_ir::lowp_codec::apply_weight_scales;
+    let (rows, cols) = (300usize, 200usize); // 3×2 grid of 128-blocks
+    let (sr, sc) = (3usize, 2usize);
+    let scale: Vec<f32> = (0..sr * sc).map(|k| (k + 2) as f32).collect();
+    let mut w = vec![1.0f32; rows * cols];
+    apply_weight_scales(&mut w, &[rows, cols], &scale, &[sr, sc], None).unwrap();
+    for i in 0..rows {
+        for j in 0..cols {
+            let want = scale[(i / 128) * sc + j / 128];
+            assert_eq!(w[i * cols + j], want, "({i}, {j})");
+        }
+    }
+
+    // Explicit block size that inference would not pick.
+    let mut w = vec![1.0f32; 4 * 6];
+    apply_weight_scales(
+        &mut w,
+        &[4, 6],
+        &[1.0, 2.0, 3.0, 4.0],
+        &[2, 2],
+        Some([2, 3]),
+    )
+    .unwrap();
+    assert_eq!(&w[..6], &[1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+    assert_eq!(&w[18..], &[3.0, 3.0, 3.0, 4.0, 4.0, 4.0]);
+
+    // Per-tensor (`[]` and `[1]`), per-channel (`[rows]` and `[rows, 1]`).
+    for ss in [&[][..], &[1][..]] {
+        let mut w = vec![2.0f32; 6];
+        apply_weight_scales(&mut w, &[2, 3], &[0.5], ss, None).unwrap();
+        assert_eq!(w, vec![1.0; 6]);
+    }
+    for ss in [&[2][..], &[2, 1][..]] {
+        let mut w = vec![1.0f32; 6];
+        apply_weight_scales(&mut w, &[2, 3], &[2.0, 3.0], ss, None).unwrap();
+        assert_eq!(w, vec![2.0, 2.0, 2.0, 3.0, 3.0, 3.0]);
+    }
+
+    // Stacked experts: one grid per leading index.
+    let mut w = vec![1.0f32; 2 * 2 * 2];
+    apply_weight_scales(&mut w, &[2, 2, 2], &[5.0, 7.0], &[2, 1, 1], None).unwrap();
+    assert_eq!(w, vec![5.0, 5.0, 5.0, 5.0, 7.0, 7.0, 7.0, 7.0]);
+
+    // Mismatches are errors, never a silent partial scale.
+    let mut w = vec![1.0f32; 6];
+    assert!(apply_weight_scales(&mut w, &[2, 3], &[1.0; 4], &[2, 2], Some([2, 2])).is_err());
+    assert!(apply_weight_scales(&mut w, &[2, 3], &[1.0; 12], &[3, 4], None).is_err());
+    assert!(apply_weight_scales(&mut w, &[2, 3], &[1.0; 2], &[1, 2], None).is_ok());
+    assert!(apply_weight_scales(&mut w, &[6], &[1.0; 2], &[2], None).is_err());
+}
+
+/// Block-FP8 (`Fp8E4m3B128` / `Fp8E5m2B128`): `dequant(pack(codes, scales))`
+/// is `decode(code) · scale[row][j / 128]` for every finite code of the format
+/// (bit-exact — one f32 multiply), and the geometry agrees with `QuantScheme`.
+#[test]
+fn fp8_b128_pack_dequant_matches_scaled_decode() {
+    use rlx_ir::lowp_codec::fp8_b128::{
+        BLOCK_BYTES, QK, dequant, dequant_block, dequant_scheme, format, pack, packed_bytes, scheme,
+    };
+    use rlx_ir::quant::{QuantScheme, ScaledFormat};
+    for (s, fmt, id) in [
+        (QuantScheme::Fp8E4m3B128, ScaledFormat::F8E4M3, 30),
+        (QuantScheme::Fp8E5m2B128, ScaledFormat::F8E5M2, 31),
+    ] {
+        assert_eq!(
+            (s.gguf_block_size() as usize, s.gguf_block_bytes() as usize),
+            (QK, BLOCK_BYTES)
+        );
+        assert!(s.is_gguf() && s.gpu_dequant_scheme_id() == Some(id));
+        assert_eq!((format(s), scheme(fmt)), (Some(fmt), Some(s)));
+
+        let (n, k) = (3usize, 384usize);
+        let finite: Vec<u8> = (0..=255u8).filter(|&c| fmt.decode(c).is_finite()).collect();
+        let codes: Vec<u8> = (0..n * k).map(|i| finite[(i * 7) % finite.len()]).collect();
+        let scales: Vec<f32> = (0..n * (k / QK))
+            .map(|t| 0.0371 * (t as f32 + 1.0))
+            .collect();
+        let packed = pack(&codes, &scales, n, k).unwrap();
+        assert_eq!(packed.len(), packed_bytes(n, k).unwrap());
+        let w = dequant(fmt, &packed, n * k).unwrap();
+        assert_eq!(dequant_scheme(s, &packed, n * k).unwrap(), w);
+        for i in 0..n {
+            for j in 0..k {
+                let want = fmt.decode(codes[i * k + j]) * scales[i * (k / QK) + j / QK];
+                assert_eq!(w[i * k + j].to_bits(), want.to_bits(), "{s} ({i}, {j})");
+            }
+        }
+        let mut blk = [0f32; QK];
+        dequant_block(fmt, &packed[BLOCK_BYTES..2 * BLOCK_BYTES], &mut blk);
+        assert_eq!(&blk[..], &w[QK..2 * QK]);
+
+        assert!(packed_bytes(1, 100).is_none());
+        assert!(pack(&codes, &scales[1..], n, k).is_err());
+        assert!(dequant(fmt, &packed[1..], n * k).is_err());
+    }
+    assert!(format(QuantScheme::GgufQ8_0).is_none());
+    assert!(dequant_scheme(QuantScheme::GgufQ8_0, &[], 0).is_err());
+}

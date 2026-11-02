@@ -437,7 +437,7 @@ fn pool3d_and_channel_concat() {
         parity(g, &[("x", &xs)]);
     }
     let a = f32s(n * 2 * d * h * w, |i| i as f32);
-    let b = f32s(n * 1 * d * h * w, |i| -(i as f32));
+    let b = f32s(n * d * h * w, |i| -(i as f32));
     let mut g = Graph::new("cat3");
     let xa = g.input("a", sh(&[n, 2, d, h, w]));
     let xb = g.input("b", sh(&[n, 1, d, h, w]));

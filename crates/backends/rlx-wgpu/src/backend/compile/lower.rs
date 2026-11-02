@@ -504,10 +504,26 @@ fn two_window_ok(arena: &crate::buffer::Arena, node: &rlx_ir::Node, graph: &Grap
     let f32 = |id: NodeId| {
         graph.node(id).shape.dtype() == rlx_ir::DType::F32 || crate::unfuse::is_half(graph.node(id))
     };
+    // and clear of its stripe's stage reserve: a tensor past the stripe's
+    // usable part gets a stripe of its own, reserve and all
+    // (`snap_plan_to_shards_ex`), and the weights staged there would
+    // overwrite its end (6% of a 1.1 MB input's conv wrong at 2 MiB stripes,
+    // 1 MiB reserve)
+    let clear_of_reserve = |id: NodeId| {
+        let o = arena.offset(id);
+        if crate::buffer::is_weight_off(o) {
+            return true;
+        }
+        let end = o + arena.len_of(id).max(1);
+        end <= arena.shard_stage_off(o) || o >= arena.shard_stage_end(o)
+    };
     (conv || norm)
         && f32(node.id)
         && one_stripe(node.id)
-        && node.inputs.iter().all(|&i| f32(i) && one_stripe(i))
+        && node
+            .inputs
+            .iter()
+            .all(|&i| f32(i) && one_stripe(i) && clear_of_reserve(i))
 }
 
 fn should_pack_host_op(
@@ -896,9 +912,9 @@ fn compile_static_with(
     // window (not only when it exceeds max_buffer_size). On Metal we raise
     // max_buffer_size to ~40 GiB so F5 fits in one buffer, but Param→Reshape
     // views still need the split pass or they stay zeroed and DiT collapses.
-    // Weight-buffer offsets are tagged with a high bit (`WEIGHT_BUF_TAG`): on
-    // wasm32 that is bit 31, so an arena crossing 2 GiB would read its own
-    // offsets as weight-tagged. Split before it can — a no-op on 64-bit.
+    // Weight-buffer offsets start at `WEIGHT_BUF_TAG`: on wasm32 that is
+    // 3 GiB, so an arena crossing it would read its own offsets as weight
+    // offsets. Split before it can — a no-op on 64-bit.
     let split_at = max_bind.min(crate::buffer::WEIGHT_BUF_TAG as u64);
     // Packed GGUF weights read only by the fused GEMV can also live in the
     // weight buffer when the arena is small: the GEMV binds it in place, and
@@ -2160,6 +2176,87 @@ fn compile_static_with(
                     _p1: 0,
                     _p2: 0,
                     _p3: 0,
+                };
+                schedule.push(Step::Unary {
+                    params: p,
+                    f16_mirror: false,
+                });
+                let u = emit_uniform(std::mem::size_of::<UnaryParams>());
+                let bg = bind_arena_window(&dev.device, uk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+            // `PRELU`: one pass, the unary kernel with the slope in `_p0`
+            // (`PRELU_TENSOR_OP`: the slope a tensor, its offset in `_p0`)
+            Op::Custom { name, attrs, .. } if name == crate::unfuse::PRELU => {
+                let word = |k: usize| {
+                    u32::from_le_bytes(attrs[4 * k..4 * k + 4].try_into().expect("PRELU attrs"))
+                };
+                let slope = node.inputs.get(1).copied();
+                let in_id = node.inputs[0];
+                let win_ids: Vec<NodeId> = [node.id, in_id].into_iter().chain(slope).collect();
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win_ids,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                // the slope first: staging it may move the window
+                let slope_off = slope.map(|sl| {
+                    arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        sl,
+                        &mut base,
+                        &mut size,
+                    )
+                });
+                let in_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    in_id,
+                    &mut base,
+                    &mut size,
+                );
+                let p = match slope_off {
+                    None => UnaryParams {
+                        n: elems,
+                        in_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        op: crate::unfuse::PRELU_OP,
+                        _p0: word(0),
+                        _p1: 0,
+                        _p2: 0,
+                        _p3: 0,
+                    },
+                    Some(slope_off) => UnaryParams {
+                        n: elems,
+                        in_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        op: crate::unfuse::PRELU_TENSOR_OP,
+                        _p0: slope_off,
+                        _p1: word(0),
+                        _p2: word(1),
+                        _p3: 0,
+                    },
                 };
                 schedule.push(Step::Unary {
                     params: p,
@@ -6307,6 +6404,10 @@ fn compile_static_with(
                             alpha: 0,
                             split: 0,
                             half: 0,
+                            in_prelu: 0,
+                            in_alpha: 0,
+                            res_max: 0,
+                            res_off: 0,
                         };
                         schedule.push(Step::Conv3d { params: p3 });
                         let ck = conv3d_kernel(&dev.device);
@@ -7561,15 +7662,27 @@ fn compile_static_with(
             {
                 let (stride, padding, dilation, groups, act, alpha) =
                     crate::unfuse::conv3d_geometry(op).unwrap();
+                let in_prelu = crate::unfuse::conv3d_in_prelu(op);
+                // a fourth input: the `max` taken in the store
+                let res_id = crate::unfuse::conv3d_max_residual(op).then(|| node.inputs[3]);
                 let (stride, padding, dilation, groups) = (&stride, &padding, &dilation, &groups);
                 let in_id = node.inputs[0];
                 let w_id = node.inputs[1];
                 let max_binding = dev.device.limits().max_storage_buffer_binding_size;
-                let fits = arena_span_bytes(&arena, &[node.id, in_id, w_id]) <= max_binding
-                    && !arena_span_crosses_shard(&arena, &[node.id, in_id]);
+                let span: Vec<NodeId> = [node.id, in_id, w_id].into_iter().chain(res_id).collect();
+                let acts: Vec<NodeId> = [node.id, in_id].into_iter().chain(res_id).collect();
+                let fits = arena_span_bytes(&arena, &span) <= max_binding
+                    && !arena_span_crosses_shard(&arena, &acts);
+                // a folded `max` reads a third activation in the output's
+                // window: past one binding, compile again without the folds
+                // (this compile is dropped: nothing of the node is emitted)
+                if res_id.is_some() && !fits {
+                    FOLDED_HOSTED.with(|f| f.set(true));
+                    continue;
+                }
                 // input and output in different stripes: each its own window
                 // (`two_window_kernel`), the weights staged beside the input
-                let two = !fits && two_window_ok(&arena, node, &graph);
+                let two = !fits && res_id.is_none() && two_window_ok(&arena, node, &graph);
                 if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
                     eprintln!(
                         "[rlx-wgpu] conv3d node {}: fits {fits} two {two} in@{} out@{} sharded {}",
@@ -7579,11 +7692,7 @@ fn compile_static_with(
                         arena.is_sharded()
                     );
                 }
-                let win_ids: Vec<NodeId> = if two {
-                    vec![in_id, w_id]
-                } else {
-                    vec![node.id, in_id, w_id]
-                };
+                let win_ids: Vec<NodeId> = if two { vec![in_id, w_id] } else { span.clone() };
                 let mut scratch = arena.scratch_off as u64;
                 let (mut base, mut size, param_anchor) = arena_multi_op_window(
                     &dev.device,
@@ -7635,8 +7744,13 @@ fn compile_static_with(
                 // weight's, its spatial dims the output's last three
                 let out_shape = node.shape.dims();
                 let argmax = act == crate::unfuse::ARGMAX_ACT;
+                // a `CONV3D_TOPK` writes `[n, 2k + 1, d, h, w]`: channels the
+                // weight's too
+                let topk = act == crate::unfuse::TOPK_ACT;
                 let (c_out, out_sp) = if argmax {
                     (w_shape[0], &out_shape[1..4])
+                } else if topk {
+                    (w_shape[0], &out_shape[2..5])
                 } else {
                     (out_shape[1], &out_shape[2..5])
                 };
@@ -7665,6 +7779,19 @@ fn compile_static_with(
                 } else {
                     in_off
                 };
+                let res_off = res_id.map(|r| {
+                    arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        r,
+                        &mut base,
+                        &mut size,
+                    )
+                });
                 let out_off = match out_win {
                     Some((b1, _)) => arena_local_off_f32(&arena, node.id, b1),
                     None => arena_local_off_f32(&arena, node.id, base),
@@ -7702,6 +7829,10 @@ fn compile_static_with(
                     split: two as u32,
                     half: crate::unfuse::is_half(graph.node(in_id)) as u32
                         | (crate::unfuse::is_half(node) as u32) << 1,
+                    in_prelu: in_prelu.is_some() as u32,
+                    in_alpha: in_prelu.unwrap_or(0.0).to_bits(),
+                    res_max: res_off.is_some() as u32,
+                    res_off: res_off.unwrap_or(0),
                 };
                 schedule.push(Step::Conv3d { params: p3 });
                 let u = emit_uniform(std::mem::size_of::<Conv3dParams>());
@@ -7862,6 +7993,10 @@ fn compile_static_with(
                         alpha: 0,
                         split: 0,
                         half: 0,
+                        in_prelu: 0,
+                        in_alpha: 0,
+                        res_max: 0,
+                        res_off: 0,
                     };
                     schedule.push(Step::ConvTranspose3d { params: p3 });
                     let sk = conv_transpose3d_kernel(&dev.device);

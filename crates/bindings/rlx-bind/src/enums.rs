@@ -347,7 +347,7 @@ pub fn scale_layout(s: &str) -> ApiResult<ScaleLayout> {
 /// GGUF names (`"Q4_K"`, `"IQ2_XXS"`, …) go through `rlx-gguf`'s own table
 /// (feature `gguf`). The non-GGUF schemes take their block parameters after a
 /// colon: `"int8:32"`, `"int8_asym:32"`, `"int4:32"`, `"fp8e4m3"`, `"fp8e5m2"`,
-/// `"nvfp4"`, `"mlx_affine:4:64"`, `"mlx_mxfp4:32"`, `"mlx_mxfp8:32"`,
+/// `"fp8e4m3_b128"`, `"fp8e5m2_b128"`, `"nvfp4"`, `"mlx_affine:4:64"`, `"mlx_mxfp4:32"`, `"mlx_mxfp8:32"`,
 /// `"mxfp4x2:32"`.
 pub fn quant_scheme(s: &str) -> ApiResult<QuantScheme> {
     let mut parts = s.trim().split(':');
@@ -369,6 +369,8 @@ pub fn quant_scheme(s: &str) -> ApiResult<QuantScheme> {
         }),
         "fp8e4m3" => Some(QuantScheme::Fp8E4m3),
         "fp8e5m2" => Some(QuantScheme::Fp8E5m2),
+        "fp8e4m3b128" => Some(QuantScheme::Fp8E4m3B128),
+        "fp8e5m2b128" => Some(QuantScheme::Fp8E5m2B128),
         "nvfp4" | "nvfp4block" => Some(QuantScheme::Nvfp4Block),
         "mlxaffine" => Some(QuantScheme::MlxAffine {
             bits: at(0, 4) as u8,
@@ -394,7 +396,7 @@ pub fn quant_scheme(s: &str) -> ApiResult<QuantScheme> {
     }
     Err(ApiError::type_(format!(
         "unknown quant scheme '{s}' (a GGUF type such as Q4_K — needs the `gguf` feature — or \
-         int8:<block>, int8_asym:<block>, int4:<block>, fp8e4m3, fp8e5m2, nvfp4, \
+         int8:<block>, int8_asym:<block>, int4:<block>, fp8e4m3, fp8e5m2, fp8e4m3_b128, fp8e5m2_b128, nvfp4, \
          mlx_affine:<bits>:<group>, mlx_mxfp4:<group>, mlx_mxfp8:<group>, mxfp4x2:<group>)"
     )))
 }

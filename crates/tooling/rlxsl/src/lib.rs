@@ -915,6 +915,8 @@ impl Lang {
         match (self, i) {
             (_, Intr::Exp) => match self {
                 Cuda => "expf",
+                // WGSL's `exp` rounds by the compiler's math mode; see `exact`.
+                Wgsl => "rlx_exp",
                 _ => "exp",
             },
             (_, Intr::Log) => match self {
@@ -1073,14 +1075,37 @@ fn render(sx: &Sx, lang: Lang, stmts: &mut Vec<String>) -> String {
                 _ => format!("clamp({ae}, {lo}, {hi})"),
             }
         }
-        Sx::Call(Intr::Erf, a) => match lang {
-            // CUDA / OpenCL expose a scalar erf builtin (hardware-accurate).
-            Lang::Cuda => format!("erff({})", go(a, stmts)),
-            Lang::OpenCl => format!("erf({})", go(a, stmts)),
-            // MSL / WGSL / GLSL have NO erf builtin → substitute the A&S 7.1.26
-            // polynomial expansion (the math still lives once, here).
-            Lang::Msl | Lang::Wgsl | Lang::Glsl => render(&erf_ansatz((**a).clone()), lang, stmts),
-        },
+        Sx::Call(Intr::Erf, a) => {
+            match lang {
+                // CUDA / OpenCL expose a scalar erf builtin (hardware-accurate).
+                Lang::Cuda => format!("erff({})", go(a, stmts)),
+                Lang::OpenCl => format!("erf({})", go(a, stmts)),
+                // MSL / WGSL / GLSL have NO erf builtin → substitute the A&S 7.1.26
+                // polynomial expansion (the math still lives once, here).
+                // WGSL spells the polynomial with explicit `fma`: shader compilers
+                // contract a plain `a * b + c` chain differently (Chrome's WebGPU
+                // and native wgpu on the same Metal GPU disagreed by up to 37 ULP
+                // in gelu), and an explicit `fma` is fused everywhere.
+                Lang::Wgsl => {
+                    let ae = go(a, stmts);
+                    let l = |v: f32| fmt_lit(v, lang);
+                    stmts.push(format!("let _ea = {ae};"));
+                    stmts.push("let _ex = abs(_ea);".to_string());
+                    stmts.push(format!(
+                        "let _et = rlx_div_rn({}, fma({}, _ex, {}));",
+                        l(1.0),
+                        l(0.3275911),
+                        l(1.0)
+                    ));
+                    stmts.push(format!(
+                    "let _ep = fma(fma(fma(fma({}, _et, {}), _et, {}), _et, {}), _et, {}) * _et;",
+                    l(1.061_405_4), l(-1.453_152_1), l(1.421_413_8), l(-0.284_496_72), l(0.254_829_6)
+                ));
+                    format!("(sign(_ea) * fma(-_ep, rlx_exp(-(_ex * _ex)), {}))", l(1.0))
+                }
+                Lang::Msl | Lang::Glsl => render(&erf_ansatz((**a).clone()), lang, stmts),
+            }
+        }
         Sx::Call(Intr::Sign, a) if lang == Lang::Cuda => {
             // CUDA has no scalar `sign`; reproduce WGSL semantics (sign(0)==0).
             let ae = go(a, stmts);

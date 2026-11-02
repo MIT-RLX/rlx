@@ -27,5 +27,17 @@ fn unary(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
     let i = gid.x + gid.y * ngs.x * 64u;
     if (i >= params.n) { return; }
     let x = arena[params.in_off + i];
+    // `unfuse::PRELU` (0xFFFF): the slope in `_p0`
+    if (params.op == 0xFFFFu) {
+        arena[params.out_off + i] = select(bitcast<f32>(params._p0) * x, x, x >= 0.0);
+        return;
+    }
+    // `unfuse::PRELU` with its slope a tensor (0xFFFE): at `_p0`, one value a
+    // channel, `_p2` channels of `_p1` elements each (one channel: a scalar)
+    if (params.op == 0xFFFEu) {
+        let a = arena[params._p0 + (i / params._p1) % params._p2];
+        arena[params.out_off + i] = select(a * x, x, x >= 0.0);
+        return;
+    }
     arena[params.out_off + i] = rlx_activation_apply(params.op, x);
 }

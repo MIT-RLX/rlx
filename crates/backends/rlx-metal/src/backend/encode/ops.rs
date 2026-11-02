@@ -5126,6 +5126,12 @@ pub(crate) fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
                         && n_probe.is_multiple_of(8)
                         && !rlx_ir::env::flag("RLX_METAL_PTQ1_0_FUSED_DISABLE")
                 }
+                // Decode-only fused GEMV; lockstep with `use_fused_fp8b128_mv`.
+                rlx_ir::QuantScheme::Fp8E4m3B128 | rlx_ir::QuantScheme::Fp8E5m2B128 => {
+                    m_probe == 1
+                        && k_probe.is_multiple_of(128)
+                        && !rlx_ir::env::flag("RLX_METAL_FP8B128_FUSED_DISABLE")
+                }
                 _ => false,
             };
             if direct_fused {
@@ -5269,6 +5275,53 @@ macro_rules! sg_mv_encoder {
 // per simdgroup; Q6_K/Q3_K reduce a whole 256-wide super-block row per simdgroup
 // so they emit one row each (NR0 = 1).
 sg_mv_encoder!(encode_q8_0_mv_f32_sg, q8_0_mv_f32_sg, 2, 4);
+
+/// `fp8b128_mv_f32_sg`: the `sg_mv_encoder!` shape (NSG = 2, NR0 = 4) plus the
+/// format flag at buffer 6 (`e5`: E5M2 codes, else E4M3).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_fp8b128_mv_f32_sg(
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &crate::mtl::Buffer,
+    w_buffer: &crate::mtl::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+    e5: bool,
+) {
+    enc.set_compute_pipeline_state(&k.fp8b128_mv_f32_sg);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    let e5_u = u32::from(e5);
+    enc.set_bytes(6, 4, &e5_u as *const u32 as *const _);
+    enc.set_buffer(7, Some(w_buffer), 0);
+    const NSG: u64 = 2;
+    const NR0: u64 = 4;
+    let n_threadgroups = (n_dim.div_ceil(NR0 as usize) as u64).div_ceil(NSG);
+    enc.dispatch_threads(
+        crate::mtl::MTLSize {
+            width: n_threadgroups * NSG * 32,
+            height: 1,
+            depth: 1,
+        },
+        crate::mtl::MTLSize {
+            width: NSG * 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
 sg_mv_encoder!(encode_q4_0_mv_f32_sg, q4_0_mv_f32_sg, 2, 4);
 sg_mv_encoder!(encode_q4_1_mv_f32_sg, q4_1_mv_f32_sg, 2, 4);
 sg_mv_encoder!(encode_q6k_mv_f32_sg, q6k_mv_f32_sg, 4, 1);
@@ -6947,6 +7000,7 @@ pub(crate) fn encode_dequant_gguf(
     enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
     buffer: &crate::mtl::Buffer,
+    w_buffer: &crate::mtl::Buffer,
     w_q: usize,
     dst: usize,
     scheme: rlx_ir::quant::QuantScheme,
@@ -6974,6 +7028,7 @@ pub(crate) fn encode_dequant_gguf(
     // KGRID_IQ1S). Schemes 0..=11 ignore it. See `crate::kernels::iq_grid_buffer`.
     let lut = k.iq_grid_buffer();
     enc.set_buffer(5, Some(lut), 0);
+    enc.set_buffer(6, Some(w_buffer), 0);
     let grid = crate::mtl::MTLSize {
         width: num_blocks as u64,
         height: 1,
@@ -7212,6 +7267,7 @@ pub(crate) fn encode_dequant_grouped_matmul_gguf(
                 encode_dequant_gguf(
                     enc,
                     k,
+                    buffer,
                     buffer,
                     w_q + e * slab_bytes,
                     dequant_off,

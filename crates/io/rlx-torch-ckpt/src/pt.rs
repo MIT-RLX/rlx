@@ -116,8 +116,8 @@ impl PtModel {
 
     /// Index a modern (ZIP) checkpoint held in memory: one fetched over the
     /// network in a browser, where there is no file to open. A gzip-wrapped
-    /// one is unwrapped first. The legacy container is read from a file only
-    /// ([`Self::open`]).
+    /// one is unwrapped first; a legacy (pre-1.6) one is decoded whole, as
+    /// [`Self::open`] does.
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
         let data = if data.starts_with(&[0x1f, 0x8b]) {
             use std::io::Read;
@@ -130,7 +130,12 @@ impl PtModel {
             data
         };
         if crate::legacy::looks_legacy(&data[..data.len().min(4)]) {
-            anyhow::bail!("a legacy (pre-1.6) checkpoint can only be read from a file");
+            let f = crate::legacy::read_bytes(&data)
+                .context("reading the bytes as a legacy torch file")?;
+            return Ok(Self {
+                tensors: f.tensors,
+                store: Store::Legacy(f.storages),
+            });
         }
         let mut cur = std::io::Cursor::new(data.as_slice());
         let entries = list_zip(&mut cur, 0, data.len() as u64)

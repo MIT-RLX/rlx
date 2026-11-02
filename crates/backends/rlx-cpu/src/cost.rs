@@ -49,7 +49,7 @@ impl HwModel {
     /// Build from runtime config and platform defaults.
     pub fn from_config(cfg: &RuntimeConfig) -> Self {
         // Platform-calibrated constants
-        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        #[cfg(all(rlx_cpu_neon, target_vendor = "apple"))]
         let model = HwModel {
             neon_flops: 72e9,            // ~72 GFLOP/s NEON FMA throughput (M4 Pro P-core)
             blas_flops: 1000e9,          // ~1 TFLOP/s AMX peak (effective varies with tile fill)
@@ -61,7 +61,7 @@ impl HwModel {
             num_threads: cfg.pool_workers + 1,
         };
 
-        #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+        #[cfg(not(all(rlx_cpu_neon, target_vendor = "apple")))]
         let model = HwModel {
             neon_flops: 32e9,
             blas_flops: 200e9,

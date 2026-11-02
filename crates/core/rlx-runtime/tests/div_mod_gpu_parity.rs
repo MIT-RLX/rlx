@@ -144,6 +144,31 @@ fn div_is_correctly_rounded() {
     same_bits(BinaryOp::Div, &a, &b, |x, y| x / y);
 }
 
+/// Quotients a hair from the midpoint of two floats, where one correction step
+/// keeps the first quotient's rounding: native Metal's fast-math `1 /
+/// 1.99999988` (BCG-FM's sigmoid at `x = 1.19e-7`) stayed 0.5 while Chrome's
+/// gave the correctly rounded 0.50000006. Each `a` is `b` times a midpoint,
+/// rounded to float, so `a / b` lands within an ULP or two of it.
+#[test]
+fn div_is_correctly_rounded_near_midpoints() {
+    let mut s = 0x9e37_79b9_u32;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s
+    };
+    let (mut a, mut b) = (vec![1.0f32], vec![2.0f32 - f32::EPSILON]);
+    while a.len() < 1 << 16 {
+        let bv = f32::from_bits((next() & 0x807f_ffff) | ((next() % 40 + 107) << 23));
+        let c = f32::from_bits((next() & 0x007f_ffff) | ((next() % 40 + 107) << 23));
+        let mid = (c as f64 + f32::from_bits(c.to_bits() + 1) as f64) / 2.0;
+        a.push((bv as f64 * mid) as f32);
+        b.push(bv);
+    }
+    same_bits(BinaryOp::Div, &a, &b, |x, y| x / y);
+}
+
 /// Divisors `2^-20 ..= 2^19` against dividends `2^-60 ..= 2^59`: quotients from
 /// far below one (the remainder is the dividend) to `2^79` (many reductions).
 #[test]

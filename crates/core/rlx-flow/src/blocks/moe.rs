@@ -53,10 +53,76 @@ pub(crate) enum Mlp<L> {
 /// A MoE layer's weights as graph params: the router `[hidden, experts]`,
 /// the experts' gate-and-up `[experts, hidden, 2·intermediate]` (gate first)
 /// and down `[experts, intermediate, hidden]` — `GroupedMatMul`'s layout.
+/// With `packed`, gate-and-up and down are instead quant banks of `[out, in]`
+/// slabs (`[2·intermediate, hidden]` and `[hidden, intermediate]` per expert)
+/// for `DequantGroupedMatMul` in that scheme.
 pub(crate) struct MoeWeights {
     router: rlx_ir::HirNodeId,
     gate_up: rlx_ir::HirNodeId,
     down: rlx_ir::HirNodeId,
+    packed: Option<rlx_ir::quant::QuantScheme>,
+}
+
+/// The experts as packed banks, when the source hands their linears over
+/// packed (an FP8 safetensors or K-quant checkpoint, one tensor per expert).
+/// Each expert's gate and up rows are concatenated into one `[2I, H]` slab —
+/// a packed row is whole blocks, so rows concatenate byte for byte. `None`
+/// when expert 0's gate is not packed (or absent: a fused checkpoint), which
+/// leaves every tensor for the f32 path.
+fn load_moe_packed(
+    ctx: &mut crate::context::FlowCtx<'_>,
+    lp: &str,
+    moe: &Qwen3Moe,
+    hidden: usize,
+) -> anyhow::Result<
+    Option<(
+        rlx_ir::HirNodeId,
+        rlx_ir::HirNodeId,
+        rlx_ir::quant::QuantScheme,
+    )>,
+> {
+    use rlx_ir::{DType, Shape};
+    let (e, i) = (moe.num_experts, moe.intermediate);
+    let key = |x: usize, p: &str| format!("{lp}.mlp.experts.{x}.{p}_proj.weight");
+    let Some(first) = ctx.weights.take_packed(&key(0, "gate")).ok().flatten() else {
+        return Ok(None);
+    };
+    let scheme = first.scheme;
+    let mut first = Some(first);
+    let (mut gu, mut dn) = (Vec::new(), Vec::new());
+    for x in 0..e {
+        let mut take = |p: &str, out: usize, inp: usize| -> anyhow::Result<Vec<u8>> {
+            let k = key(x, p);
+            let w = match (p, x, first.take()) {
+                ("gate", 0, Some(w)) => w,
+                _ => ctx.weights.take_packed(&k)?.ok_or_else(|| {
+                    anyhow::anyhow!("{k}: expert 0's gate is packed but this linear is not")
+                })?,
+            };
+            if w.scheme != scheme || (w.out_dim, w.in_dim) != (out, inp) {
+                anyhow::bail!(
+                    "{k}: {} [{}, {}], expected {scheme} [{out}, {inp}]",
+                    w.scheme,
+                    w.out_dim,
+                    w.in_dim
+                );
+            }
+            Ok(w.w_q)
+        };
+        gu.extend(take("gate", i, hidden)?);
+        gu.extend(take("up", i, hidden)?);
+        dn.extend(take("down", hidden, i)?);
+    }
+    let mut param = |name: String, bytes: Vec<u8>| {
+        let id = ctx
+            .hir()
+            .param(&name, Shape::new(&[bytes.len()], DType::U8));
+        ctx.state.typed_params.push((name, bytes, DType::U8));
+        id
+    };
+    let gate_up = param(format!("{lp}.mlp.experts.gate_up.packed"), gu);
+    let down = param(format!("{lp}.mlp.experts.down.packed"), dn);
+    Ok(Some((gate_up, down, scheme)))
 }
 
 /// `x` (`[e, a, b]`) with each `[a, b]` slab transposed to `[b, a]`.
@@ -90,6 +156,14 @@ pub(crate) fn load_moe(
     use rlx_ir::{DType, Shape};
     let (e, i) = (moe.num_experts, moe.intermediate);
     let router = ctx.load_param(&format!("{lp}.mlp.gate.weight"), true)?;
+    if let Some((gate_up, down, scheme)) = load_moe_packed(ctx, lp, moe, hidden)? {
+        return Ok(MoeWeights {
+            router,
+            gate_up,
+            down,
+            packed: Some(scheme),
+        });
+    }
     let f = |d: &[usize]| Shape::new(d, DType::F32);
     let gu_key = format!("{lp}.mlp.experts.gate_up_proj");
     // Fused when the checkpoint has the fused tensor (taking it is the probe:
@@ -161,6 +235,7 @@ pub(crate) fn load_moe(
         router,
         gate_up,
         down,
+        packed: None,
     })
 }
 
@@ -202,16 +277,16 @@ pub(crate) fn emit_moe(
         let idx = gb.narrow_(top, 1, slot, 1);
         let idx = gb.reshape_(idx, vec![rows as i64]);
         let wt = gb.narrow_(weights, 1, slot, 1);
-        let gu = gb.add_node(
-            Op::GroupedMatMul,
-            vec![x2, w.gate_up, idx],
-            f(&[rows, 2 * i]),
-        );
+        let grouped = match w.packed {
+            Some(scheme) => Op::DequantGroupedMatMul { scheme },
+            None => Op::GroupedMatMul,
+        };
+        let gu = gb.add_node(grouped.clone(), vec![x2, w.gate_up, idx], f(&[rows, 2 * i]));
         let gate = gb.narrow_(gu, 1, 0, i);
         let up = gb.narrow_(gu, 1, i, i);
         let gate = gb.silu(gate);
         let act = gb.mul(gate, up);
-        let out = gb.add_node(Op::GroupedMatMul, vec![act, w.down, idx], f(&[rows, h]));
+        let out = gb.add_node(grouped, vec![act, w.down, idx], f(&[rows, h]));
         let out = gb.mul(out, wt);
         acc = Some(match acc {
             None => out,

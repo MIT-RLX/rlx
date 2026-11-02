@@ -107,8 +107,9 @@ pub fn gguf_fused_gemv_m1_supported(scheme_id: u32, m: usize, k: usize) -> bool 
         25 => k.is_multiple_of(128),
         // G8_0 (Pestle token_embd / lm_head): 32-elem blocks
         28 => k.is_multiple_of(32),
-        // Q8_0: 32-elem blocks; Q5_K: 256 (`gguf_gemv_elem` only)
+        // Q8_0: 32-elem blocks; Q5_K: 256; FP8-B128: 128 (`gguf_gemv_elem` only)
         20 => k.is_multiple_of(32),
+        30 | 31 => k.is_multiple_of(128),
         1 => gguf_gemv_elem_enabled() && k.is_multiple_of(256),
         _ => false,
     }
@@ -123,6 +124,7 @@ pub fn gguf_gemv_rows_supported(scheme_id: u32, m: usize, k: usize) -> bool {
     (2..=GGUF_GEMV_MAX_ROWS).contains(&m)
         && match scheme_id {
             20 => k.is_multiple_of(32),
+            30 | 31 => k.is_multiple_of(128),
             1 => k.is_multiple_of(256),
             0 | 2 => gguf_gemv_elem_enabled() && k.is_multiple_of(256),
             _ => false,
@@ -338,7 +340,7 @@ pub fn run_dequant_matmul_gguf_gemv_m1(
     // Q8_0 / Q4_K / Q5_K / Q6_K: one block per row, threads striding its elements
     // (all busy at any k). `RLX_GGUF_GEMV_ELEM=0` keeps the one-thread-per-row
     // scalar kernel for Q4_K / Q6_K.
-    if scheme_id == 20 || scheme_id == 1 || gguf_gemv_elem_enabled() {
+    if matches!(scheme_id, 1 | 20 | 30 | 31) || gguf_gemv_elem_enabled() {
         let kernel = crate::kernels::dequant_matmul_gguf_gemv_elem_kernel(ctx);
         // 8 rows of 32 threads per block.
         let cfg = LaunchConfig {

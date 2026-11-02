@@ -41,7 +41,7 @@ use crate::{GraphScope, Tensor};
 pub struct Func {
     graph: Graph,
     /// Bound parameter values (`name -> data`), applied before each run.
-    params: Vec<(String, Vec<f32>)>,
+    pub(crate) params: Vec<(String, Vec<f32>)>,
 }
 
 impl Func {
@@ -553,7 +553,7 @@ impl Func {
 
     /// Apply `opt` to each `wrt` param given a `[loss, grad…]` output vector,
     /// returning the updated `Func` and the loss. Shared by every `train_step*`.
-    fn apply_optimizer_step(
+    pub(crate) fn apply_optimizer_step(
         &self,
         opt: &mut dyn rlx_optim::Optimizer,
         wrt: &[&str],
@@ -621,7 +621,7 @@ impl Func {
 /// tensor (indices `1..`). Returns `1.0` (no clip) when `max_norm <= 0` or the
 /// grad norm is within budget. Accumulated in `f64` for numerical safety.
 #[cfg(feature = "optim")]
-fn grad_clip_scale(outputs: &[Vec<f32>], max_norm: f32) -> f32 {
+pub(crate) fn grad_clip_scale(outputs: &[Vec<f32>], max_norm: f32) -> f32 {
     if max_norm <= 0.0 {
         return 1.0;
     }

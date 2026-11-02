@@ -47,6 +47,24 @@ fn read_w_i8(rel: u32) -> i32 {
     return select(i32(b), i32(b) - 256, b >= 128u);
 }
 
+// One OCP FP8 code to f32 by building its bits — exact, no exp2: E4M3 (`e5`
+// false; only S.1111.111 is NaN) or E5M2 (IEEE-like inf / NaN at exponent 31).
+fn dq_fp8(c: u32, e5: bool) -> f32 {
+    var v: f32;
+    if (e5) {
+        let e = (c >> 2u) & 31u;
+        let m = c & 3u;
+        v = select(bitcast<f32>(((e + 112u) << 23u) | (m << 21u)), f32(m) * 1.52587890625e-05, e == 0u);
+        if (e == 31u) { v = bitcast<f32>(select(0x7FC00000u, 0x7F800000u, m == 0u)); }
+    } else {
+        let e = (c >> 3u) & 15u;
+        let m = c & 7u;
+        v = select(bitcast<f32>(((e + 120u) << 23u) | (m << 20u)), f32(m) * 0.001953125, e == 0u);
+        if ((c & 0x7Fu) == 0x7Fu) { v = bitcast<f32>(0x7FC00000u); }
+    }
+    return select(v, -v, (c & 0x80u) != 0u);
+}
+
 fn dq_read_bf16(rel: u32) -> f32 {
     // bf16 is the top 16 bits of an f32: shift into place and bitcast.
     return bitcast<f32>((read_w(rel) | (read_w(rel + 1u) << 8u)) << 16u);
@@ -113,7 +131,8 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         && params.scheme_id != 19u && params.scheme_id != 20u
         && params.scheme_id != 21u && params.scheme_id != 22u && params.scheme_id != 23u
         && params.scheme_id != 24u && params.scheme_id != 25u
-        && params.scheme_id != 28u && params.scheme_id != 29u) {
+        && params.scheme_id != 28u && params.scheme_id != 29u
+        && params.scheme_id != 30u && params.scheme_id != 31u) {
         let dst_base = params.dst_f32_off + gid * 256u;
 
         if (params.scheme_id == 3u) {
@@ -739,6 +758,19 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         for (var j: u32 = 0u; j < 128u; j = j + 1u) {
             let q = (read_w(qs_rel + (j >> 2u)) >> ((j & 3u) * 2u)) & 3u;
             arena[dst_base + j] = f32(i32(q) - 1) * d;
+        }
+        return;
+    }
+
+    if (params.scheme_id == 30u || params.scheme_id == 31u) {
+        // FP8 block (HF fp8 / DeepSeek-V3): f32 scale | 128 codes (132 bytes /
+        // 128 elems), E4M3 (30) or E5M2 (31); see `dq_fp8`.
+        let e5 = params.scheme_id == 31u;
+        let off = gid * 132u;
+        let s = bitcast<f32>(read_w(off) | (read_w(off + 1u) << 8u) | (read_w(off + 2u) << 16u) | (read_w(off + 3u) << 24u));
+        let dst_base = params.dst_f32_off + gid * 128u;
+        for (var j: u32 = 0u; j < 128u; j = j + 1u) {
+            arena[dst_base + j] = dq_fp8(read_w(off + 4u + j), e5) * s;
         }
         return;
     }

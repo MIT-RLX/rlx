@@ -18,12 +18,16 @@ fn quarter_pi() -> F80 {
 }
 
 /// Whether this target's reference (`scipy`'s wheel) has an 80-bit `long double`:
-/// the Linux x86-64 reference does, Apple arm64's `long double` is `double`.
-pub(crate) const X87: bool = !cfg!(target_vendor = "apple");
+/// the Linux x86-64 reference does, Apple arm64's `long double` is `double`
+/// (unless `rlx_libm::platform::use_linux_reference` asked for Linux's).
+#[inline]
+pub(crate) fn x87() -> bool {
+    !rlx_libm::platform::apple_reference()
+}
 
 /// `Thigh(0.25L*pi/n)`.
 pub(crate) fn quarter_pi_over(n: usize) -> f64 {
-    if X87 {
+    if x87() {
         quarter_pi().div(F80::from_u64(n as u64)).to_f64()
     } else {
         0.25 * std::f64::consts::PI / n as f64
@@ -32,7 +36,7 @@ pub(crate) fn quarter_pi_over(n: usize) -> f64 {
 
 /// `T(1/ldbl_t(n))`.
 pub(crate) fn recip(n: usize) -> f64 {
-    if X87 {
+    if x87() {
         F80::from_u64(1).div(F80::from_u64(n as u64)).to_f64()
     } else {
         1.0 / n as f64
@@ -41,7 +45,7 @@ pub(crate) fn recip(n: usize) -> f64 {
 
 /// `T(1/sqrt(ldbl_t(n)))`.
 pub(crate) fn recip_sqrt(n: usize) -> f64 {
-    if X87 {
+    if x87() {
         F80::from_u64(1)
             .div(F80::from_u64(n as u64).sqrt())
             .to_f64()

@@ -12,8 +12,11 @@
 //! Both helpers start from the hardware result and correct it with exact
 //! `fma` remainders, so they are right on either kind of driver:
 //!
-//! * `rlx_div_rn`: one step `q + (a − b·q)/b`. The remainder is exact once `q`
-//!   is within an ULP. Below `2^-100` the correction is subnormal and Metal
+//! * `rlx_div_rn`: one step `q + (a − b·q)/b`, then a midpoint test against
+//!   the neighbour on the remainder's side (the step alone rounds its
+//!   correction first, so near a midpoint it kept the first quotient's
+//!   rounding: native Metal's `1/1.99999988` stayed 0.5 where Chrome's gave
+//!   0.50000006). The remainders are exact once `q` is within an ULP. Below `2^-100` the correction is subnormal and Metal
 //!   flushes it, so a small quotient is formed from `a·2^64` and scaled back. A
 //!   zero or non-finite first quotient is already the IEEE answer and is kept —
 //!   the correction would turn `x/0`'s infinity into NaN.
@@ -24,19 +27,27 @@
 //!   (Sterbenz). Inputs beyond `2^±60` are scaled by `2^∓100` so the remainders
 //!   neither underflow nor overflow, and the root is scaled back by `2^±50`.
 //!
+//! * `rlx_exp`: Cody–Waite reduction `x = n·ln2 + r` (ln2 split in two, each
+//!   step one `fma`), Cephes' degree-5 polynomial in `fma`s, and `ldexp`.
+//!   Within 1 ULP of the correctly rounded value, 99% of it exactly. The
+//!   builtin `exp` is not used because its rounding depends on the compiler's
+//!   math mode: native wgpu compiles Metal in Apple's fast math, Chrome (Dawn)
+//!   in safe math, and on the same GPU sigmoid(1.16e-7) came out 0.5 natively
+//!   and 0.50000006 in the browser (BCG-FM's squeeze-excite gate).
+//!
 //! The helpers live in one string so the binary, activation and batch-norm
 //! shaders share a single copy. The WGSL modules call them but do not embed
 //! them: a shader that combines modules (the fused elementwise region takes
 //! both binary and activation) would otherwise define them twice. Prepend
 //! [`wgsl_numeric_helpers`] exactly once per shader.
 
-/// WGSL definitions of `rlx_div_rn`, `rlx_sqrt_rn` and `rlx_rsqrt_rn`.
+/// WGSL definitions of `rlx_div_rn`, `rlx_sqrt_rn`, `rlx_rsqrt_rn` and `rlx_exp`.
 pub fn wgsl_numeric_helpers() -> &'static str {
     WGSL_NUMERIC_HELPERS
 }
 
-/// The same three functions as plain WGSL `/`, `sqrt` and `inverseSqrt`: up
-/// to 2.5 ULP off on some drivers, but a few instructions shorter. Opt-in
+/// The same four functions as plain WGSL `/`, `sqrt`, `inverseSqrt` and `exp`:
+/// up to 2.5 ULP off (and math-mode dependent) on some drivers, but a few instructions shorter. Opt-in
 /// only (rlx-wgpu's `set_fast_math`); exact is the default everywhere.
 pub fn wgsl_fast_numeric_helpers() -> &'static str {
     WGSL_FAST_NUMERIC_HELPERS
@@ -55,6 +66,10 @@ fn rlx_sqrt_rn(x: f32) -> f32 {
 fn rlx_rsqrt_rn(x: f32) -> f32 {
     return inverseSqrt(x);
 }
+
+fn rlx_exp(x: f32) -> f32 {
+    return exp(x);
+}
 ";
 
 const WGSL_NUMERIC_HELPERS: &str = "\
@@ -63,7 +78,26 @@ fn rlx_div_rn(a: f32, b: f32) -> f32 {
     let k = abs(a / b) < 0x1p-100f;
     let a2 = select(a, a * 0x1p64f, k);
     let q = a2 / b;
-    let c = select(q, q + fma(-b, q, a2) / b, q != 0.0 && abs(q) <= 0x1.fffffep+127f);
+    let ok = q != 0.0 && abs(q) <= 0x1.fffffep+127f;
+    var c = select(q, q + fma(-b, q, a2) / b, ok);
+    // The step rounds its correction before adding it, so near a midpoint
+    // `c` depends on the first quotient. Move to the neighbour on the
+    // quotient's side when the quotient lies past their midpoint (ties to
+    // even): `r = a - b·c` is exact, and `r - b·u/2` has the sign of
+    // `a - b·(c + n)/2`.
+    if (ok && c != 0.0 && abs(c) < 0x1.fffffep+127f) {
+        let r = fma(-b, c, a2);
+        if (r != 0.0) {
+            let up = (r > 0.0) == (b > 0.0);
+            let cb = bitcast<u32>(c);
+            let nb = select(cb - 1u, cb + 1u, up == (c > 0.0));
+            let n = bitcast<f32>(nb);
+            let t = fma(-b, (n - c) * 0.5, r);
+            if ((t != 0.0 && ((t > 0.0) == (b > 0.0)) == up) || (t == 0.0 && (nb & 1u) == 0u)) {
+                c = n;
+            }
+        }
+    }
     return select(c, c * 0x1p-64f, k);
 }
 
@@ -102,5 +136,20 @@ fn rlx_sqrt_rn(x: f32) -> f32 {
 
 fn rlx_rsqrt_rn(x: f32) -> f32 {
     return rlx_div_rn(1.0, rlx_sqrt_rn(x));
+}
+
+fn rlx_exp(x: f32) -> f32 {
+    let bx = bitcast<u32>(x);
+    if ((bx & 0x7fffffffu) > 0x7f800000u) { return x; }
+    let xc = clamp(x, -110.0, 89.0);
+    let n = round(xc * 1.44269504);
+    let r = fma(n, -1.428606765330187e-6, fma(n, -0.693145751953125, xc));
+    var p = 1.9875691500e-4;
+    p = fma(p, r, 1.3981999507e-3);
+    p = fma(p, r, 8.3334519073e-3);
+    p = fma(p, r, 4.1665795894e-2);
+    p = fma(p, r, 1.6666665459e-1);
+    p = fma(p, r, 5.0000001201e-1);
+    return ldexp(1.0 + fma(p, r * r, r), i32(n));
 }
 ";

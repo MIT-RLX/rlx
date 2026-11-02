@@ -1667,7 +1667,19 @@ pub fn plan_memory_native(graph: &Graph, alignment: usize) -> MemoryPlan {
 /// Same relationship to [`plan_memory_native`] as that function has to
 /// [`plan_memory_aligned`]: identical dtype widths, strictly less pinning.
 pub fn plan_memory_native_in_order(graph: &Graph, alignment: usize) -> MemoryPlan {
+    plan_memory_native_in_order_params(graph, alignment, true)
+}
+
+/// [`plan_memory_native_in_order`] that can leave `Op::Param` nodes (and the
+/// views rooted at them) unassigned, for a caller that lays the weights out
+/// itself — the CPU backend's shared-weight arena.
+pub fn plan_memory_native_in_order_params(
+    graph: &Graph,
+    alignment: usize,
+    allocate_params: bool,
+) -> MemoryPlan {
     let opts = MemoryPlanOptions {
+        allocate_params,
         // No host-indexing pin either, for the same reason as the dequant pin
         // below: [`graph_has_host_indexing`] guards backends whose hosted gather
         // writes its result at a LATER flush, so liveness ends too early there.

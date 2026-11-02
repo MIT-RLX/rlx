@@ -397,6 +397,15 @@ impl Graph {
     }
 }
 
+/// `(sin, cos)` for host-built DFT matrices: rlx-libm's reference under
+/// `parity` (std's is musl on wasm, so a browser would bake different ones).
+fn sin_cos(x: f64) -> (f64, f64) {
+    #[cfg(feature = "parity")]
+    return (rlx_libm::reference::sin(x), rlx_libm::reference::cos(x));
+    #[cfg(not(feature = "parity"))]
+    (x.sin(), x.cos())
+}
+
 #[cfg(test)]
 mod rfft_exact_tests {
     use super::*;
@@ -427,13 +436,4 @@ mod rfft_exact_tests {
         let mag = g.rfft_exact_mag(x, 400, FftNorm::Backward);
         assert_eq!(dims(&g, mag), vec![7, 201]);
     }
-}
-
-/// `(sin, cos)` for host-built DFT matrices: rlx-libm's reference under
-/// `parity` (std's is musl on wasm, so a browser would bake different ones).
-fn sin_cos(x: f64) -> (f64, f64) {
-    #[cfg(feature = "parity")]
-    return (rlx_libm::reference::sin(x), rlx_libm::reference::cos(x));
-    #[cfg(not(feature = "parity"))]
-    (x.sin(), x.cos())
 }

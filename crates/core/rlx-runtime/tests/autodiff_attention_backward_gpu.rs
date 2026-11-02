@@ -219,6 +219,20 @@ fn rocm_attention_backward_matches_cpu() {
 /// zero. Every device's gradients must match the CPU's.
 #[test]
 fn attention_gradients_through_a_computed_dy_match_the_cpu() {
+    attention_gradients_match_the_cpu(false);
+}
+
+/// The same with rank-4 **BSHD** `[B, S, H, D]` tensors (the layout
+/// `attention_geom` detects when axis 1 is not the head count). The GPU
+/// backward kernels index BHSD; a BSHD tensor reaching them untransposed
+/// attends across heads instead of positions, and only the value gradient
+/// path made it visible in a GPT (dV cosine 0.2 on ROCm before the fix).
+#[test]
+fn bshd_attention_gradients_match_the_cpu() {
+    attention_gradients_match_the_cpu(true);
+}
+
+fn attention_gradients_match_the_cpu(bshd: bool) {
     use rlx_ir::GraphExt;
     use rlx_ir::op::ReduceOp;
     use rlx_runtime::{Device, Session};
@@ -235,7 +249,11 @@ fn attention_gradients_through_a_computed_dy_match_the_cpu() {
             })
             .collect()
     };
-    let shape = Shape::new(&[1, h, s, dh], DType::F32);
+    let shape = if bshd {
+        Shape::new(&[1, s, h, dh], DType::F32)
+    } else {
+        Shape::new(&[1, h, s, dh], DType::F32)
+    };
     for mask_kind in [MaskKind::None, MaskKind::Causal] {
         let mut g = Graph::new("attn_through_dy");
         let q = g.param("q", shape.clone());
@@ -288,7 +306,7 @@ fn attention_gradients_through_a_computed_dy_match_the_cpu() {
                     .fold(0.0, f32::max);
                 assert!(
                     err <= 1e-4 * scale.max(1.0),
-                    "{d:?} {mask_kind:?} {name}: max |Δ| {err} (CPU scale {scale})"
+                    "{d:?} {mask_kind:?} bshd={bshd} {name}: max |Δ| {err} (CPU scale {scale})"
                 );
             }
         }

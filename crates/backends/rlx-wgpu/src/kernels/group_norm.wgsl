@@ -110,7 +110,7 @@ fn group_norm(
     let span = cpg * params.hw;                // == params.group_elems
     let in_base = params.in_off + ni * plane + gi * span;
     let out_base = params.out_off + ni * plane + gi * span;
-    let n_inv = 1.0 / f32(span);
+    let n_inv = rlx_div_rn(1.0, f32(span));
     let eps = bitcast<f32>(params.eps_bits);
 
     // ── Pass 1: mean over the group. ──
@@ -159,7 +159,7 @@ fn group_norm(
     scratch[tid] = partial;
     workgroupBarrier();
     tree_sum(tid);
-    let inv_std = inverseSqrt(scratch[0] * n_inv + eps);
+    let inv_std = rlx_rsqrt_rn(scratch[0] * n_inv + eps);
     workgroupBarrier();
 
     // ── Pass 3: scale/shift per channel. ──
@@ -283,7 +283,7 @@ fn group_norm_partial(
     var m: f32 = 0.0;
     var m2: f32 = 0.0;
     if (len > 0u) {
-        m = partial_sum(base, len, tid, 0.0, false) / f32(len);
+        m = rlx_div_rn(partial_sum(base, len, tid, 0.0, false), f32(len));
         m2 = partial_sum(base, len, tid, m, true);
     }
     if (tid == 0u) {
@@ -301,7 +301,7 @@ fn split_stats(at: u32, tid: u32, span: u32, eps: f32) -> vec2<f32> {
     scratch[tid] = nm;
     workgroupBarrier();
     tree_sum(tid);
-    let mean = scratch[0] / f32(span);
+    let mean = rlx_div_rn(scratch[0], f32(span));
     workgroupBarrier();
     var q: f32 = 0.0;
     if (tid < params.chunks) {
@@ -311,7 +311,7 @@ fn split_stats(at: u32, tid: u32, span: u32, eps: f32) -> vec2<f32> {
     scratch[tid] = q;
     workgroupBarrier();
     tree_sum(tid);
-    let inv_std = inverseSqrt(scratch[0] / f32(span) + eps);
+    let inv_std = rlx_rsqrt_rn(rlx_div_rn(scratch[0], f32(span)) + eps);
     workgroupBarrier();
     return vec2<f32>(mean, inv_std);
 }

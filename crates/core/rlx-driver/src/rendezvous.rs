@@ -134,8 +134,18 @@ impl Roster {
         peers.insert(0, own);
         Self { world, peers }
     }
-    /// Admit `reg`, returning its rank or a reason to refuse it.
+    /// Admit `reg`, returning its rank or a reason to refuse it. An open
+    /// roster (`world == 0`, see [`serve_open`]) takes ranks in arrival order
+    /// and ignores the worker's `WORLD`.
     fn admit(&mut self, reg: &Reg) -> Result<u32, String> {
+        if self.world == 0 {
+            if let Some((&r, _)) = self.peers.iter().find(|(_, a)| **a == reg.addr) {
+                return Ok(r);
+            }
+            let r = self.peers.len() as u32;
+            self.peers.insert(r, reg.addr);
+            return Ok(r);
+        }
         if let Some(w) = reg.world
             && w != self.world
         {
@@ -167,6 +177,10 @@ impl Roster {
     fn full(&self) -> bool {
         self.peers.len() as u32 == self.world
     }
+    /// Close an open roster: the world is whoever registered.
+    fn close(&mut self) {
+        self.world = self.peers.len() as u32;
+    }
     fn list(&self) -> Vec<SocketAddr> {
         self.peers.values().copied().collect()
     }
@@ -187,8 +201,26 @@ pub fn serve(
     }
     let bind = SocketAddr::new(at.ip(), at.port());
     match proto {
-        RendezvousProto::Tcp => serve_tcp(TcpListener::bind(bind)?, world, own, timeout),
-        RendezvousProto::Udp => serve_udp(UdpSocket::bind(bind)?, world, own, timeout),
+        RendezvousProto::Tcp => serve_tcp(TcpListener::bind(bind)?, world, own, timeout, None),
+        RendezvousProto::Udp => serve_udp(UdpSocket::bind(bind)?, world, own, timeout, None),
+    }
+}
+
+/// Coordinator (rank 0) with no fixed world size (`WORLD=auto`): admit every
+/// rank that registers within `window`, then close the roster and tell each
+/// rank the world it ended up in. A job then runs on whatever nodes answered —
+/// one (the coordinator alone) if none did. Returns the peer list; its length
+/// is the world size.
+pub fn serve_open(
+    at: SocketAddr,
+    proto: RendezvousProto,
+    own: SocketAddr,
+    window: Duration,
+) -> io::Result<Vec<SocketAddr>> {
+    let bind = SocketAddr::new(at.ip(), at.port());
+    match proto {
+        RendezvousProto::Tcp => serve_tcp(TcpListener::bind(bind)?, 0, own, window, Some(window)),
+        RendezvousProto::Udp => serve_udp(UdpSocket::bind(bind)?, 0, own, window, Some(window)),
     }
 }
 
@@ -197,12 +229,17 @@ fn serve_tcp(
     world: u32,
     own: SocketAddr,
     timeout: Duration,
+    window: Option<Duration>,
 ) -> io::Result<Vec<SocketAddr>> {
     let deadline = Instant::now() + timeout;
     listener.set_nonblocking(true)?;
     let mut roster = Roster::new(world, own);
     let mut waiting: Vec<(TcpStream, u32)> = Vec::new();
     while !roster.full() {
+        if window.is_some() && Instant::now() >= deadline {
+            roster.close();
+            break;
+        }
         if Instant::now() >= deadline {
             return Err(err(
                 io::ErrorKind::TimedOut,
@@ -242,7 +279,7 @@ fn serve_tcp(
     }
     let peers = roster.list();
     for (mut s, r) in waiting {
-        let _ = s.write_all(peers_line(r, world, &peers).as_bytes());
+        let _ = s.write_all(peers_line(r, roster.world, &peers).as_bytes());
     }
     Ok(peers)
 }
@@ -252,6 +289,7 @@ fn serve_udp(
     world: u32,
     own: SocketAddr,
     timeout: Duration,
+    window: Option<Duration>,
 ) -> io::Result<Vec<SocketAddr>> {
     let deadline = Instant::now() + timeout;
     sock.set_read_timeout(Some(Duration::from_millis(100)))?;
@@ -266,9 +304,19 @@ fn serve_udp(
     loop {
         let now = Instant::now();
         if let Some(t) = done_at
-            && (acked.len() as u32 + 1 >= world || now.duration_since(t) > Duration::from_secs(5))
+            && (acked.len() as u32 + 1 >= roster.world
+                || now.duration_since(t) > Duration::from_secs(5))
         {
             return Ok(roster.list());
+        }
+        if done_at.is_none() && window.is_some() && now >= deadline {
+            roster.close();
+            done_at = Some(now);
+            let peers = roster.list();
+            for (&r, &to) in &reply_to {
+                let _ = sock.send_to(peers_line(r, roster.world, &peers).as_bytes(), to);
+            }
+            continue;
         }
         if done_at.is_none() && now >= deadline {
             return Err(err(
@@ -296,15 +344,16 @@ fn serve_udp(
         match roster.admit(&reg) {
             Ok(r) => {
                 reply_to.insert(r, from);
-                if roster.full() {
+                if roster.full() || done_at.is_some() {
                     let peers = roster.list();
                     if done_at.is_none() {
                         done_at = Some(Instant::now());
                         for (&r, &to) in &reply_to {
-                            let _ = sock.send_to(peers_line(r, world, &peers).as_bytes(), to);
+                            let _ =
+                                sock.send_to(peers_line(r, roster.world, &peers).as_bytes(), to);
                         }
                     } else {
-                        let _ = sock.send_to(peers_line(r, world, &peers).as_bytes(), from);
+                        let _ = sock.send_to(peers_line(r, roster.world, &peers).as_bytes(), from);
                     }
                 }
             }
@@ -540,6 +589,47 @@ mod tests {
             let r3 = out.iter().find(|a| a.rank == 3).unwrap();
             assert_eq!(r3.peers[3].port(), 41001);
         }
+    }
+
+    /// `WORLD=auto`: whoever registers inside the window joins, and every rank
+    /// learns the resulting world size.
+    #[test]
+    fn open_roster_takes_whoever_joins() {
+        for proto in [RendezvousProto::Tcp, RendezvousProto::Udp] {
+            let port = free_port();
+            let at: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+            let own: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            let srv =
+                std::thread::spawn(move || serve_open(at, proto, own, Duration::from_millis(1500)));
+            let workers: Vec<_> = (0..2u16)
+                .map(|i| {
+                    std::thread::spawn(move || {
+                        register(
+                            at,
+                            proto,
+                            None,
+                            None,
+                            |_| Ok(42000 + i),
+                            Duration::from_secs(10),
+                        )
+                        .unwrap()
+                    })
+                })
+                .collect();
+            let out: Vec<Assignment> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+            let peers = srv.join().unwrap().unwrap();
+            assert_eq!(peers.len(), 3, "{proto:?}");
+            for a in &out {
+                assert_eq!(a.world, 3, "{proto:?}");
+                assert_eq!(a.peers, peers);
+            }
+        }
+        // Nobody joins: the coordinator runs alone.
+        let port = free_port();
+        let at: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+        let own: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let peers = serve_open(at, RendezvousProto::Tcp, own, Duration::from_millis(200)).unwrap();
+        assert_eq!(peers, vec![own]);
     }
 
     #[cfg(not(windows))]

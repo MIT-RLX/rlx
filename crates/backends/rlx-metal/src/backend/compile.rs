@@ -432,7 +432,10 @@ impl MetalExecutable {
             .nodes()
             .iter()
             .filter(|n| matches!(&n.op, Op::Param { .. }))
-            .filter(|n| matches!(n.shape.dtype(), rlx_ir::DType::F32 | rlx_ir::DType::F16))
+            .filter(|n| {
+                matches!(n.shape.dtype(), rlx_ir::DType::F32 | rlx_ir::DType::F16)
+                    || is_shareable_fp8_weight(&fused, n)
+            })
             .map(|n| n.shape.num_elements().unwrap_or(0) * n.shape.dtype().size_bytes())
             .filter(|nb| *nb >= EXTERNAL_WEIGHT_MIN)
             .sum();
@@ -523,7 +526,15 @@ impl MetalExecutable {
                 // separate `w_buffer` argument, which is exactly the shape the
                 // K-quant encoders need to grow.
                 let ext_quant = rlx_ir::env::flag("RLX_METAL_EXTERNALIZE_QUANT");
-                let is_quant = matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8) && !ext_quant;
+                // Block-FP8 is the exception that needs no flag: every Metal path
+                // it can take (fused GEMV, dequant-to-scratch) binds the weight
+                // buffer, and the host fallback is ruled out by requiring GPU
+                // dequant. So an FP8 weight read only by FP8 `DequantMatMul`s
+                // can be shared across executables like an f32 one.
+                let fp8_weight = is_shareable_fp8_weight(&fused, node);
+                let is_quant = matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8)
+                    && !ext_quant
+                    && !fp8_weight;
                 // The external weight buffer is only read back correctly by ops
                 // whose Metal thunk resolves the WEIGHT_BUF_TAG (matmul + gather,
                 // via `resolve_off`). Ops like `Rope` bind the activation arena
@@ -543,6 +554,7 @@ impl MetalExecutable {
                         // `is_quant` note above for what happens otherwise.
                         let tag_aware =
                             matches!(c.op, Op::MatMul | Op::DotGeneral { .. } | Op::Gather { .. })
+                                || fp8_weight
                                 || (ext_quant
                                     && match &c.op {
                                         Op::DequantMatMul { scheme } => {
@@ -1483,6 +1495,33 @@ fn sharing_weights() -> bool {
     return crate::shared_weights::scope().is_some();
     #[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
     false
+}
+
+/// A packed block-FP8 weight that can live in the external weight buffer: a
+/// `Param` read only as the weight of FP8 `DequantMatMul`s, with GPU dequant on.
+/// Every Metal path such a matmul takes (the fused decode GEMV, dequant to
+/// scratch) binds the weight buffer, and requiring GPU dequant rules out the
+/// host fallback, which reads the activation arena.
+fn is_shareable_fp8_weight(graph: &rlx_ir::Graph, param: &rlx_ir::Node) -> bool {
+    use rlx_ir::quant::QuantScheme;
+    if !matches!(param.op, Op::Param { .. }) || crate::runtime_config().dequant_gpu_disable {
+        return false;
+    }
+    let mut readers = graph
+        .nodes()
+        .iter()
+        .filter(|c| c.inputs.contains(&param.id))
+        .peekable();
+    readers.peek().is_some()
+        && readers.all(|c| {
+            matches!(
+                c.op,
+                Op::DequantMatMul {
+                    scheme: QuantScheme::Fp8E4m3B128 | QuantScheme::Fp8E5m2B128
+                }
+            ) && c.inputs.get(1) == Some(&param.id)
+                && c.inputs.first() != Some(&param.id)
+        })
 }
 
 #[cfg(test)]

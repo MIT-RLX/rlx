@@ -47,6 +47,12 @@ portable-gemm = ["dep:gemm"]
 # MKL link), vector exp/tanh/log in Rust instead of Accelerate's vForce, the
 # `gemm` crate's pure-Rust kernels for GEMM, and rlx-ir's BNNS stubs.
 pure-rust = ["portable-gemm", "amx-sme", "rlx-ir/pure-rust"]
+# The wasm build's arithmetic on every target, for runs that must round the
+# same on macOS, Linux and in a browser: no vendor BLAS (GEMM is the in-order
+# fused-multiply-add chain the relaxed-SIMD wasm kernel computes), and aarch64
+# takes the AVX2-mirror / portable arms instead of its NEON kernels. Slower;
+# pair with rlx-libm's `export-glibc` so libm rounds the same too.
+portable = []
 # x86-64 AVX2 int8 decode GEMVs (`m == 1`) for Q4_K / Q5_K / Q6_K / Q8_0 /
 # Q4_0 / Q4_1, which otherwise dequantize each block to f32 before the dot.
 # Rounds the activation to int8 like llama.cpp, so it is not bit-identical to
@@ -120,6 +126,10 @@ rayon = "1.10"
 strum_macros = "0.28"
 # Optional same-as-candle CPU sgemm; gated behind `parity-gemm`.
 gemm = { version = "0.19", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# Shared-memory weight pages across executables (`shared_params`).
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

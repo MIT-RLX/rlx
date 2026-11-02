@@ -24,6 +24,8 @@ pt = ["dep:rlx-nemo"]
 
 [dependencies]
 rlx-gguf = { workspace = true }
+# FP8 (`F8_E4M3` / `F8_E5M2`) safetensors decode via `rlx_ir::lowp_codec`.
+rlx-ir = { workspace = true }
 anyhow = "1"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"

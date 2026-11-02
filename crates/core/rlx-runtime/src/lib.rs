@@ -66,6 +66,16 @@ pub fn set_param_sharing_scope(label: &str) {
 /// with their own scopes. The scope is process-wide, so compiles on other
 /// threads during `f` see it too.
 pub fn with_param_sharing_scope<R>(label: &str, f: impl FnOnce() -> R) -> R {
+    // CPU: large read-only weights on pages shared by the scope's executables
+    // (`rlx_cpu::shared_params`); `RLX_CPU_SHARED_WEIGHTS=0` keeps a copy each.
+    #[cfg(feature = "cpu")]
+    let cpu_before = rlx_ir::env::var_result("RLX_CPU_SHARED_WEIGHTS")
+        .map_or(true, |v| v != "0")
+        .then(|| {
+            let before = rlx_cpu::shared_params::scope();
+            rlx_cpu::shared_params::set_scope(Some(label.to_string()));
+            before
+        });
     // Metal: one copy of each weight across the scope's executables, on
     // unified memory (`rlx_metal::shared_weights`); `RLX_METAL_SHARED_WEIGHTS=0`
     // keeps a copy per executable.
@@ -93,6 +103,10 @@ pub fn with_param_sharing_scope<R>(label: &str, f: impl FnOnce() -> R) -> R {
     #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
     if let Some(before) = metal_before {
         rlx_metal::shared_weights::set_scope(before);
+    }
+    #[cfg(feature = "cpu")]
+    if let Some(before) = cpu_before {
+        rlx_cpu::shared_params::set_scope(before);
     }
     out
 }
@@ -221,7 +235,10 @@ pub use rlx_driver::{
 // Collective ops (plan #12).
 pub use aot_cache::{AotCache, AotCacheError};
 #[cfg(feature = "hwprofile")]
-pub use arena_budget::{arena_budget, device_arena_limit, fit_batch, plan_arena_bytes};
+pub use arena_budget::{
+    WGPU_32BIT_ARENA_LIMIT, arena_budget, device_arena_limit, fit_batch, fit_batch_within,
+    plan_arena_bytes,
+};
 pub use backend::{Backend, ExecutableGraph, compile_hir, compile_module};
 pub use backends_manifest::BackendsManifest;
 pub use browser::{
@@ -263,7 +280,7 @@ pub use device_policy::{
     DeviceCandidate, DeviceFallbackError, DevicePickStrategy, DevicePolicy, advisory_capabilities,
     device_chain_from_env, device_chain_from_env_key, device_from_env, device_from_env_key,
     device_report, devices_for_with_policy, resolve_device, resolve_device_chain,
-    run_with_fallback,
+    run_with_fallback, training_devices,
 };
 pub use device_router::DeviceRouter;
 pub use expert_pool::{

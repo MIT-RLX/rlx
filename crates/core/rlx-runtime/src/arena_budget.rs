@@ -27,6 +27,12 @@
 use rlx_driver::Device;
 use rlx_ir::Graph;
 
+/// Arena ceiling of `rlx-wgpu` on a 32-bit target (the browser): the arena
+/// gets the offsets below 3 GiB (`buffer::tag32::BASE`; the top 1 GiB of a
+/// 32-bit `usize` addresses its weight buffer). Public so a 64-bit caller that
+/// must choose the same batch as the browser can budget against it.
+pub const WGPU_32BIT_ARENA_LIMIT: u64 = 0xC000_0000;
+
 /// Widest arena, in bytes, that `device` can address in a single compiled plan.
 ///
 /// `None` means "no ABI ceiling" — the backend addresses the arena with 64-bit
@@ -38,10 +44,9 @@ pub fn device_arena_limit(device: Device) -> Option<u64> {
         // truncates inside the kernel signature no matter how wide the host
         // field is. `rlx-rocm`'s compile step asserts on this.
         Device::Rocm => Some(u32::MAX as u64),
-        // On a 32-bit target (the browser) `rlx-wgpu` marks weight-buffer
-        // offsets with bit 31 of a `usize` (`WEIGHT_BUF_TAG`), so an arena
-        // offset at or past 2 GiB would read as a weight offset.
-        Device::Gpu if cfg!(target_pointer_width = "32") => Some(i32::MAX as u64),
+        // On a 32-bit target (the browser) an arena offset past
+        // `WGPU_32BIT_ARENA_LIMIT` would read as a weight-buffer offset.
+        Device::Gpu if cfg!(target_pointer_width = "32") => Some(WGPU_32BIT_ARENA_LIMIT),
         // A single storage-buffer binding is capped at 4 GiB by the underlying
         // APIs; `rlx-wgpu` shards above that, and Vulkan inherits the same rule.
         Device::Gpu | Device::Vulkan => Some(u32::MAX as u64),
@@ -119,7 +124,21 @@ pub fn fit_batch<F>(device: Device, requested: usize, headroom: f64, mut build: 
 where
     F: FnMut(usize) -> Option<Graph>,
 {
-    let Some(budget) = arena_budget(device, headroom) else {
+    fit_batch_within(device, requested, arena_budget(device, headroom), build)
+}
+
+/// [`fit_batch`] against an explicit arena `budget` (`None`: unconstrained),
+/// for a caller that budgets tighter than this host's own limits.
+pub fn fit_batch_within<F>(
+    device: Device,
+    requested: usize,
+    budget: Option<u64>,
+    mut build: F,
+) -> usize
+where
+    F: FnMut(usize) -> Option<Graph>,
+{
+    let Some(budget) = budget else {
         return requested;
     };
     let mut b = requested.max(1);

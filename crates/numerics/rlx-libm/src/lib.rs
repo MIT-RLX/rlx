@@ -37,9 +37,13 @@ mod erfc;
 mod fma;
 pub use fma::fma_emulated;
 mod expm1_log1p;
+pub mod platform;
 mod sin;
 mod tables;
-#[cfg(all(feature = "wasm-glibc", target_arch = "wasm32"))]
+#[cfg(any(
+    all(feature = "wasm-glibc", target_arch = "wasm32"),
+    feature = "export-glibc"
+))]
 mod wasm_glibc;
 pub use complex::{cexp, csqrt, hypot};
 pub use erfc::erfc;

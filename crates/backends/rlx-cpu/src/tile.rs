@@ -53,12 +53,12 @@ pub trait TileIO {
     unsafe fn prefetch(&self, base: *const f32, c: Coord2) {
         unsafe {
             let addr = self.address(base, c);
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(rlx_cpu_neon)]
             {
                 std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) addr,
                     options(nostack, readonly));
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(not(rlx_cpu_neon))]
             {
                 let _ = addr;
             }

@@ -97,6 +97,21 @@ fn resolve_shim(shim_path: &str) -> Result<String, XdnaError> {
 /// A persistent INT8-GEMM context on the NPU (device/xclbin/hw_context/kernel +
 /// resident BOs held open). Create once, [`run`](Self::run) many times; the
 /// expensive setup is paid only in [`open`](Self::open).
+/// Pass the per-command wait bound to a freshly loaded shim:
+/// `RLX_XDNA_WAIT_MS` (default 10 000; `0` waits forever). A command that
+/// overruns it is aborted and its call fails instead of hanging the process.
+fn configure_shim(lib: &libloading::Library) {
+    type SetWait = unsafe extern "C" fn(u32);
+    // SAFETY: the symbol, when present, is the shim's `void(unsigned)` setter.
+    if let Ok(f) = unsafe { lib.get::<SetWait>(b"rlx_xdna_set_wait_ms") } {
+        let ms = rlx_ir::env::var("RLX_XDNA_WAIT_MS")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(10_000);
+        // SAFETY: plain value setter, no pointers.
+        unsafe { f(ms) };
+    }
+}
+
 pub struct NpuGemm {
     // Fields drop in declaration order *after* `Drop::drop` runs, so `close_fn`
     // (called in drop) still sees `_lib` mapped. Keep `_lib` last for clarity.
@@ -128,6 +143,7 @@ impl NpuGemm {
         let shim = resolve_shim(shim_path)?;
         let lib = unsafe { libloading::Library::new(&shim) }
             .map_err(|e| XdnaError(format!("dlopen {shim}: {e}")))?;
+        configure_shim(&lib);
         let sym = |name: &[u8]| -> Result<*mut c_void, XdnaError> {
             unsafe { lib.get::<*mut c_void>(name) }
                 .map(|s| *s)
@@ -287,6 +303,7 @@ impl NpuIo {
         let shim = resolve_shim(shim_path)?;
         let lib = unsafe { libloading::Library::new(&shim) }
             .map_err(|e| XdnaError(format!("dlopen {shim}: {e}")))?;
+        configure_shim(&lib);
         let sym = |name: &[u8]| -> Result<*mut c_void, XdnaError> {
             unsafe { lib.get::<*mut c_void>(name) }
                 .map(|s| *s)
@@ -454,7 +471,9 @@ impl NpuIoBf16 {
         // `Vec<u16>` does not promise. Little-endian keeps element order.
         let bf: Vec<u16> = input.iter().map(|&f| f32_to_bf16(f)).collect();
         let as_i32: Vec<i32> = bf
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i32::from(c[0]) | (i32::from(c[1]) << 16))
             .collect();
         debug_assert_eq!(as_i32.len(), self.n / 2);
@@ -502,6 +521,7 @@ impl NpuMm32 {
         let shim = resolve_shim(shim_path)?;
         let lib = unsafe { libloading::Library::new(&shim) }
             .map_err(|e| XdnaError(format!("dlopen {shim}: {e}")))?;
+        configure_shim(&lib);
         let sym = |name: &[u8]| -> Result<*mut c_void, XdnaError> {
             unsafe { lib.get::<*mut c_void>(name) }
                 .map(|s| *s)
@@ -595,6 +615,7 @@ impl NpuRun3 {
         let shim = resolve_shim(shim_path)?;
         let lib = unsafe { libloading::Library::new(&shim) }
             .map_err(|e| XdnaError(format!("dlopen {shim}: {e}")))?;
+        configure_shim(&lib);
         let sym = |name: &[u8]| -> Result<*mut c_void, XdnaError> {
             unsafe { lib.get::<*mut c_void>(name) }
                 .map(|s| *s)
@@ -685,6 +706,7 @@ pub fn run_passthrough(
     let shim = resolve_shim(shim_path)?;
     let lib = unsafe { libloading::Library::new(&shim) }
         .map_err(|e| XdnaError(format!("dlopen {shim}: {e}")))?;
+    configure_shim(&lib);
     let f = unsafe { lib.get::<PassthroughFn>(b"rlx_xdna_run_passthrough") }
         .map_err(|e| XdnaError(format!("shim symbol rlx_xdna_run_passthrough: {e}")))?;
     let xclbin_c = CString::new(xclbin_path).unwrap();

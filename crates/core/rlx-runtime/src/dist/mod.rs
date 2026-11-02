@@ -463,6 +463,16 @@ fn decode_safetensors_f32(dtype: &str, raw: &[u8]) -> Result<Vec<f32>, String> {
             .collect(),
         "I8" => raw.iter().map(|&b| b as i8 as f32).collect(),
         "U8" | "BOOL" => raw.iter().map(|&b| b as f32).collect(),
+        "F8_E4M3" | "F8_E5M2" => {
+            let fmt = if dtype == "F8_E4M3" {
+                rlx_ir::quant::ScaledFormat::F8E4M3
+            } else {
+                rlx_ir::quant::ScaledFormat::F8E5M2
+            };
+            let mut out = vec![0.0f32; raw.len()];
+            rlx_ir::lowp_codec::decode_slice(fmt, raw, &mut out);
+            out
+        }
         other => return Err(format!("unsupported safetensors dtype: {other}")),
     })
 }
@@ -488,6 +498,24 @@ mod tests {
         let got = resolve_weight_uri(&format!("safetensors://{}#w", path.display())).unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(got, vals);
+    }
+
+    #[test]
+    fn resolve_safetensors_fp8() {
+        // 1.0, -2.0, 448 (max finite) in E4M3; 1.0, -inf in E5M2.
+        let data = [0x38u8, 0xc0, 0x7e, 0x3c, 0xfc];
+        let header = r#"{"a":{"dtype":"F8_E4M3","shape":[3],"data_offsets":[0,3]},"b":{"dtype":"F8_E5M2","shape":[2],"data_offsets":[3,5]}}"#;
+        let mut buf = (header.len() as u64).to_le_bytes().to_vec();
+        buf.extend_from_slice(header.as_bytes());
+        buf.extend_from_slice(&data);
+        let path =
+            std::env::temp_dir().join(format!("rlx_dist_fp8_{}.safetensors", std::process::id()));
+        std::fs::write(&path, &buf).unwrap();
+        let a = resolve_weight_uri(&format!("safetensors://{}#a", path.display())).unwrap();
+        let b = resolve_weight_uri(&format!("safetensors://{}#b", path.display())).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(a, [1.0, -2.0, 448.0]);
+        assert_eq!(b, [1.0, f32::NEG_INFINITY]);
     }
 
     #[test]

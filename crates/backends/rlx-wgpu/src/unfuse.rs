@@ -70,7 +70,9 @@ pub fn unfuse(graph: Graph) -> Graph {
 /// [`is_folded`]).
 pub fn unfuse_with(graph: Graph, folds: bool) -> Graph {
     let g = if folds {
-        fold_conv_argmax(fold_norm_activation(fold_conv_activation(graph)))
+        fold_conv_max(fold_conv_input_prelu(fold_conv_argmax(
+            fold_norm_activation(fold_conv_activation(fold_prelu(graph))),
+        )))
     } else {
         graph
     };
@@ -127,12 +129,12 @@ pub fn pack_half_activations(g: Graph) -> Graph {
             && groups <= 1
             && act != ARGMAX_ACT
             && n.shape.dim(1).unwrap_static() > 4
-            && n.shape.dim(4).unwrap_static() % 2 == 0
+            && n.shape.dim(4).unwrap_static().is_multiple_of(2)
     };
     let norm = |n: &rlx_ir::Node| {
         group_norm_act(&n.op).is_some() && {
             let d = n.shape.dims();
-            n.shape.rank() == 4 && (d[2].unwrap_static() * d[3].unwrap_static()) % 2 == 0
+            n.shape.rank() == 4 && (d[2].unwrap_static() * d[3].unwrap_static()).is_multiple_of(2)
         }
     };
     let reshape = |n: &rlx_ir::Node| matches!(n.op, Op::Reshape { .. });
@@ -261,7 +263,12 @@ pub fn is_folded(node: &rlx_ir::Node) -> bool {
             ..
         } => node.shape.rank() == 5,
         Op::Custom { name, .. } => {
-            name == CONV3D_LEAKY || name == GROUP_NORM_ACT || name == CONV3D_ARGMAX
+            name == CONV3D_LEAKY
+                || name == GROUP_NORM_ACT
+                || name == CONV3D_ARGMAX
+                || name == CONV3D_TOPK
+                || name == PRELU
+                || name == CONV3D_K3
         }
         _ => false,
     }
@@ -303,10 +310,31 @@ pub fn conv3d_geometry(op: &Op) -> Option<([usize; 3], [usize; 3], [usize; 3], u
             activation.map_or(0, |a| a.opcode_relu_first() + 1),
             0.0,
         )),
-        Op::Custom { name, attrs, .. } if name == CONV3D_LEAKY || name == CONV3D_ARGMAX => {
+        Op::Custom { name, attrs, .. } if name == CONV3D_K3 => {
             let w: Vec<u32> = attrs
-                .chunks_exact(4)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b))
+                .collect();
+            let u = |i: usize| w[i] as usize;
+            Some((
+                [u(0), u(1), u(2)],
+                [u(3), u(4), u(5)],
+                [u(6), u(7), u(8)],
+                u(9),
+                w[10],
+                f32::from_bits(w[11]),
+            ))
+        }
+        Op::Custom { name, attrs, .. }
+            if name == CONV3D_LEAKY || name == CONV3D_ARGMAX || name == CONV3D_TOPK =>
+        {
+            let w: Vec<u32> = attrs
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b))
                 .collect();
             let u = |i: usize| w[i] as usize;
             Some((
@@ -316,6 +344,8 @@ pub fn conv3d_geometry(op: &Op) -> Option<([usize; 3], [usize; 3], [usize; 3], u
                 u(9),
                 if name == CONV3D_ARGMAX {
                     ARGMAX_ACT
+                } else if name == CONV3D_TOPK {
+                    TOPK_ACT
                 } else {
                     LEAKY_ACT
                 },
@@ -338,6 +368,407 @@ pub const ARGMAX_ACT: u32 = 0xFFFE;
 /// reader; the output is the argmax's. Attrs as [`CONV3D_LEAKY`]'s, without α.
 /// See [`fold_conv_argmax`].
 pub const CONV3D_ARGMAX: &str = "rlx_wgpu.conv3d_argmax";
+
+/// `Op::Custom` name of a PReLU with one slope, `x` where `x ≥ 0`, else `α·x`
+/// (attrs: `α` as f32 bits): one pass of the unary kernel
+/// ([`PRELU_OP`]), where a graph of max, min, multiply and add took four —
+/// FastSurfer has 44 a slice batch, a quarter of its GPU time.
+pub const PRELU: &str = "rlx_wgpu.prelu";
+
+/// The unary kernel's op id for [`PRELU`] (`α` in `_p0`).
+pub const PRELU_OP: u32 = 0xFFFF;
+
+/// The unary kernel's op id for a [`PRELU`] whose slope is a tensor (its
+/// second input; attrs: elements a channel, channels): `_p0` the slope's
+/// offset, `_p1`, `_p2` the attrs.
+pub const PRELU_TENSOR_OP: u32 = 0xFFFE;
+
+/// Run each PReLU [`rlx_ir::match_prelu`] finds — [`Graph::prelu`]'s
+/// `max(x, 0) + a·min(x, 0)`, the ONNX importer's `relu(x) − a·relu(−x)` —
+/// as one [`PRELU`], when nothing else reads its interior: a constant slope
+/// as the op's attribute (which [`fold_conv_input_prelu`] can take into a
+/// conv's loads), any other slope — a scalar, or one value per channel of a
+/// learned weight — as its second input. Four or five full-size passes
+/// become one, the same values (each output is `x` or `a·x` either way).
+/// `RLX_WGPU_NO_FOLD_PRELU=1` keeps the element-wise ops.
+fn fold_prelu(g: Graph) -> Graph {
+    use std::collections::HashSet;
+    if rlx_ir::env::flag("RLX_WGPU_NO_FOLD_PRELU") {
+        return g;
+    }
+    let mut readers: HashMap<NodeId, usize> = HashMap::new();
+    for n in g.nodes() {
+        for &i in &n.inputs {
+            *readers.entry(i).or_default() += 1;
+        }
+    }
+    // root -> (x, slope as attrs, or slope node and its (inner, count))
+    enum Slope {
+        Const(f32),
+        Tensor(NodeId, u32, u32),
+    }
+    let mut folds: HashMap<NodeId, (NodeId, Slope)> = HashMap::new();
+    let mut gone: HashSet<NodeId> = HashSet::new();
+    for n in g.nodes() {
+        let Some(m) = rlx_ir::match_prelu(&g, n.id) else {
+            continue;
+        };
+        let xs = &g.node(m.x).shape;
+        if xs.dtype() != rlx_ir::DType::F32 || xs.num_elements().is_none() {
+            continue;
+        }
+        // the interior read only inside the match: max/min (or relu and
+        // neg) by one reader each, the min's/neg's input `x` aside
+        let interior_ok = m
+            .interior
+            .iter()
+            .all(|&i| readers.get(&i) == Some(&1) && !g.outputs.contains(&i) && !gone.contains(&i));
+        if !interior_ok {
+            continue;
+        }
+        let slope = match m.constant_slope(&g) {
+            Some(a) => Slope::Const(a),
+            None => {
+                // one non-1 dim of the slope, right-aligned against `x`: a
+                // channel axis; none: a scalar
+                let sd: Vec<usize> = match g
+                    .node(m.slope)
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.is_static().then(|| d.unwrap_static()))
+                    .collect::<Option<Vec<_>>>()
+                {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let xd: Vec<usize> = xs.dims().iter().map(|d| d.unwrap_static()).collect();
+                if sd.len() > xd.len() || g.node(m.slope).shape.dtype() != rlx_ir::DType::F32 {
+                    continue;
+                }
+                let lead = xd.len() - sd.len();
+                let wide: Vec<usize> = (0..sd.len()).filter(|&k| sd[k] != 1).collect();
+                match wide.as_slice() {
+                    [] => Slope::Tensor(m.slope, 1, 1),
+                    [k] if sd[*k] == xd[lead + k] => {
+                        let inner: usize = xd[lead + k + 1..].iter().product();
+                        Slope::Tensor(m.slope, inner.max(1) as u32, sd[*k] as u32)
+                    }
+                    _ => continue,
+                }
+            }
+        };
+        gone.extend(m.interior.iter().copied());
+        folds.insert(n.id, (m.x, slope));
+    }
+    if folds.is_empty() {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        if gone.contains(&node.id) {
+            continue;
+        }
+        let (op, ins) = match folds.get(&node.id) {
+            Some((x, Slope::Const(a))) => (
+                Op::Custom {
+                    name: PRELU.to_string(),
+                    num_inputs: 1,
+                    attrs: a.to_bits().to_le_bytes().to_vec(),
+                },
+                vec![id_map[x]],
+            ),
+            Some((x, Slope::Tensor(sl, inner, count))) => (
+                Op::Custom {
+                    name: PRELU.to_string(),
+                    num_inputs: 2,
+                    attrs: [*inner, *count]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect(),
+                },
+                vec![id_map[x], id_map[sl]],
+            ),
+            None => (
+                node.op.clone(),
+                node.inputs.iter().map(|i| id_map[i]).collect(),
+            ),
+        };
+        id_map.insert(node.id, out.add_node(op, ins, node.shape.clone()));
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+/// `Conv3dParams::act` of a [`CONV3D_TOPK`]; `alpha` carries `k`.
+pub const TOPK_ACT: u32 = 0xFFFC;
+
+/// `Op::Custom` name of a 1×1×1, stride-1, unpadded, ungrouped conv whose
+/// store keeps, per voxel, only its `k` largest output channels — a
+/// classifier read by a vote over several networks, whose full scores
+/// (FastSurfer's 79 classes, a slice batch at a time) are the largest
+/// tensor and the largest read-back. Inputs as a biased conv (`x`, `w`, `b`);
+/// attrs: stride, padding, dilation (3 each), groups, `k` as f32 bits.
+/// Output `[n, 2k + 1, d, h, w]`: the `k` largest values, best first (the
+/// earlier channel first among equals), the `k + 1`-th (a bound on all the
+/// rest), then the `k` channels, f32-encoded. Built by the caller (no fold
+/// makes it); `k` at most 8.
+pub const CONV3D_TOPK: &str = "rlx_wgpu.conv3d_topk";
+
+/// `Op::Custom` name of a 2-D 3×3 conv (`conv3d_k3_c8`'s shape) with the
+/// element-wise op on either side of it folded in:
+///
+/// * flag bit 0: its input read through a PReLU of one slope, applied as each
+///   value is loaded (`Conv3dParams::in_prelu`; [`fold_conv_input_prelu`]);
+/// * flag bit 1: its output the elementwise `max` with a fourth input of its
+///   shape, taken in the store (`Conv3dParams::res_max`; [`fold_conv_max`]).
+///
+/// The folded tensors are never written or read. Inputs `x` (the PReLU's
+/// input), `w`, `b`, and the `max`'s other operand; attrs: stride, padding,
+/// dilation (3 each), groups, the store's `act` and `α` (as
+/// [`conv3d_geometry`] gives them), the input slope as f32 bits, the flags.
+pub const CONV3D_K3: &str = "rlx_wgpu.conv3d_k3";
+
+fn conv3d_k3_word(op: &Op, k: usize) -> Option<u32> {
+    match op {
+        Op::Custom { name, attrs, .. } if name == CONV3D_K3 => Some(u32::from_le_bytes(
+            attrs[4 * k..4 * k + 4].try_into().unwrap(),
+        )),
+        _ => None,
+    }
+}
+
+/// The input slope of a [`CONV3D_K3`] that has one.
+pub fn conv3d_in_prelu(op: &Op) -> Option<f32> {
+    let flags = conv3d_k3_word(op, 13)?;
+    (flags & 1 != 0).then(|| f32::from_bits(conv3d_k3_word(op, 12).unwrap()))
+}
+
+/// Whether a [`CONV3D_K3`] takes the `max` with its fourth input.
+pub fn conv3d_max_residual(op: &Op) -> bool {
+    conv3d_k3_word(op, 13).is_some_and(|f| f & 2 != 0)
+}
+
+/// Off under the switches that take `conv3d_k3_c8` away (the folds need it).
+fn k3_folds_off(own: &str) -> bool {
+    [
+        own,
+        "RLX_WGPU_CONV3D_NO_K3",
+        "RLX_WGPU_CONV3D_NO_C8",
+        "RLX_WGPU_CONV3D_W2",
+        "RLX_WGPU_CONV3D_NO_W2",
+        "RLX_WGPU_CONV3D_SCALAR",
+    ]
+    .iter()
+    .any(|k| rlx_ir::env::flag(k))
+}
+
+/// A biased rank-5 conv `conv3d_k3_c8` runs: kernel `[1, 3, 3]`, stride 1,
+/// padding `[0, 1, 1]`, no dilation, ungrouped, past four output channels —
+/// a `FusedConvBiasAct`, a [`CONV3D_LEAKY`] or a [`CONV3D_K3`].
+fn k3_conv(g: &Graph, n: &rlx_ir::Node) -> bool {
+    let kind = matches!(
+        n.op,
+        Op::FusedConvBiasAct {
+            has_residual: false,
+            ..
+        }
+    ) || matches!(&n.op, Op::Custom { name, .. } if name == CONV3D_LEAKY || name == CONV3D_K3);
+    let Some((s, pad, d, groups, ..)) = conv3d_geometry(&n.op) else {
+        return false;
+    };
+    if !kind || n.inputs.len() < 3 || n.shape.rank() != 5 {
+        return false;
+    }
+    let w = g.node(n.inputs[1]).shape.dims();
+    w.len() == 5
+        && (2..5).all(|i| w[i].is_static())
+        && (
+            w[2].unwrap_static(),
+            w[3].unwrap_static(),
+            w[4].unwrap_static(),
+        ) == (1, 3, 3)
+        && s == [1, 1, 1]
+        && pad == [0, 1, 1]
+        && d == [1, 1, 1]
+        && groups <= 1
+        && n.shape.dim(1).unwrap_static() > 4
+}
+
+/// `node` as a [`CONV3D_K3`] with these inputs, its input slope and flags
+/// (added to what it has, when it is one already)
+fn as_k3(node: &rlx_ir::Node, in_slope: Option<f32>, add_flags: u32, n_in: usize) -> Op {
+    let (s, p, d, groups, act, alpha) = conv3d_geometry(&node.op).unwrap();
+    let flags = conv3d_k3_word(&node.op, 13).unwrap_or(0) | add_flags;
+    let slope = in_slope
+        .or_else(|| conv3d_in_prelu(&node.op))
+        .unwrap_or(0.0);
+    Op::Custom {
+        name: CONV3D_K3.to_string(),
+        num_inputs: n_in as u32,
+        attrs: s
+            .iter()
+            .chain(&p)
+            .chain(&d)
+            .map(|&v| v as u32)
+            .chain([groups as u32, act, alpha.to_bits(), slope.to_bits(), flags])
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+    }
+}
+
+/// Fold a [`PRELU`] whose every reader is a conv `conv3d_k3_c8` runs, reading
+/// it as its input, into those convs: [`CONV3D_K3`]s reading the PReLU's
+/// input, the slope applied as each value is loaded — the same
+/// `select(α·x, x, x ≥ 0)` as the unary kernel, so the same sums; a
+/// full-size write and two reads per PReLU are gone (FastSurfer: 39 a
+/// batch). `RLX_WGPU_NO_FOLD_CONV_PRELU=1` keeps them.
+fn fold_conv_input_prelu(g: Graph) -> Graph {
+    if k3_folds_off("RLX_WGPU_NO_FOLD_CONV_PRELU") {
+        return g;
+    }
+    let mut readers: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for n in g.nodes() {
+        for &i in &n.inputs {
+            readers.entry(i).or_default().push(n.id);
+        }
+    }
+    // a reader that takes the fold: the PReLU its input and nothing else,
+    // no input slope of its own yet
+    let k3_reader = |r: NodeId, p: NodeId| {
+        let n = g.node(r);
+        k3_conv(&g, n)
+            && n.inputs[0] == p
+            && !n.inputs[1..].contains(&p)
+            && conv3d_in_prelu(&n.op).is_none()
+    };
+    let mut slope: HashMap<NodeId, f32> = HashMap::new(); // conv -> input slope
+    let mut gone: HashMap<NodeId, NodeId> = HashMap::new(); // prelu -> its input
+    for n in g.nodes() {
+        let Op::Custom { name, attrs, .. } = &n.op else {
+            continue;
+        };
+        // the slope an attribute (a constant), not a tensor input
+        if name != PRELU || n.inputs.len() != 1 || g.outputs.contains(&n.id) {
+            continue;
+        }
+        let rs = readers.get(&n.id).map_or(&[][..], |v| v.as_slice());
+        if rs.is_empty() || !rs.iter().all(|&r| k3_reader(r, n.id)) {
+            continue;
+        }
+        let a = f32::from_le_bytes(attrs[..4].try_into().unwrap());
+        for &r in rs {
+            slope.insert(r, a);
+        }
+        gone.insert(n.id, n.inputs[0]);
+    }
+    if gone.is_empty() {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        if gone.contains_key(&node.id) {
+            continue;
+        }
+        let ins: Vec<NodeId> = node
+            .inputs
+            .iter()
+            .map(|i| id_map[gone.get(i).unwrap_or(i)])
+            .collect();
+        let op = match slope.get(&node.id) {
+            Some(&a) => as_k3(node, Some(a), 1, ins.len()),
+            None => node.op.clone(),
+        };
+        id_map.insert(node.id, out.add_node(op, ins, node.shape.clone()));
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+/// Fold an element-wise `max(conv, r)` — the conv's only reader, `r` of the
+/// conv's shape — into a conv `conv3d_k3_c8` runs with no activation of its
+/// own: a [`CONV3D_K3`] taking `r` as a fourth input and the `max` in its
+/// store (FastSurfer's competitive dense blocks: 36 a batch). The same
+/// values: the store's `max` is the binary kernel's. The fused node takes the
+/// `max`'s place in the order (`r` may come after the conv).
+/// `RLX_WGPU_NO_FOLD_CONV_MAX=1` keeps them.
+fn fold_conv_max(g: Graph) -> Graph {
+    use rlx_ir::op::BinaryOp;
+    if k3_folds_off("RLX_WGPU_NO_FOLD_CONV_MAX") {
+        return g;
+    }
+    let mut readers: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for n in g.nodes() {
+        for &i in &n.inputs {
+            readers.entry(i).or_default().push(n.id);
+        }
+    }
+    // max node -> (conv, the other operand)
+    let mut folds: HashMap<NodeId, (NodeId, NodeId)> = HashMap::new();
+    let mut convs: std::collections::HashSet<NodeId> = Default::default();
+    for n in g.nodes() {
+        let no_act = conv3d_geometry(&n.op).is_some_and(|c| c.4 == 0);
+        if !k3_conv(&g, n)
+            || !no_act
+            || n.inputs.len() != 3
+            || conv3d_max_residual(&n.op)
+            || g.outputs.contains(&n.id)
+            || n.shape.dtype() != rlx_ir::DType::F32
+        {
+            continue;
+        }
+        let [m] = readers.get(&n.id).map_or(&[][..], |v| v.as_slice()) else {
+            continue;
+        };
+        let mn = g.node(*m);
+        if !matches!(mn.op, Op::Binary(BinaryOp::Max)) || mn.shape != n.shape {
+            continue;
+        }
+        let r = if mn.inputs[0] == n.id {
+            mn.inputs[1]
+        } else {
+            mn.inputs[0]
+        };
+        if r == n.id || g.node(r).shape != n.shape {
+            continue;
+        }
+        folds.insert(*m, (n.id, r));
+        convs.insert(n.id);
+    }
+    if folds.is_empty() {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        if convs.contains(&node.id) {
+            // emitted at its max
+            continue;
+        }
+        let (op, ins) = match folds.get(&node.id) {
+            Some(&(c, r)) => {
+                let cn = g.node(c);
+                let mut ins: Vec<NodeId> = cn.inputs.iter().map(|i| id_map[i]).collect();
+                ins.push(id_map[&r]);
+                (as_k3(cn, None, 2, 4), ins)
+            }
+            None => (
+                node.op.clone(),
+                node.inputs.iter().map(|i| id_map[i]).collect(),
+            ),
+        };
+        let shape = node.shape.clone();
+        let nid = out.add_node(op, ins, shape);
+        id_map.insert(node.id, nid);
+        if let Some(&(c, _)) = folds.get(&node.id) {
+            id_map.insert(c, nid);
+        }
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
 
 /// A scalar `Op::Constant`'s value.
 fn scalar_constant(g: &Graph, id: NodeId) -> Option<f32> {

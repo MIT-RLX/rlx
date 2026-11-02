@@ -162,33 +162,31 @@ impl RandomState {
     }
 }
 
-/// `sincosf(x)` → `(sin, cos)` as the platform's merged call computes it.
-#[cfg(target_os = "macos")]
+/// `sincosf(x)` → `(sin, cos)` as the platform's merged call computes it: Apple's
+/// `__sincosf_stret` on macOS; elsewhere (and under
+/// `rlx_libm::platform::use_linux_reference`) glibc's (torch on Linux), ported in
+/// [`rlx_libm`] so a wasm or non-glibc build draws the same values.
 fn sincosf(x: f32) -> (f32, f32) {
-    #[repr(C)]
-    struct SinCos {
-        s: f32,
-        c: f32,
+    #[cfg(target_os = "macos")]
+    if rlx_libm::platform::macos_reference() {
+        #[repr(C)]
+        struct SinCos {
+            s: f32,
+            c: f32,
+        }
+        unsafe extern "C" {
+            fn __sincosf_stret(x: f32) -> SinCos;
+        }
+        // SAFETY: a pure libm function returning a two-float struct by value.
+        let r = unsafe { __sincosf_stret(x) };
+        return (r.s, r.c);
     }
-    unsafe extern "C" {
-        fn __sincosf_stret(x: f32) -> SinCos;
-    }
-    // SAFETY: a pure libm function returning a two-float struct by value.
-    let r = unsafe { __sincosf_stret(x) };
-    (r.s, r.c)
-}
-
-/// `sincosf(x)` → `(sin, cos)` as the platform's merged call computes it: off
-/// macOS the reference is glibc's (torch on Linux), ported in [`rlx_libm`] so a
-/// wasm or non-glibc build draws the same values.
-#[cfg(not(target_os = "macos"))]
-fn sincosf(x: f32) -> (f32, f32) {
     rlx_libm::sincosf(x)
 }
 
 /// `std::log(float)`: Apple's `logf` on macOS, glibc's ([`rlx_libm::logf`]) elsewhere.
 fn logf(x: f32) -> f32 {
-    if cfg!(target_os = "macos") {
+    if rlx_libm::platform::macos_reference() {
         x.ln()
     } else {
         rlx_libm::logf(x)

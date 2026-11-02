@@ -309,6 +309,10 @@ pub(crate) fn dequant_gguf_weight(
             .map_err(|e| MlxError(format!("GGUF FV5B dequant: {e}"))),
         Q::GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0(w_bytes, elems)
             .map_err(|e| MlxError(format!("GGUF G8_0 dequant: {e}"))),
+        Q::Fp8E4m3B128 | Q::Fp8E5m2B128 => {
+            rlx_ir::lowp_codec::fp8_b128::dequant_scheme(*scheme, w_bytes, elems)
+                .map_err(|e| MlxError(format!("FP8 block dequant: {e}")))
+        }
         other => Err(MlxError(format!(
             "MLX DequantMatMul: unsupported GGUF scheme {other:?}"
         ))),

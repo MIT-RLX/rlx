@@ -95,6 +95,7 @@ pub fn gguf_fused_gemv_m1_supported(scheme_id: u32, m: usize, k: usize) -> bool 
             0 => k.is_multiple_of(256),
             1 | 2 => gguf_gemv_elem_enabled() && k.is_multiple_of(256),
             20 => k.is_multiple_of(32),
+            30 | 31 => k.is_multiple_of(128),
             _ => false,
         }
 }
@@ -105,6 +106,7 @@ pub fn gguf_gemv_rows_supported(scheme_id: u32, m: usize, k: usize) -> bool {
     (2..=4).contains(&m)
         && match scheme_id {
             20 => k.is_multiple_of(32),
+            30 | 31 => k.is_multiple_of(128),
             1 => k.is_multiple_of(256),
             0 | 2 => gguf_gemv_elem_enabled() && k.is_multiple_of(256),
             _ => false,

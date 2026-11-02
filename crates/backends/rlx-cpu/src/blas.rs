@@ -288,6 +288,18 @@ unsafe fn cblas_sgemm(
         return;
     }
 
+    // `portable` natively: what the relaxed-SIMD wasm kernel computes, the
+    // in-order fused-multiply-add chain per element.
+    #[cfg(all(rlx_cpu_portable, not(target_arch = "wasm32")))]
+    {
+        unsafe {
+            sgemm_fused(
+                m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
+            )
+        };
+        return;
+    }
+
     // wasm with simd128: the register-tiled kernel, bit-identical to the
     // loops in `sgemm_loops`.
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -305,6 +317,158 @@ unsafe fn cblas_sgemm(
             m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
         )
     };
+}
+
+/// `cblas_sgemm` under `portable` on a native target: every element of C is
+/// the chain the relaxed-SIMD wasm kernel computes (`wasm_gemm`'s
+/// `fused_gemm_is_the_in_order_fma_chain`). Untransposed, C starts as
+/// `beta·C` (0 when `beta == 0`) and takes `fma(alpha·a, b, ·)` for each `k`
+/// whose `alpha·a` is nonzero; transposed, an FMA chain from 0 finished as
+/// `alpha·acc (+ beta·C)`. Rows stream B (packed row-major when transposed)
+/// so the column loop vectorizes into fused lanes, which round each lane as
+/// the scalar chain does.
+///
+/// # Safety
+/// Same contract as `cblas_sgemm`: the pointers cover the strided extents.
+#[cfg(all(rlx_cpu_portable, not(target_arch = "wasm32")))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn sgemm_fused(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: *const f32,
+    lda: usize,
+    trans_a: bool,
+    b: *const f32,
+    ldb: usize,
+    trans_b: bool,
+    beta: f32,
+    c: *mut f32,
+    ldc: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: FMA just checked; `mul_add` lowers to `vfmadd` here.
+        unsafe {
+            sgemm_fused_x86(
+                m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
+            )
+        };
+        return;
+    }
+    unsafe {
+        sgemm_fused_body(
+            m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
+        )
+    };
+}
+
+#[cfg(all(rlx_cpu_portable, target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sgemm_fused_x86(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: *const f32,
+    lda: usize,
+    trans_a: bool,
+    b: *const f32,
+    ldb: usize,
+    trans_b: bool,
+    beta: f32,
+    c: *mut f32,
+    ldc: usize,
+) {
+    unsafe {
+        sgemm_fused_body(
+            m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
+        )
+    };
+}
+
+#[cfg(all(rlx_cpu_portable, not(target_arch = "wasm32")))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sgemm_fused_body(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: *const f32,
+    lda: usize,
+    trans_a: bool,
+    b: *const f32,
+    ldb: usize,
+    trans_b: bool,
+    beta: f32,
+    c: *mut f32,
+    ldc: usize,
+) {
+    if !trans_a && !trans_b {
+        for i in 0..m {
+            let crow = unsafe { std::slice::from_raw_parts_mut(c.add(i * ldc), n) };
+            if beta == 0.0 {
+                crow.fill(0.0);
+            } else if beta != 1.0 {
+                for v in crow.iter_mut() {
+                    *v *= beta;
+                }
+            }
+            for p in 0..k {
+                let av = alpha * unsafe { *a.add(i * lda + p) };
+                if av == 0.0 {
+                    continue;
+                }
+                let brow = unsafe { std::slice::from_raw_parts(b.add(p * ldb), n) };
+                for (cv, &bv) in crow.iter_mut().zip(brow) {
+                    *cv = av.mul_add(bv, *cv);
+                }
+            }
+        }
+        return;
+    }
+    let mut bp = vec![0f32; k * n];
+    for p in 0..k {
+        for (j, v) in bp[p * n..(p + 1) * n].iter_mut().enumerate() {
+            *v = unsafe {
+                if trans_b {
+                    *b.add(j * ldb + p)
+                } else {
+                    *b.add(p * ldb + j)
+                }
+            };
+        }
+    }
+    let mut acc = vec![0f32; n];
+    for i in 0..m {
+        acc.fill(0.0);
+        for p in 0..k {
+            let av = unsafe {
+                if trans_a {
+                    *a.add(p * lda + i)
+                } else {
+                    *a.add(i * lda + p)
+                }
+            };
+            for (s, &bv) in acc.iter_mut().zip(&bp[p * n..(p + 1) * n]) {
+                *s = av.mul_add(bv, *s);
+            }
+        }
+        let crow = unsafe { std::slice::from_raw_parts_mut(c.add(i * ldc), n) };
+        // CBLAS: `beta == 0` does not read C (as `wasm_gemm::finish`).
+        if beta == 0.0 {
+            for (cv, &s) in crow.iter_mut().zip(&acc) {
+                *cv = alpha * s;
+            }
+        } else {
+            for (cv, &s) in crow.iter_mut().zip(&acc) {
+                *cv = alpha * s + beta * *cv;
+            }
+        }
+    }
 }
 
 /// The portable loops behind the `cblas_sgemm` fallback (and the reference
@@ -3203,7 +3367,7 @@ pub fn sgemm_strided(
 }
 
 /// NEON-vectorized bias addition in-place.
-#[cfg(target_arch = "aarch64")]
+#[cfg(rlx_cpu_neon)]
 pub fn bias_add(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     use std::arch::aarch64::*;
     let chunks = n / 4;
@@ -3223,7 +3387,7 @@ pub fn bias_add(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(rlx_cpu_neon))]
 pub fn bias_add(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     for row in 0..m {
         let base = row * n;
@@ -4052,7 +4216,7 @@ fn bf16_bits_to_f32(bits: u16) -> f32 {
 /// the high half of an f32), FMA into the accumulator, so the dequant vectorizes.
 #[inline]
 fn saxpy_bf16(scale: f32, b: &[u16], acc: &mut [f32]) {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(rlx_cpu_neon)]
     unsafe {
         use std::arch::aarch64::*;
         let n = acc.len();
@@ -4073,7 +4237,7 @@ fn saxpy_bf16(scale: f32, b: &[u16], acc: &mut [f32]) {
             nn += 1;
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(rlx_cpu_neon))]
     for (v, &bw) in acc.iter_mut().zip(b) {
         *v += scale * bf16_bits_to_f32(bw);
     }
@@ -4642,7 +4806,13 @@ pub fn round_half_into(src: &[f32], dst: &mut [u16], bf16: bool) {
 
 /// The no-BLAS `cblas_sgemm`'s transposed path packs op(B) for a contiguous
 /// inner loop; it must stay bit-identical to the scalar loop it replaced.
-#[cfg(all(test, not(rlx_cpu_blas)))]
+/// (`portable` natively computes the fused chain instead, pinned by
+/// `portable_sgemm_tests`.)
+#[cfg(all(
+    test,
+    not(rlx_cpu_blas),
+    not(all(rlx_cpu_portable, not(target_arch = "wasm32")))
+))]
 mod fallback_gemm_tests {
     use super::*;
 
@@ -4846,5 +5016,119 @@ mod fallback_gemm_tests {
             }
         }
         assert_eq!(cases, 60);
+    }
+}
+
+#[cfg(all(test, rlx_cpu_portable, not(target_arch = "wasm32")))]
+mod portable_sgemm_tests {
+    /// `portable`'s native GEMM is the relaxed-SIMD wasm kernel's chain:
+    /// the same scalar reference as `wasm_gemm`'s
+    /// `fused_gemm_is_the_in_order_fma_chain`, start value and zero-skip
+    /// included (an infinity in B turns a non-skipped `0·inf` into NaN).
+    #[test]
+    fn portable_gemm_is_the_in_order_fma_chain() {
+        let fma = crate::avx2_mirror::fmaf;
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / 8_388_608.0) - 1.0
+        };
+        let mut cases = 0;
+        for &(m, n, k) in &[
+            (1, 8, 1),
+            (1, 2303, 768),
+            (3, 7, 5),
+            (5, 17, 33),
+            (9, 24, 0),
+            (40, 77, 64),
+            (13, 1, 9),
+        ] {
+            for (ta, tb) in [(false, false), (true, false), (false, true), (true, true)] {
+                for (alpha, beta) in [(1.0f32, 0.0f32), (1.0, 1.0), (-1.25, 0.75)] {
+                    let (lda, ldb, ldc) = (
+                        if ta { m + 3 } else { k + 2 },
+                        if tb { k + 1 } else { n + 5 },
+                        n + 4,
+                    );
+                    let a: Vec<f32> = (0..lda * if ta { k } else { m })
+                        .map(|i| if i % 11 == 0 { 0.0 } else { rnd() })
+                        .collect();
+                    let b: Vec<f32> = (0..ldb * if tb { n } else { k })
+                        .map(|i| {
+                            if i % 37 == 5 {
+                                if i % 2 == 0 {
+                                    f32::INFINITY
+                                } else {
+                                    f32::NEG_INFINITY
+                                }
+                            } else {
+                                rnd() * 3.0
+                            }
+                        })
+                        .collect();
+                    let c0: Vec<f32> = (0..ldc * m).map(|_| rnd()).collect();
+                    let at = |i: usize, p: usize| if ta { a[p * lda + i] } else { a[i * lda + p] };
+                    let bt = |p: usize, j: usize| if tb { b[j * ldb + p] } else { b[p * ldb + j] };
+                    let mut got = c0.clone();
+                    unsafe {
+                        super::sgemm_fused(
+                            m,
+                            n,
+                            k,
+                            alpha,
+                            a.as_ptr(),
+                            lda,
+                            ta,
+                            b.as_ptr(),
+                            ldb,
+                            tb,
+                            beta,
+                            got.as_mut_ptr(),
+                            ldc,
+                        )
+                    };
+                    for i in 0..m {
+                        for j in 0..n {
+                            let old = c0[i * ldc + j];
+                            let want = if !ta && !tb {
+                                let mut s = if beta == 0.0 {
+                                    0.0
+                                } else if beta != 1.0 {
+                                    old * beta
+                                } else {
+                                    old
+                                };
+                                for p in 0..k {
+                                    let av = alpha * at(i, p);
+                                    if av != 0.0 {
+                                        s = fma(av, bt(p, j), s);
+                                    }
+                                }
+                                s
+                            } else {
+                                let mut s = 0f32;
+                                for p in 0..k {
+                                    s = fma(at(i, p), bt(p, j), s);
+                                }
+                                if beta == 0.0 {
+                                    alpha * s
+                                } else {
+                                    alpha * s + beta * old
+                                }
+                            };
+                            let g = got[i * ldc + j];
+                            assert!(
+                                g.to_bits() == want.to_bits() || (g.is_nan() && want.is_nan()),
+                                "m{m} n{n} k{k} ta{ta} tb{tb} a{alpha} b{beta} at ({i},{j}): {g} vs {want}"
+                            );
+                        }
+                    }
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 7 * 4 * 3);
     }
 }

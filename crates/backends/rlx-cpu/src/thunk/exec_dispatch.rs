@@ -70,7 +70,7 @@ impl Drop for MoeResidencyGuard {
 /// Contiguous AVX2 Add/Mul/Sub. Large buffers are split across Rayon so we
 /// keep SIMD *and* multi-core (serial AVX2 alone lost to 16-wide scalar rayon
 /// on F5-TTS DiT residuals).
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[inline]
 fn binary_contig_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp) -> bool {
     if !std::arch::is_x86_feature_detected!("avx2") {
@@ -121,7 +121,7 @@ fn binary_contig_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp) -> bool 
 /// # Safety
 /// Caller has checked `is_x86_feature_detected!("avx2")`, `op` is one of
 /// Add/Sub/Mul, and `[i0, i1)` is in bounds of all three buffers.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn binary_contig_avx2(
@@ -160,7 +160,7 @@ unsafe fn binary_contig_avx2(
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(rlx_cpu_x86))]
 #[inline]
 #[allow(dead_code)]
 fn binary_contig_f32(_l: &[f32], _r: &[f32], _o: &mut [f32], _op: BinaryOp) -> bool {
@@ -179,7 +179,7 @@ fn binary_row_bcast_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp, rl: u
     let r_ptr = r.as_ptr() as usize;
     let o_ptr = o.as_mut_ptr() as usize;
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(rlx_cpu_x86)]
     let use_avx2 = rl >= 8
         && rl.is_multiple_of(8)
         && matches!(op, BinaryOp::Add | BinaryOp::Mul | BinaryOp::Sub)
@@ -189,7 +189,7 @@ fn binary_row_bcast_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp, rl: u
         let l = l_ptr as *const f32;
         let r = r_ptr as *const f32;
         let o = o_ptr as *mut f32;
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(rlx_cpu_x86)]
         if use_avx2 {
             // SAFETY: AVX2 + `rl % 8 == 0` + Add/Sub/Mul all checked in
             // `use_avx2`; rows `[row0, row1)` are within `rows`.
@@ -238,7 +238,7 @@ fn binary_row_bcast_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp, rl: u
 /// Caller has checked `is_x86_feature_detected!("avx2")`, that `rl` is a
 /// non-zero multiple of 8, that `op` is one of Add/Sub/Mul, and that rows
 /// `[row0, row1)` are in bounds of all three buffers.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn binary_row_bcast_avx2(
@@ -1869,7 +1869,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                             };
                         }
                         if ll == len && rl == len {
-                            #[cfg(target_arch = "aarch64")]
+                            #[cfg(rlx_cpu_neon)]
                             if matches!(op, BinaryOp::Add | BinaryOp::Mul) {
                                 use std::arch::aarch64::*;
                                 // one IEEE add/mul per element, whichever lane or
@@ -1912,7 +1912,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                             }
                             // x86: contiguous same-shape Add/Mul/Sub — AVX2 when
                             // available, else a plain parallel loop (no N-D index walk).
-                            #[cfg(target_arch = "x86_64")]
+                            #[cfg(rlx_cpu_x86)]
                             if matches!(op, BinaryOp::Add | BinaryOp::Mul | BinaryOp::Sub) {
                                 let used = binary_contig_f32(l, r, o, *op);
                                 if used {
@@ -2481,7 +2481,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     // (`dots_by_key_lanes`); past the threshold it is taken
                     // only without a BLAS, at a 512-row bucket ~11 ms of a
                     // ~30 ms step on three cores.
-                    #[cfg(target_arch = "x86_64")]
+                    #[cfg(rlx_cpu_x86)]
                     if b == 1
                         && q_s == 1
                         && nh > 1
@@ -2557,9 +2557,9 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     if b == 1 && q_s.max(k_s) <= cfg.sdpa_seq_threshold {
                         // ── Sequential NEON path (zero overhead) ──
                         let scores = &mut sdpa_scores[..ss];
-                        #[cfg(target_arch = "aarch64")]
+                        #[cfg(rlx_cpu_neon)]
                         let neon_chunks = dh / 4;
-                        #[cfg(target_arch = "aarch64")]
+                        #[cfg(rlx_cpu_neon)]
                         let neon_chunks_v = dh_v / 4;
 
                         for bi in 0..b {
@@ -2570,11 +2570,11 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     let q_off = bi * q_s * qrs + qi * qrs + hi * dh;
                                     for ki in 0..k_s {
                                         let k_off = bi * k_s * krs + ki * krs + kv_hi * dh;
-                                        #[cfg(target_arch = "aarch64")]
+                                        #[cfg(rlx_cpu_neon)]
                                         let mut dot;
-                                        #[cfg(not(target_arch = "aarch64"))]
+                                        #[cfg(not(rlx_cpu_neon))]
                                         let mut dot = 0f32;
-                                        #[cfg(target_arch = "aarch64")]
+                                        #[cfg(rlx_cpu_neon)]
                                         {
                                             use std::arch::aarch64::*;
                                             let mut acc = vdupq_n_f32(0.0);
@@ -2590,7 +2590,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                                 dot += q_data[q_off + d] * k_data[k_off + d];
                                             }
                                         }
-                                        #[cfg(not(target_arch = "aarch64"))]
+                                        #[cfg(not(rlx_cpu_neon))]
                                         for d in 0..dh {
                                             dot += q_data[q_off + d] * k_data[k_off + d];
                                         }
@@ -2631,7 +2631,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                         let sc = scores[qi * k_s + ki];
                                         if sc > score_thr {
                                             let v_off = bi * k_s * vrs + ki * vrs + kv_hi * dh_v;
-                                            #[cfg(target_arch = "aarch64")]
+                                            #[cfg(rlx_cpu_neon)]
                                             {
                                                 use std::arch::aarch64::*;
                                                 let vsc = vdupq_n_f32(sc);
@@ -2652,7 +2652,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                                     out_data[o_off + d] += sc * v_data[v_off + d];
                                                 }
                                             }
-                                            #[cfg(not(target_arch = "aarch64"))]
+                                            #[cfg(not(rlx_cpu_neon))]
                                             for d in 0..dh_v {
                                                 out_data[o_off + d] += sc * v_data[v_off + d];
                                             }
@@ -2962,7 +2962,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     //    are read-only. Serial per-head SDPA lost ~3× to the
                     //    unfused Attention thunk (which is per-head parallel) on
                     //    wide heads — e.g. MoonViT 12×128 @ seq 64.
-                    #[cfg(target_arch = "aarch64")]
+                    #[cfg(rlx_cpu_neon)]
                     let neon_chunks = d_h / 4;
                     let qkv_ptr = qkv.as_ptr() as usize;
                     let out_ptr = attn_out.as_mut_ptr() as usize;
@@ -3019,7 +3019,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                             dot += qr1 * kr1 + qr2 * kr2;
                                         }
                                     } else {
-                                        #[cfg(target_arch = "aarch64")]
+                                        #[cfg(rlx_cpu_neon)]
                                         {
                                             use std::arch::aarch64::*;
                                             let mut acc = vdupq_n_f32(0.0);
@@ -3035,7 +3035,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                                 dot += qkv[q_base + d] * qkv[k_base + d];
                                             }
                                         }
-                                        #[cfg(not(target_arch = "aarch64"))]
+                                        #[cfg(not(rlx_cpu_neon))]
                                         for d in 0..d_h {
                                             dot += qkv[q_base + d] * qkv[k_base + d];
                                         }
@@ -3066,7 +3066,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     let sc = scores[qi * s + ki];
                                     if sc > score_thr {
                                         let v_base = bi * s * 3 * h + ki * 3 * h + 2 * h + hi * d_h;
-                                        #[cfg(target_arch = "aarch64")]
+                                        #[cfg(rlx_cpu_neon)]
                                         {
                                             use std::arch::aarch64::*;
                                             let vsc = vdupq_n_f32(sc);
@@ -3080,7 +3080,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                                 );
                                             }
                                         }
-                                        #[cfg(not(target_arch = "aarch64"))]
+                                        #[cfg(not(rlx_cpu_neon))]
                                         for d in 0..d_h {
                                             *out.add(o_base + d) += sc * qkv[v_base + d];
                                         }
@@ -3136,7 +3136,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 let id = *int_dim as usize;
                 let scale = (d_h as f32).powf(-0.5);
                 let _half = d_h / 2;
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(rlx_cpu_neon)]
                 let neon_chunks = d_h / 4;
                 unsafe {
                     let inp = sl(*hidden, base, m * h);
@@ -3169,11 +3169,11 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 for ki in 0..s {
                                     let q_base = bi * s * 3 * h + qi * 3 * h + hi * d_h;
                                     let k_base = bi * s * 3 * h + ki * 3 * h + h + hi * d_h;
-                                    #[cfg(target_arch = "aarch64")]
+                                    #[cfg(rlx_cpu_neon)]
                                     let dot;
-                                    #[cfg(not(target_arch = "aarch64"))]
+                                    #[cfg(not(rlx_cpu_neon))]
                                     let mut dot = 0f32;
-                                    #[cfg(target_arch = "aarch64")]
+                                    #[cfg(rlx_cpu_neon)]
                                     {
                                         use std::arch::aarch64::*;
                                         let mut acc = vdupq_n_f32(0.0);
@@ -3186,7 +3186,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                         }
                                         dot = vaddvq_f32(acc);
                                     }
-                                    #[cfg(not(target_arch = "aarch64"))]
+                                    #[cfg(not(rlx_cpu_neon))]
                                     for d in 0..d_h {
                                         dot += qkv[q_base + d] * qkv[k_base + d];
                                     }
@@ -3206,7 +3206,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     let w = sc[qi * s + ki];
                                     if w > score_thr {
                                         let v = bi * s * 3 * h + ki * 3 * h + 2 * h + hi * d_h;
-                                        #[cfg(target_arch = "aarch64")]
+                                        #[cfg(rlx_cpu_neon)]
                                         {
                                             use std::arch::aarch64::*;
                                             let vw = vdupq_n_f32(w);
@@ -3222,7 +3222,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                                 );
                                             }
                                         }
-                                        #[cfg(not(target_arch = "aarch64"))]
+                                        #[cfg(not(rlx_cpu_neon))]
                                         for d in 0..d_h {
                                             attn[o + d] += w * qkv[v + d];
                                         }
@@ -3242,7 +3242,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         h,
                         h,
                     );
-                    #[cfg(target_arch = "aarch64")]
+                    #[cfg(rlx_cpu_neon)]
                     {
                         use std::arch::aarch64::*;
                         let chunks_h = (m * h) / 4;
@@ -3260,7 +3260,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                             res[i] += inp[i];
                         }
                     }
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(not(rlx_cpu_neon))]
                     for i in 0..m * h {
                         res[i] += inp[i];
                     }
@@ -3292,7 +3292,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         id,
                         h,
                     );
-                    #[cfg(target_arch = "aarch64")]
+                    #[cfg(rlx_cpu_neon)]
                     {
                         use std::arch::aarch64::*;
                         let chunks_h = (m * h) / 4;
@@ -3310,7 +3310,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                             res[i] += normed[i];
                         }
                     }
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(not(rlx_cpu_neon))]
                     for i in 0..m * h {
                         res[i] += normed[i];
                     }
@@ -3360,7 +3360,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 let id = *int_dim as usize;
                 let scale = (d_h as f32).powf(-0.5);
                 let half_dh = d_h / 2;
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(rlx_cpu_neon)]
                 let neon_chunks = d_h / 4;
                 unsafe {
                     let inp = sl(*hidden, base, m * h);
@@ -3423,7 +3423,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     let w = sc[qi * s + ki];
                                     if w > score_thr {
                                         let v = bi * s * 3 * h + ki * 3 * h + 2 * h + hi * d_h;
-                                        #[cfg(target_arch = "aarch64")]
+                                        #[cfg(rlx_cpu_neon)]
                                         {
                                             use std::arch::aarch64::*;
                                             let vw = vdupq_n_f32(w);
@@ -3439,7 +3439,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                                 );
                                             }
                                         }
-                                        #[cfg(not(target_arch = "aarch64"))]
+                                        #[cfg(not(rlx_cpu_neon))]
                                         for d in 0..d_h {
                                             attn[o + d] += w * qkv[v + d];
                                         }
@@ -4819,7 +4819,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
 /// dependency on one accumulator (an add latency per element); here eight keys
 /// run in the eight lanes of one AVX register, fed by an 8×8 transpose of
 /// their rows.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 pub(super) fn dots_by_key_lanes(
     q: &[f32],
     k: &[f32],
@@ -4860,7 +4860,7 @@ pub(super) fn dots_by_key_lanes(
 
 /// Eight [`dots_by_key_lanes`] dots, one per lane. `q.len()` is a multiple
 /// of 8.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[target_feature(enable = "avx")]
 unsafe fn dot8_avx(q: &[f32], rows: [&[f32]; 8]) -> [f32; 8] {
     use std::arch::x86_64::*;

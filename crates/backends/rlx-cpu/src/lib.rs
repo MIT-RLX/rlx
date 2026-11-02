@@ -16,6 +16,7 @@ pub mod attention_bwd;
 pub mod autotune;
 mod avx2_mirror;
 pub mod blas;
+pub mod shared_params;
 /// Accurate vectorized f32 exp / log / tanh (the `rlx-fastmath` crate).
 pub use rlx_fastmath as fastmath;
 pub mod calibrate;
@@ -46,7 +47,7 @@ pub mod spd_batched; // batched, differentiable ReEig/LogEig custom ops (f64 LAP
 pub mod spd_kernels; // CpuKernel impls for the core SPDNet ops (BiMap/ReEig/LogEig/SpdBatchNorm)
 pub use gguf_scheme::quant_scheme_for_ggml;
 pub mod im2col;
-#[cfg(all(feature = "int8-gemv", target_arch = "x86_64"))]
+#[cfg(all(feature = "int8-gemv", rlx_cpu_x86))]
 mod int8_gemv;
 pub mod int_storage;
 pub mod intrinsics;

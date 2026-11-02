@@ -77,11 +77,17 @@ pub fn looks_legacy(head: &[u8]) -> bool {
 /// Read a legacy `torch.save` file.
 pub fn read(path: &Path) -> Result<LegacyFile> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    read_bytes(&bytes)
+}
+
+/// [`read`] from the file's bytes — one fetched over the network in a
+/// browser, where there is no file.
+pub fn read_bytes(bytes: &[u8]) -> Result<LegacyFile> {
     let mut pos = 0usize;
 
     // magic, protocol version, sys_info — validated only loosely: a wrong
     // magic is worth reporting, but the other two carry nothing this needs.
-    let (magic, n) = unpickle_prefix(&bytes).context("legacy torch file: magic number")?;
+    let (magic, n) = unpickle_prefix(bytes).context("legacy torch file: magic number")?;
     pos += n;
     if let Value::Int(v) = magic {
         // 0x1950a86a20f9469cfc6c truncated into i64 by the pickle's LONG.

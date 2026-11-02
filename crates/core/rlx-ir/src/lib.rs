@@ -341,6 +341,7 @@ pub use op_registry::{OpRegistry, global_registry, register_op, register_op_stri
 pub use ops::attention::attention_kind_op;
 pub use ops::backward::{unpack_ada_layer_norm_backward, unpack_gated_residual_backward};
 pub use ops::dsp::{FirMode, iir_impulse_response};
+pub use ops::prelu::{PreluMatch, match_prelu};
 #[cfg(feature = "std")]
 pub use phase::{Phase, PhaseSchedule, derive_phases};
 pub use provenance::{NodeOrigin, node_label, stamp_pass_origins};

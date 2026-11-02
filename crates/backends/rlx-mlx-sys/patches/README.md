@@ -12,7 +12,10 @@ the submodule commit, not a silent skip: the failure it would otherwise cause is
 a metallib stamped for the wrong platform, which does not surface until Metal
 refuses to load it on a device.
 
-After bumping the submodule, re-base anything that no longer fits:
+To bump the submodule, run `just update-mlx [REF]` (`scripts/update-mlx.sh`;
+default ref is the newest release tag, `main` for the tip). It takes the patches
+out, moves the pin, re-applies them and names any that no longer fit. Re-base
+those by hand:
 
 ```sh
 cd vendor/mlx

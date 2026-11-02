@@ -104,7 +104,7 @@ fn f16_shadow_arena_size(plan: &MemoryPlan) -> usize {
 pub const SHARD_STAGE_RESERVE: usize = 768 * 1024 * 1024;
 
 /// The stage reserve on a 32-bit target (the browser). Its whole logical
-/// arena must stay below 2 GiB ([`WEIGHT_BUF_TAG`] is bit 31), and 768 MiB a
+/// arena must stay below 3 GiB ([`WEIGHT_BUF_TAG`]; it was 2 GiB), and 768 MiB a
 /// stripe did not leave room: MindGrab's 1.29 GB plan under a 1 GiB binding
 /// snapped to 4.03 GB of stripes and the compile panicked. 64 MiB is what the
 /// ≤ 2 GiB-buffer adapters already get (`compile`'s scratch tail).
@@ -446,22 +446,95 @@ pub struct ArenaBindSpec<'a> {
     pub rebase: u64,
 }
 
-/// High bit tagging a byte offset as living in [`Arena::weight_buffer`] rather
-/// than the main arena buffer. Real arena offsets are < 4 GiB, so a high bit is
-/// free. On 64-bit use bit 62; on 32-bit wasm (`usize` = 32 bits, `1 << 62`
-/// overflows) use bit 31 — browser WebGPU arenas are far below 2 GiB.
+/// Where offsets into [`Arena::weight_buffer`] start, as opposed to the main
+/// arena buffer: a weight-buffer offset is `WEIGHT_BUF_TAG + raw`, and every
+/// arena offset is below it. On 64-bit that is bit 62 (arena offsets are far
+/// below it). On 32-bit wasm, where `usize` has 32 bits, it is 3 GiB
+/// ([`tag32`]): the arena gets the lower 3 GiB (it used to be split at bit 31,
+/// which cut browser arenas to 2 GiB when WebGPU binds 4 GiB, and halved
+/// minibatches native training fits) and the weight buffer the top 1 GiB.
 #[cfg(target_pointer_width = "64")]
 pub const WEIGHT_BUF_TAG: usize = 1usize << 62;
 #[cfg(not(target_pointer_width = "64"))]
-pub const WEIGHT_BUF_TAG: usize = 1usize << 31;
+pub const WEIGHT_BUF_TAG: usize = tag32::BASE as usize;
+
+/// The 32-bit offset split, on `u32` so the 64-bit host tests it too.
+pub mod tag32 {
+    /// First weight-buffer offset: arena offsets lie in `[0, BASE)`, weight
+    /// offsets in `[BASE, 2^32)`.
+    pub const BASE: u32 = 0xC000_0000;
+    #[inline]
+    pub fn is_weight(off: u32) -> bool {
+        off >= BASE
+    }
+    /// The weight-buffer byte offset of a tagged offset; an untagged one is
+    /// returned as is (callers ask of either kind).
+    #[inline]
+    pub fn raw(off: u32) -> u32 {
+        if off >= BASE { off - BASE } else { off }
+    }
+    /// Tag weight-buffer offset `w` (below `2^32 - BASE`).
+    #[inline]
+    pub fn tag(w: u32) -> u32 {
+        assert!(
+            w < u32::MAX - BASE,
+            "rlx-wgpu: weight-buffer offset {w} past the 1 GiB a 32-bit target addresses"
+        );
+        BASE + w
+    }
+}
+
+#[cfg(test)]
+mod tag32_tests {
+    use super::tag32::{BASE, is_weight, raw, tag};
+
+    /// The 32-bit split: every arena offset below 3 GiB reads as an arena
+    /// offset (bit 31 used to claim 2..3 GiB), every tagged one round-trips,
+    /// and an arena offset passes through `raw` unchanged.
+    #[test]
+    fn arena_gets_three_gib_and_weights_round_trip() {
+        for off in [0u32, 4, 0x7fff_fffc, 0x8000_0000, 0xa000_0000, BASE - 4] {
+            assert!(!is_weight(off), "{off:#x} is an arena offset");
+            assert_eq!(raw(off), off);
+        }
+        for w in [0u32, 16, 0x1000_0000, 0x3fff_fff0] {
+            let t = tag(w);
+            assert!(is_weight(t));
+            assert_eq!(raw(t), w);
+            // a byte inside a weight tensor stays a weight offset
+            assert_eq!(raw(t + 8), w + 8);
+        }
+        assert_eq!(BASE, 0xC000_0000);
+    }
+
+    #[test]
+    #[should_panic(expected = "past the 1 GiB")]
+    fn weight_offsets_past_one_gib_are_refused() {
+        tag(0x4000_0000);
+    }
+}
 
 #[inline]
 pub fn is_weight_off(off: usize) -> bool {
-    off & WEIGHT_BUF_TAG != 0
+    #[cfg(target_pointer_width = "64")]
+    return off & WEIGHT_BUF_TAG != 0;
+    #[cfg(not(target_pointer_width = "64"))]
+    tag32::is_weight(off as u32)
 }
 #[inline]
 pub fn raw_weight_off(off: usize) -> usize {
-    off & !WEIGHT_BUF_TAG
+    #[cfg(target_pointer_width = "64")]
+    return off & !WEIGHT_BUF_TAG;
+    #[cfg(not(target_pointer_width = "64"))]
+    (tag32::raw(off as u32) as usize)
+}
+/// Tag weight-buffer offset `w` (see [`WEIGHT_BUF_TAG`]).
+#[inline]
+pub fn tag_weight_off(w: usize) -> usize {
+    #[cfg(target_pointer_width = "64")]
+    return w | WEIGHT_BUF_TAG;
+    #[cfg(not(target_pointer_width = "64"))]
+    (tag32::tag(w as u32) as usize)
 }
 
 /// Whether this device runs Expand/Concat/Transpose/Narrow on the *host*.
@@ -533,10 +606,10 @@ impl Arena {
         // After possible shard-boundary repack, scratch is the last zone.
         arena.scratch_off = arena.size.saturating_sub(scratch_aligned);
         assert!(
-            cfg!(target_pointer_width = "64") || arena.scratch_off < WEIGHT_BUF_TAG,
-            "rlx-wgpu: the scratch zone starts at {:.2} GiB; a 32-bit target addresses \
-             below 2 GiB only (bit 31 tags weight offsets)",
-            arena.scratch_off as f64 / (1u64 << 30) as f64,
+            cfg!(target_pointer_width = "64") || arena.size <= WEIGHT_BUF_TAG,
+            "rlx-wgpu: the scratch zone ends at {:.2} GiB; a 32-bit target addresses \
+             the arena below 3 GiB only (the top 1 GiB of offsets is the weight buffer's)",
+            arena.size as f64 / (1u64 << 30) as f64,
         );
         arena
     }
@@ -601,25 +674,23 @@ impl Arena {
     }
 
     pub fn from_plan(device: &wgpu::Device, plan: &MemoryPlan) -> Self {
-        // On 32-bit targets bit 31 of an offset is `WEIGHT_BUF_TAG`: a tensor
-        // placed at or past 2 GiB would be read as a weight-buffer offset (in
-        // the browser that surfaced as "weight-tagged off without
-        // weight_buffer" on a 2.x GiB training arena). The arena itself may
-        // extend past 2 GiB (a 2.02 GiB inference arena whose tensors all start
-        // below it runs exactly); what must not is a tensor's start.
+        // On 32-bit targets an offset at or past `WEIGHT_BUF_TAG` (3 GiB)
+        // reads as a weight-buffer offset (in the browser that surfaced as
+        // "weight-tagged off without weight_buffer"), so every byte of every
+        // tensor, not just its start, must lie below it.
         if cfg!(not(target_pointer_width = "64")) {
             let top = plan
                 .assignments
                 .values()
-                .map(|s| s.offset)
+                .map(|s| s.offset + s.size)
                 .max()
                 .unwrap_or(0);
             assert!(
-                top < WEIGHT_BUF_TAG,
-                "rlx-wgpu: a tensor of this {:.2} GiB activation arena starts at {:.2} GiB; \
-                 a 32-bit target addresses tensors below 2 GiB only (bit 31 tags weight \
-                 offsets). Use a smaller batch (`rlx_runtime::arena_budget::fit_batch` \
-                 stays under it) or the CPU.",
+                top <= WEIGHT_BUF_TAG,
+                "rlx-wgpu: this {:.2} GiB activation arena places tensors up to {:.2} GiB; \
+                 a 32-bit target addresses the arena below 3 GiB only (the top 1 GiB of \
+                 offsets is the weight buffer's). Use a smaller batch \
+                 (`rlx_runtime::arena_budget::fit_batch` stays under it) or the CPU.",
                 plan.arena_size as f64 / (1u64 << 30) as f64,
                 top as f64 / (1u64 << 30) as f64,
             );
@@ -1599,7 +1670,7 @@ impl Arena {
 
     pub fn offset(&self, id: NodeId) -> usize {
         if let Some(&w) = self.weight_offsets.get(&id) {
-            w | WEIGHT_BUF_TAG
+            tag_weight_off(w)
         } else {
             *self.offsets.get(&id).unwrap_or_else(|| {
                 panic!("rlx-wgpu arena: no offset for node {id:?} (not in arena or weight buffer)")
@@ -1922,8 +1993,8 @@ impl Arena {
             return;
         }
         const CHUNK: usize = 64 * 1024 * 1024;
-        // Weight-buffer uploads must not use act-shard boundary math — the high
-        // WEIGHT_BUF_TAG bit would make `% shard_size` nonsense and truncate.
+        // Weight-buffer uploads must not use act-shard boundary math — the
+        // WEIGHT_BUF_TAG base would make `% shard_size` nonsense and truncate.
         let weight = is_weight_off(byte_off);
         let mut off = 0usize;
         while off < data.len() {
@@ -2418,7 +2489,7 @@ fn planned(graph: Graph) -> (Graph, MemoryPlan) {
 
 /// The largest arena this device holds in one storage binding: its
 /// `maxStorageBufferBindingSize` (and `maxBufferSize`), and in wasm below the
-/// 2 GiB of [`WEIGHT_BUF_TAG`]. `None` before the device is up.
+/// 3 GiB of [`WEIGHT_BUF_TAG`]. `None` before the device is up.
 pub fn arena_binding_limit() -> Option<u64> {
     let l = crate::device::wgpu_device()?.device.limits();
     Some(

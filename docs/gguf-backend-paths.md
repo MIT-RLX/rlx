@@ -48,13 +48,30 @@ kernels. Canonical helpers live in `rlx-gpu-host`
 | 27 | `GgufFV5B` | 256 | 260 |
 | 28 | `GgufG8_0` | 32 | 16 |
 | 29 | `GgufPtq1_0` | 128 | 28 |
+| 30 | `Fp8E4m3B128` | 128 | 132 |
+| 31 | `Fp8E5m2B128` | 128 | 132 |
+
+`Fp8E4m3B128` / `Fp8E5m2B128` are not GGML types: they are the HF `fp8` /
+DeepSeek-V3 block layout (FP8 E4M3 / E5M2 codes, one f32 scale per 128 along K) packed into
+self-contained `f32 scale | 128 codes` blocks so it rides this path.
+`rlx_flow::formats::SafetensorsSource::fp8_packed` produces it from a
+safetensors checkpoint; the codec is `rlx_ir::lowp_codec::fp8_b128`.
+
+On Metal these are the only packed schemes that may live in the external
+weight buffer by default, so one copy serves every executable of a sharing
+scope (`rlx_runtime::with_param_sharing_scope`): both of their encode paths —
+`fp8b128_mv_f32_sg` and `dequant_gguf` — take the weight as its own buffer
+binding (`resolve_off`), and requiring GPU dequant rules out the host
+fallback, which reads the activation arena. See `is_shareable_fp8_weight` in
+`rlx-metal/src/backend/compile.rs`; another scheme can join once every path it
+takes binds the weight the same way.
 
 ⚠️ **Adding a scheme takes two edits per backend, not one.** Each
 `dequant_gguf` kernel opens with a guard that routes everything *except* an
 explicit list of small-block ids into a 256-element branch:
 
 ```c
-if (scheme_id != 6u && ... && scheme_id != 28u && scheme_id != 29u) { /* 256-elem */ }
+if (scheme_id != 6u && ... && scheme_id != 30u && scheme_id != 31u) { /* 256-elem */ }
 ```
 
 A new sub-256 scheme needs its id added to that exclusion list as well as its
@@ -63,7 +80,10 @@ own branch — three copies, in
 (shared with ROCm) and `rlx-wgpu/src/kernels/dequant_gguf.wgsl`. Miss the
 guard and the branch is unreachable: the weights decode through the wrong
 block geometry and the model degrades silently. Vulkan has no `dequant_gguf`
-path and needs neither.
+path and needs neither. wgpu has a third edit: `gguf_gpu::kernel_supports_scheme`
+lists the branched ids, and an id outside it quietly takes the host
+dequant (correct, but D2H/H2D per call); `tests/gguf_kernel_scheme_coverage.rs`
+checks the list against the WGSL branches.
 
 Note also that backends treat "has an id" as "has an on-device branch" —
 `rlx_metal::has_metal_dequant_kernel` is literally

@@ -45,14 +45,40 @@ pub fn gemv_supports_scheme(scheme_id: u32) -> bool {
 
 /// The 32-weight block formats `dequant_gemv_b32x16` reads: IQ4_NL (6),
 /// IQ4_XS (7, as 32-weight sub-blocks), Q4_0 (19), Q8_0 (20), Q4_1 (21),
-/// Q5_0 (22), Q5_1 (23), Q2_0 (25, as 32-weight sub-blocks of its 128).
+/// Q5_0 (22), Q5_1 (23), Q2_0 (25, as 32-weight sub-blocks of its 128),
+/// Fp8E4m3B128 / Fp8E5m2B128 (30 / 31, likewise).
 ///
 /// Q2_0 used to fall to the one-thread-per-column `dequant_gemv` — and before
 /// that to no fused GEMV at all, so every ternary projection of a decode step
 /// (197 on KittenTTS 2's Qwen3-1.7B) took the dequant-to-scratch path with its
 /// own submit and host sync: 3.4 s per token on Apple wgpu.
 fn b32_scheme(scheme_id: u32) -> bool {
-    matches!(scheme_id, 6 | 7 | 19 | 20 | 21 | 22 | 23 | 25)
+    matches!(scheme_id, 6 | 7 | 19 | 20 | 21 | 22 | 23 | 25 | 30 | 31)
+}
+
+/// Most activation rows the block-FP8 schemes (30 / 31) take through the
+/// row-looped GEMV; past it a `[m, k] × [n, k]ᵀ` costs `m` weight passes, so
+/// dequant-to-scratch + one tiled matmul wins. Apple wgpu, 4096²: GEMV ahead
+/// at m = 16 (3.7–4.4 vs 5.0 ms), scratch 4.5× ahead at m = 64 (4.1 vs 18.4
+/// ms) and 7× at m = 256.
+pub const FP8_GEMV_MAX_ROWS: usize = 16;
+
+/// Largest f32 scratch slab (bytes) reserved for a block-FP8 prefill matmul.
+/// A bigger one (an LM head) keeps the GEMV: the slab is what once pushed the
+/// arena past the 2 GiB storage-binding limit (see
+/// [`dequant_gguf_scratch_bytes`]).
+pub const FP8_PREFILL_SCRATCH_MAX: usize = 1 << 30;
+
+/// Whether the fused GEMV takes an `m × k → n` step of this scheme. Every
+/// [`gemv_supports_scheme`] scheme at any `m`, except block FP8 past
+/// [`FP8_GEMV_MAX_ROWS`] rows with a slab under [`FP8_PREFILL_SCRATCH_MAX`],
+/// which goes to scratch + matmul. [`dequant_gguf_scratch_bytes`] reserves
+/// exactly the steps this turns away.
+pub fn gemv_takes(scheme_id: u32, m: usize, k: usize, n: usize) -> bool {
+    gemv_supports_scheme(scheme_id)
+        && !(matches!(scheme_id, 30 | 31)
+            && m > FP8_GEMV_MAX_ROWS
+            && k * n * std::mem::size_of::<f32>() <= FP8_PREFILL_SCRATCH_MAX)
 }
 
 /// Whether `graph` has packed (U8/I8) params and every one of them is only
@@ -111,7 +137,7 @@ pub fn packed_weights_bind_in_place(graph: &Graph) -> bool {
 /// adding a scheme id without a branch (or a branch without listing it here)
 /// fails the tests rather than shipping a silent mis-decode.
 pub fn kernel_supports_scheme(scheme_id: u32) -> bool {
-    matches!(scheme_id, 0..=29)
+    matches!(scheme_id, 0..=31)
 }
 
 /// Max f32 scratch for dequantized weights `[n, k]` across all GGUF ops.
@@ -124,17 +150,17 @@ pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
             let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
             let total = node.shape.num_elements().unwrap();
             let m = total / n.max(1);
+            let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+            let k = x_total / m.max(1);
             // Q4_K/Q6_K GGUF matmuls run scratch-free via the windowed GEMV path
             // (`run_dequant_matmul_gguf_gemv`), looped over rows for m>1. Skipping
             // them here keeps the arena from reserving the (multi-GiB) dequant
             // scratch — the LM-head slab (~0.6 GiB for a 0.6B model) is what pushed
             // the arena over wgpu's 2 GiB storage-buffer binding limit and made the
             // prefill dequant bind fail (Validation Error: binding range > limit).
-            if gemv_supports_scheme(crate::gguf_host::gguf_scheme_id(*scheme)) {
+            if gemv_takes(crate::gguf_host::gguf_scheme_id(*scheme), m, k, n) {
                 continue;
             }
-            let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
-            let k = x_total / m.max(1);
             max = max.max(k * n * std::mem::size_of::<f32>());
         }
         if let Op::DequantGroupedMatMul { scheme: _ } = &node.op {
@@ -323,7 +349,7 @@ pub fn run_dequant_matmul_gguf_gpu(
         return;
     }
     // Q4_K/Q6_K/Q1_0: scratch-free windowed GEMV (batched rows → one submit).
-    if gemv_supports_scheme(scheme_id) {
+    if gemv_takes(scheme_id, m, k, n) {
         run_dequant_matmul_gguf_gemv_rows(
             arena,
             device,

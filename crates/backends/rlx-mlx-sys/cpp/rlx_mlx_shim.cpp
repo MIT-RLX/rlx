@@ -1248,8 +1248,9 @@ int rlx_mlx_op_attention(
                 mask = std::optional<mc::array>(unwrap(mask_or_null));
                 break;
         }
+        // window_size = -1: sliding windows arrive as an explicit mask array.
         *out = wrap(mc::fast::scaled_dot_product_attention(
-            unwrap(q), unwrap(k), unwrap(v), scale, mode, mask));
+            unwrap(q), unwrap(k), unwrap(v), scale, /*window_size=*/-1, mode, mask));
     });
 }
 

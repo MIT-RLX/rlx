@@ -39,8 +39,12 @@ struct Params {
 @group(0) @binding(1) var<uniform>              params: Params;
 
 @compute @workgroup_size(256, 1, 1)
-fn conv3d_backward_input(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn conv3d_backward_input(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) ngs: vec3<u32>,
+) {
+    // a dispatch past 65535 workgroups spills into y (`dispatch_dims`)
+    let i = gid.x + gid.y * ngs.x * 256u;
     let total = params.n * params.c_in * params.d * params.h * params.w;
     if (i >= total) {
         return;

@@ -71,7 +71,7 @@ pub(crate) trait Contract {
 impl Contract for f64 {
     #[inline(always)]
     fn fmac(self, b: f64, c: f64) -> f64 {
-        if cfg!(target_vendor = "apple") {
+        if rlx_libm::platform::apple_reference() {
             self.mul_add(b, c)
         } else {
             self * b + c

@@ -23,8 +23,83 @@ use rlx_opt::memory::MemoryPlan;
 /// reinterprets below are sound rather than allocator luck.
 #[derive(Clone)]
 pub struct Arena {
-    buf: AlignedBytes,
+    buf: Store,
     plan: MemoryPlan,
+}
+
+/// The arena's bytes: a heap buffer, or a page-aligned mapping whose large
+/// weight slots may be shared with other executables
+/// ([`crate::shared_params`]).
+enum Store {
+    Heap(AlignedBytes),
+    Mapped(crate::shared_params::MappedArena),
+}
+
+impl Store {
+    fn slice_of<T: rlx_ir::bytes::LeBytes>(&self, offset: usize, len_bytes: usize) -> &[T] {
+        match self {
+            Store::Heap(b) => b.slice_of(offset, len_bytes),
+            Store::Mapped(m) => {
+                let bytes = &m.as_slice()[offset..offset + len_bytes];
+                assert_eq!(
+                    offset % std::mem::align_of::<T>(),
+                    0,
+                    "offset {offset} misaligned"
+                );
+                // SAFETY: the mapping is page-aligned, `offset` is aligned for
+                // `T` (asserted), the range is in bounds, `T: LeBytes`.
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), len_bytes / T::SIZE) }
+            }
+        }
+    }
+
+    fn slice_of_mut<T: rlx_ir::bytes::LeBytes>(
+        &mut self,
+        offset: usize,
+        len_bytes: usize,
+    ) -> &mut [T] {
+        match self {
+            Store::Heap(b) => b.slice_of_mut(offset, len_bytes),
+            Store::Mapped(m) => {
+                assert_eq!(
+                    offset % std::mem::align_of::<T>(),
+                    0,
+                    "offset {offset} misaligned"
+                );
+                let bytes = &mut m.as_mut_slice()[offset..offset + len_bytes];
+                // SAFETY: as `slice_of`, and `&mut self` makes it exclusive.
+                unsafe {
+                    std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast(), len_bytes / T::SIZE)
+                }
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for Store {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Store::Heap(b) => b,
+            Store::Mapped(m) => m.as_slice(),
+        }
+    }
+}
+
+impl std::ops::DerefMut for Store {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Store::Heap(b) => b,
+            Store::Mapped(m) => m.as_mut_slice(),
+        }
+    }
+}
+
+/// A clone is a private copy: shared weight pages are copied, not shared.
+impl Clone for Store {
+    fn clone(&self) -> Self {
+        Store::Heap(AlignedBytes::from_slice(self))
+    }
 }
 
 impl Arena {
@@ -70,7 +145,42 @@ impl Arena {
         if poison {
             buf.as_mut_slice().fill(0xFF);
         }
-        Self { buf, plan }
+        Self {
+            buf: Store::Heap(buf),
+            plan,
+        }
+    }
+
+    /// [`Self::from_plan`] whose `shared` slots — `(name, dtype tag, bytes,
+    /// offset)`, each offset page-aligned — are backed by the `scope`'s shared
+    /// copy of that weight ([`crate::shared_params`]). Returns the arena and,
+    /// per shared slot, whether its values were already there (another
+    /// executable made the copy). `None` when the platform cannot map shared
+    /// pages; the caller then builds a plain arena.
+    pub fn from_plan_shared(
+        plan: MemoryPlan,
+        scope: &str,
+        shared: &[(String, u8, usize, usize)],
+    ) -> Option<(Self, Vec<bool>)> {
+        let mut m = crate::shared_params::MappedArena::new(plan.arena_size)?;
+        if rlx_ir::env::flag("RLX_POISON_ARENA") {
+            m.as_mut_slice().fill(0xFF);
+        }
+        let mut present = Vec::with_capacity(shared.len());
+        for (name, tag, nbytes, offset) in shared {
+            // A slot that cannot be mapped stays private (and is uploaded).
+            present.push(
+                m.map_shared(scope, name, *tag, *nbytes, *offset)
+                    .unwrap_or(false),
+            );
+        }
+        Some((
+            Self {
+                buf: Store::Mapped(m),
+                plan,
+            },
+            present,
+        ))
     }
 
     /// Total arena size in bytes.

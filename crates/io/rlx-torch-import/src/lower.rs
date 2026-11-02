@@ -99,6 +99,8 @@ const SUPPORTED: &[&str] = &[
     "sin",
     "cos",
     "leaky_relu",
+    "prelu",
+    "_prelu_kernel",
     "hardtanh",
     "hardsigmoid",
     "hardswish",
@@ -353,6 +355,38 @@ fn scalar_const(lo: &mut Lowered, id: &str, value: f64, dtype: rlx_ir::DType) ->
         },
     );
     nm
+}
+
+/// PReLU as `rlx_ir::Graph::prelu` builds it, `max(x, 0) + slope·min(x, 0)`:
+/// `x` where `x ≥ 0`, else `slope·x`, for any slope; `slope` a scalar or
+/// shaped to broadcast against `x`. Defines `id`.
+fn push_prelu(
+    lo: &mut Lowered,
+    id: &str,
+    x: Value,
+    slope: Value,
+    out: &[usize],
+    dt: rlx_ir::DType,
+) {
+    let zero = scalar_const(lo, &format!("{id}_pzero"), 0.0, dt);
+    let shaped = |op, a, b| {
+        Call::Node(crate::nodeop::NodeOp::BinaryShaped {
+            op,
+            a,
+            b,
+            out: out.to_vec(),
+            out_dtype: dt,
+        })
+    };
+    let (pos, neg, prod) = (
+        format!("{id}__ppos"),
+        format!("{id}__pneg"),
+        format!("{id}__pmul"),
+    );
+    push(lo, &pos, shaped(BinaryOp::Max, x.clone(), zero.clone()));
+    push(lo, &neg, shaped(BinaryOp::Min, x, zero));
+    push(lo, &prod, shaped(BinaryOp::Mul, neg, slope));
+    push(lo, id, shaped(BinaryOp::Add, pos, prod));
 }
 
 /// Broadcast a (non-scalar) tensor operand up to `target` if its shape differs.
@@ -862,26 +896,69 @@ fn lower_node(
         "sin" => push(lo, &id, Call::Act(Activation::Sin, arg_ref(n, 0)?)),
         "cos" => push(lo, &id, Call::Act(Activation::Cos, arg_ref(n, 0)?)),
         "leaky_relu" => {
-            // leaky_relu(x, slope=0.01) = max(x, slope·x)  (exact for 0 ≤ slope ≤ 1).
+            // leaky_relu(x, slope=0.01) = max(x, slope·x) for 0 ≤ slope ≤ 1
+            // (the form backends fold into a conv's store); past that, or
+            // negative, `max` picks the wrong side: PReLU's form
             let x = arg_ref(n, 0)?;
             let (out, dt) = primary_out(&n.out).ok_or_else(|| anyhow!("leaky_relu has no out"))?;
             let dt = dtype_from_str(&dt)?;
             let out = dims_usize(&out);
             let slope = n.args.get(1).and_then(|a| a.as_float()).unwrap_or(0.01);
             let s = scalar_const(lo, &format!("{id}_lslope"), slope, dt);
-            let sx = format!("{id}__lrx");
-            push(lo, &sx, Call::Binary(BinaryOp::Mul, x.clone(), s));
-            push(
-                lo,
-                &id,
-                Call::Node(crate::nodeop::NodeOp::BinaryShaped {
-                    op: BinaryOp::Max,
-                    a: x,
-                    b: sx,
-                    out,
-                    out_dtype: dt,
-                }),
-            );
+            if (0.0..=1.0).contains(&slope) {
+                let sx = format!("{id}__lrx");
+                push(lo, &sx, Call::Binary(BinaryOp::Mul, x.clone(), s));
+                push(
+                    lo,
+                    &id,
+                    Call::Node(crate::nodeop::NodeOp::BinaryShaped {
+                        op: BinaryOp::Max,
+                        a: x,
+                        b: sx,
+                        out,
+                        out_dtype: dt,
+                    }),
+                );
+            } else {
+                push_prelu(lo, &id, x, s, &out, dt);
+            }
+        }
+        "prelu" | "_prelu_kernel" => {
+            // prelu(x, weight): one slope, or one per channel (dim 1), as
+            // `rlx_ir::Graph::prelu`'s `max(x, 0) + a·min(x, 0)` — which
+            // backends with a one-pass PReLU recognise (`rlx_ir::match_prelu`)
+            let x = arg_ref(n, 0)?;
+            let w = arg_ref(n, 1)?;
+            let (out, dt) = primary_out(&n.out).ok_or_else(|| anyhow!("prelu has no out"))?;
+            let dt = dtype_from_str(&dt)?;
+            let out = dims_usize(&out);
+            let numel: i64 = value_shape
+                .get(&w)
+                .ok_or_else(|| anyhow!("prelu weight {w} has no shape"))?
+                .iter()
+                .product();
+            // `[C]` against `[N, C, …]`: as `[1, C, 1, …]`, broadcasting along dim 1
+            let slope = if numel > 1 && out.len() >= 2 {
+                let mut shape = vec![1i64; out.len()];
+                shape[1] = numel;
+                let r = format!("{id}__slope");
+                push(lo, &r, Call::Reshape { x: w, shape });
+                r
+            } else if numel > 1 {
+                w
+            } else {
+                let r = format!("{id}__slope");
+                push(
+                    lo,
+                    &r,
+                    Call::Reshape {
+                        x: w,
+                        shape: vec![1],
+                    },
+                );
+                r
+            };
+            push_prelu(lo, &id, x, slope, &out, dt);
         }
         "hardtanh" => {
             // hardtanh(x, min=-1, max=1) = min(max(x, min), max).

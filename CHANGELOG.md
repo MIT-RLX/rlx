@@ -25,6 +25,34 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ### Added
 
+- `rlx-cpu`: a `portable` feature, the wasm build's arithmetic on every
+  target, so a CPU run rounds the same on macOS, Linux and in a browser. No
+  vendor BLAS is linked (`cblas_sgemm` is `sgemm_fused`: per element the
+  in-order fused-multiply-add chain the relaxed-SIMD wasm kernel computes,
+  pinned by `portable_gemm_is_the_in_order_fma_chain`); aarch64 leaves its
+  NEON kernels and Accelerate vForce, and x86-64 its AVX kernels and
+  thresholds, for the arms wasm takes (the build script sets `rlx_cpu_neon` /
+  `rlx_cpu_x86` only without it). Off by default: features unify across a
+  workspace, and it is slower. Measured with exgb: BCG-FM's CPU encoder
+  equal to the browser at all 437 nodes on macOS and on Linux x86-64, and
+  every op of exgb-web's CPU probe.
+- `rlx-libm`: an `export-glibc` feature, `wasm-glibc`'s symbols on every
+  target (plus `sincos` / `__sincos_stret`, which LLVM merges a sin and cos
+  into), and the functions with no glibc port (`powf`, `atan2`, `tanh`, …)
+  from the `libm` crate on every target including wasm. On macOS the ported
+  functions then hash equal to glibc 2.43's over 10^6 inputs each. For
+  binaries: it replaces the platform libm for the whole program.
+- `rlx-libm::platform`: which platform's reference the ports reproduce.
+  `apple_reference()` is true on Apple targets until `use_linux_reference()`
+  switches the process to the Linux x86-64 one (the arm wasm always takes):
+  rlx-pocketfft (contraction, `__sincos_stret` twiddles, the x87 angle),
+  rlx-signal, rlx-special and rlx-rng consult it. Native rlx-pocketfft then
+  equals the wasm build on every tested length.
+- `rlx-runtime`: `taps::enter`, a `with_tap` scope as a guard, for a caller
+  that compiles across an `await`; and `fit_batch_within` (an explicit arena
+  budget) with `WGPU_32BIT_ARENA_LIMIT`, so a 64-bit caller can fit the batch
+  the browser fits.
+
 - `rlx-libm`: `tanhf`, glibc's. Since 2.41 that is CORE-MATH's, correctly
   rounded, and `tanh` in double rounded once matches it on all 2^32 inputs
   (checked against glibc 2.43). `reference::tanhf` uses it off Apple; it was
@@ -44,9 +72,16 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
   bits, and faster than even the old inexact loops (GELU 0.85 ns per element vs
   16 ns emulated, LayerNorm 0.32 vs 2.3, softmax 0.65 vs 9.3). The GEMM also
   uses it, so each element of C becomes the in-order FMA chain the GPU kernels
-  compute: 1.2–1.9× over the simd128 tiles (`Aᵀ·B` 46 GF/s, `A·Bᵀ` 54). When
-  it is not fused, nothing changes. Tests cover both paths, including a mutation
-  check of each.
+  compute: 1.3–1.9× over the simd128 tiles (`Aᵀ·B` 59 GF/s, `A·Bᵀ` 70). When
+  it is not fused, nothing changes. CPU training in Chrome (ShallowConvNet,
+  EEGNet, DeepConvNet) runs 1.2–1.3× faster than the plain simd128 build.
+  Fused matmul bits differ from the plain build's, so a trained model's score
+  can move (DeepConvNet 0.636 → 0.650); the elementwise ops stay bit-identical.
+  Tests cover both paths, including a mutation check of each.
+- `rlx-cpu` wasm GEMM: the last `n % 8` columns (all of them when n < 8, as
+  in many conv products) run four rows to a vector, with every tail column's
+  sum in flight at once. They used to run one element at a time, slower than
+  the old loops (256×4×576: 3.4 GF/s, now 9.2; with hardware FMA 1.4, now 8.2).
 - `rlx-cpu`: a simd128 GEMM for wasm32 (no BLAS there). A 4 × 8 tile of C
   stays in registers, and B is packed into 8-column panels. Each element is
   still summed over `k` in order from the same start value, so results are
@@ -436,6 +471,56 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ### Fixed
 
+- `rlxsl`: `rlx_div_rn` was not correctly rounded near a midpoint. Its one
+  correction step rounds the correction before adding it, so the result kept
+  the first quotient's rounding: native Metal's fast-math `1 / 1.99999988`
+  stayed 0.5 where Chrome's gave 0.50000006 (BCG-FM's squeeze-excite sigmoid
+  at `x = 1.19e-7`). A midpoint test against the neighbour on the remainder's
+  side now settles it (`div_is_correctly_rounded_near_midpoints`, 2^16
+  near-midpoint quotients on the GPU; fails without the test). The 18
+  epilogue copies follow.
+- `rlxsl`: WGSL `exp` is `rlx_exp` (Cody–Waite reduction, an `fma`
+  polynomial, `ldexp`; within 1 ULP, 99% correctly rounded) instead of the
+  builtin, whose rounding follows the compiler's math mode (Apple's fast math
+  natively, safe math in Chrome). The epilogues carry it as `epi_exp`.
+- `rlx-wgpu`: LayerNorm, the fused residual LayerNorm / RMSNorm kernels,
+  AdaLN, softmax and attention took `1/n`, `1/sqrt` and `exp` from the WGSL
+  builtins, which round by the math mode: BIOT's first LayerNorm differed
+  between native wgpu and Chrome on the same GPU. They now carry verbatim
+  copies of rlxsl's exact helpers (`epi_div_rn`, `epi_rsqrt_rn`,
+  `epi_exp`), pinned by `tests/epilogue_exact_math.rs`.
+- `rlx-cpu`: the AVX2 mirror's `vvexpf` / `vvtanhf` copied a buffer onto
+  itself when called in place (a `copy_nonoverlapping` of overlapping ranges;
+  the debug precondition check aborted `vvsigmoidf` on the mirror arm).
+
+- `rlx-wgpu`: the fused matmul / conv epilogues (`apply_act` in 18 shaders)
+  computed sigmoid and SiLU with a raw WGSL `/`, and GELU's erf with a plain
+  `a * b + c` chain. Neither is portable: native wgpu and Chrome's WebGPU on
+  the same Mac GPU disagreed by ULPs (a BCG-FM squeeze-excite sigmoid in an
+  `m = 1` gemv; every fused GELU, up to 180 ULP). The epilogues now divide
+  through `epi_div_rn` (a copy of rlxsl's correctly-rounded `rlx_div_rn`,
+  pinned by `tests/epilogue_exact_math.rs`) and use explicit `fma` in the erf
+  polynomial and the tanh-GELU cubic. rlxsl's WGSL `erf` (GELU in the
+  elementwise kernels, up to 37 ULP apart) does the same.
+- `rlx-wgpu` on 32-bit targets (the browser): the GPU arena may use 3 GiB of
+  offsets, up from 2. Weight-buffer offsets used to be tagged with bit 31,
+  which halved what an arena could address while WebGPU binds 4 GiB, and
+  `rlx_runtime::fit_batch` then halved training minibatches. CFSPMNet's
+  2.67 GB arena trained at batch 8 in Chrome and 16 natively, so its score
+  differed. Weight-buffer offsets now start at 3 GiB (`buffer::tag32`, tested
+  on the host), and the weight buffer gets the top 1 GiB (it had 2); an offset
+  past that panics with a message. `device_arena_limit(Gpu)` on 32-bit is
+  3 GiB. Every tensor's end, not just its start, is checked against the split.
+- `rlx-webgl`: tensors larger than a texture plan. A row longer than
+  `MAX_TEXTURE_SIZE` (a training graph's flat gradient vector, millions long)
+  is laid out wide like a tall slot. Matmul, softmax, LayerNorm and RmsNorm
+  read their operands by linear index when a slot is widened (the natural
+  layout keeps the old direct fetch), so the planner no longer pins their slots
+  to the natural layout: an im2col matmul with 59392 rows and a 59392-long `K`
+  now plan within 16384 texels. Tested in Chrome (`tests/gl_layout_parity.rs`,
+  with a mutation check) and natively (`tests/long_rows.rs`). Training conv
+  decoders on WebGL is still out of reach: the planner's per-element gather
+  index tables for a ShallowConvNet training graph at batch 32 peak near 30 GB.
 - `rlx-cpu` on wasm / riscv: GELU, bias-GELU, SiLU, the fast `exp` / `tanh`,
   softmax and LayerNorm now compute exactly what the x86-64 AVX2+FMA kernels
   compute: the same fused multiply-adds, eight-lane reductions folded in the

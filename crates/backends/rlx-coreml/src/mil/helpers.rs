@@ -157,6 +157,10 @@ pub(super) fn dequant_scheme(scheme: QuantScheme, bytes: &[u8], n: usize) -> Res
         GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(bytes, n),
         GgufFV5 => rlx_gguf::fv5_dequant::dequant_fv5(bytes, n),
         GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b(bytes, n),
+        Fp8E4m3B128 | Fp8E5m2B128 => {
+            return rlx_ir::lowp_codec::fp8_b128::dequant_scheme(scheme, bytes, n)
+                .map_err(|e| CoremlError::Runtime(format!("fp8 block dequant: {e}")));
+        }
         other => {
             return Err(CoremlError::Unsupported(format!(
                 "GGUF dequant scheme {other:?}"

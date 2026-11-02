@@ -194,6 +194,9 @@ impl Node {
     ///                                           (workers: `RANK=auto`, `WORLD` optional);
     ///   `RENDEZVOUS=auto` (`udp://auto`)      — rank 0 announces it on the LAN,
     ///                                           workers need no address at all
+    ///   `WORLD=auto` (with `RENDEZVOUS`)      — rank 0 runs with every rank that
+    ///                                           registers within `RENDEZVOUS_WINDOW`
+    ///                                           seconds (default 10)
     ///   `TRANSPORT=tcp|quic`                  — collectives over TCP or QUIC/UDP
     ///   `TOPOLOGY=mesh|star` (`DIAL_OUT=1` = star)
     ///   `HEAP_MB`                             — per-rank heap (optional)
@@ -209,6 +212,8 @@ impl Node {
         };
         let world: u32 = match var("WORLD") {
             None if rendezvous.is_some() && rank != 0 => 0,
+            // Open roster: rank 0 takes whoever joins in RENDEZVOUS_WINDOW.
+            Some(w) if w == "auto" && rendezvous.is_some() => 0,
             w => w
                 .as_deref()
                 .unwrap_or("1")
@@ -346,7 +351,9 @@ impl Node {
         at: &str,
         proto: RendezvousProto,
     ) -> io::Result<Arc<ProcessGroup>> {
-        use crate::rendezvous::{ANNOUNCE_PORT, announce, find, parse_rendezvous, register, serve};
+        use crate::rendezvous::{
+            ANNOUNCE_PORT, announce, find, parse_rendezvous, register, serve, serve_open,
+        };
         let timeout = Duration::from_secs(
             rlx_ir::env::read("RENDEZVOUS_TIMEOUT")
                 .ok()
@@ -397,15 +404,21 @@ impl Node {
             Ok(port)
         };
         let (rank, world, peers) = if self.rank == 0 {
-            if self.world == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "the rendezvous coordinator (rank 0) needs WORLD",
-                ));
-            }
             // Rank 0 is reached at the rendezvous host's address.
             let own = SocketAddr::new(at.ip(), bind_data(at.ip())?);
-            (0, self.world, serve(at, proto, self.world, own, timeout)?)
+            if self.world == 0 {
+                // WORLD=auto: whoever registers within the window.
+                let window = Duration::from_secs(
+                    rlx_ir::env::read("RENDEZVOUS_WINDOW")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(10),
+                );
+                let peers = serve_open(at, proto, own, window)?;
+                (0, peers.len() as u32, peers)
+            } else {
+                (0, self.world, serve(at, proto, self.world, own, timeout)?)
+            }
         } else {
             let rank = (self.rank != RANK_UNASSIGNED).then_some(self.rank);
             let world = (self.world != 0).then_some(self.world);

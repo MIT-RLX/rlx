@@ -250,30 +250,7 @@ pub(super) fn training_lanes(
     graph: &Graph,
 ) -> Vec<Device> {
     if spec_device.eq_ignore_ascii_case("all") {
-        let native = crate::devices_for(graph);
-        let portable = |d: &Device| {
-            matches!(
-                d,
-                Device::Gpu | Device::Vulkan | Device::OpenGl | Device::DirectX | Device::WebGpu
-            )
-        };
-        let has_native_gpu = available
-            .iter()
-            .any(|d| !matches!(d, Device::Cpu | Device::Ane | Device::Xdna) && !portable(d));
-        let mut ds: Vec<Device> = available
-            .iter()
-            .copied()
-            .filter(|d| !matches!(d, Device::Ane | Device::Xdna))
-            .filter(|d| !(has_native_gpu && portable(d)))
-            .filter(|d| !(*d == Device::Mlx && available.contains(&Device::Metal)))
-            .collect();
-        // Native-supporting backends first (they run without host fallback).
-        ds.sort_by_key(|d| !native.contains(d));
-        if ds.is_empty() {
-            vec![crate::fastest_device()]
-        } else {
-            ds
-        }
+        crate::training_devices(available, graph)
     } else if spec_device.contains(',') {
         let mut ds = Vec::new();
         for s in spec_device.split(',').map(str::trim) {

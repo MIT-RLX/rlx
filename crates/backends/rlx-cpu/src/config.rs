@@ -24,23 +24,23 @@ use std::sync::OnceLock;
 /// Cache line size — known at compile time per platform.
 /// Apple Silicon (Macs, iPhones/iPads, Apple TV/Watch, Vision Pro) uses
 /// 128-byte L1 lines.
-#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+#[cfg(all(rlx_cpu_neon, target_vendor = "apple"))]
 const PLATFORM_CACHE_LINE: usize = 128; // Apple Silicon: 128-byte L1 lines
 
-#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+#[cfg(all(rlx_cpu_neon, not(target_vendor = "apple")))]
 const PLATFORM_CACHE_LINE: usize = 64; // ARM servers (Graviton, Ampere): typically 64
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(rlx_cpu_neon))]
 const PLATFORM_CACHE_LINE: usize = 64; // x86_64: 64-byte cache lines
 
 /// Default parallel threshold — tuned per platform.
 /// Apple Silicon AMX handles BLAS internally; our par_for is for element-wise ops.
 /// Lower threshold = more parallelism for LayerNorm/GELU on small tensors.
 /// All Apple devices are Apple Silicon, so they share the macOS tuning.
-#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+#[cfg(all(rlx_cpu_neon, target_vendor = "apple"))]
 const PLATFORM_PAR_THRESHOLD: usize = 16_384; // Apple Silicon: AMX does BLAS, parallelize rest earlier
 
-#[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+#[cfg(not(all(rlx_cpu_neon, target_vendor = "apple")))]
 const PLATFORM_PAR_THRESHOLD: usize = 30_000;
 
 // ── Runtime hardware detection ──────────────────────────────────────────
@@ -110,7 +110,7 @@ impl HwInfo {
     fn optimal_workers(&self) -> usize {
         let base = if self.perf_cores > 0 {
             self.perf_cores / 2
-        } else if cfg!(all(target_arch = "aarch64", target_vendor = "apple")) {
+        } else if cfg!(all(rlx_cpu_neon, target_vendor = "apple")) {
             self.total_cpus / 2
         } else {
             self.total_cpus.saturating_mul(3) / 4

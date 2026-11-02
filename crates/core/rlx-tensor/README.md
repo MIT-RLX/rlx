@@ -148,6 +148,24 @@ let (loss, _) = f.train_step(&mut opt, &[("x", &xs)]);
 
 `Adam`, `Muon`, `AdamW`, `Lion`, `Sgd`, `Optimizer`, and `LrSchedule` are re-exported.
 
+### Several devices at once
+
+`parallel::DataParallel` runs one step across the devices of a machine: each
+`Replica` is the model traced at its share of the batch on one device (its own
+worker thread, compiled once), gradients are averaged by share and the
+optimizer runs once on the host — the same update as one device taking the
+whole batch. `run` is the forward-only counterpart for inference. `tune`
+measures each device alone and the speed split (`split_batch`) and keeps the
+faster layout; a device's time is not proportional to its share, so the split
+is measured, not trusted.
+
+```rust
+use rlx_tensor::{Device, Replica, tune};
+
+let tuned = tune(&[Device::Rocm, Device::Cpu], 32, |_, b| build(b), |dp, shares| time(dp, shares));
+let (next, report) = tuned.dp.train_step(&model, &mut opt, &sched, step, 1.0, feeds);
+```
+
 ## Features
 
 | feature        | what it adds                                                                 |

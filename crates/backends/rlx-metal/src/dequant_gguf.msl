@@ -118,6 +118,25 @@ inline uint lut_u32(device const uchar* lut, uint off) {
          | (uint(lut[off + 3u]) << 24u);
 }
 
+// One OCP FP8 code to f32 by building its bits — exact, no exp2 (fast-math
+// safe): E4M3 (`e5` false; only S.1111.111 is NaN) or E5M2 (IEEE-like inf /
+// NaN at exponent 31). Used by the `Fp8E4m3B128` / `Fp8E5m2B128` paths.
+static inline float fp8_dec(uint c, bool e5) {
+    float v;
+    if (e5) {
+        uint e = (c >> 2u) & 31u, m = c & 3u;
+        v = (e == 0u) ? float(m) * 1.52587890625e-05f
+            : (e == 31u) ? as_type<float>(m == 0u ? 0x7F800000u : 0x7FC00000u)
+            : as_type<float>(((e + 112u) << 23u) | (m << 21u));
+    } else {
+        uint e = (c >> 3u) & 15u, m = c & 7u;
+        v = (e == 0u) ? float(m) * 0.001953125f
+            : as_type<float>(((e + 120u) << 23u) | (m << 20u));
+        if ((c & 0x7Fu) == 0x7Fu) v = as_type<float>(0x7FC00000u);
+    }
+    return (c & 0x80u) != 0u ? -v : v;
+}
+
 kernel void dequant_gguf(
     device float* arena        [[buffer(0)]],
     constant ulong& w_byte_off   [[buffer(1)]],
@@ -125,20 +144,23 @@ kernel void dequant_gguf(
     constant uint& scheme_id     [[buffer(3)]],
     constant uint& num_blocks    [[buffer(4)]],
     device const uchar* iq_lut   [[buffer(5)]],
+    device uchar* wbuf           [[buffer(6)]],
     uint gid                     [[thread_position_in_grid]]
 ) {
     if (gid >= num_blocks) return;
 
     // w_byte_off / dst_f32_off are 64-bit because for ≥4 GB models the
     // activation byte offsets exceed u32 (task #50: 12B Q4 GGUF arena ≈14 GB).
-    device uchar* w_base = (device uchar*)((device char*)arena + w_byte_off);
+    // The weight has its own binding (`wbuf`): the arena itself, or the weight
+    // buffer an externalized param lives in.
+    device uchar* w_base = wbuf + w_byte_off;
 
     // ── 256-elem block schemes (K-quants, IQ4_XS, IQ2/3/1, TQ) ─────
     if (scheme_id != 6u && scheme_id != 10u && scheme_id != 11u
         && scheme_id != 19u && scheme_id != 20u
         && scheme_id != 21u && scheme_id != 22u && scheme_id != 23u
         && scheme_id != 24u && scheme_id != 25u && scheme_id != 28u
-        && scheme_id != 29u) {
+        && scheme_id != 29u && scheme_id != 30u && scheme_id != 31u) {
         device float* dst = arena + dst_f32_off + gid * DQ_QK_K;
 
         if (scheme_id == 3u) {
@@ -714,6 +736,22 @@ kernel void dequant_gguf(
         for (uint j = 0u; j < 128u; ++j) {
             uint q = (uint(qs[j >> 2u]) >> ((j & 3u) * 2u)) & 3u;
             dst[j] = float(int(q) - 1) * d;
+        }
+        return;
+    }
+
+    if (scheme_id == 30u || scheme_id == 31u) {
+        // FP8 block (HF fp8 / DeepSeek-V3): f32 scale | 128 codes (132 bytes /
+        // 128 elems), E4M3 (30) or E5M2 (31); see `fp8_dec`.
+        bool e5 = scheme_id == 31u;
+        uint off = gid * 132u;
+        uint sb = uint(w_base[off]) | (uint(w_base[off + 1u]) << 8u)
+            | (uint(w_base[off + 2u]) << 16u) | (uint(w_base[off + 3u]) << 24u);
+        float s = as_type<float>(sb);
+        device const uchar* qs = w_base + off + 4u;
+        device float* dst = arena + dst_f32_off + gid * 128u;
+        for (uint j = 0u; j < 128u; ++j) {
+            dst[j] = fp8_dec(uint(qs[j]), e5) * s;
         }
         return;
     }
@@ -1374,6 +1412,76 @@ kernel void q8_0_mv_f32_sg(
     }
 
     for (ushort row = 0; row < Q8_0_NR0; ++row) {
+        const uint row_idx = first_row + row;
+        if (row_idx >= n_dim) break;
+        const float total = simd_sum(sumf[row]);
+        if (tiisg == 0u) dst[row_idx] = total;
+    }
+}
+
+// ── Simdgroup-cooperative Fp8E4m3B128 / Fp8E5m2B128 GEMV (HF fp8) ─────────
+//
+// Blocks are `f32 scale | 128 FP8 codes` (132 bytes); `e5` picks E5M2. Same shape as
+// `q8_0_mv_f32_sg`: FP8B_NR0 rows per simdgroup, FP8B_NSG simdgroups per
+// threadgroup; lane = (block parity ix, 8-code run il), so a simdgroup reads
+// two whole blocks per step. Codes decode through `fp8_dec`. Decode only (m == 1),
+// `k_dim % 128 == 0`. `encode_fp8b128_mv_f32_sg` (ops.rs) MUST match these.
+constant uint FP8B_NR0 = 4u;
+constant uint FP8B_NSG = 2u;
+constant uint FP8B_BLK_BYTES = 132u;
+
+
+kernel void fp8b128_mv_f32_sg(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    constant uint& e5             [[buffer(6)]],
+    device const uchar* wbuf      [[buffer(7)]],
+    uint3 tgpig                   [[threadgroup_position_in_grid]],
+    ushort tiisg                  [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint nb = k_dim / 128u;
+    const bool is_e5 = e5 != 0u;
+    const uint first_row = (tgpig.x * FP8B_NSG + sgitg) * FP8B_NR0;
+    if (first_row >= n_dim) return;
+
+    device const float* x_base = (device const float*)((device char*)arena + x_off);
+    // Weights from their own binding: the activation arena, or the weight
+    // buffer a large param was externalized to.
+    device const uchar* w_base = wbuf + w_off;
+    device float*       dst    = (device float*)((device char*)arena + dst_off);
+
+    const uint ix = (uint)tiisg / 16u;           // 0..1 : block parity
+    const uint il = (uint)tiisg % 16u;           // 0..15: which 8 of the 128
+
+    float yl[8];
+    float sumf[FP8B_NR0] = {0.f};
+    device const float* yb = x_base + ix * 128u + il * 8u;
+
+    for (uint ib = ix; ib < nb; ib += 2u) {
+        #pragma unroll
+        for (short i = 0; i < 8; ++i) yl[i] = yb[i];
+        #pragma unroll
+        for (ushort row = 0; row < FP8B_NR0; ++row) {
+            const uint row_idx = first_row + row;
+            if (row_idx >= n_dim) break;
+            device const uchar* blk = w_base + (ulong)(row_idx * nb + ib) * FP8B_BLK_BYTES;
+            const float d = as_type<float>(uint(blk[0]) | (uint(blk[1]) << 8u)
+                | (uint(blk[2]) << 16u) | (uint(blk[3]) << 24u));
+            device const uchar* qs = blk + 4u + il * 8u;
+            float sumq = 0.f;
+            #pragma unroll
+            for (short i = 0; i < 8; ++i) sumq += fp8_dec(uint(qs[i]), is_e5) * yl[i];
+            sumf[row] += sumq * d;
+        }
+        yb += 256u;                               // two blocks
+    }
+
+    for (ushort row = 0; row < FP8B_NR0; ++row) {
         const uint row_idx = first_row + row;
         if (row_idx >= n_dim) break;
         const float total = simd_sum(sumf[row]);

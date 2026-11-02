@@ -2210,6 +2210,29 @@ pub struct Conv3dParams {
     /// (`unfuse::pack_half_activations`). Selects the pipeline's `IN_HALF` /
     /// `OUT_HALF` overrides; not read by the shaders.
     pub half: u32,
+    /// Nonzero: each input value goes through a PReLU of slope `in_alpha`
+    /// (f32 bits) as it is loaded — `conv3d_k3_c8` only (`unfuse::CONV3D_K3`).
+    pub in_prelu: u32,
+    pub in_alpha: u32,
+    /// Nonzero: the store takes the `max` with the tensor at `res_off`, of the
+    /// output's shape (before the activation) — `conv3d_k3_c8` only. With
+    /// the two above, 144 bytes: the WGSL struct's size (a multiple of 16).
+    pub res_max: u32,
+    pub res_off: u32,
+}
+
+impl Conv3dParams {
+    /// A 2-D 3×3 conv over each slice of the depth — kernel `[1, 3, 3]`,
+    /// stride 1, padding `[0, 1, 1]`, no dilation, ungrouped, past four
+    /// output channels: `conv3d_k3_c8`'s shape.
+    pub fn is_k3(&self) -> bool {
+        (self.kd, self.kh, self.kw) == (1, 3, 3)
+            && (self.sd, self.sh, self.sw) == (1, 1, 1)
+            && (self.dd, self.dh, self.dw) == (1, 1, 1)
+            && (self.pd, self.ph, self.pw) == (0, 1, 1)
+            && self.groups <= 1
+            && self.c_out > 4
+    }
 }
 
 /// Lazy-init container for a compute pipeline + its bind-group layout.
@@ -2867,7 +2890,9 @@ static CONV3D_CTILE: OnceLock<Kernel> = OnceLock::new();
 static CONV3D_CTILE_W2: OnceLock<Kernel> = OnceLock::new();
 static CONV3D_CTILE_W4: OnceLock<Kernel> = OnceLock::new();
 static CONV3D_CTILE_W4C8: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_K3_C8: OnceLock<Kernel> = OnceLock::new();
 static CONV3D_ARGMAX: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_TOPK: OnceLock<Kernel> = OnceLock::new();
 static CONV_TRANSPOSE3D: OnceLock<Kernel> = OnceLock::new();
 static SCATTER_ADD: OnceLock<Kernel> = OnceLock::new();
 static TOPK: OnceLock<Kernel> = OnceLock::new();
@@ -4497,6 +4522,30 @@ pub fn conv3d_ctile_w4c8_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu conv3d_ctile_w4c8",
             CONV3D_CTILE_WGSL,
             "conv3d_ctile_w4c8",
+        )
+    })
+}
+/// A 2-D 3×3 conv (kernel `[1, 3, 3]`, stride 1, padding `[0, 1, 1]`), its
+/// weights in workgroup memory; see [`Conv3dParams::is_k3`].
+pub fn conv3d_k3_c8_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_K3_C8.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_k3_c8",
+            CONV3D_CTILE_WGSL,
+            "conv3d_k3_c8",
+        )
+    })
+}
+/// A 1×1×1 conv3d keeping each voxel's `k` best output channels
+/// (`Conv3dParams::act == TOPK_ACT`; see `unfuse::CONV3D_TOPK`).
+pub fn conv3d_topk_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_TOPK.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_topk",
+            CONV3D_CTILE_WGSL,
+            "conv3d_topk",
         )
     })
 }

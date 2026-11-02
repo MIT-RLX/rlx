@@ -20,7 +20,7 @@ use crate::complex::{self as cx, C};
 /// `_sigtools*.so` / `_sosfilt*.so`).
 #[inline(always)]
 fn fma_c(a: f64, b: f64, c: f64) -> f64 {
-    if cfg!(target_vendor = "apple") {
+    if rlx_libm::platform::apple_reference() {
         a.mul_add(b, c)
     } else {
         a * b + c
@@ -301,10 +301,10 @@ fn convolve_root_complex(a: &[C], r: C) -> Vec<C> {
         .map(|k| {
             let t = convolve_terms(a, &v, k);
             let d = match t.as_slice() {
-                [(x, y)] if swapped && cx::BASELINE_FUSED => cx::mul(*x, *y),
+                [(x, y)] if swapped && cx::baseline_fused() => cx::mul(*x, *y),
                 [(x, y)] => cx::mul_plain(*x, *y),
                 // OpenBLAS `zdotu` (Linux reference): four plain accumulators from 0
-                [(x0, y0), (x1, y1)] if !cx::BASELINE_FUSED => {
+                [(x0, y0), (x1, y1)] if !cx::baseline_fused() => {
                     let s1 = (0.0 + x0.re * y0.re) + x1.re * y1.re;
                     let s2 = (0.0 + x0.im * y0.im) + x1.im * y1.im;
                     let s3 = (0.0 + x0.re * y0.im) + x1.re * y1.im;

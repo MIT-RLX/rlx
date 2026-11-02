@@ -39,6 +39,24 @@ static __device__ __forceinline__ float dq_read_f16(const unsigned char* b, unsi
     return (sign != 0u) ? -v : v;
 }
 
+// One OCP FP8 code to f32 by building its bits: E4M3 (`e5` false; only
+// S.1111.111 is NaN) or E5M2 (IEEE-like inf / NaN at exponent 31).
+static __device__ __forceinline__ float dq_fp8(unsigned int c, bool e5) {
+    float v;
+    if (e5) {
+        unsigned int e = (c >> 2u) & 31u, m = c & 3u;
+        v = (e == 0u) ? (float)m * 1.52587890625e-05f
+            : (e == 31u) ? __uint_as_float(m == 0u ? 0x7F800000u : 0x7FC00000u)
+            : __uint_as_float(((e + 112u) << 23u) | (m << 21u));
+    } else {
+        unsigned int e = (c >> 3u) & 15u, m = c & 7u;
+        v = (e == 0u) ? (float)m * 0.001953125f
+            : __uint_as_float(((e + 120u) << 23u) | (m << 20u));
+        if ((c & 0x7Fu) == 0x7Fu) v = __uint_as_float(0x7FC00000u);
+    }
+    return (c & 0x80u) ? -v : v;
+}
+
 static __device__ __forceinline__ void dq_get_scale_min_k4(
     const unsigned char* q, unsigned int j, unsigned int& sc, unsigned int& mn
 ) {
@@ -83,7 +101,7 @@ extern "C" __global__ void dequant_gguf(
         && scheme_id != 19u && scheme_id != 20u
         && scheme_id != 21u && scheme_id != 22u && scheme_id != 23u
         && scheme_id != 24u && scheme_id != 25u && scheme_id != 28u
-        && scheme_id != 29u) {
+        && scheme_id != 29u && scheme_id != 30u && scheme_id != 31u) {
         float* dst = arena + dst_f32_off + gid * 256u;
 
         if (scheme_id == 3u) {
@@ -626,6 +644,23 @@ extern "C" __global__ void dequant_gguf(
         for (unsigned int j = 0u; j < 128u; ++j) {
             unsigned int q = (qs[j >> 2u] >> ((j & 3u) * 2u)) & 3u;
             dst[j] = (float)((int)q - 1) * d;
+        }
+        return;
+    }
+
+    if (scheme_id == 30u || scheme_id == 31u) {
+        // FP8 block (HF fp8 / DeepSeek-V3): f32 scale | 128 codes (132 bytes /
+        // 128 elems), E4M3 (30) or E5M2 (31). Codes decode by building the f32
+        // bits — exact, no exp2; NaN / inf like the CPU codec.
+        bool e5 = scheme_id == 31u;
+        unsigned int off = gid * 132u;
+        unsigned int sb = (unsigned int)w_base[off] | ((unsigned int)w_base[off + 1u] << 8u)
+            | ((unsigned int)w_base[off + 2u] << 16u) | ((unsigned int)w_base[off + 3u] << 24u);
+        float s = __uint_as_float(sb);
+        const unsigned char* qs = w_base + off + 4u;
+        float* dst = arena + dst_f32_off + gid * 128u;
+        for (unsigned int j = 0u; j < 128u; ++j) {
+            dst[j] = dq_fp8(qs[j], e5) * s;
         }
         return;
     }

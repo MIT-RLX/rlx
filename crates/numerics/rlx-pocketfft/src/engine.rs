@@ -177,7 +177,8 @@ fn rotx90<T: Real>(fwd: bool, a: Cx<T>) -> Cx<T> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Twiddles {
     /// What a clang `-O3` build does on this target: [`Twiddles::AppleSinCos`] on
-    /// macOS, [`Twiddles::Separate`] elsewhere.
+    /// macOS, [`Twiddles::Separate`] elsewhere or after
+    /// `rlx_libm::platform::use_linux_reference`.
     #[default]
     Platform,
     /// One `__sincos_stret` call per angle, as clang merges `cos`+`sin` on Darwin
@@ -195,7 +196,12 @@ impl Twiddles {
         !matches!(self, Twiddles::AppleSinCos) || cfg!(target_os = "macos")
     }
     fn merged(self) -> bool {
-        cfg!(target_os = "macos") && matches!(self, Twiddles::Platform | Twiddles::AppleSinCos)
+        match self {
+            // the platform's reference, which `use_linux_reference` can make Linux's
+            Twiddles::Platform => rlx_libm::platform::macos_reference(),
+            Twiddles::AppleSinCos => cfg!(target_os = "macos"),
+            Twiddles::Separate => false,
+        }
     }
 }
 
@@ -205,7 +211,8 @@ pub enum Contraction {
     /// What SciPy's wheel for this target does: [`Contraction::Clang`] on Apple
     /// targets, [`Contraction::None`] elsewhere — the Linux x86-64 wheel (the Linux
     /// and wasm reference) is an SSE2 baseline build: `pypocketfft*.so` contains no
-    /// FMA instruction.
+    /// FMA instruction. `rlx_libm::platform::use_linux_reference` makes it
+    /// [`Contraction::None`] on Apple targets too.
     #[default]
     Platform,
     /// Exactly where clang `-ffp-contract=on` fuses: one scalar expression, the
@@ -219,7 +226,7 @@ impl Contraction {
     /// Whether this choice fuses on the current target.
     pub fn fused(self) -> bool {
         match self {
-            Contraction::Platform => cfg!(target_vendor = "apple"),
+            Contraction::Platform => rlx_libm::platform::apple_reference(),
             Contraction::Clang => true,
             Contraction::None => false,
         }

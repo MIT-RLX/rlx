@@ -84,6 +84,9 @@ mod interop;
 pub mod lowp;
 #[cfg(feature = "eval")]
 mod model;
+/// Data parallelism across the devices of one machine (GPU + NPU + CPU).
+#[cfg(feature = "optim")]
+pub mod parallel;
 mod scalar;
 #[cfg(feature = "optim")]
 mod schedule;
@@ -93,6 +96,8 @@ mod tensor;
 mod transform;
 
 pub use array::{cat, stack};
+#[cfg(feature = "optim")]
+pub use parallel::{DataParallel, Replica, StepReport, Tuned, apply_gradients, split_batch, tune};
 pub use rlx_ir::op::{Activation, MaskKind};
 pub use rlx_ir::{DType, Dim, Graph, NodeId, ScaleLayout, ScaledFormat, Shape};
 /// Optimizers for [`Func::train_step`] (re-exported from `rlx_optim`).
@@ -121,7 +126,10 @@ pub use rlx_runtime::Device;
 /// Backend detection (re-exported from `rlx_runtime`): which devices this build
 /// can use, and the fastest one. `to_vec` / `Func::run` pick automatically.
 #[cfg(feature = "eval")]
-pub use rlx_runtime::{available_devices, fastest_device, fastest_device_for, is_available};
+pub use rlx_runtime::{
+    available_devices, device_label, fastest_device, fastest_device_for, is_available,
+    parse_device, training_devices,
+};
 #[cfg(feature = "eval")]
 pub use tensor::Materialize;
 

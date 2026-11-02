@@ -38,6 +38,24 @@ fn main() {
 
     // The `blas` feature is the top-level switch; `--no-default-features`
     // (or a target with no BLAS) falls back to the portable gemm.
+    // `portable`: the arithmetic of the wasm build on every target, so a run
+    // rounds the same on macOS, Linux and in the browser. aarch64 leaves its
+    // NEON kernels (`rlx_cpu_neon` unset) for the arms wasm takes, x86-64
+    // its AVX kernels and thresholds (`rlx_cpu_x86` unset), and no
+    // vendor BLAS is linked (its blocking order is the vendor's).
+    println!("cargo:rustc-check-cfg=cfg(rlx_cpu_neon)");
+    println!("cargo:rustc-check-cfg=cfg(rlx_cpu_portable)");
+    println!("cargo:rustc-check-cfg=cfg(rlx_cpu_x86)");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PORTABLE");
+    let portable = std::env::var_os("CARGO_FEATURE_PORTABLE").is_some();
+    if portable {
+        println!("cargo:rustc-cfg=rlx_cpu_portable");
+    } else if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+        println!("cargo:rustc-cfg=rlx_cpu_neon");
+    } else if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
+        // likewise x86-64's AVX kernels and its own thresholds
+        println!("cargo:rustc-cfg=rlx_cpu_x86");
+    }
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BLAS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PURE_RUST");
     // `pure-rust` wins over `blas` (features unify additively, so it must be
@@ -45,6 +63,7 @@ fn main() {
     // OpenBLAS / MKL, the portable gemm instead.
     if std::env::var_os("CARGO_FEATURE_BLAS").is_none()
         || std::env::var_os("CARGO_FEATURE_PURE_RUST").is_some()
+        || portable
     {
         return;
     }

@@ -128,6 +128,11 @@ pub(crate) fn dequant_block(scheme: QuantScheme, block: &[u8], out: &mut [f32; Q
         QuantScheme::GgufBF16 => {
             out[0] = f32::from_bits(u32::from(u16::from_le_bytes([block[0], block[1]])) << 16);
         }
+        // 128-element FP8 block: f32 scale + 128 codes; caller slices `out`.
+        QuantScheme::Fp8E4m3B128 | QuantScheme::Fp8E5m2B128 => {
+            let fmt = rlx_ir::lowp_codec::fp8_b128::format(scheme).unwrap();
+            rlx_ir::lowp_codec::fp8_b128::dequant_block(fmt, block, out)
+        }
         other => panic!(
             "gguf_matmul: scheme {other:?} has no block-level dequant — use load-time dequant_cache"
         ),
@@ -683,6 +688,10 @@ pub fn dequant_moe_weights_to_grouped_f32(
             QuantScheme::GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(slab, k * n),
             QuantScheme::GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0(slab, k * n),
             QuantScheme::GgufPtq1_0 => rlx_gguf::ptq1_dequant::dequant_ptq1_0(slab, k * n),
+            QuantScheme::Fp8E4m3B128 | QuantScheme::Fp8E5m2B128 => Ok(
+                rlx_ir::lowp_codec::fp8_b128::dequant_scheme(scheme, slab, k * n)
+                    .expect("dequant_moe_weights: slab dequant failed"),
+            ),
             other => panic!("dequant_moe_weights: unsupported scheme {other:?}"),
         }
         .expect("dequant_moe_weights: slab dequant failed");

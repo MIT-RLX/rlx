@@ -8011,6 +8011,16 @@ impl MetalExecutable {
                     // that. Without this the 27B re-materializes every weight
                     // to f32 per token: ~90% of decode on the thunk profile.
                     // Off-switch: RLX_METAL_PTQ1_0_FUSED_DISABLE=1.
+                    // Fused Fp8E4m3B128 decode GEMV (HF fp8 checkpoints). Decode
+                    // only; lockstep with `dequant_gguf_scratch_bytes`.
+                    let use_fused_fp8b128_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(128)
+                        && matches!(
+                            scheme,
+                            rlx_ir::QuantScheme::Fp8E4m3B128 | rlx_ir::QuantScheme::Fp8E5m2B128
+                        )
+                        && !rlx_ir::env::flag("RLX_METAL_FP8B128_FUSED_DISABLE");
                     let use_fused_ptq1_0_mv = use_gpu_dequant
                         && m_u == 1
                         && k_u.is_multiple_of(128)
@@ -8024,11 +8034,20 @@ impl MetalExecutable {
                     let needs_scratch = !(use_fused_q1_0_mv
                         || use_fused_q1_0_mm
                         || use_fused_g8_0_mv
-                        || use_fused_ptq1_0_mv);
+                        || use_fused_ptq1_0_mv
+                        || use_fused_fp8b128_mv);
                     if !use_gpu_dequant
                         || (needs_scratch && self.dequant_scratch_off == 0)
                         || !has_metal_dequant_kernel(*scheme)
                     {
+                        // The host kernel reads the weight out of the arena;
+                        // compile only externalizes weights whose every path
+                        // stays on the GPU (`metal_encoder_binds_weight_buffer`).
+                        assert!(
+                            !crate::thunk::is_weight_off(*w_q),
+                            "{scheme:?} weight lives in the weight buffer but this \
+                             DequantMatMul took the host path"
+                        );
                         deferred_host.push(DeferredHostOp::DequantMatMulGguf {
                             x: *x,
                             w_q: *w_q,
@@ -8068,6 +8087,22 @@ impl MetalExecutable {
                     } else if use_q8_0_mv_sg {
                         let enc = e!();
                         encode_q8_0_mv_f32_sg(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                    } else if use_fused_fp8b128_mv {
+                        let (w_buf, w_raw) = self.resolve_off(*w_q);
+                        let enc = e!();
+                        let e5 = matches!(scheme, rlx_ir::QuantScheme::Fp8E5m2B128);
+                        encode_fp8b128_mv_f32_sg(
+                            enc,
+                            k,
+                            &self.arena.buffer,
+                            w_buf,
+                            *x,
+                            w_raw,
+                            *dst,
+                            k_u,
+                            n_u,
+                            e5,
+                        );
                     } else if use_q4_0_mv_sg {
                         let enc = e!();
                         encode_q4_0_mv_f32_sg(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
@@ -8358,12 +8393,14 @@ impl MetalExecutable {
                             n_u,
                         );
                     } else {
+                        let (w_buf, w_raw) = self.resolve_off(*w_q);
                         let enc = e!();
                         encode_dequant_gguf(
                             enc,
                             k,
                             &self.arena.buffer,
-                            *w_q,
+                            w_buf,
+                            w_raw,
                             self.dequant_scratch_off,
                             *scheme,
                             k_u,

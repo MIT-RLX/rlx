@@ -32,15 +32,41 @@
 // precompiled XCLBIN/INSTS overlay) is still required before `is_available`
 // reports Xdna as dispatchable.
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_kernel.h"
+
+// Longest wait for one NPU command, in ms (0 = forever). A dispatch whose
+// DMA never completes (a malformed overlay, or a tile waiting for data that
+// is not coming) would otherwise block the process in the driver forever;
+// with a bound the command is aborted and the call fails, so the caller can
+// run that step on the host. Set by rlx through `rlx_xdna_set_wait_ms`.
+static unsigned int g_wait_ms = 10000;
+
+extern "C" void rlx_xdna_set_wait_ms(unsigned int ms) { g_wait_ms = ms; }
+
+static void wait_done(xrt::run &run) {
+  ert_cmd_state st = run.wait(std::chrono::milliseconds(g_wait_ms));
+  if (st == ERT_CMD_STATE_COMPLETED) return;
+  if (st == ERT_CMD_STATE_TIMEOUT) {
+    try {
+      run.abort();
+    } catch (...) {
+    }
+    throw std::runtime_error("NPU command timed out after " +
+                             std::to_string(g_wait_ms) + " ms (aborted)");
+  }
+  throw std::runtime_error("NPU command ended in state " +
+                           std::to_string(static_cast<int>(st)));
+}
 
 #ifndef XCL_BO_FLAGS_CACHEABLE
 #define XCL_BO_FLAGS_CACHEABLE (1U << 24)
@@ -113,7 +139,7 @@ extern "C" int rlx_xdna_gemm_run(RlxXdnaGemm *h, const int8_t *A,
     h->bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     h->bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     h->run.start();
-    h->run.wait();
+    wait_done(h->run);
     h->bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     std::memcpy(C, h->bo_c.map<void *>(), h->c_bytes);
     return 0;
@@ -144,7 +170,7 @@ extern "C" int rlx_xdna_gemm_run_a(RlxXdnaGemm *h, const int8_t *A, int32_t *C) 
     std::memcpy(h->bo_a.map<void *>(), A, h->a_bytes);
     h->bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     h->run.start();
-    h->run.wait();
+    wait_done(h->run);
     h->bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     std::memcpy(C, h->bo_c.map<void *>(), h->c_bytes);
     return 0;
@@ -183,7 +209,7 @@ extern "C" int rlx_xdna_gemm_run_block(RlxXdnaGemm *h, int idx, const int8_t *A,
     h->bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     h->run.set_arg(4, h->wbos[idx]); // resident B block
     h->run.start();
-    h->run.wait();
+    wait_done(h->run);
     h->bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     std::memcpy(C, h->bo_c.map<void *>(), h->c_bytes);
     return 0;
@@ -232,7 +258,7 @@ extern "C" int rlx_xdna_run_passthrough(const char *xclbin_path,
     run.set_arg(4, bo_b);
     run.set_arg(5, bo_out);
     run.start();
-    run.wait();
+    wait_done(run);
 
     bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     std::memcpy(out, bo_out.map<void *>(), bytes);
@@ -311,7 +337,7 @@ extern "C" int rlx_xdna_io_run(RlxXdnaIO *h, const int32_t *in, int32_t *out) {
     std::memcpy(h->bo_in.map<void *>(), in, h->nbytes);
     h->bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     h->run.start();
-    h->run.wait();
+    wait_done(h->run);
     h->bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     std::memcpy(out, h->bo_out.map<void *>(), h->nbytes);
     return 0;
@@ -333,7 +359,7 @@ extern "C" int rlx_xdna_io_run2(RlxXdnaIO *h, const int32_t *a, const int32_t *b
     h->bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     h->bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     h->run.start();
-    h->run.wait();
+    wait_done(h->run);
     h->bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     std::memcpy(out, h->bo_out.map<void *>(), h->nbytes);
     return 0;
@@ -403,7 +429,7 @@ extern "C" int rlx_xdna_mm32_run(RlxXdnaMM32 *h, const int32_t *A,
     h->bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     h->bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     h->run.start();
-    h->run.wait();
+    wait_done(h->run);
     h->bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     std::memcpy(C, h->bo_c.map<void *>(), h->c_bytes);
     return 0;
@@ -472,7 +498,7 @@ extern "C" int rlx_xdna_run3_run(RlxXdnaRun3 *h, const void *a, const void *b,
     h->bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     h->bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     h->run.start();
-    h->run.wait();
+    wait_done(h->run);
     h->bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     std::memcpy(c, h->bo_c.map<void *>(), h->nc);
     return 0;

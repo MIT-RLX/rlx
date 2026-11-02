@@ -27,19 +27,19 @@ pub enum CpuArch {
 impl CpuArch {
     /// Pick the best label for the running target.
     pub const fn current() -> Self {
-        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        #[cfg(all(rlx_cpu_neon, target_vendor = "apple"))]
         {
             Self::AppleSilicon
         }
-        #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+        #[cfg(all(rlx_cpu_neon, not(target_vendor = "apple")))]
         {
             Self::AarchGeneric
         }
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(rlx_cpu_x86)]
         {
             Self::X86_64
         }
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        #[cfg(not(any(rlx_cpu_neon, rlx_cpu_x86)))]
         {
             Self::Other
         }

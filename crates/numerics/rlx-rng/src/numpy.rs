@@ -13,7 +13,7 @@
 /// fused, legacy `standard_normal` 20000 vs 17107).
 #[inline(always)]
 fn fma_c(a: f64, b: f64, c: f64) -> f64 {
-    if cfg!(target_vendor = "apple") {
+    if rlx_libm::platform::apple_reference() {
         a.mul_add(b, c)
     } else {
         a * b + c

@@ -112,3 +112,41 @@ fn per_tensor_scheme_overrides() {
         rlx_gguf::GgmlType::Q4K
     );
 }
+
+/// A block-FP8 HF weight (`F8_E4M3` + `weight_scale_inv`) converts to the
+/// scaled values, and the scale grid is folded in — not written as a tensor.
+#[test]
+fn fp8_block_scaled_weight_converts_scaled() {
+    use rlx_ir::quant::ScaledFormat;
+    let codes: Vec<u8> = (0..2 * 256).map(|k| (k % 0x7e) as u8).collect();
+    let scale: [f32; 2] = [0.5, 3.0]; // one 128-block per half of each row
+    let s_bytes: Vec<u8> = scale.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let mut tensors: HashMap<String, TensorView<'_>> = HashMap::new();
+    tensors.insert(
+        "w".into(),
+        TensorView::new(Dtype::F8_E4M3, vec![2, 256], &codes).unwrap(),
+    );
+    tensors.insert(
+        "w_scale_inv".into(),
+        TensorView::new(Dtype::F32, vec![1, 2], &s_bytes).unwrap(),
+    );
+    let st_path = tempfile::NamedTempFile::new().unwrap();
+    safetensors::serialize_to_file(&tensors, None, st_path.path()).unwrap();
+
+    let gguf_path = tempfile::NamedTempFile::new().unwrap();
+    let report = Converter::from_safetensors(st_path.path())
+        .unwrap()
+        .default_scheme(Scheme::F32)
+        .write_gguf(gguf_path.path())
+        .unwrap();
+    assert_eq!(report.tensors, 1, "the scale is not a tensor of its own");
+
+    let parsed = rlx_gguf::GgufFile::from_path(gguf_path.path()).unwrap();
+    assert!(parsed.dequant_f32("w_scale_inv").is_err());
+    let (w, shape) = parsed.dequant_f32("w").unwrap();
+    assert_eq!(shape, vec![2, 256]);
+    for (k, v) in w.iter().enumerate() {
+        let want = ScaledFormat::F8E4M3.decode(codes[k]) * scale[(k % 256) / 128];
+        assert_eq!(*v, want, "w[{k}]");
+    }
+}

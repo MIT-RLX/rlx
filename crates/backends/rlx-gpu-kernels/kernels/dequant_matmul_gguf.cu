@@ -599,6 +599,25 @@ __device__ __forceinline__ float rd_f16_bits(
 // Q6_K (2): 256 / 210 B. Same decode as the scalar `dequant_matmul_gguf`
 // above and rlx-gguf.
 // The 8 weights at elements `e0..e0+8` of the row at `row_base`, decoded.
+// One OCP FP8 code to f32 by building its bits — exact, no exp2: E4M3
+// (`Fp8E4m3B128`; only S.1111.111 is NaN) or E5M2 (`Fp8E5m2B128`; IEEE-like
+// inf / NaN at exponent 31), like the CPU codec.
+__device__ __forceinline__ float fp8_dec(unsigned int c, bool e5) {
+    float v;
+    if (e5) {
+        unsigned int e = (c >> 2u) & 31u, m = c & 3u;
+        v = (e == 0u) ? (float)m * 1.52587890625e-05f
+            : (e == 31u) ? __uint_as_float(m == 0u ? 0x7F800000u : 0x7FC00000u)
+            : __uint_as_float(((e + 112u) << 23u) | (m << 21u));
+    } else {
+        unsigned int e = (c >> 3u) & 15u, m = c & 7u;
+        v = (e == 0u) ? (float)m * 0.001953125f
+            : __uint_as_float(((e + 120u) << 23u) | (m << 20u));
+        if ((c & 0x7Fu) == 0x7Fu) v = __uint_as_float(0x7FC00000u);
+    }
+    return (c & 0x80u) ? -v : v;
+}
+
 __device__ __forceinline__ void gguf_load8(
     const float* arena,
     unsigned long long w_word,
@@ -607,7 +626,20 @@ __device__ __forceinline__ void gguf_load8(
     unsigned long long e0,
     float w[8]
 ) {
-    if (scheme_id == 20u) {
+    if (scheme_id == 30u || scheme_id == 31u) {
+        // Fp8E4m3B128 / Fp8E5m2B128: f32 scale | 128 codes (132 bytes / 128 elems).
+        bool e5 = scheme_id == 31u;
+        unsigned long long base = row_base + (e0 >> 7ull) * 132ull;
+        unsigned int sb, unused, q0, q1;
+        rd8(arena, w_word, base, sb, unused);
+        float d = __uint_as_float(sb);
+        rd8(arena, w_word, base + 4ull + (e0 & 127ull), q0, q1);
+        #pragma unroll
+        for (unsigned int t = 0u; t < 8u; t++) {
+            unsigned int b = ((t < 4u) ? (q0 >> (t * 8u)) : (q1 >> ((t - 4u) * 8u))) & 0xFFu;
+            w[t] = fp8_dec(b, e5) * d;
+        }
+    } else if (scheme_id == 20u) {
         unsigned long long base = row_base + (e0 >> 5ull) * 34ull;
         float d = rd_f16_bits(arena, w_word, base);
         unsigned int q0, q1;
@@ -738,7 +770,7 @@ __device__ __forceinline__ float row32_sum(float acc, float comp) {
     return acc + comp;
 }
 
-// Decode GEMV (m == 1) for Q8_0 / Q4_K / Q5_K / Q6_K: 32 threads per output
+// Decode GEMV (m == 1) for Q8_0 / Q4_K / Q5_K / Q6_K / FP8-B128: 32 threads per output
 // row, `blockDim.x / 32` rows per block, each thread taking chunks of 8
 // consecutive elements — every thread works at any k (the block-strided
 // kernels leave all but k/256 of 128 threads idle at k = 1024), and one
@@ -760,6 +792,7 @@ extern "C" __global__ void dequant_matmul_gguf_gemv_elem(
 
     unsigned long long w_word = w_byte_off / 4ull;
     unsigned long long row_bytes = (scheme_id == 20u) ? (k / 32ull) * 34ull
+        : (scheme_id == 30u || scheme_id == 31u) ? (k / 128ull) * 132ull
         : (k / 256ull) * ((scheme_id == 0u) ? 144ull : (scheme_id == 1u) ? 176ull : 210ull);
     float acc = 0.0f;
     float comp = 0.0f;
@@ -801,6 +834,7 @@ extern "C" __global__ void dequant_matmul_gguf_gemv_rows(
 
     unsigned long long w_word = w_byte_off / 4ull;
     unsigned long long row_bytes = (scheme_id == 20u) ? (k / 32ull) * 34ull
+        : (scheme_id == 30u || scheme_id == 31u) ? (k / 128ull) * 132ull
         : (k / 256ull) * ((scheme_id == 0u) ? 144ull : (scheme_id == 1u) ? 176ull : 210ull);
     float acc[GGUF_GEMV_MAX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
     float comp[GGUF_GEMV_MAX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};

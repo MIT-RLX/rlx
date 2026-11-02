@@ -16,8 +16,12 @@ struct Params {
 @group(0) @binding(1) var<uniform>              params: Params;
 
 @compute @workgroup_size(256)
-fn gather_bwd_zero(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn gather_bwd_zero(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) ngs: vec3<u32>,
+) {
+    // past 65535 workgroups the dispatch spills into y (`dispatch_dims`)
+    let i = gid.x + gid.y * ngs.x * 256u;
     let n = params.outer * params.axis_dim * params.trailing;
     if (i < n) {
         arena[params.dst_off + i] = 0.0;

@@ -14,7 +14,7 @@ use crate::pool;
 
 /// NEON vectorized exp(x) for 4 floats. Range reduction + 6th-order Taylor.
 /// Max relative error: ~2e-7 across [-87, 88].
-#[cfg(target_arch = "aarch64")]
+#[cfg(rlx_cpu_neon)]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub unsafe fn neon_exp4(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
@@ -41,7 +41,7 @@ pub unsafe fn neon_exp4(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch6
 /// AVX2+FMA vectorised exp(x) for 8 floats. Same range reduction +
 /// 6th-order Taylor polynomial as `neon_exp4`. Max relative error
 /// stays in the ~2e-7 range. Runtime-dispatch via `is_x86_feature_detected`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[target_feature(enable = "avx2", enable = "fma")]
 // Cody–Waite ln2 split (`ln2_hi`/`ln2_lo`) and the Taylor coefficients below are
 // written at full precision on purpose — each rounds to the intended nearest-f32,
@@ -79,7 +79,7 @@ pub unsafe fn avx2_exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m2
 
 /// Fused bias addition + GELU activation on a [m, n] buffer.
 /// Uses Abramowitz & Stegun erf approximation with NEON exp.
-#[cfg(target_arch = "aarch64")]
+#[cfg(rlx_cpu_neon)]
 pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     use std::arch::aarch64::*;
     let chunks = n / 4;
@@ -129,7 +129,7 @@ pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
 ///
 /// # Safety
 /// Caller has checked `is_x86_feature_detected!("avx2")` and `"fma"`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[allow(clippy::excessive_precision)]
 pub(crate) unsafe fn bias_gelu_avx2(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
@@ -191,7 +191,7 @@ pub(crate) unsafe fn bias_gelu_avx2(data: &mut [f32], bias: &[f32], m: usize, n:
 /// Portable bias + erf-GELU: x86-64's runtime fallback, so one binary covers
 /// AVX2 hosts and pre-AVX ones (every Atom through Tremont) without
 /// recompiling.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 fn bias_gelu_scalar(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     for row in 0..m {
         let base = row * n;
@@ -206,7 +206,7 @@ fn bias_gelu_scalar(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
 /// `cfg(target_feature)`: a compile-time gate meant the portable build lost
 /// the AVX2 kernel entirely and the only way to get it was a
 /// `-C target-cpu=native` artifact that SIGILLs on an Atom.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         // SAFETY: both feature bits just checked.
@@ -218,7 +218,7 @@ pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
 
 /// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]), so a wasm run
 /// rounds like Linux x86-64.
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(not(any(rlx_cpu_neon, rlx_cpu_x86)))]
 pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     crate::avx2_mirror::bias_gelu(data, bias, m, n);
 }
@@ -274,7 +274,7 @@ pub fn par_bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
 // ── Fused SiLU ──────────────────────────────────────────────────────────
 
 /// SiLU (Swish) in-place: x / (1 + exp(-x))
-#[cfg(target_arch = "aarch64")]
+#[cfg(rlx_cpu_neon)]
 pub fn silu_inplace(data: &mut [f32]) {
     use std::arch::aarch64::*;
     let chunks = data.len() / 4;
@@ -295,7 +295,7 @@ pub fn silu_inplace(data: &mut [f32]) {
 }
 
 /// SiLU via AVX2+FMA. Caller must have checked `is_x86_feature_detected`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn silu_inplace_avx2(data: &mut [f32]) {
@@ -318,7 +318,7 @@ pub(crate) unsafe fn silu_inplace_avx2(data: &mut [f32]) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 pub fn silu_inplace(data: &mut [f32]) {
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         unsafe { silu_inplace_avx2(data) };
@@ -333,7 +333,7 @@ pub fn silu_inplace(data: &mut [f32]) {
 }
 
 /// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]).
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(not(any(rlx_cpu_neon, rlx_cpu_x86)))]
 pub fn silu_inplace(data: &mut [f32]) {
     crate::avx2_mirror::silu_inplace(data);
 }
@@ -342,7 +342,7 @@ pub fn silu_inplace(data: &mut [f32]) {
 
 /// Single-row LayerNorm: out = (x - mean) * inv_std * gamma + beta.
 /// 2-pass: compute mean+variance (E\[x²\]-E\[x\]²), then normalize.
-#[cfg(target_arch = "aarch64")]
+#[cfg(rlx_cpu_neon)]
 pub fn layer_norm_row(
     input: &[f32],
     gamma: &[f32],
@@ -405,7 +405,7 @@ pub fn layer_norm_row(
 ///
 /// # Safety
 /// Caller has checked `is_x86_feature_detected!("avx2")` and `"fma"`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[target_feature(enable = "avx2", enable = "fma")]
 pub(crate) unsafe fn layer_norm_row_avx2(
     input: &[f32],
@@ -476,7 +476,7 @@ pub(crate) unsafe fn layer_norm_row_avx2(
 }
 
 /// Portable two-pass LayerNorm over one row: x86-64's runtime fallback.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 fn layer_norm_row_scalar(
     input: &[f32],
     gamma: &[f32],
@@ -507,7 +507,7 @@ fn layer_norm_row_scalar(
 /// x86-64 LayerNorm row. CPUID-dispatched at runtime so the same artifact
 /// takes the AVX2 kernel on a capable host and the portable two-pass loop on
 /// a pre-AVX one (Atom Bonnell..Tremont) — see [`bias_gelu`].
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 pub fn layer_norm_row(
     input: &[f32],
     gamma: &[f32],
@@ -525,7 +525,7 @@ pub fn layer_norm_row(
 }
 
 /// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]).
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(not(any(rlx_cpu_neon, rlx_cpu_x86)))]
 pub fn layer_norm_row(
     input: &[f32],
     gamma: &[f32],
@@ -557,7 +557,7 @@ pub fn layer_norm_rows(
     eps: f32,
 ) {
     debug_assert!(input.len() >= rows * h && output.len() >= rows * h);
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(rlx_cpu_x86)]
     {
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
@@ -588,7 +588,7 @@ pub fn layer_norm_rows(
         }
     }
     // Other targets dispatch at compile time, so there is nothing to hoist.
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(rlx_cpu_x86))]
     for r in 0..rows {
         layer_norm_row(
             &input[r * h..(r + 1) * h],
@@ -794,7 +794,7 @@ fn par_softmax_rows<F: Fn(&mut [f32], usize, usize) + Sync>(
 }
 
 /// NEON-vectorized softmax: 3-pass (max, exp+sum, normalize).
-#[cfg(target_arch = "aarch64")]
+#[cfg(rlx_cpu_neon)]
 fn softmax_rows_neon(data: &mut [f32], rows: usize, cols: usize) {
     use std::arch::aarch64::*;
     let chunks = cols / 4;
@@ -843,12 +843,12 @@ fn softmax_rows_neon(data: &mut [f32], rows: usize, cols: usize) {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(rlx_cpu_neon)]
 pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
     par_softmax_rows(data, rows, cols, &softmax_rows_neon);
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn softmax_rows_avx2(data: &mut [f32], rows: usize, cols: usize) {
@@ -918,7 +918,7 @@ pub(crate) unsafe fn softmax_rows_avx2(data: &mut [f32], rows: usize, cols: usiz
 /// hold only masked scores, whose exponentials (≈1e-38, the `avx2_exp8`
 /// floor) vanish against a sum ≥ 1, so the live entries come out as the full
 /// row's; the skipped entries are left unnormalized and must not be read.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn softmax_row_avx2_chunks(row: &mut [f32], live: &[usize]) {
@@ -979,7 +979,7 @@ pub(crate) unsafe fn softmax_row_avx2_chunks(row: &mut [f32], live: &[usize]) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
     let avx2 =
         std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
@@ -1063,7 +1063,7 @@ fn reduce_sum4(row: &[f32]) -> f32 {
 /// would sink the whole thing back to scalar.
 // Dead on aarch64 by design (NEON arm always wins); kept compiled so the
 // guard test runs on an Apple dev machine.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[cfg_attr(rlx_cpu_neon, allow(dead_code))]
 fn softmax_row_poly(row: &mut [f32]) {
     let max_v = reduce_max4(row);
     if !max_v.is_finite() {
@@ -1084,7 +1084,7 @@ fn softmax_row_poly(row: &mut [f32]) {
 }
 
 /// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]).
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(not(any(rlx_cpu_neon, rlx_cpu_x86)))]
 pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
     par_softmax_rows(data, rows, cols, &crate::avx2_mirror::softmax_rows);
 }
@@ -1092,7 +1092,7 @@ pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
 // ── GELU in-place (no bias) ────────────────────────────────────────────
 
 /// NEON GELU activation in-place (without bias addition).
-#[cfg(target_arch = "aarch64")]
+#[cfg(rlx_cpu_neon)]
 pub fn gelu_inplace(data: &mut [f32]) {
     use std::arch::aarch64::*;
     let len = data.len();
@@ -1135,7 +1135,7 @@ pub fn gelu_inplace(data: &mut [f32]) {
 }
 
 /// Erf-GELU via AVX2+FMA. Caller must have checked feature bits.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[target_feature(enable = "avx2", enable = "fma")]
 // a1..a5 are the Abramowitz & Stegun 7.1.26 erf coefficients — published
 // full-precision values whose nearest-f32 is exactly what we want. Keep the
@@ -1184,7 +1184,7 @@ pub(crate) unsafe fn gelu_inplace_avx2(data: &mut [f32]) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 pub fn gelu_inplace(data: &mut [f32]) {
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         unsafe { gelu_inplace_avx2(data) };
@@ -1196,7 +1196,7 @@ pub fn gelu_inplace(data: &mut [f32]) {
 }
 
 /// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]).
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(not(any(rlx_cpu_neon, rlx_cpu_x86)))]
 pub fn gelu_inplace(data: &mut [f32]) {
     crate::avx2_mirror::gelu_inplace(data);
 }
@@ -1376,7 +1376,7 @@ pub fn par_silu_inplace(data: &mut [f32]) {
 /// C = A @ B where A=\[m,k\], B=\[k,n\], C=\[m,n\], all row-major.
 /// For m≤8 with small k×n (under ~16K elements), this beats cblas_sgemm
 /// by avoiding AMX setup cost and function call overhead.
-#[cfg(target_arch = "aarch64")]
+#[cfg(rlx_cpu_neon)]
 pub fn neon_sgemm_small(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     use std::arch::aarch64::*;
     let n4 = n / 4;
@@ -1409,13 +1409,13 @@ pub fn neon_sgemm_small(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize,
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(rlx_cpu_neon))]
 pub fn neon_sgemm_small(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     crate::naive::matmul(a, b, c, m, k, n);
 }
 
 /// NEON sgemm_bias for tiny m: C = A @ B + bias.
-#[cfg(target_arch = "aarch64")]
+#[cfg(rlx_cpu_neon)]
 pub fn neon_sgemm_bias_small(
     a: &[f32],
     b: &[f32],
@@ -1429,7 +1429,7 @@ pub fn neon_sgemm_bias_small(
     crate::blas::bias_add(c, bias, m, n);
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(rlx_cpu_neon))]
 pub fn neon_sgemm_bias_small(
     a: &[f32],
     b: &[f32],
@@ -1810,7 +1810,7 @@ mod tests {
     /// scalar arm is the only one reachable, and `just check-isa` exercises
     /// exactly that leg on an emulated Atom.
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(rlx_cpu_x86)]
     fn x86_dispatch_arms_agree() {
         if !(std::arch::is_x86_feature_detected!("avx2")
             && std::arch::is_x86_feature_detected!("fma"))

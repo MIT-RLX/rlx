@@ -3361,8 +3361,17 @@ impl Step {
                 | Step::AttentionBackward { .. }
                 | Step::Binary { .. }
                 | Step::Concat { .. }
+                // conv2d*.cu / conv_bias_act_epilogue.cu index f32 elements
+                // with products bounded by their own tensors; the backward
+                // steps keep u64 byte offsets and pass `bytes / 4`; MIOpen
+                // pointers are built in u64.
+                | Step::Conv2d { .. }
+                | Step::Conv2dBackwardInput { .. }
+                | Step::Conv2dBackwardWeight { .. }
                 | Step::Expand { .. }
                 | Step::Gather { .. }
+                // gated_residual.cu: element offsets, `mod_base + col` < gate size.
+                | Step::GatedResidual { .. }
                 | Step::LayerNorm { .. }
                 | Step::Matmul { .. }
                 | Step::Narrow { .. }
@@ -3374,6 +3383,8 @@ impl Step {
                 | Step::RopeBackward { .. }
                 | Step::ScatterAddAcc { .. }
                 | Step::ScatterAddZero { .. }
+                // softmax.cu: `in_off + base + j * stride` < in_off + tensor size.
+                | Step::Softmax { .. }
                 | Step::SoftmaxCrossEntropyBackward { .. }
                 | Step::SoftmaxCrossEntropyWithLogits { .. }
                 | Step::Transpose { .. }

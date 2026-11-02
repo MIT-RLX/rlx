@@ -285,7 +285,20 @@ pub fn unfuse(graph: Graph, policy: &dyn DecomposePolicy) -> Graph {
                 wrt,
             } => {
                 let q_dims = graph.node(node.inputs[0]).shape.dims();
-                if policy.promote_attention_backward() && q_dims.len() == 3 {
+                // The kernel indexes `[B, H, S, D]`. Rank-3 `[B, S, H·D]` and
+                // rank-4 BSHD `[B, S, H, D]` (the layout `attention_geom`
+                // detects when axis 1 is not the head count) are transposed in
+                // and the gradient transposed back; a BSHD tensor read as BHSD
+                // attends across heads instead of positions.
+                let bshd4 = q_dims.len() == 4
+                    && !rlx_ir::attention_layout::attention_geom(
+                        &graph.node(node.inputs[0]).shape,
+                        &graph.node(node.inputs[1]).shape,
+                        *num_heads,
+                        *head_dim,
+                    )
+                    .bhsd;
+                if policy.promote_attention_backward() && (q_dims.len() == 3 || bshd4) {
                     expand_attention_backward_rank3(
                         &mut out,
                         &graph,
@@ -541,7 +554,30 @@ fn needs_attn_rank3_promotion(
 ) -> bool {
     let is_attn = matches!(node.op, Op::Attention { .. })
         || (policy.promote_attention_backward() && matches!(node.op, Op::AttentionBackward { .. }));
-    is_attn && graph.node(node.inputs[0]).shape.rank() == 3
+    if !is_attn {
+        return false;
+    }
+    let q = &graph.node(node.inputs[0]).shape;
+    if q.rank() == 3 {
+        return true;
+    }
+    // A rank-4 BSHD backward is transposed to the kernel's BHSD too.
+    match &node.op {
+        Op::AttentionBackward {
+            num_heads,
+            head_dim,
+            ..
+        } if q.rank() == 4 => {
+            !rlx_ir::attention_layout::attention_geom(
+                q,
+                &graph.node(node.inputs[1]).shape,
+                *num_heads,
+                *head_dim,
+            )
+            .bhsd
+        }
+        _ => false,
+    }
 }
 
 // ── Expansions ───────────────────────────────────────────────────
@@ -1749,11 +1785,14 @@ fn expand_attention_backward_rank3(
         vec![grad4],
         Shape::new(&[batch, seq_wrt, num_heads, head_dim], dtype),
     );
-    out.reshape(
-        bsd,
-        vec![batch as i64, seq_wrt as i64, (num_heads * head_dim) as i64],
-        out_shape.clone(),
-    )
+    // Back to the caller's layout: `[B, S, H·D]`, or `[B, S, H, D]` when the
+    // inputs were rank-4 BSHD (both have the sequence on axis 1).
+    let target: Vec<i64> = out_shape
+        .dims()
+        .iter()
+        .map(|d| d.unwrap_static() as i64)
+        .collect();
+    out.reshape(bsd, target, out_shape.clone())
 }
 
 /// Inline a sub-graph into `out`, binding the sub-graph's `Op::Input`

@@ -95,6 +95,31 @@ mod safetensors_reader {
             Ok(Self { data, tensors })
         }
 
+        fn meta(&self, name: &str) -> Option<&TensorMeta> {
+            self.tensors.iter().find(|t| t.name == name)
+        }
+
+        fn is_fp8(dtype: StDtype) -> bool {
+            matches!(dtype, StDtype::F8_E4M3 | StDtype::F8_E5M2)
+        }
+
+        /// The scale stored beside FP8 weight `name` (`_scale_inv` / `_scale`).
+        fn fp8_scale(&self, name: &str) -> Option<&TensorMeta> {
+            ["_scale_inv", "_scale"]
+                .iter()
+                .find_map(|s| self.meta(&format!("{name}{s}")))
+        }
+
+        /// A scale tensor that belongs to an FP8 weight — folded into the
+        /// weight on read, so not a tensor of its own.
+        fn is_fp8_scale(&self, name: &str) -> bool {
+            ["_scale_inv", "_scale"].iter().any(|s| {
+                name.strip_suffix(s)
+                    .and_then(|w| self.meta(w))
+                    .is_some_and(|w| Self::is_fp8(w.dtype))
+            })
+        }
+
         fn convert_to_f32(dtype: StDtype, bytes: &[u8]) -> Result<Vec<f32>> {
             match dtype {
                 StDtype::F32 => {
@@ -151,6 +176,16 @@ mod safetensors_reader {
                 StDtype::U8 => Ok(bytes.iter().map(|&b| b as f32).collect()),
                 StDtype::I8 => Ok(bytes.iter().map(|&b| b as i8 as f32).collect()),
                 StDtype::BOOL => Ok(bytes.iter().map(|&b| f32::from(b != 0)).collect()),
+                StDtype::F8_E4M3 | StDtype::F8_E5M2 => {
+                    let fmt = if dtype == StDtype::F8_E4M3 {
+                        rlx_ir::quant::ScaledFormat::F8E4M3
+                    } else {
+                        rlx_ir::quant::ScaledFormat::F8E5M2
+                    };
+                    let mut out = vec![0.0f32; bytes.len()];
+                    rlx_ir::lowp_codec::decode_slice(fmt, bytes, &mut out);
+                    Ok(out)
+                }
                 other => Err(anyhow!("safetensors dtype {other:?} not supported yet")),
             }
         }
@@ -167,7 +202,11 @@ mod safetensors_reader {
 
     impl TensorReader for SafetensorsReader {
         fn names(&self) -> Vec<String> {
-            self.tensors.iter().map(|t| t.name.clone()).collect()
+            self.tensors
+                .iter()
+                .filter(|t| !self.is_fp8_scale(&t.name))
+                .map(|t| t.name.clone())
+                .collect()
         }
         fn read_tensor(&self, name: &str) -> Result<NamedTensor> {
             let t = self
@@ -177,7 +216,15 @@ mod safetensors_reader {
                 .ok_or_else(|| anyhow!("no tensor {name}"))?;
             let bytes = &self.data[t.start..t.start + t.len];
             let source_bytes = bytes.len();
-            let data = Self::convert_to_f32(t.dtype, bytes)?;
+            let mut data = Self::convert_to_f32(t.dtype, bytes)?;
+            if let Some(sc) = self.fp8_scale(name).filter(|_| Self::is_fp8(t.dtype)) {
+                let scale =
+                    Self::convert_to_f32(sc.dtype, &self.data[sc.start..sc.start + sc.len])?;
+                rlx_ir::lowp_codec::apply_weight_scales(
+                    &mut data, &t.shape, &scale, &sc.shape, None,
+                )
+                .map_err(|e| anyhow!("{name}: {e}"))?;
+            }
             Ok(NamedTensor {
                 name: t.name.clone(),
                 shape: t.shape.clone(),

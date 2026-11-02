@@ -181,14 +181,46 @@ over 40 steps, gradient computed on the NPU).
 - **mlir-aie versions:** the matmul kernel is read from `aie_kernels/aie2/mm.cc`
   (≤ v1.4.3) or `aie_kernels/linalg/mm.cc` (v1.4.4+, where `zero_*` is
   supplied by rlx since the vendor moved it to a separate `zero.cc`).
-- **Reduce is last-axis only.** Use `keep_dim: true` so a scalar loss/reduce stays
-  rank-1 — a **rank-0** tensor has no last axis and the kernels reject it.
-- **Chains** are limited by the NPU's concurrent hardware-context count (4 per
-  process measured on Phoenix): a deep graph runs through a bounded LRU pool of
-  contexts (`RLX_XDNA_CHAIN_CAP`, default = the budget), re-opening evicted
-  contexts from cache. The budget (`RLX_XDNA_MAX_CONTEXTS`, default 4) is
-  process-wide — a chain evicts its idle contexts while other compiled graphs
-  hold theirs.
+- **Host steps.** Inside a compiled XDNA graph, a node the NPU kernels do
+  not cover runs on the host (rlx's CPU backend, bit-exact with `Device::Cpu`)
+  instead of failing the graph. That includes:
+  - a data-movement op larger than one AIE tile's memory (the copy kernels
+    stage the whole tensor in a 64 KB tile; on this shared-memory APU a host
+    copy is also faster than a DMA round trip);
+  - a configuration the kernels do not implement (a reduce over a non-last
+    axis, a batched matmul with a batched weight, a multi-axis tile, expand or
+    reverse);
+  - a kernel aiecc cannot place in tile memory.
+
+  Each op kind that falls back prints one `[rlx-xdna] … runs on the host`
+  line saying why. `RLX_XDNA_STRICT=1` turns that back into a hard error.
+  Binary ops with a broadcast operand stay on the NPU: the operand is
+  broadcast on the host and the kernel runs at full size. A matmul
+  `[..., m, k] · [k, n]` folds its leading axes into `m`.
+- **Conv** lowers to `Im2Col` (host) + NPU GEMM in `rlx-compile`'s rewrite
+  (`LowerConvIm2col`). A depthwise conv (one input channel per group) becomes
+  im2col, multiply and sum; other groups become a batched product.
+- **Chains** are limited by the NPU's AIE columns (4 on Phoenix / Hawk Point).
+  A deep graph runs through a bounded LRU pool of contexts
+  (`RLX_XDNA_CHAIN_CAP`, default = the budget), re-opening evicted contexts
+  from cache. The budget (`RLX_XDNA_MAX_CONTEXTS`, default 4) is
+  process-wide. A chain that needs a context closes its own idle ones first,
+  then another compiled graph's (a training loop holds a forward graph and a
+  gradient graph). A context the driver refuses, because a multi-column GEMM
+  holds the columns, is retried after one more is closed.
+- **Failed dispatches.** Every NPU command wait is bounded
+  (`RLX_XDNA_WAIT_MS`, default 10 000; `0` = forever): an overrun is aborted
+  and the call fails instead of blocking in the driver. A failed step is
+  retried once on a fresh context, then runs on the host for the rest of the
+  graph's life. The usual cause is runtime suspend: the NPU suspends after
+  5 s idle (`power/control = auto`, e.g. during a stretch of host steps), and
+  on resume the driver restarts every context; that restart can fail
+  (`aie2_hwctx_restart: Config cu failed` in the kernel log), leaving the
+  context dead. `echo on | sudo tee /sys/bus/pci/devices/<npu>/power/control`
+  keeps the NPU awake for long jobs.
+- **Overlay cache.** A finished matmul overlay build (`/tmp/rlx_xdna_mk_*`,
+  marked `built`) is reused, so an evicted context re-opens from the cached
+  `k.xclbin` without rerunning clang++ and aiecc.
 - **XDNA 1 only.** The kernels target Phoenix / Hawk Point `npu1`; an XDNA 2
   (Strix-class) part is reported unavailable rather than failing at load.
 - **Pool / Im2Col / Quantize / Dequantize** are host-computed (coverage so vision
@@ -198,8 +230,10 @@ over 40 steps, gradient computed on the NPU).
   are approximate (cosine ≈ 0.99, fine for SGD); the optimizer step is host-side.
 - **Attention** is standard multi-head + causal; GQA/MQA is handled by upstream
   KV-expansion (no separate `num_kv_heads` on the op).
-- **No CPU fallback.** A missing runtime/overlay is a hard `XdnaError`, never a
-  silent CPU masquerade — the device either does the work or says it can't.
+- **No silent device fallback.** A missing runtime/overlay is a hard
+  `XdnaError`, never a CPU masquerade. Per-node host steps (above) happen
+  only with a working NPU, each kind is named on stderr, and
+  `RLX_XDNA_STRICT=1` forbids them.
 - **`direct` path is parked** — see below.
 
 ## The `direct` path (parked)
