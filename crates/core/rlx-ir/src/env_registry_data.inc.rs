@@ -12,6 +12,15 @@
         layer: EnvLayer::Tooling,
     },
     EnvVarEntry {
+        name: "RLX_AGENT_REAL_CLI",
+        group: "debug",
+        summary: "Run rlx-bind's agent test against the real Claude Code CLI (billed; with `-- --ignored`)",
+        kind: EnvKind::Bool,
+        stability: EnvStability::Internal,
+        aliases: &[],
+        layer: EnvLayer::Tooling,
+    },
+    EnvVarEntry {
         name: "RLX_ARCH",
         group: "misc",
         summary: "Trainer architecture to build: mlp | cnn",

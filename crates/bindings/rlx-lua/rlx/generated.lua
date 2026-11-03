@@ -790,9 +790,10 @@ function M.Optimizer:set_lr(lr)
   S.check(rc)
 end
 
---- Takes `graph` (consumed): its first output is the loss. `wrt` are the
---- trainable params; `initial` their starting values. options: {optimizer,
---- device, resident, clip_norm, …}.
+--- Takes `graph` (consumed): its first output is the loss (further outputs
+--- reach step_with by name). `wrt` are the trainable params; `initial`
+--- their starting values. options: {optimizer, device, resident, clip_norm,
+--- schedule, accumulate, loss_scale, …}.
 function M.Trainer.new(graph, wrt, initial, opts)
   opts = opts or {}
   local in_initial = S.inputs(initial)

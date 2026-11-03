@@ -113,6 +113,8 @@ members = [
     # Benchmark framework (PLAN L5)
     "crates/tooling/rlx-bench",       # BenchmarkPattern + per-backend timing harness
     "crates/tooling/rlx-opscope",     # Data-pattern recording harness: inject stat taps, sweep synthetic data, mine exploitable structure
+    "crates/tooling/rlx-wsp",         # Weight-space programming: LLM reads/writes weights via a budgeted tool surface
+    "crates/tooling/rlx-agent",       # Launch agent CLIs (claude / agent / copilot) against MCP servers; normalised events
     "crates/tooling/rlx-hwprofile",   # Host GPU/VRAM detection for device selection + topology planning
     "crates/tooling/rlx-check",       # `cargo rlx check` — device-free static graph diagnostics
     "crates/tooling/rlx-corpus",      # Named kernel corpus a compiler change must clear
@@ -266,6 +268,8 @@ rlx-onnx-conformance = { path = "crates/io/rlx-onnx-conformance", version = "0.2
 rlx-onnx-import = { path = "crates/io/rlx-onnx-import", version = "0.2.20" }
 rlx-onnx-proto = { path = "crates/io/rlx-onnx-proto", version = "0.2.20" }
 rlx-opscope = { path = "crates/tooling/rlx-opscope", version = "0.2.20" }
+rlx-wsp = { path = "crates/tooling/rlx-wsp", version = "0.2.20" }
+rlx-agent = { path = "crates/tooling/rlx-agent", version = "0.2.20" }
 rlx-opt = { path = "crates/core/rlx-opt", version = "0.2.20" }
 rlx-optim = { path = "crates/core/rlx-optim", version = "0.2.20" }
 rlx-pkg = { path = "crates/io/rlx-pkg", version = "0.2.20", default-features = false }  # rlx-runtime takes the reader alone; others list theirs

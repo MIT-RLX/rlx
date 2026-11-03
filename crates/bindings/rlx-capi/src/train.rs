@@ -7,7 +7,9 @@
 use std::ffi::{c_char, c_void};
 
 use rlx_bind::ApiError;
-use rlx_bind::runtime::train::{Optimizer, Resident, RunStats, StepItem, Trainer, TrainerConfig};
+use rlx_bind::runtime::train::{
+    Optimizer, Resident, RunStats, StepItem, Trainer, TrainerConfig, TrainingOptions,
+};
 
 use crate::ffi::{RlxTensorMap, arg, borrow, guard, handle, out, release};
 use crate::graph::{RlxGraph, take_graph};
@@ -189,6 +191,7 @@ pub unsafe extern "C" fn rlx_trainer_new(
         let clip_norm = o.f64("clip_norm")?.map(|v| v as f32);
         let resident =
             Resident::from_json(o.get("resident").unwrap_or(&rlx_bind::runtime::Value::Null))?;
+        let training = TrainingOptions::read(&o)?;
         o.finish()?;
         let g = take_graph(graph, "rlx_trainer_new graph")?;
         let t = Trainer::new(
@@ -201,6 +204,7 @@ pub unsafe extern "C" fn rlx_trainer_new(
                 policy,
                 clip_norm,
                 resident,
+                training,
             },
         )?;
         out::put(out, handle(RlxTrainer(t)), "rlx_trainer_new out")

@@ -838,15 +838,21 @@ fn expf_impl<const TOINT: bool>(x: f32) -> f32 {
 /// The libm a port that must agree with NumPy / SciPy / torch computes with:
 /// these pure-Rust ports (glibc's algorithms, so the Linux reference bit for
 /// bit) by default on every target; with the `libm` feature, Apple's system
-/// libm on Apple targets (the macOS reference).
+/// libm on Apple targets (the macOS reference) — unless the process called
+/// [`crate::platform::use_linux_reference`], which takes the ports there too.
 pub mod reference {
     /// The platform libm on Apple with the `libm` feature (validation against
-    /// NumPy / SciPy on macOS), the ports everywhere else.
+    /// NumPy / SciPy on macOS) while [`crate::platform::apple_reference`]
+    /// holds, the ports everywhere else.
     macro_rules! apple_or {
         ($apple:expr, $port:expr) => {{
             #[cfg(all(target_vendor = "apple", feature = "libm"))]
             {
-                $apple
+                if crate::platform::apple_reference() {
+                    $apple
+                } else {
+                    $port
+                }
             }
             #[cfg(not(all(target_vendor = "apple", feature = "libm")))]
             {
@@ -881,10 +887,7 @@ pub mod reference {
     }
     /// `erfc(x)` (glibc's is correctly rounded since 2.42).
     pub fn erfc(x: f64) -> f64 {
-        #[cfg(all(target_vendor = "apple", feature = "libm"))]
-        return crate::sys::erfc(x);
-        #[cfg(not(all(target_vendor = "apple", feature = "libm")))]
-        super::erfc(x)
+        apple_or!(crate::sys::erfc(x), super::erfc(x))
     }
     /// `tan(x)`.
     pub fn tan(x: f64) -> f64 {
@@ -924,8 +927,9 @@ pub mod reference {
     /// Rust ports otherwise.
     pub fn sincos(x: f64) -> (f64, f64) {
         #[cfg(all(target_os = "macos", feature = "libm"))]
-        return crate::sys::sincos(x);
-        #[cfg(not(all(target_os = "macos", feature = "libm")))]
+        if crate::platform::macos_reference() {
+            return crate::sys::sincos(x);
+        }
         (sin(core::hint::black_box(x)), cos(core::hint::black_box(x)))
     }
     /// `(sinf(x), cosf(x))` — glibc's `sinf` / `cosf` share `sincosf`'s
@@ -941,8 +945,9 @@ pub mod reference {
     /// macOS wheel computes); glibc's `sincosf` otherwise.
     pub fn sincosf_merged(x: f32) -> (f32, f32) {
         #[cfg(all(target_os = "macos", feature = "libm"))]
-        return crate::sys::sincosf_stret(x);
-        #[cfg(not(all(target_os = "macos", feature = "libm")))]
+        if crate::platform::macos_reference() {
+            return crate::sys::sincosf_stret(x);
+        }
         super::sincosf(x)
     }
     /// `asin(x)`.
@@ -951,23 +956,23 @@ pub mod reference {
     }
     /// `cexp(re + i·im)` → `(re, im)`.
     pub fn cexp(re: f64, im: f64) -> (f64, f64) {
-        #[cfg(all(target_vendor = "apple", feature = "libm"))]
-        {
-            let z = crate::sys::cfn(c"cexp", crate::sys::Cplx { re, im });
-            (z.re, z.im)
-        }
-        #[cfg(not(all(target_vendor = "apple", feature = "libm")))]
-        super::cexp(re, im)
+        apple_or!(
+            {
+                let z = crate::sys::cfn(c"cexp", crate::sys::Cplx { re, im });
+                (z.re, z.im)
+            },
+            super::cexp(re, im)
+        )
     }
     /// `csqrt(re + i·im)` → `(re, im)`.
     pub fn csqrt(re: f64, im: f64) -> (f64, f64) {
-        #[cfg(all(target_vendor = "apple", feature = "libm"))]
-        {
-            let z = crate::sys::cfn(c"csqrt", crate::sys::Cplx { re, im });
-            (z.re, z.im)
-        }
-        #[cfg(not(all(target_vendor = "apple", feature = "libm")))]
-        super::csqrt(re, im)
+        apple_or!(
+            {
+                let z = crate::sys::cfn(c"csqrt", crate::sys::Cplx { re, im });
+                (z.re, z.im)
+            },
+            super::csqrt(re, im)
+        )
     }
 }
 

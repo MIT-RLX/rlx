@@ -960,9 +960,10 @@ public final class Trainer {
 
     deinit { rlx_trainer_free(handle) }
 
-    /// Takes `graph` (consumed): its first output is the loss. `wrt` are the
-    /// trainable params; `initial` their starting values. options: {optimizer,
-    /// device, resident, clip_norm, …}.
+    /// Takes `graph` (consumed): its first output is the loss (further outputs
+    /// reach step_with by name). `wrt` are the trainable params; `initial`
+    /// their starting values. options: {optimizer, device, resident, clip_norm,
+    /// schedule, accumulate, loss_scale, …}.
     public convenience init(_ graph: Graph, wrt: [String], initial: [String: [Float]], options: [String: Any]? = nil) throws {
         let optionsJ = try jsonText(options)
         var out0: OpaquePointer? = nil

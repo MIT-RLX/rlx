@@ -427,6 +427,37 @@ pub trait ExecutableGraph: Send {
     /// Execute the graph with named inputs. Returns output data (copies from arena).
     fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>>;
 
+    /// [`Self::run`] that returns a failure of the device itself (a browser
+    /// context it cannot create, a lost context) as an error instead of
+    /// panicking, so a caller can run on another backend. Default: `run`.
+    fn try_run(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>, String> {
+        Ok(self.run(inputs))
+    }
+
+    /// Start a run without waiting for its outputs, for a backend that can
+    /// (WebGL2: the read-back into pixel-pack buffers): the caller prepares
+    /// the next run meanwhile and takes these with [`Self::try_collect`].
+    /// `None`: not supported here — use [`Self::try_run`].
+    fn try_submit(&mut self, _inputs: &[(&str, &[f32])]) -> Option<Result<(), String>> {
+        None
+    }
+
+    /// [`Self::try_submit`] with the inputs as IEEE half bits (WebGL2:
+    /// R16F textures, half the bytes to send). The buffers come back for the
+    /// caller's next run. `None`: not supported here.
+    #[allow(clippy::type_complexity)]
+    fn try_submit_half(
+        &mut self,
+        _inputs: Vec<(String, Vec<u16>)>,
+    ) -> Option<Result<Vec<(String, Vec<u16>)>, String>> {
+        None
+    }
+
+    /// The outputs of the oldest [`Self::try_submit`]ted run.
+    fn try_collect(&mut self) -> Result<Vec<Vec<f32>>, String> {
+        Err("nothing submitted".into())
+    }
+
     /// Like [`Self::run`] but only read back outputs at `read_indices`.
     /// GPU handle feeds still update for every output. Default: all outputs.
     fn run_read_outputs(

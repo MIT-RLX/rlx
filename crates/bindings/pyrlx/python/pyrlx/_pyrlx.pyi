@@ -7,7 +7,7 @@ layer only; see ``python/pyrlx/__init__.py`` for the full surface.
 
 from __future__ import annotations
 
-from typing import Any, Literal, Mapping, Sequence, overload
+from typing import Any, Callable, Literal, Mapping, Sequence, overload
 
 import numpy as np
 import numpy.typing as npt
@@ -1229,19 +1229,24 @@ class Group:
 # ── Training (cargo feature `training`, default on) ────────────────
 
 OptimizerKind = Literal[
-    "sgd", "adam", "adamw", "lion", "muon", "radam", "nadamw",
+    "sgd", "adam", "adamw", "lion", "muon", "muon_adamw", "radam", "nadamw",
     "lamb", "mars", "soap", "sophia", "qhadamw", "adafactor",
 ]
 
 class Optimizer:
     """``rlx-optim`` over caller-owned arrays. Options: ``lr``, ``beta1``,
     ``beta2``, ``eps``, ``weight_decay``, ``momentum``, ``nesterov``, ``gamma``,
-    ``rho``, ``f32_math``."""
+    ``rho``, ``f32_math``, ``muon_scale``. ``muon_adamw`` is Muon on the 2-D
+    matrices and AdamW on every other param."""
     def __init__(self, kind: OptimizerKind = "adamw", **opts: float) -> None: ...
     def step(
         self, params: Mapping[str, tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]],
     ) -> dict[str, npt.NDArray[np.float32]]: ...
     def set_lr(self, lr: float) -> None: ...
+    def state_dict(self) -> dict[str, Any] | None:
+        """``{"step": int, "buffers": {key: float32 array}}``, or None when the
+        algorithm cannot save its state."""
+    def load_state_dict(self, state: Mapping[str, Any]) -> bool: ...
 
 class Trainer:
     """Differentiate-once / compile-once loop over a scalar-loss graph."""
@@ -1255,12 +1260,37 @@ class Trainer:
         policy: PolicySpec | None = None,
         clip_norm: float | None = None,
         resident: bool | Literal["unverified"] | None = None,
-    ) -> None: ...
+        schedule: Mapping[str, Any] | None = None,
+        accumulate: int = 1,
+        loss_scale: Literal["dynamic"] | float | Mapping[str, Any] | None = None,
+    ) -> None:
+        """``schedule``: ``{"kind": "constant" | "linear" | "cosine" | "step" |
+        "multistep" | "exponential" | "polynomial" | "onecycle", "total_steps",
+        "warmup_steps", "warmup_start", "min_factor", "end_factor", "step_size",
+        "gamma", "milestones", "power", "pct_start", "div_factor",
+        "final_div_factor"}`` (``torch.optim.lr_scheduler``'s); ``accumulate``:
+        micro-batches per update; ``loss_scale``: ``"dynamic"`` (as
+        ``GradScaler``), a fixed scale, or ``{init, dynamic, growth, backoff,
+        interval}``."""
     def step(self, batch: Mapping[str, npt.NDArray[np.float32]]) -> float: ...
+    def step_with(
+        self,
+        batch: Mapping[str, npt.NDArray[np.float32]],
+        update: Callable[
+            [dict[str, npt.NDArray[np.float32]], dict[str, npt.NDArray[np.float32]], int], object
+        ],
+    ) -> float: ...
     def evaluate(self, batch: Mapping[str, npt.NDArray[np.float32]]) -> float: ...
     def run(
         self, steps: int, batch: Any, lr: Any = None, on_step: Any = None, every: int = 1,
+        eval_batch: Any = None, eval_every: int = 0, patience: int | None = None,
+        min_delta: float = 0.0, checkpoint: str | None = None, checkpoint_every: int = 0,
     ) -> dict[str, Any]: ...
+    def set_data_parallel(self, group: "Group") -> None: ...
+    def replicas_agree(self) -> bool: ...
+    def lr(self) -> float: ...
+    def loss_scale(self) -> float | None: ...
+    def skipped_updates(self) -> int: ...
     def freeze(self, names: Sequence[str] | None = None) -> int: ...
     def unfreeze(self, names: Sequence[str] | None = None) -> int: ...
     def frozen(self) -> list[str]: ...
@@ -1279,6 +1309,63 @@ class Trainer:
         path: str, options: dict[str, Any] | None = None, **kw: Any
     ) -> "Trainer": ...
     def save_package(self, path: str, name: str | None = None) -> None: ...
+
+class AgentOptimizer:
+    """A coding agent rewriting a Trainer's optimizer while it trains (OPAL's
+    protocol over ``Trainer.step_with``). ``program``: ``"rules"``
+    (``updater.json``) or ``"python"`` (``updater.py``); ``backend``:
+    ``"keep"`` (no agent), ``"claude"``, ``"cursor"`` or ``"copilot"``.
+    ``options``: decisions, seconds_per_decision, max_wait_ratio, spread,
+    every, blocking (True / False / "auto"), max_lag_updates, trial_steps,
+    snapshot_limit_gb, max_cost_usd, run_root, pause_on_nonfinite, validation,
+    validation_size, eval_integrity, integrity_threshold, epochs, train_size,
+    batch_size, same_order_each_epoch, task_facts, share, share_code (default
+    True: the training script goes to the agent's reference/code/), prompt
+    ("neutral" / "aggressive" / a template path)."""
+    def __init__(
+        self,
+        goal: str,
+        total_steps: int,
+        optimizer: OptimizerKind | Mapping[str, Any] | None = None,
+        program: Literal["rules", "python"] = "rules",
+        backend: Literal["keep", "claude", "cursor", "copilot", "codex", "mailbox"] = "keep",
+        backend_options: Mapping[str, Any] | None = None,
+        **options: Any,
+    ) -> None: ...
+    @staticmethod
+    def resume(
+        path: str,
+        goal: str,
+        total_steps: int,
+        optimizer: OptimizerKind | Mapping[str, Any] | None = None,
+        program: Literal["rules", "python"] = "rules",
+        backend: Literal["keep", "claude", "cursor", "copilot", "codex", "mailbox"] = "keep",
+        backend_options: Mapping[str, Any] | None = None,
+        **options: Any,
+    ) -> "AgentOptimizer": ...
+    @staticmethod
+    def replay(
+        path: str,
+        goal: str,
+        total_steps: int,
+        optimizer: OptimizerKind | Mapping[str, Any] | None = None,
+        program: Literal["rules", "python"] = "rules",
+        **options: Any,
+    ) -> "AgentOptimizer": ...
+    def train_step(self, trainer: Trainer, batch: Mapping[str, npt.NDArray[np.float32]]) -> float: ...
+    def set_lr(self, lr: float) -> None: ...
+    def report_validation(
+        self, loss: float | None = None, accuracy: float | None = None, update: int | None = None,
+    ) -> None: ...
+    def log(
+        self, values: Mapping[str, Any] | None = None, show_agent: bool = False, **kw: Any,
+    ) -> None: ...
+    def version(self) -> int: ...
+    def run_dir(self) -> str: ...
+    def files(self) -> dict[str, str]: ...
+    def schedule(self) -> list[int] | None: ...
+    def save(self, path: str) -> None: ...
+    def close(self) -> dict[str, Any]: ...
 
 # ── Text (cargo feature `text`, default on) ────────────────────────
 

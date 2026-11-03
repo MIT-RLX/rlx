@@ -1676,9 +1676,10 @@ optimizer_set_lr :: proc(self: Optimizer, lr: f32) -> Error {
 	return .None
 }
 
-// Takes `graph` (consumed): its first output is the loss. `wrt` are the
-// trainable params; `initial` their starting values. options: {optimizer,
-// device, resident, clip_norm, …}.
+// Takes `graph` (consumed): its first output is the loss (further outputs
+// reach step_with by name). `wrt` are the trainable params; `initial`
+// their starting values. options: {optimizer, device, resident, clip_norm,
+// schedule, accumulate, loss_scale, …}.
 trainer_new :: proc(graph: Graph, wrt: []string, initial: map[string][]f32, options: string = "") -> (Trainer, Error) {
 	a_wrt := cstrings(wrt)
 	defer free_cstrings(a_wrt)

@@ -58,8 +58,9 @@ per backend, missed fusions, numeric hazards, memory-plan safety).
 
 Training / text
 ---------------
-``Trainer`` / ``Optimizer`` (``rlx-optim``: Adam, AdamW, Muon, SOAP, …) and
-``load_tokenizer`` / ``Sampler`` / ``render_chat`` (``rlx-text``) — cargo
+``Trainer`` / ``Optimizer`` (``rlx-optim``: Adam, AdamW, Muon, SOAP, …),
+``AgentOptimizer`` (a coding agent rewriting the optimizer while a ``Trainer``
+trains) and ``load_tokenizer`` / ``Sampler`` / ``render_chat`` (``rlx-text``) — cargo
 features ``training`` and ``text``, both on by default.
 
 GGUF
@@ -134,7 +135,7 @@ from . import _pyrlx as _native
 # Feature-gated native surface: present only when the wheel was built with the
 # matching cargo feature (`training`, `text` — both default — and `fpga`).
 _OPTIONAL = (
-    "Trainer", "Optimizer",                                   # training
+    "Trainer", "Optimizer", "AgentOptimizer",                 # training
     "Tokenizer", "Sampler", "load_tokenizer", "argmax",       # text
     "sample_next", "render_chat",
     "export_fpga",                                            # fpga

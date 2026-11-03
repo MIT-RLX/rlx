@@ -33,7 +33,7 @@ pub fn loopback_peers(world: u32) -> PyResult<Vec<String>> {
 /// This process's membership in a mesh.
 #[pyclass(name = "Group", module = "pyrlx._pyrlx")]
 pub(crate) struct PyGroup {
-    inner: Group,
+    pub(crate) inner: Group,
 }
 
 #[pymethods]

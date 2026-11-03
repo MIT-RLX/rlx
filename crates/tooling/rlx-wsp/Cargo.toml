@@ -1,0 +1,38 @@
+[package]
+name = "rlx-wsp"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Weight-space programming harness — an LLM reads, edits and writes network weights through a budgeted tool surface"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+documentation.workspace = true
+
+[dependencies]
+rlx-ir = { workspace = true }
+rlx-agent = { workspace = true }
+# default-features = false + cpu: same unification rule as rlx-opscope (no
+# OpenBLAS link requirement when path-depended from rlx-models).
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.20", default-features = false, features = ["cpu"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `script` tool sandbox: the embedded JS engine rlx-js uses, without host APIs.
+quickrs-core = { version = "0.16.2", default-features = false, features = ["std"] }
+
+[[bin]]
+name = "rlx-wsp"
+path = "src/bin/rlx-wsp.rs"
+
+[features]
+default = []
+metal = ["rlx-runtime/metal"]
+cuda  = ["rlx-runtime/cuda"]
+# `rlx-wsp export --fpga`: SystemVerilog through rlx_runtime::export.
+fpga  = ["rlx-runtime/fpga"]
+
+[lints]
+workspace = true

@@ -5,9 +5,11 @@
 //! Training: `Optimizer` (rlx-optim over caller-owned arrays) and `Trainer`
 //! (differentiate once, compile once, keep the params, step).
 //!
-//! The forward graph must have exactly one output, the scalar loss — `grad`
-//! seeds `d_output` with `1`, which only means "differentiate the loss" when
-//! the loss is what the graph ends on.
+//! The forward graph's first output is the scalar loss — `grad` seeds
+//! `d_output` with `1`, which only means "differentiate the loss" when the
+//! loss is what the graph ends on. Any further outputs (an activation, a
+//! metric) are computed alongside and handed to [`Trainer::step_with`]'s
+//! update by name; they are not differentiated.
 //!
 //! # Where the update runs
 //!
@@ -32,12 +34,20 @@
 
 use std::collections::HashMap;
 
+/// The ranks of a data-parallel run ([`Trainer::set_data_parallel`]).
+pub use rlx_driver::{ProcessGroup, ReduceKind, Transport};
 use rlx_ir::{Dim, Graph, NodeId, Op};
+/// What [`Trainer::step_with`]'s update receives, one per param.
+pub use rlx_optim::OptItem;
+/// An optimizer's checkpointable state (moments keyed `slot/param`).
+pub use rlx_optim::OptimizerState;
 use rlx_optim::{
-    Adafactor, Adam, AdamW, Lamb, Lion, Mars, Muon, NAdamW, OptItem, Optimizer as OptimizerTrait,
+    Adafactor, Adam, AdamW, Lamb, Lion, Mars, Muon, MuonAdamW, NAdamW, Optimizer as OptimizerTrait,
     QHAdamW, RAdam, Sgd, Soap, Sophia,
 };
-use rlx_runtime::train::ResidentTrainer;
+/// Learning-rate schedules ([`TrainingOptions::schedule`]).
+pub use rlx_optim::{LrSchedule, ScheduleKind};
+use rlx_runtime::train::{AdamSpec, FusedRule, MuonSpec, ResidentTrainer};
 use rlx_runtime::{CompiledGraph, Device, PrecisionPolicy};
 use serde_json::{Value, json};
 
@@ -54,6 +64,7 @@ pub const KINDS: &[&str] = &[
     "adamw",
     "lion",
     "muon",
+    "muon_adamw",
     "radam",
     "nadamw",
     "lamb",
@@ -77,7 +88,9 @@ pub struct OptimizerSpec {
 
 /// Build one of rlx-optim's algorithms. `kind` wins over `opts.kind`; both
 /// absent means `adamw`. `opts` may also be just the kind's name. Options: `lr`, `beta1`, `beta2`, `eps`,
-/// `weight_decay`, `momentum`, `nesterov`, `f32_math`, `gamma`, `rho`.
+/// `weight_decay`, `momentum`, `nesterov`, `f32_math`, `gamma`, `rho`,
+/// `muon_scale`. `muon_adamw` is Muon on the 2-D matrices and AdamW on every
+/// other param, one `lr` for both (Muon's scaled by `muon_scale`, default 0.2).
 ///
 /// An unknown `kind` or option is an error: silently falling back would make a
 /// config typo look like a bad learning rate.
@@ -137,6 +150,25 @@ pub fn optimizer(kind: Option<&str>, opts: &Value) -> ApiResult<OptimizerSpec> {
             x.nesterov = o.bool("nesterov", x.nesterov)?;
             x.weight_decay = num("weight_decay", x.weight_decay)?;
             Box::new(x)
+        }
+        "muon_adamw" => {
+            let mut x = MuonAdamW::new(lr);
+            x.muon_scale = num("muon_scale", x.muon_scale)?;
+            if !(x.muon_scale.is_finite() && x.muon_scale > 0.0) {
+                return Err(ApiError::range(format!(
+                    "optimizer 'muon_adamw': muon_scale must be positive, got {}",
+                    x.muon_scale
+                )));
+            }
+            x.muon.lr = lr * x.muon_scale;
+            x.muon.momentum = num("momentum", x.muon.momentum)?;
+            x.muon.nesterov = o.bool("nesterov", x.muon.nesterov)?;
+            x.adamw.beta1 = num("beta1", x.adamw.beta1)?;
+            x.adamw.beta2 = num("beta2", x.adamw.beta2)?;
+            x.adamw.eps = num("eps", x.adamw.eps)?;
+            x.adamw.f32_math = o.bool("f32_math", x.adamw.f32_math)?;
+            // After muon_scale: Muon's decay is divided by it.
+            Box::new(x.with_weight_decay(num("weight_decay", 0.0)?))
         }
         "radam" => {
             let mut x = RAdam::new(lr);
@@ -320,6 +352,190 @@ pub struct TrainerConfig {
     /// Global gradient-norm clip across all trainable params together.
     pub clip_norm: Option<f32>,
     pub resident: Resident,
+    /// Schedule, gradient accumulation, loss scaling.
+    pub training: TrainingOptions,
+}
+
+/// What a step does around the optimizer, as PyTorch training sets it up: a
+/// learning-rate schedule (`torch.optim.lr_scheduler`), gradient accumulation
+/// over micro-batches, and loss scaling for low-precision gradients
+/// (`torch.amp.GradScaler`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrainingOptions {
+    /// The factor on the base learning rate at each update.
+    pub schedule: Option<LrSchedule>,
+    /// Micro-batches per update: `step` adds up their gradients and updates
+    /// on every `accumulate`-th call. 0 or 1: every call.
+    pub accumulate: usize,
+    pub loss_scale: Option<LossScale>,
+}
+
+/// Loss scaling: the backward pass starts from `scale` instead of 1, the
+/// gradients are divided by it, and an update whose gradients are not finite
+/// is skipped. Dynamic scaling halves the scale on a skip and doubles it after
+/// `interval` good updates in a row, as `GradScaler` does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LossScale {
+    pub init: f32,
+    pub dynamic: bool,
+    pub growth: f32,
+    pub backoff: f32,
+    pub interval: u64,
+}
+
+impl LossScale {
+    /// `GradScaler`'s defaults: 65536, ×2 after 2000 good updates, ×0.5 on a skip.
+    pub fn dynamic() -> Self {
+        Self {
+            init: 65536.0,
+            dynamic: true,
+            growth: 2.0,
+            backoff: 0.5,
+            interval: 2000,
+        }
+    }
+}
+
+impl TrainingOptions {
+    /// `schedule`, `accumulate` and `loss_scale` from an options object (the
+    /// other options are left for the caller to read).
+    ///
+    /// `schedule`: `{kind: "constant" | "linear" | "cosine" | "step" |
+    /// "multistep" | "exponential" | "polynomial" | "onecycle", total_steps,
+    /// warmup_steps, warmup_start, min_factor, end_factor, step_size, gamma,
+    /// milestones, power, pct_start, div_factor, final_div_factor}`.
+    /// `loss_scale`: `"dynamic"`, a fixed number, or `{init, dynamic, growth,
+    /// backoff, interval}`.
+    pub fn read(o: &Opts) -> ApiResult<Self> {
+        let schedule = o.get("schedule").map(parse_schedule).transpose()?;
+        let accumulate = o.usize("accumulate", 1)?;
+        let loss_scale = match o.get("loss_scale") {
+            None => None,
+            Some(Value::String(s)) if s == "dynamic" => Some(LossScale::dynamic()),
+            Some(Value::Number(n)) => Some(LossScale {
+                init: n.as_f64().unwrap_or(1.0) as f32,
+                dynamic: false,
+                ..LossScale::dynamic()
+            }),
+            Some(v @ Value::Object(_)) => {
+                let s = Opts::new("loss_scale", v)?;
+                let d = LossScale::dynamic();
+                let ls = LossScale {
+                    init: s.f32("init", d.init)?,
+                    dynamic: s.bool("dynamic", d.dynamic)?,
+                    growth: s.f32("growth", d.growth)?,
+                    backoff: s.f32("backoff", d.backoff)?,
+                    interval: s.u64("interval")?.unwrap_or(d.interval),
+                };
+                s.finish()?;
+                Some(ls)
+            }
+            Some(other) => {
+                return Err(ApiError::type_(format!(
+                    "loss_scale is \"dynamic\", a number or an object, got {other}"
+                )));
+            }
+        };
+        if let Some(ls) = &loss_scale
+            && !(ls.init.is_finite()
+                && ls.init > 0.0
+                && ls.growth >= 1.0
+                && ls.backoff > 0.0
+                && ls.backoff <= 1.0)
+        {
+            return Err(ApiError::range(format!(
+                "loss_scale: {ls:?} is not a usable scale"
+            )));
+        }
+        Ok(Self {
+            schedule,
+            accumulate,
+            loss_scale,
+        })
+    }
+
+    /// [`Self::read`] over an object of just these options.
+    pub fn from_json(v: &Value) -> ApiResult<Self> {
+        let o = Opts::new("training", v)?;
+        let t = Self::read(&o)?;
+        o.finish()?;
+        Ok(t)
+    }
+
+    fn check(&self, resident: bool) -> ApiResult<()> {
+        if resident && (self.accumulate > 1 || self.loss_scale.is_some()) {
+            return Err(ApiError::type_(
+                "Trainer(resident): accumulate and loss_scale need the gradients on the host; \
+                 build the trainer without `resident`",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn parse_schedule(v: &Value) -> ApiResult<LrSchedule> {
+    let o = Opts::new("schedule", v)?;
+    let total = || -> ApiResult<u64> {
+        o.u64("total_steps")?
+            .ok_or_else(|| ApiError::type_("schedule: this kind needs `total_steps`"))
+    };
+    let gamma = || -> ApiResult<f64> {
+        o.f64("gamma")?
+            .ok_or_else(|| ApiError::type_("schedule: this kind needs `gamma`"))
+    };
+    let kind = match o.str("kind")?.unwrap_or("constant") {
+        "constant" => ScheduleKind::Constant,
+        "linear" => ScheduleKind::Linear {
+            total: total()?,
+            end_factor: o.f64("end_factor")?.unwrap_or(0.0),
+        },
+        "cosine" => ScheduleKind::Cosine {
+            total: total()?,
+            min_factor: o.f64("min_factor")?.unwrap_or(0.0),
+        },
+        "step" => ScheduleKind::Step {
+            step_size: o
+                .u64("step_size")?
+                .ok_or_else(|| ApiError::type_("schedule step: `step_size` is required"))?,
+            gamma: gamma()?,
+        },
+        "multistep" => ScheduleKind::MultiStep {
+            milestones: o
+                .get("milestones")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_u64).collect())
+                .ok_or_else(|| {
+                    ApiError::type_(
+                        "schedule multistep: `milestones` (a list of updates) is required",
+                    )
+                })?,
+            gamma: gamma()?,
+        },
+        "exponential" => ScheduleKind::Exponential { gamma: gamma()? },
+        "polynomial" => ScheduleKind::Polynomial {
+            total: total()?,
+            power: o.f64("power")?.unwrap_or(1.0),
+            end_factor: o.f64("end_factor")?.unwrap_or(0.0),
+        },
+        "onecycle" => ScheduleKind::OneCycle {
+            total: total()?,
+            pct_start: o.f64("pct_start")?.unwrap_or(0.3),
+            div_factor: o.f64("div_factor")?.unwrap_or(25.0),
+            final_div_factor: o.f64("final_div_factor")?.unwrap_or(1e4),
+        },
+        other => {
+            return Err(ApiError::type_(format!(
+                "schedule kind is constant, linear, cosine, step, multistep, exponential, \
+                 polynomial or onecycle, got {other:?}"
+            )));
+        }
+    };
+    let s = LrSchedule::new(kind).with_warmup(
+        o.u64("warmup_steps")?.unwrap_or(0),
+        o.f64("warmup_start")?.unwrap_or(0.0),
+    );
+    o.finish()?;
+    Ok(s)
 }
 
 /// Differentiate-once / compile-once training over a scalar-loss graph.
@@ -351,6 +567,53 @@ pub struct Trainer {
     /// A trainer of a package ([`Trainer::from_package`]): what writes its
     /// results back as a package.
     package: Option<PackageSaver>,
+    /// Names of the forward graph's outputs after the loss.
+    extra: Vec<String>,
+    training: TrainingOptions,
+    /// The rate the schedule scales (`set_lr` changes it).
+    base_lr: f32,
+    /// The rate was set by a schedule or `set_lr`: `step_with` passes it on.
+    lr_driven: bool,
+    /// Gradient accumulation: the sums so far, how many micro-batches, their loss.
+    acc: Vec<Vec<f32>>,
+    acc_n: usize,
+    acc_loss: f64,
+    scale: f32,
+    scale_good: u64,
+    skipped: u64,
+    /// Data-parallel: the ranks training replicas of this model on their own batches.
+    group: Option<ProcessGroup>,
+}
+
+/// What [`Trainer::step_with`]'s update knows about its step besides the params.
+#[derive(Clone, Copy, Debug)]
+pub struct StepInfo<'a> {
+    /// This step's index, counted from 1.
+    pub update: u64,
+    /// This step's training loss (computed before the update).
+    pub loss: f32,
+    /// The forward graph's outputs after the loss, by name (empty when it has
+    /// only the loss).
+    pub outputs: &'a [(String, Vec<f32>)],
+    /// The learning rate for this update, when a schedule or `set_lr` sets
+    /// it (`None`: the optimizer config's own rate throughout).
+    pub lr: Option<f32>,
+}
+
+/// The names of `forward`'s outputs after the loss: each node's name, else
+/// `output<i>`.
+fn extra_output_names(forward: &Graph) -> Vec<String> {
+    forward.outputs[1..]
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| {
+            forward
+                .node(id)
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("output{}", i + 1))
+        })
+        .collect()
 }
 
 #[cfg(feature = "models")]
@@ -363,7 +626,8 @@ impl Trainer {
     /// Train a function of the package at `path`, whatever the model is
     /// (`rlx_runtime::model::trainer::prepare`). options: `{function, dims,
     /// loss, train, optimizer}` (over the package's own `train`) and the
-    /// trainer's `{device, policy, clip_norm, resident}`.
+    /// trainer's `{device, policy, clip_norm, resident, schedule, accumulate,
+    /// loss_scale}`.
     pub fn from_package(path: &str, opts: &Value) -> ApiResult<Self> {
         let prepared = rlx_runtime::model::trainer::prepare(path, opts)
             .map_err(|e| ApiError::type_(format!("Trainer.from_package: {e:#}")))?;
@@ -386,6 +650,11 @@ impl Trainer {
             .and_then(Value::as_f64)
             .map(|v| v as f32);
         let resident = Resident::from_json(opts.get("resident").unwrap_or(&Value::Null))?;
+        let training: serde_json::Map<String, Value> = ["schedule", "accumulate", "loss_scale"]
+            .into_iter()
+            .filter_map(|k| Some((k.to_string(), opts.get(k)?.clone())))
+            .collect();
+        let training = TrainingOptions::from_json(&Value::Object(training))?;
         let mut t = Self::new(
             graph,
             TrainerConfig {
@@ -396,6 +665,7 @@ impl Trainer {
                 policy,
                 clip_norm,
                 resident,
+                training,
             },
         )?;
         t.package = Some(saver);
@@ -461,12 +731,23 @@ impl Trainer {
             super::policy::check_supported(device, p)?;
         }
         let spec = optimizer(None, &cfg.optimizer)?;
-        if forward.outputs.len() != 1 {
+        if forward.outputs.is_empty() {
+            return Err(ApiError::type_(
+                "Trainer: the forward graph needs an output: its first is the scalar loss",
+            ));
+        }
+        // `grad` seeds d_output with 1, which only means "differentiate the
+        // loss" when the first output is one number.
+        let loss_shape = &forward.node(forward.outputs[0]).shape;
+        if loss_shape.num_elements() != Some(1) {
             return Err(ApiError::type_(format!(
-                "Trainer: the forward graph must have exactly one output (the scalar loss), got {}",
-                forward.outputs.len()
+                "Trainer: the forward graph's first output must be the scalar loss, got shape {:?} \
+                 (further outputs are allowed after it)",
+                loss_shape.dims()
             )));
         }
+        let extra = extra_output_names(&forward);
+        cfg.training.check(cfg.resident != Resident::Off)?;
         let nodes = param_nodes(&forward);
         let mut wrt = Vec::with_capacity(cfg.wrt.len());
         let mut shapes = Vec::with_capacity(cfg.wrt.len());
@@ -551,6 +832,17 @@ impl Trainer {
             clip_norm: cfg.clip_norm,
             last_grad_norm: 0.0,
             package: None,
+            extra,
+            base_lr: spec.lr,
+            lr_driven: cfg.training.schedule.is_some(),
+            scale: cfg.training.loss_scale.map_or(1.0, |l| l.init),
+            training: cfg.training,
+            acc: Vec::new(),
+            acc_n: 0,
+            acc_loss: 0.0,
+            scale_good: 0,
+            skipped: 0,
+            group: None,
         })
     }
 
@@ -580,10 +872,11 @@ impl Trainer {
             )));
         }
         let kind = spec.kind.clone();
-        if kind != "adam" && kind != "adamw" {
+        if !FUSED_KINDS.contains(&kind.as_str()) {
             return Err(ApiError::type_(format!(
-                "Trainer(resident): only 'adam' and 'adamw' are fused into the graph; '{kind}' \
-                 runs on the host. Drop `resident` to use it."
+                "Trainer(resident): only {} are fused into the graph; '{kind}' runs on the host. \
+                 Drop `resident` to use it.",
+                FUSED_KINDS.join(", ")
             )));
         }
         if cfg.clip_norm.is_some() {
@@ -592,6 +885,44 @@ impl Trainer {
                  the fused path never brings them back. Drop one of the two.",
             ));
         }
+        let o = Opts::new("optimizer", &spec.options)?;
+        let rule = match kind.as_str() {
+            "muon" => {
+                let d = Muon::new(spec.lr);
+                Some(FusedRule::Muon(MuonSpec {
+                    lr: spec.lr,
+                    momentum: o.f32("momentum", d.momentum)?,
+                    nesterov: o.bool("nesterov", d.nesterov)?,
+                    weight_decay: o.f32("weight_decay", d.weight_decay)?,
+                    ns_steps: d.ns_steps,
+                    ns_coeffs: d.ns_coeffs,
+                    adamw: None,
+                    muon_scale: 1.0,
+                }))
+            }
+            "muon_adamw" => {
+                let d = MuonAdamW::new(spec.lr);
+                let scale = o.f32("muon_scale", d.muon_scale)?;
+                let adamw = AdamSpec {
+                    lr: spec.lr,
+                    beta1: o.f32("beta1", d.adamw.beta1)?,
+                    beta2: o.f32("beta2", d.adamw.beta2)?,
+                    eps: o.f32("eps", d.adamw.eps)?,
+                    weight_decay: o.f32("weight_decay", 0.0)?,
+                };
+                Some(FusedRule::Muon(MuonSpec {
+                    lr: spec.lr * scale,
+                    momentum: o.f32("momentum", d.muon.momentum)?,
+                    nesterov: o.bool("nesterov", d.muon.nesterov)?,
+                    weight_decay: 0.0,
+                    ns_steps: d.muon.ns_steps,
+                    ns_coeffs: d.muon.ns_coeffs,
+                    adamw: Some(adamw),
+                    muon_scale: scale,
+                }))
+            }
+            _ => None,
+        };
         // Defaults come from the host optimizer this replaces: `AdamW::new`
         // defaults `weight_decay` to 0.01 (as PyTorch does), and hardcoding 0
         // here once trained a different objective on the two paths.
@@ -602,8 +933,11 @@ impl Trainer {
             let d = AdamW::new(spec.lr);
             (d.beta1, d.beta2, d.eps, d.weight_decay)
         };
-        let o = Opts::new("optimizer", &spec.options)?;
-        let weight_decay = o.f32("weight_decay", d_wd)?;
+        let weight_decay = if rule.is_some() {
+            0.0
+        } else {
+            o.f32("weight_decay", d_wd)?
+        };
         // Classic Adam folds L2 into the gradient; the fused graph implements
         // AdamW's decoupled decay — different algorithms when decay is nonzero.
         if kind == "adam" && weight_decay != 0.0 {
@@ -614,12 +948,15 @@ impl Trainer {
                  decay. Use 'adamw', or drop `resident`.",
             ));
         }
-        let adam = rlx_runtime::train::AdamSpec {
-            lr: spec.lr,
-            beta1: o.f32("beta1", d_beta1)?,
-            beta2: o.f32("beta2", d_beta2)?,
-            eps: o.f32("eps", d_eps)?,
-            weight_decay,
+        let rule = match rule {
+            Some(r) => r,
+            None => FusedRule::Adam(AdamSpec {
+                lr: spec.lr,
+                beta1: o.f32("beta1", d_beta1)?,
+                beta2: o.f32("beta2", d_beta2)?,
+                eps: o.f32("eps", d_eps)?,
+                weight_decay,
+            }),
         };
         let slots: Vec<rlx_runtime::train::TrainableParam> = cfg
             .wrt
@@ -636,7 +973,7 @@ impl Trainer {
             compile_opts = compile_opts.policy(p);
         }
         let trainer = catch("Trainer(resident)", || {
-            ResidentTrainer::with_options(&forward, &slots, &seed, &adam, device, &compile_opts)
+            ResidentTrainer::with_rule(&forward, &slots, &seed, &rule, device, &compile_opts)
         })?
         .map_err(|e| ApiError::type_(format!("Trainer(resident): {e}")))?;
         let fixed = cfg
@@ -661,6 +998,17 @@ impl Trainer {
             clip_norm: None,
             last_grad_norm: f32::NAN,
             package: None,
+            extra: extra_output_names(&forward),
+            base_lr: spec.lr,
+            lr_driven: cfg.training.schedule.is_some(),
+            scale: 1.0,
+            training: cfg.training,
+            acc: Vec::new(),
+            acc_n: 0,
+            acc_loss: 0.0,
+            scale_good: 0,
+            skipped: 0,
+            group: None,
         })
     }
 
@@ -675,7 +1023,12 @@ impl Trainer {
     }
 
     fn forward_backward(&mut self, inputs: &[(&str, &[f32])]) -> ApiResult<Vec<Vec<f32>>> {
-        let pairs = Self::with_seed(inputs);
+        // Loss scaling starts the backward pass from the scale instead of 1.
+        let seed = [self.scale];
+        let mut pairs = inputs.to_vec();
+        if !pairs.iter().any(|(n, _)| *n == "d_output") {
+            pairs.push(("d_output", &seed));
+        }
         let compiled = self
             .compiled
             .as_mut()
@@ -684,9 +1037,10 @@ impl Trainer {
             compiled.set_param(name, data);
         }
         let outputs = catch("Trainer step", || compiled.run(&pairs))?;
-        if outputs.len() != self.names.len() + 1 {
+        if outputs.len() != 1 + self.extra.len() + self.names.len() {
             return Err(ApiError::runtime(format!(
-                "Trainer: expected a loss and {} gradients, got {} outputs",
+                "Trainer: expected a loss, {} further outputs and {} gradients, got {} outputs",
+                self.extra.len(),
                 self.names.len(),
                 outputs.len()
             )));
@@ -700,6 +1054,11 @@ impl Trainer {
             .resident
             .as_mut()
             .ok_or_else(|| ApiError::runtime("resident_step: not a resident trainer"))?;
+        if !evaluate_only && let Some(s) = &self.training.schedule {
+            let lr = (self.base_lr as f64 * s.factor(trainer.steps())) as f32;
+            self.lr = lr;
+            trainer.set_lr(lr);
+        }
         let outputs = catch("Trainer step (resident)", || {
             if evaluate_only {
                 trainer.forward_only(&pairs)
@@ -721,9 +1080,127 @@ impl Trainer {
         if self.resident.is_some() {
             return self.resident_step(inputs, false);
         }
-        let outputs = self.forward_backward(inputs)?;
+        self.train_once(inputs, |items, optimizer, _| {
+            catch("optimizer step", || {
+                optimizer.step_batch(items);
+                optimizer.end_iteration();
+            })
+        })
+    }
+
+    /// One step whose update the caller makes, on `inputs` → the loss.
+    ///
+    /// Forward, backward and clipping run as in [`Trainer::step`]; then
+    /// `update` gets every unfrozen trainable param with its gradient, in
+    /// [`Trainer::trainable`] order, and the step's [`StepInfo`] (its index,
+    /// counted from 1, its loss and the graph's further outputs), and changes
+    /// the params in place. The trainer's own optimizer
+    /// neither runs nor changes, so a checkpoint holds its state as it was.
+    ///
+    /// When `update` fails, the params keep whatever it had written and the
+    /// step is not counted. Host path only: a resident trainer's update is
+    /// part of its compiled graph.
+    pub fn step_with<F>(&mut self, inputs: &[(&str, &[f32])], update: F) -> ApiResult<f32>
+    where
+        F: FnOnce(&mut [OptItem<'_>], &StepInfo<'_>) -> ApiResult<()>,
+    {
+        if self.resident.is_some() {
+            return Err(ApiError::type_(
+                "Trainer.step_with: a resident trainer's update is fused into its graph; \
+                 build the trainer without `resident` to make the update yourself",
+            ));
+        }
+        self.train_once(inputs, |items, _, info| {
+            catch("Trainer.step_with update", || update(items, info))?
+        })
+    }
+
+    /// Forward and backward on `inputs`; then, when an update is due (every
+    /// `accumulate` calls), unscale, skip on non-finite gradients under loss
+    /// scaling, move the schedule, clip and hand the update to `f` → the loss
+    /// of `inputs`.
+    fn train_once<F>(&mut self, inputs: &[(&str, &[f32])], f: F) -> ApiResult<f32>
+    where
+        F: FnOnce(&mut [OptItem<'_>], &mut dyn OptimizerTrait, &StepInfo<'_>) -> ApiResult<()>,
+    {
+        let mut outputs = self.forward_backward(inputs)?;
         let loss = outputs[0].first().copied().unwrap_or(f32::NAN);
-        self.apply_update(&outputs)?;
+        let first = 1 + self.extra.len();
+        let extra: Vec<(String, Vec<f32>)> = self
+            .extra
+            .iter()
+            .cloned()
+            .zip(outputs[1..first].iter().cloned())
+            .collect();
+        let mut grads = outputs.split_off(first);
+        if self.scale != 1.0 {
+            let inv = 1.0 / self.scale;
+            for g in &mut grads {
+                g.iter_mut().for_each(|x| *x *= inv);
+            }
+        }
+        let k = self.training.accumulate.max(1);
+        let mut step_loss = loss;
+        if k > 1 {
+            if self.acc.is_empty() {
+                self.acc = grads.iter().map(|g| vec![0.0; g.len()]).collect();
+            }
+            let w = 1.0 / k as f32;
+            for (a, g) in self.acc.iter_mut().zip(&grads) {
+                a.iter_mut().zip(g).for_each(|(a, g)| *a += g * w);
+            }
+            self.acc_n += 1;
+            self.acc_loss += loss as f64;
+            if self.acc_n < k {
+                return Ok(loss);
+            }
+            grads = std::mem::take(&mut self.acc);
+            step_loss = (self.acc_loss / k as f64) as f32;
+            self.acc_n = 0;
+            self.acc_loss = 0.0;
+        }
+        if let Some(g) = &self.group {
+            step_loss = all_reduce_mean(g, &mut grads, step_loss)?;
+        }
+        if let Some(ls) = self.training.loss_scale {
+            let finite = grads.iter().all(|g| g.iter().all(|x| x.is_finite()));
+            if ls.dynamic {
+                if finite {
+                    self.scale_good += 1;
+                    if self.scale_good >= ls.interval {
+                        self.scale *= ls.growth;
+                        self.scale_good = 0;
+                    }
+                } else {
+                    self.scale *= ls.backoff;
+                    self.scale_good = 0;
+                }
+            }
+            if !finite {
+                // Skipped as GradScaler skips it: the update's index (and the
+                // schedule) move on, the optimizer's own step count does not.
+                self.skipped += 1;
+                self.steps += 1;
+                return Ok(loss);
+            }
+        }
+        if let Some(s) = &self.training.schedule {
+            let lr = (self.base_lr as f64 * s.factor(self.steps)) as f32;
+            if lr != self.lr {
+                self.lr = lr;
+                self.optimizer.set_lr(lr);
+            }
+        }
+        let lr = self.lr_driven.then_some(self.lr);
+        self.update_params(&grads, |items, optimizer, step| {
+            let info = StepInfo {
+                update: step,
+                loss: step_loss,
+                outputs: &extra,
+                lr,
+            };
+            f(items, optimizer, &info)
+        })?;
         Ok(loss)
     }
 
@@ -736,13 +1213,17 @@ impl Trainer {
         Ok(outputs[0].first().copied().unwrap_or(f32::NAN))
     }
 
-    /// Clip, then hand the unfrozen parameters to the optimizer.
+    /// Clip, then hand the unfrozen parameters to `update` with the optimizer
+    /// and the index of this step; count the step once `update` succeeds.
     ///
     /// The clip norm spans *every* trainable gradient, frozen or not: it is a
     /// property of the step, and leaving frozen tensors out of it would scale
     /// differently from an unfrozen run of the same recipe.
-    fn apply_update(&mut self, outputs: &[Vec<f32>]) -> ApiResult<()> {
-        let grads: Vec<&[f32]> = outputs[1..].iter().map(Vec::as_slice).collect();
+    fn update_params<F>(&mut self, grads: &[Vec<f32>], update: F) -> ApiResult<()>
+    where
+        F: FnOnce(&mut [OptItem<'_>], &mut dyn OptimizerTrait, u64) -> ApiResult<()>,
+    {
+        let grads: Vec<&[f32]> = grads.iter().map(Vec::as_slice).collect();
         let norm_sq: f64 = grads
             .iter()
             .map(|g| {
@@ -779,15 +1260,11 @@ impl Trainer {
                 param: param.as_mut_slice(),
                 grad: match &clipped {
                     Some(scaled) => scaled[i].as_slice(),
-                    None => outputs[i + 1].as_slice(),
+                    None => grads[i],
                 },
             });
         }
-        let optimizer = &mut self.optimizer;
-        catch("optimizer step", || {
-            optimizer.step_batch(&mut items);
-            optimizer.end_iteration();
-        })?;
+        update(&mut items, self.optimizer.as_mut(), self.steps + 1)?;
         self.steps += 1;
         Ok(())
     }
@@ -924,7 +1401,14 @@ impl Trainer {
         }
     }
 
+    /// Set the base learning rate; under a schedule, the rate the schedule
+    /// scales from the next update on.
     pub fn set_lr(&mut self, lr: f32) {
+        self.base_lr = lr;
+        self.lr_driven = true;
+        if self.training.schedule.is_some() {
+            return;
+        }
         self.lr = lr;
         match self.resident.as_mut() {
             Some(t) => t.set_lr(lr),
@@ -934,6 +1418,67 @@ impl Trainer {
 
     pub fn lr(&self) -> f32 {
         self.lr
+    }
+
+    /// The loss scale now, under loss scaling.
+    pub fn loss_scale(&self) -> Option<f32> {
+        self.training.loss_scale.map(|_| self.scale)
+    }
+
+    /// Updates skipped for non-finite gradients under loss scaling.
+    pub fn skipped_updates(&self) -> u64 {
+        self.skipped
+    }
+
+    /// Micro-batches waiting for the next update under gradient accumulation.
+    pub fn pending_micro_batches(&self) -> usize {
+        self.acc_n
+    }
+
+    /// Train data-parallel over `group`, as PyTorch's DDP does: every rank
+    /// holds a replica, steps on its own batches, and each update uses the
+    /// mean gradient (and reports the mean loss) over the ranks. Rank 0's
+    /// params are broadcast now, so the replicas start equal; clipping, loss
+    /// scaling and the schedule then act on the same numbers on every rank.
+    /// Every rank must call this, and then step, the same number of times.
+    pub fn set_data_parallel(&mut self, group: ProcessGroup) -> ApiResult<()> {
+        if self.resident.is_some() {
+            return Err(ApiError::type_(
+                "Trainer.set_data_parallel: a resident trainer's gradients stay on the device; \
+                 build the trainer without `resident`",
+            ));
+        }
+        if self.acc_n > 0 {
+            return Err(ApiError::type_(
+                "Trainer.set_data_parallel: micro-batches are waiting; attach the group between updates",
+            ));
+        }
+        for v in &mut self.values {
+            group.broadcast(0, v).map_err(collective)?;
+        }
+        self.group = Some(group);
+        Ok(())
+    }
+
+    pub fn process_group(&self) -> Option<&ProcessGroup> {
+        self.group.as_ref()
+    }
+
+    /// Whether every rank holds the same params (a strided sample of each,
+    /// compared by the min and max over the ranks). True without a group.
+    pub fn replicas_agree(&self) -> ApiResult<bool> {
+        let Some(g) = &self.group else {
+            return Ok(true);
+        };
+        let mut lo: Vec<f32> = self
+            .values
+            .iter()
+            .flat_map(|v| v.iter().step_by(v.len().div_ceil(256).max(1)).copied())
+            .collect();
+        let mut hi = lo.clone();
+        g.all_reduce(&mut lo, ReduceKind::Min).map_err(collective)?;
+        g.all_reduce(&mut hi, ReduceKind::Max).map_err(collective)?;
+        Ok(lo.iter().zip(&hi).all(|(a, b)| a.to_bits() == b.to_bits()))
     }
 
     /// The algorithm, lowercased (`"adamw"`).
@@ -1017,6 +1562,102 @@ impl RunStats {
     }
 }
 
+/// The optimizer kinds the resident path fuses into the graph.
+pub const FUSED_KINDS: [&str; 4] = ["adam", "adamw", "muon", "muon_adamw"];
+
+impl Trainer {
+    /// Where param `name`'s state goes in a checkpoint, as the host optimizer
+    /// of this kind names it: the first moment's (or momentum's) slot, and
+    /// whether a second moment `v/` exists.
+    fn state_slots(&self) -> HashMap<String, (&'static str, bool)> {
+        self.names
+            .iter()
+            .zip(&self.shapes)
+            .map(|(name, shape)| {
+                let slots = match self.optimizer_kind.as_str() {
+                    "muon" => ("m", false),
+                    "muon_adamw" if MuonAdamW::is_matrix(shape) => ("muon_m", false),
+                    _ => ("m", true),
+                };
+                (name.clone(), slots)
+            })
+            .collect()
+    }
+}
+
+fn collective(e: rlx_driver::CollectiveError) -> ApiError {
+    ApiError::runtime(format!("data-parallel collective: {e:?}"))
+}
+
+/// The mean of `grads` and `loss` over the ranks, in one all-reduce.
+fn all_reduce_mean(g: &ProcessGroup, grads: &mut [Vec<f32>], loss: f32) -> ApiResult<f32> {
+    if g.world_size() <= 1 {
+        return Ok(loss);
+    }
+    let mut flat: Vec<f32> = Vec::with_capacity(grads.iter().map(Vec::len).sum::<usize>() + 1);
+    for v in grads.iter() {
+        flat.extend_from_slice(v);
+    }
+    flat.push(loss);
+    g.all_reduce(&mut flat, ReduceKind::Mean)
+        .map_err(collective)?;
+    let mut at = 0;
+    for v in grads.iter_mut() {
+        let n = v.len();
+        v.copy_from_slice(&flat[at..at + n]);
+        at += n;
+    }
+    Ok(flat[at])
+}
+
+/// Evaluations during a run (`run`'s `eval_every`): the history, the best so
+/// far, and early stopping after `patience` evaluations without improvement —
+/// what a training loop needs to keep the best checkpoint and stop on time.
+#[derive(Clone, Debug, Default)]
+pub struct EvalTracker {
+    pub evals: Vec<(u64, f32)>,
+    pub best: Option<(u64, f32)>,
+    /// Stop after this many evaluations in a row without a new best.
+    pub patience: Option<usize>,
+    /// A new best must beat the old by more than this.
+    pub min_delta: f32,
+    since_best: usize,
+}
+
+impl EvalTracker {
+    pub fn new(patience: Option<usize>, min_delta: f32) -> Self {
+        Self {
+            patience,
+            min_delta,
+            ..Self::default()
+        }
+    }
+
+    /// Record the evaluation loss after `step` → (a new best?, stop now?). A
+    /// non-finite loss is never a best.
+    pub fn record(&mut self, step: u64, loss: f32) -> (bool, bool) {
+        self.evals.push((step, loss));
+        let improved = loss.is_finite() && self.best.is_none_or(|(_, b)| loss < b - self.min_delta);
+        if improved {
+            self.best = Some((step, loss));
+            self.since_best = 0;
+        } else {
+            self.since_best += 1;
+        }
+        let stop = self.patience.is_some_and(|p| self.since_best >= p);
+        (improved, stop)
+    }
+
+    /// `{evals: [[step, loss], …], best_step, best_loss}` for a run summary.
+    pub fn summary(&self) -> Value {
+        json!({
+            "evals": self.evals,
+            "best_step": self.best.map(|b| b.0),
+            "best_loss": self.best.map(|b| b.1),
+        })
+    }
+}
+
 // ── checkpoints ─────────────────────────────────────────────
 
 #[cfg(feature = "gguf-io")]
@@ -1031,12 +1672,17 @@ impl Trainer {
     pub fn save(&mut self, path: &str) -> ApiResult<usize> {
         use rlx_gguf::{GgmlType, GgufWriter, MetaValue};
 
+        let slots = self.state_slots();
         let (values, buffers, opt_step, steps) = if let Some(t) = self.resident.as_mut() {
             let params = t.params();
             let mut buffers = Vec::new();
             for (name, m, v) in t.moments() {
-                buffers.push((format!("m/{name}"), m));
-                buffers.push((format!("v/{name}"), v));
+                // The host optimizer's slots, so a checkpoint resumes on either path.
+                let (m_slot, v_used) = slots.get(&name).copied().unwrap_or(("m", true));
+                buffers.push((format!("{m_slot}/{name}"), m));
+                if v_used {
+                    buffers.push((format!("v/{name}"), v));
+                }
             }
             let values: Vec<Vec<f32>> = self
                 .names
@@ -1216,6 +1862,7 @@ impl Trainer {
             restored += 1;
         }
 
+        let slots = self.state_slots();
         let optimizer_restored = if let Some(t) = self.resident.as_mut() {
             // Group `m/<name>` + `v/<name>` back into per-parameter triples.
             let moments: Vec<(String, Vec<f32>, Vec<f32>)> = self
@@ -1228,11 +1875,14 @@ impl Trainer {
                             .find(|(key, _)| *key == k)
                             .map(|(_, v)| v.clone())
                     };
-                    Some((
-                        name.clone(),
-                        find(format!("m/{name}"))?,
-                        find(format!("v/{name}"))?,
-                    ))
+                    let (m_slot, v_used) = slots.get(name).copied().unwrap_or(("m", true));
+                    let m = find(format!("{m_slot}/{name}"))?;
+                    let v = if v_used {
+                        find(format!("v/{name}"))?
+                    } else {
+                        vec![0.0; m.len()]
+                    };
+                    Some((name.clone(), m, v))
                 })
                 .collect();
             t.set_params(&restored_params);

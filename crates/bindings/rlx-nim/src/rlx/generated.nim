@@ -1290,9 +1290,10 @@ proc setLr*(self: Optimizer; lr: float) =
   check c_rlx_optimizer_set_lr(self.h, cfloat(lr))
 
 proc newTrainer*(graph: Graph; wrt: openArray[string]; initial: openArray[(string, seq[float])]; options: JsonNode = nil): Trainer =
-  ## Takes `graph` (consumed): its first output is the loss. `wrt` are the
-  ## trainable params; `initial` their starting values. options: {optimizer,
-  ## device, resident, clip_norm, …}.
+  ## Takes `graph` (consumed): its first output is the loss (further outputs
+  ## reach step_with by name). `wrt` are the trainable params; `initial`
+  ## their starting values. options: {optimizer, device, resident, clip_norm,
+  ## schedule, accumulate, loss_scale, …}.
   var k: Keep
   let inInitial = k.inputs(initial)
   var o0: pointer

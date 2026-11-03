@@ -822,6 +822,14 @@ LAMB / Adafactor / SOAP / Muon / Sophia / MARS.
   trainer is the multi-dataset, multi-machine harness).
 - **NaN / Inf localization** during training via `RLX_DEBUG_NANS` —
   [`docs/nan-debugging.md`](docs/nan-debugging.md).
+- **The training loop around the optimizer**, as PyTorch sets it up:
+  learning-rate schedules (cosine, one-cycle, step, … with warmup), gradient
+  accumulation, dynamic loss scaling, data-parallel replicas
+  (`Trainer::set_data_parallel`), and evaluation / early stopping /
+  checkpoints in `run`.
+- **An agent rewriting the optimizer while the model trains** (OPAL's
+  protocol; Claude Code and other agent CLIs through `rlx-agent`) —
+  [`docs/agent-optimizer.md`](docs/agent-optimizer.md).
 
 ## Status by area
 

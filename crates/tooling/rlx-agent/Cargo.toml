@@ -1,0 +1,19 @@
+[package]
+name = "rlx-agent"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Launch agent CLIs (Claude Code, Cursor Agent, Copilot) against MCP servers and normalise their event streams"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+documentation.workspace = true
+
+[dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

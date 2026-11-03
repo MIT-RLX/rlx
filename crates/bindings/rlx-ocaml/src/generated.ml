@@ -1999,9 +1999,10 @@ module Trainer = struct
   (* Free the handle now (it is unusable afterwards). *)
   let close self = c_rlx_trainer_free self
 
-  (* Takes `graph` (consumed): its first output is the loss. `wrt` are the *)
-  (* trainable params; `initial` their starting values. options: {optimizer, *)
-  (* device, resident, clip_norm, …}. *)
+  (* Takes `graph` (consumed): its first output is the loss (further outputs *)
+  (* reach step_with by name). `wrt` are the trainable params; `initial` *)
+  (* their starting values. options: {optimizer, device, resident, clip_norm, *)
+  (* schedule, accumulate, loss_scale, …}. *)
   let create ?options (graph : graph_h) (wrt : string array) (initial : (string * float array) list) =
     let in_initial = Support.inputs initial in
     c_rlx_trainer_new (Some graph) wrt (Array.length wrt) in_initial.inames in_initial.idata in_initial.ilens (Array.length in_initial.inames) (Option.map Json.to_string options)

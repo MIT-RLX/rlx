@@ -1,0 +1,134 @@
+syntax = "proto2";
+
+package onnx;
+
+enum Version {
+  _START_VERSION = 0;
+  IR_VERSION_2017_10_10 = 1;
+  IR_VERSION_2017_10_30 = 2;
+  IR_VERSION = 3;
+}
+message AttributeProto {
+  enum AttributeType {
+    UNDEFINED = 0;
+    FLOAT = 1;
+    INT = 2;
+    STRING = 3;
+    TENSOR = 4;
+    GRAPH = 5;
+    FLOATS = 6;
+    INTS = 7;
+    STRINGS = 8;
+    TENSORS = 9;
+    GRAPHS = 10;
+  }
+  optional string name = 1;
+  optional string doc_string = 13;
+  optional .onnx.AttributeProto.AttributeType type = 20;
+  optional float f = 2;
+  optional int64 i = 3;
+  optional bytes s = 4;
+  optional .onnx.TensorProto t = 5;
+  optional .onnx.GraphProto g = 6;
+  repeated float floats = 7;
+  repeated int64 ints = 8;
+  repeated bytes strings = 9;
+  repeated .onnx.TensorProto tensors = 10;
+  repeated .onnx.GraphProto graphs = 11;
+}
+message ValueInfoProto {
+  optional string name = 1;
+  optional .onnx.TypeProto type = 2;
+  optional string doc_string = 3;
+}
+message NodeProto {
+  repeated string input = 1;
+  repeated string output = 2;
+  optional string name = 3;
+  optional string op_type = 4;
+  optional string domain = 7;
+  repeated .onnx.AttributeProto attribute = 5;
+  optional string doc_string = 6;
+}
+message ModelProto {
+  optional int64 ir_version = 1;
+  repeated .onnx.OperatorSetIdProto opset_import = 8;
+  optional string producer_name = 2;
+  optional string producer_version = 3;
+  optional string domain = 4;
+  optional int64 model_version = 5;
+  optional string doc_string = 6;
+  optional .onnx.GraphProto graph = 7;
+  repeated .onnx.StringStringEntryProto metadata_props = 14;
+}
+message StringStringEntryProto {
+  optional string key = 1;
+  optional string value = 2;
+}
+message GraphProto {
+  repeated .onnx.NodeProto node = 1;
+  optional string name = 2;
+  repeated .onnx.TensorProto initializer = 5;
+  optional string doc_string = 10;
+  repeated .onnx.ValueInfoProto input = 11;
+  repeated .onnx.ValueInfoProto output = 12;
+  repeated .onnx.ValueInfoProto value_info = 13;
+}
+message TensorProto {
+  enum DataType {
+    UNDEFINED = 0;
+    FLOAT = 1;
+    UINT8 = 2;
+    INT8 = 3;
+    UINT16 = 4;
+    INT16 = 5;
+    INT32 = 6;
+    INT64 = 7;
+    STRING = 8;
+    BOOL = 9;
+    FLOAT16 = 10;
+    DOUBLE = 11;
+    UINT32 = 12;
+    UINT64 = 13;
+    COMPLEX64 = 14;
+    COMPLEX128 = 15;
+  }
+  message Segment {
+    optional int64 begin = 1;
+    optional int64 end = 2;
+  }
+  repeated int64 dims = 1;
+  optional .onnx.TensorProto.DataType data_type = 2;
+  optional .onnx.TensorProto.Segment segment = 3;
+  repeated float float_data = 4 [packed = true];
+  repeated int32 int32_data = 5 [packed = true];
+  repeated bytes string_data = 6;
+  repeated int64 int64_data = 7 [packed = true];
+  optional string name = 8;
+  optional string doc_string = 12;
+  optional bytes raw_data = 9;
+  repeated double double_data = 10 [packed = true];
+  repeated uint64 uint64_data = 11 [packed = true];
+}
+message TensorShapeProto {
+  message Dimension {
+    oneof value {
+      int64 dim_value = 1;
+      string dim_param = 2;
+    }
+  }
+  repeated .onnx.TensorShapeProto.Dimension dim = 1;
+}
+message TypeProto {
+  message Tensor {
+    optional .onnx.TensorProto.DataType elem_type = 1;
+    optional .onnx.TensorShapeProto shape = 2;
+  }
+  oneof value {
+    .onnx.TypeProto.Tensor tensor_type = 1;
+  }
+}
+message OperatorSetIdProto {
+  optional string domain = 1;
+  optional int64 version = 2;
+}

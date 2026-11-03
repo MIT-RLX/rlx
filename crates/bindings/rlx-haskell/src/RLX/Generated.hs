@@ -2773,9 +2773,10 @@ defNewTrainer = NewTrainerOpts
   { newTrainerOptions = Nothing
   }
 
--- | Takes `graph` (consumed): its first output is the loss. `wrt` are the
--- trainable params; `initial` their starting values. options: {optimizer,
--- device, resident, clip_norm, …}.
+-- | Takes `graph` (consumed): its first output is the loss (further outputs
+-- reach step_with by name). `wrt` are the trainable params; `initial`
+-- their starting values. options: {optimizer, device, resident, clip_norm,
+-- schedule, accumulate, loss_scale, …}.
 newTrainer :: Graph -> [String] -> [(String, [Float])] -> IO Trainer
 newTrainer = newTrainerWith defNewTrainer
 

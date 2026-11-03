@@ -80,3 +80,48 @@ def test_runner_and_router_rows_added_for_parity(tmp_path):
         pyrlx.load_weights("nope", str(tmp_path / "missing"))
     with pytest.raises(Exception):
         pyrlx.to_rlxp("gguf", str(tmp_path / "missing.gguf"), str(tmp_path / "never.rlxp"))
+
+
+DDP_RANK = r'''
+import json, sys
+import numpy as np
+import pyrlx
+
+rank, peers = int(sys.argv[1]), json.loads(sys.argv[2])
+g = pyrlx.Graph("bias")
+x = g.input("x", [1, 2], "f32")
+t = g.input("t", [1, 2], "f32")
+w = g.param("w", [2, 2], "f32")
+b = g.param("b", [1, 2], "f32")
+d = g.sub(g.add(g.matmul(x, w), b), t)
+g.set_outputs([g.mean(g.mul(d, d), [0, 1], False)])
+init = {"w": np.full(4, 0.1 * (rank + 1), np.float32), "b": np.zeros(2, np.float32)}
+trainer = pyrlx.Trainer(g, wrt=["w", "b"], init=init, optimizer={"kind": "sgd", "lr": 0.05})
+group = pyrlx.Group.connect(rank, 2, {"peers": peers})
+trainer.set_data_parallel(group)
+for i in range(20):
+    batch = {"x": np.array([1 + rank, 2 - i % 3], np.float32), "t": np.array([1, -1], np.float32)}
+    trainer.step(batch)
+print(json.dumps({"agree": trainer.replicas_agree(),
+                  "w": trainer.params()["w"].ravel().tolist(), "steps": trainer.steps()}))
+'''
+
+
+def test_data_parallel_trainers_in_two_processes_stay_equal(tmp_path):
+    import json
+    import subprocess
+    import sys
+
+    script = tmp_path / "ddp_rank.py"
+    script.write_text(DDP_RANK)
+    peers = json.dumps(pyrlx.loopback_peers(2))
+    procs = [subprocess.Popen([sys.executable, str(script), str(r), peers],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for r in range(2)]
+    outs = [p.communicate(timeout=120) for p in procs]
+    for p, (out, err) in zip(procs, outs):
+        assert p.returncode == 0, err
+    results = [json.loads(out.strip().splitlines()[-1]) for out, _ in outs]
+    assert all(r["agree"] for r in results)
+    assert results[0]["w"] == results[1]["w"], "rank 0's start, then the same mean gradients"
+    assert results[0]["steps"] == 20

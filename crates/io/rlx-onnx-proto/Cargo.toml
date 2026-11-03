@@ -1,11 +1,10 @@
 # Pure-Rust ONNX protobuf types. This is a vendored, protoc-free replacement for
 # the crates.io `onnx` crate, whose build.rs shelled out to the external `protoc`
 # binary to code-generate `src/onnx.rs` on every build. Here `src/onnx.rs` is the
-# checked-in rust-protobuf output; the only runtime dependency is the pure-Rust
-# `protobuf` crate. `src/onnx.rs` was post-processed to add `dyn` before its `Any`
-# trait objects so it builds on a modern edition. Regenerate only if the ONNX
-# schema changes: rust-protobuf 1.x output, then `sed` the bare `::std::any::Any`
-# refs to `dyn ::std::any::Any`.
+# checked-in rust-protobuf 3.7.2 output for `onnx.proto` (also checked in); the only
+# runtime dependency is the pure-Rust `protobuf` crate. The generated code asserts
+# its exact runtime version, hence the `=` pin. Regenerate with
+# `cargo run --manifest-path crates/io/rlx-onnx-proto/regen/Cargo.toml` (see README).
 [package]
 name = "rlx-onnx-proto"
 version.workspace      = true
@@ -21,7 +20,7 @@ repository.workspace   = true
 documentation.workspace = true
 
 [dependencies]
-protobuf = "1.7"
+protobuf = "=3.7.2" # must match the codegen version in regen/Cargo.toml
 
 [lints]
 workspace = true

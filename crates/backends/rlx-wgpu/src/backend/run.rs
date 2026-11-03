@@ -395,20 +395,46 @@ impl WgpuExecutable {
         inputs: &[(&str, &[f32])],
         read_indices: Option<&[usize]>,
     ) -> Vec<Vec<f32>> {
+        self.try_run_read_outputs_async(inputs, read_indices)
+            .await
+            .unwrap_or_else(|e| panic!("rlx-wgpu run_async: {e}"))
+    }
+
+    /// [`Self::run_read_outputs_async`] that returns a lost device or a
+    /// WebGPU error (out of memory, validation) instead of panicking, so the
+    /// caller can run on another backend.
+    #[cfg(target_family = "wasm")]
+    pub async fn try_run_read_outputs_async(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        read_indices: Option<&[usize]>,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        if crate::device::device_lost() {
+            return Err(crate::device::take_gpu_error()
+                .unwrap_or_else(|| "the WebGPU device was lost".into()));
+        }
+        // errors from earlier runs are not this one's
+        let _ = crate::device::take_gpu_error();
         self.pending_read_indices = read_indices.map(|s| s.to_vec());
         let outs = self.run_async_inner(inputs).await;
         self.pending_read_indices = None;
-        outs
+        match (outs, crate::device::take_gpu_error()) {
+            (_, Some(e)) | (Err(e), None) => Err(e),
+            (Ok(outs), None) => Ok(outs),
+        }
     }
 
     #[cfg(target_family = "wasm")]
-    async fn run_async_inner(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+    async fn run_async_inner(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+    ) -> Result<Vec<Vec<f32>>, String> {
         // Name what is actually in the way. "Contains host-executed ops (GGUF
         // dequant, LSTM, collectives, FFT-host, …)" listed what it might have
         // been; a conv graph's real answer is one `Conv2dHost` per conv.
         if self.blocks_on_host() {
             let summary = self.host_summary().unwrap_or_default();
-            panic!("rlx-wgpu run_async: unsupported on wasm — {summary}");
+            return Err(format!("unsupported on wasm — {summary}"));
         }
 
         // 1. Dispatch + submit all compute, skipping the blocking readback.
@@ -440,7 +466,7 @@ impl WgpuExecutable {
         // orders the next run after this one.
         if layout.regions.is_empty() {
             dev.queue.submit(std::iter::once(enc.finish()));
-            return Vec::new();
+            return Ok(Vec::new());
         }
         ReadbackStaging::prepare(&dev.device, &mut self.readback_staging, layout.total_bytes);
         let staging_buf = self
@@ -452,12 +478,16 @@ impl WgpuExecutable {
         encode_readback_copies(&mut enc, &self.arena, &staging_buf, &out_ids, &layout);
         dev.queue.submit(std::iter::once(enc.finish()));
 
-        crate::buffer::wasm_async::map_read_async(&staging_buf, layout.total_bytes)
-            .await
-            .expect("rlx-wgpu async buffer map failed");
+        if let Err(e) =
+            crate::buffer::wasm_async::map_read_async(&staging_buf, layout.total_bytes).await
+        {
+            // the map fails when the device was lost on the way: say why
+            return Err(crate::device::take_gpu_error()
+                .unwrap_or_else(|| format!("reading the outputs back failed: {e}")));
+        }
 
         let partial = decode_mapped_readback_f32(&staging_buf, &layout);
-        self.pack_readback_outputs(&plan, partial)
+        Ok(self.pack_readback_outputs(&plan, partial))
     }
 
     /// True when the compiled schedule contains host-executed ops (GGUF

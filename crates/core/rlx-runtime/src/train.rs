@@ -137,17 +137,226 @@ struct FusedStep {
     params: Vec<FusedParam>,
 }
 
-/// Append the Adam update to the backward of `forward` w.r.t. `wrt`.
+/// Muon hyperparameters for the fused step: rlx-optim's `Muon` on the device,
+/// and with `adamw` set its `MuonAdamW` (AdamW for every param that is not a
+/// matrix with both sides above 1, Muon's rate `muon_scale` × the AdamW one).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MuonSpec {
+    pub lr: f32,
+    pub momentum: f32,
+    pub nesterov: bool,
+    pub weight_decay: f32,
+    pub ns_steps: u32,
+    /// `(a, b, c)` of `X ← a·X + b·(XXᵀ)X + c·(XXᵀ)²X`.
+    pub ns_coeffs: (f32, f32, f32),
+    pub adamw: Option<AdamSpec>,
+    pub muon_scale: f32,
+}
+
+impl MuonSpec {
+    /// rlx-optim's `Muon::new` defaults.
+    pub fn new(lr: f32) -> Self {
+        Self {
+            lr,
+            momentum: 0.95,
+            nesterov: true,
+            weight_decay: 0.0,
+            ns_steps: 5,
+            ns_coeffs: (3.4445, -4.7750, 2.0315),
+            adamw: None,
+            muon_scale: 1.0,
+        }
+    }
+}
+
+/// The update the fused step runs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FusedRule {
+    Adam(AdamSpec),
+    Muon(MuonSpec),
+}
+
+impl FusedRule {
+    /// The rate fed as `__lr`.
+    fn lr(&self) -> f32 {
+        match self {
+            Self::Adam(a) => a.lr,
+            Self::Muon(m) => m.adamw.map_or(m.lr, |a| a.lr),
+        }
+    }
+
+    /// The Adam part, whose bias corrections the step feeds.
+    fn adam(&self) -> Option<AdamSpec> {
+        match self {
+            Self::Adam(a) => Some(*a),
+            Self::Muon(m) => m.adamw,
+        }
+    }
+}
+
+/// `p'`, `m'`, `v'` of one param's AdamW update (gated: `gate` 0 holds all three).
+#[allow(clippy::too_many_arguments)]
+fn adam_update(
+    g: &mut Graph,
+    spec: &AdamSpec,
+    p: NodeId,
+    grad: NodeId,
+    m: NodeId,
+    v: NodeId,
+    gate: NodeId,
+    lr: NodeId,
+    bc1: NodeId,
+    bc2: NodeId,
+) -> (NodeId, NodeId, NodeId) {
+    let f = DType::F32;
+    let c_b1 = g.constant(spec.beta1 as f64, f);
+    let c_1mb1 = g.constant((1.0 - spec.beta1) as f64, f);
+    let c_b2 = g.constant(spec.beta2 as f64, f);
+    let c_1mb2 = g.constant((1.0 - spec.beta2) as f64, f);
+    let c_eps = g.constant(spec.eps as f64, f);
+    // Each builder call takes `&mut g`, so every intermediate needs its own
+    // binding rather than nesting.
+    // m' = β₁·m + (1-β₁)·g
+    let m_decayed = g.mul(m, c_b1);
+    let g_scaled = g.mul(grad, c_1mb1);
+    let m_new = g.add(m_decayed, g_scaled);
+    // v' = β₂·v + (1-β₂)·g²
+    let sq = g.mul(grad, grad);
+    let v_decayed = g.mul(v, c_b2);
+    let sq_scaled = g.mul(sq, c_1mb2);
+    let v_new = g.add(v_decayed, sq_scaled);
+    // p' = p - gate·lr·(m'/bc1)/(√(v'/bc2)+ε)
+    let mhat = g.div(m_new, bc1);
+    let vhat = g.div(v_new, bc2);
+    let root = g.sqrt(vhat);
+    let denom = g.add(root, c_eps);
+    let ratio = g.div(mhat, denom);
+    let update = g.mul(ratio, lr);
+    let gated = g.mul(update, gate);
+    let stepped = g.sub(p, gated);
+    let p_new = if spec.weight_decay != 0.0 {
+        let c_wd = g.constant(spec.weight_decay as f64, f);
+        let lrwd = g.mul(lr, c_wd);
+        let decay = g.mul(p, lrwd);
+        let gated_decay = g.mul(decay, gate);
+        g.sub(stepped, gated_decay)
+    } else {
+        stepped
+    };
+    let m_kept = hold(g, gate, m_new, m);
+    let v_kept = hold(g, gate, v_new, v);
+    (p_new, m_kept, v_kept)
+}
+
+/// `gate·new + (1−gate)·old`: freezing holds the state too, so unfreezing
+/// resumes rather than lurching on state built from updates never applied.
+fn hold(g: &mut Graph, gate: NodeId, new: NodeId, old: NodeId) -> NodeId {
+    let one = g.constant(1.0, DType::F32);
+    let keep = g.sub(one, gate);
+    let taken = g.mul(new, gate);
+    let held = g.mul(old, keep);
+    g.add(taken, held)
+}
+
+/// `p'`, `m'` of one param's Muon update: momentum, then for a `[rows, cols]`
+/// matrix the Newton–Schulz orthogonalization scaled by `√max(rows, cols)`;
+/// for anything else momentum SGD. `lr_factor` scales `lr` (MuonAdamW's
+/// `muon_scale`); `wd` is the decoupled decay on that rate.
+#[allow(clippy::too_many_arguments)]
+fn muon_update(
+    g: &mut Graph,
+    spec: &MuonSpec,
+    matrix: Option<(usize, usize)>,
+    p: NodeId,
+    grad: NodeId,
+    m: NodeId,
+    gate: NodeId,
+    lr: NodeId,
+    lr_factor: f32,
+    wd: f32,
+) -> (NodeId, NodeId) {
+    let f = DType::F32;
+    let c_mu = g.constant(spec.momentum as f64, f);
+    // m' = μ·m + g
+    let m_decayed = g.mul(m, c_mu);
+    let m_new = g.add(m_decayed, grad);
+    // Nesterov: g + μ·m'; else m'.
+    let dir = if spec.nesterov {
+        let ahead = g.mul(m_new, c_mu);
+        g.add(grad, ahead)
+    } else {
+        m_new
+    };
+    let step = match matrix {
+        Some((rows, cols)) => {
+            // X = G / ‖G‖_F, the smaller side as rows (the Gram is min × min).
+            let sq = g.mul(dir, dir);
+            let total = g.sum(sq, vec![0, 1], false);
+            let norm = g.sqrt(total);
+            let c_tiny = g.constant(1e-12, f);
+            let fro = g.add(norm, c_tiny);
+            let mut x = g.div(dir, fro);
+            let transposed = rows > cols;
+            if transposed {
+                x = g.transpose_(x, vec![1, 0]);
+            }
+            let (a, b, c) = spec.ns_coeffs;
+            let (ca, cb, cc) = (
+                g.constant(a as f64, f),
+                g.constant(b as f64, f),
+                g.constant(c as f64, f),
+            );
+            for _ in 0..spec.ns_steps {
+                let xt = g.transpose_(x, vec![1, 0]);
+                let gram = g.mm(x, xt);
+                let gram2 = g.mm(gram, gram);
+                let bg = g.mul(gram, cb);
+                let cg = g.mul(gram2, cc);
+                let poly = g.add(bg, cg);
+                let px = g.mm(poly, x);
+                let ax = g.mul(x, ca);
+                x = g.add(ax, px);
+            }
+            if transposed {
+                x = g.transpose_(x, vec![1, 0]);
+            }
+            let c_s = g.constant((rows.max(cols) as f64).sqrt(), f);
+            g.mul(x, c_s)
+        }
+        None => dir,
+    };
+    // p' = p − gate·lr·factor·(step + wd·p)
+    let with_decay = if wd != 0.0 {
+        let c_wd = g.constant(wd as f64, f);
+        let decay = g.mul(p, c_wd);
+        g.add(step, decay)
+    } else {
+        step
+    };
+    let rate = if lr_factor != 1.0 {
+        let c_f = g.constant(lr_factor as f64, f);
+        g.mul(lr, c_f)
+    } else {
+        lr
+    };
+    let update = g.mul(with_decay, rate);
+    let gated = g.mul(update, gate);
+    let p_new = g.sub(p, gated);
+    (p_new, hold(g, gate, m_new, m))
+}
+
+/// Append the update of `rule` to the backward of `forward` w.r.t. `wrt`.
 ///
 /// Outputs become `[loss, aux…, p'₀, m'₀, v'₀, p'₁, …]`. Per-parameter inputs
-/// `{name}__m` / `{name}__v` carry the moments and `{name}__scale` gates the
-/// update (1 to train, 0 to freeze); shared scalars `__lr`, `__bc1`, `__bc2`
-/// carry the learning rate and the bias corrections, so a schedule needs no
-/// recompile.
-fn fused_adam_graph(
+/// `{name}__m` / `{name}__v` carry the state (Muon's momentum in `m`; `v`
+/// passes through for its matrices) and `{name}__scale` gates the update (1 to
+/// train, 0 to freeze); shared scalars `__lr` and, when an Adam part runs,
+/// `__bc1`, `__bc2` carry the learning rate and the bias corrections, so a
+/// schedule needs no recompile.
+fn fused_graph(
     forward: &Graph,
     wrt: &[TrainableParam],
-    spec: &AdamSpec,
+    rule: &FusedRule,
 ) -> Result<FusedStep, FuseError> {
     if forward.outputs.is_empty() {
         return Err(FuseError::NoLoss);
@@ -170,16 +379,11 @@ fn fused_adam_graph(
     let grads: Vec<NodeId> = g.outputs[grad_start..].to_vec();
 
     let lr = g.input("__lr", Shape::scalar(f));
-    let bc1 = g.input("__bc1", Shape::scalar(f));
-    let bc2 = g.input("__bc2", Shape::scalar(f));
-    let c_b1 = g.constant(spec.beta1 as f64, f);
-    let c_1mb1 = g.constant((1.0 - spec.beta1) as f64, f);
-    let c_b2 = g.constant(spec.beta2 as f64, f);
-    let c_1mb2 = g.constant((1.0 - spec.beta2) as f64, f);
-    let c_eps = g.constant(spec.eps as f64, f);
-    let lr_wd = (spec.weight_decay != 0.0).then(|| {
-        let c_wd = g.constant(spec.weight_decay as f64, f);
-        g.mul(lr, c_wd)
+    let bc = rule.adam().map(|_| {
+        (
+            g.input("__bc1", Shape::scalar(f)),
+            g.input("__bc2", Shape::scalar(f)),
+        )
     });
 
     let mut params = Vec::with_capacity(wrt.len());
@@ -196,50 +400,45 @@ fn fused_adam_graph(
         let scale_name = format!("{}__scale", slot.name);
         let m = g.input(&m_name, shape.clone());
         let v = g.input(&v_name, shape.clone());
-        // Scalar gate: 1 trains, 0 freezes. Keeping the moments updating while
-        // frozen would make unfreezing jump, so the gate multiplies the *whole*
-        // delta including the moment refresh.
+        // Scalar gate: 1 trains, 0 freezes.
         let gate = g.input(&scale_name, Shape::scalar(f));
-
-        // Each builder call takes `&mut g`, so every intermediate needs its own
-        // binding rather than nesting.
-        // m' = β₁·m + (1-β₁)·g
-        let m_decayed = g.mul(m, c_b1);
-        let g_scaled = g.mul(grad, c_1mb1);
-        let m_new = g.add(m_decayed, g_scaled);
-        // v' = β₂·v + (1-β₂)·g²
-        let sq = g.mul(grad, grad);
-        let v_decayed = g.mul(v, c_b2);
-        let sq_scaled = g.mul(sq, c_1mb2);
-        let v_new = g.add(v_decayed, sq_scaled);
-        // p' = p - gate·lr·(m'/bc1)/(√(v'/bc2)+ε)
-        let mhat = g.div(m_new, bc1);
-        let vhat = g.div(v_new, bc2);
-        let root = g.sqrt(vhat);
-        let denom = g.add(root, c_eps);
-        let ratio = g.div(mhat, denom);
-        let update = g.mul(ratio, lr);
-        let gated = g.mul(update, gate);
-        let stepped = g.sub(p, gated);
-        let p_new = match lr_wd {
-            Some(lrwd) => {
-                let decay = g.mul(p, lrwd);
-                let gated_decay = g.mul(decay, gate);
-                g.sub(stepped, gated_decay)
+        let dims: Vec<usize> = shape
+            .dims()
+            .iter()
+            .map(|d| match d {
+                rlx_ir::Dim::Static(n) => *n,
+                rlx_ir::Dim::Dynamic(_) => 0,
+            })
+            .collect();
+        let (p_new, m_kept, v_kept) = match rule {
+            FusedRule::Adam(spec) => {
+                let (bc1, bc2) = bc.expect("Adam feeds its corrections");
+                adam_update(&mut g, spec, p, grad, m, v, gate, lr, bc1, bc2)
             }
-            None => stepped,
+            FusedRule::Muon(spec) => {
+                let is_matrix = dims.len() == 2 && dims[0] > 1 && dims[1] > 1;
+                match (spec.adamw, is_matrix) {
+                    // MuonAdamW: AdamW for what is not a matrix.
+                    (Some(adam), false) => {
+                        let (bc1, bc2) = bc.expect("MuonAdamW feeds its corrections");
+                        adam_update(&mut g, &adam, p, grad, m, v, gate, lr, bc1, bc2)
+                    }
+                    (adamw, _) => {
+                        // Muon's matrices are rank 2 (rlx-optim's `Muon`
+                        // orthogonalizes any; MuonAdamW only both sides > 1).
+                        let matrix = (dims.len() == 2 && (adamw.is_none() || is_matrix))
+                            .then(|| (dims[0], dims[1]));
+                        let (factor, wd) = match adamw {
+                            Some(a) => (spec.muon_scale, a.weight_decay / spec.muon_scale),
+                            None => (1.0, spec.weight_decay),
+                        };
+                        let (p_new, m_kept) =
+                            muon_update(&mut g, spec, matrix, p, grad, m, gate, lr, factor, wd);
+                        (p_new, m_kept, v)
+                    }
+                }
+            }
         };
-        // Freezing holds the moments too, so unfreezing resumes rather than
-        // lurching on a moment built from gradients that were never applied.
-        let one = g.constant(1.0, f);
-        let hold = g.sub(one, gate);
-        let m_taken = g.mul(m_new, gate);
-        let m_held = g.mul(m, hold);
-        let m_kept = g.add(m_taken, m_held);
-        let v_taken = g.mul(v_new, gate);
-        let v_held = g.mul(v, hold);
-        let v_kept = g.add(v_taken, v_held);
-
         let p_out = outputs.len();
         outputs.push(p_new);
         let m_out = outputs.len();
@@ -273,7 +472,10 @@ fn fused_adam_graph(
 pub struct ResidentTrainer {
     compiled: CompiledGraph,
     params: Vec<FusedParam>,
+    /// The Adam part's betas for the bias corrections, and `lr` the rate fed
+    /// as `__lr` (for Muon alone, only `lr` is read).
     spec: AdamSpec,
+    rule: FusedRule,
     step_count: i32,
     /// How many outputs precede the first `p'` — 1 for the loss plus any aux
     /// outputs the forward graph declared.
@@ -314,8 +516,32 @@ impl ResidentTrainer {
         device: Device,
         options: &CompileOptions,
     ) -> Result<Self, FuseError> {
+        Self::with_rule(
+            forward,
+            wrt,
+            initial,
+            &FusedRule::Adam(*spec),
+            device,
+            options,
+        )
+    }
+
+    /// [`Self::with_options`] for any fused rule: AdamW, or Muon / MuonAdamW
+    /// with the Newton–Schulz orthogonalization in the graph.
+    pub fn with_rule(
+        forward: &Graph,
+        wrt: &[TrainableParam],
+        initial: &HashMap<String, Vec<f32>>,
+        rule: &FusedRule,
+        device: Device,
+        options: &CompileOptions,
+    ) -> Result<Self, FuseError> {
         let leading_outputs = forward.outputs.len();
-        let step = fused_adam_graph(forward, wrt, spec)?;
+        let step = fused_graph(forward, wrt, rule)?;
+        let spec = AdamSpec {
+            lr: rule.lr(),
+            ..rule.adam().unwrap_or_default()
+        };
         let mut compiled = Session::new(device).compile_with(step.graph, options);
 
         let trainable: Vec<&str> = step.params.iter().map(|p| p.name.as_str()).collect();
@@ -350,7 +576,8 @@ impl ResidentTrainer {
         Ok(Self {
             compiled,
             params: step.params,
-            spec: *spec,
+            spec,
+            rule: *rule,
             step_count: 0,
             leading_outputs,
             param_vals,
@@ -426,8 +653,10 @@ impl ResidentTrainer {
         let mut run_inputs: Vec<(&str, &[f32])> = inputs.to_vec();
         run_inputs.push(("d_output", &seed));
         run_inputs.push(("__lr", &lr));
-        run_inputs.push(("__bc1", &bc1));
-        run_inputs.push(("__bc2", &bc2));
+        if self.rule.adam().is_some() {
+            run_inputs.push(("__bc1", &bc1));
+            run_inputs.push(("__bc2", &bc2));
+        }
         for (name, value) in &gate_values {
             run_inputs.push((name.as_str(), value));
         }
@@ -474,8 +703,10 @@ impl ResidentTrainer {
         let mut run_inputs: Vec<(&str, &[f32])> = inputs.to_vec();
         run_inputs.push(("d_output", &seed));
         run_inputs.push(("__lr", &lr));
-        run_inputs.push(("__bc1", &bc1));
-        run_inputs.push(("__bc2", &bc2));
+        if self.rule.adam().is_some() {
+            run_inputs.push(("__bc1", &bc1));
+            run_inputs.push(("__bc2", &bc2));
+        }
         for (name, value) in &held {
             run_inputs.push((name.as_str(), value));
         }
@@ -756,6 +987,138 @@ mod tests {
             fused_losses[11] < fused_losses[0] * 0.5,
             "the fused trainer did not learn: {fused_losses:?}"
         );
+    }
+
+    /// The fused `rule` and the host `opt` from the same start, 12 steps each →
+    /// (fused losses, host losses, fused params, host params).
+    #[allow(clippy::type_complexity)]
+    fn fused_and_host(
+        rule: FusedRule,
+        mut opt: Box<dyn rlx_optim::Optimizer>,
+    ) -> (
+        Vec<f32>,
+        Vec<f32>,
+        HashMap<String, Vec<f32>>,
+        HashMap<String, Vec<f32>>,
+    ) {
+        const DIM: usize = 4;
+        const BATCH: usize = 2;
+        let x: Vec<f32> = vec![1.0, 0.5, -0.5, 2.0, 0.25, -1.0, 1.5, 0.0];
+        let t: Vec<f32> = vec![1.0, -1.0, 0.5, 0.0, 0.0, 2.0, -1.0, 1.0];
+        let (forward, wrt) = regression(BATCH, DIM);
+        let mut fused = ResidentTrainer::with_rule(
+            &forward,
+            &wrt,
+            &initial(DIM),
+            &rule,
+            Device::Cpu,
+            &CompileOptions::new(),
+        )
+        .expect("fuses");
+        let fused_losses: Vec<f32> = (0..12)
+            .map(|_| fused.step(&[("x", &x), ("t", &t)])[0][0])
+            .collect();
+
+        let (forward2, _) = regression(BATCH, DIM);
+        let ids = [
+            forward2.param_id("w").unwrap(),
+            forward2.param_id("b").unwrap(),
+        ];
+        let mut compiled =
+            Session::new(Device::Cpu).compile(rlx_opt::autodiff::grad_with_loss(&forward2, &ids));
+        let mut host = initial(DIM);
+        let mut host_losses = Vec::new();
+        for _ in 0..12 {
+            compiled.set_param("w", &host["w"]);
+            compiled.set_param("b", &host["b"]);
+            let outs = compiled.run(&[("x", &x), ("t", &t), ("d_output", &[1.0])]);
+            host_losses.push(outs[0][0]);
+            let mut w = host["w"].clone();
+            let mut b = host["b"].clone();
+            let mut items = [
+                rlx_optim::OptItem {
+                    name: "w",
+                    shape: &[DIM, DIM],
+                    param: &mut w,
+                    grad: &outs[1],
+                },
+                rlx_optim::OptItem {
+                    name: "b",
+                    shape: &[1, DIM],
+                    param: &mut b,
+                    grad: &outs[2],
+                },
+            ];
+            opt.step_batch(&mut items);
+            opt.end_iteration();
+            host.insert("w".into(), w);
+            host.insert("b".into(), b);
+        }
+        (fused_losses, host_losses, fused.params(), host)
+    }
+
+    fn assert_close(
+        fused: &[f32],
+        host: &[f32],
+        fp: &HashMap<String, Vec<f32>>,
+        hp: &HashMap<String, Vec<f32>>,
+    ) {
+        // The Newton–Schulz iteration is fifteen f32 matmuls a step; the host
+        // sums its Frobenius norm in f64. The bound is relative and stated.
+        const REL: f32 = 1e-4;
+        for (step, (a, b)) in fused.iter().zip(host).enumerate() {
+            assert!(
+                (a - b).abs() <= REL * b.abs().max(1.0),
+                "step {step}: fused {a} vs host {b}"
+            );
+        }
+        for name in ["w", "b"] {
+            for (i, (a, b)) in fp[name].iter().zip(&hp[name]).enumerate() {
+                assert!(
+                    (a - b).abs() <= REL * b.abs().max(1.0),
+                    "{name}[{i}]: fused {a} vs host {b}"
+                );
+            }
+        }
+        assert!(fused[11] < fused[0] * 0.9, "did not learn: {fused:?}");
+    }
+
+    #[test]
+    fn the_fused_muon_matches_rlx_optims_muon() {
+        let mut spec = MuonSpec::new(0.02);
+        spec.weight_decay = 0.01;
+        let mut host = rlx_optim::Muon::new(0.02);
+        host.weight_decay = 0.01;
+        let (f, h, fp, hp) = fused_and_host(FusedRule::Muon(spec), Box::new(host));
+        assert_close(&f, &h, &fp, &hp);
+        // Without Nesterov too.
+        let mut spec = MuonSpec::new(0.02);
+        spec.nesterov = false;
+        let mut host = rlx_optim::Muon::new(0.02);
+        host.nesterov = false;
+        let (f, h, fp, hp) = fused_and_host(FusedRule::Muon(spec), Box::new(host));
+        assert_close(&f, &h, &fp, &hp);
+    }
+
+    #[test]
+    fn the_fused_muon_adamw_matches_rlx_optims() {
+        let lr = 0.05;
+        let host = rlx_optim::MuonAdamW::new(lr).with_weight_decay(0.01);
+        let adamw = AdamSpec {
+            lr,
+            beta1: host.adamw.beta1,
+            beta2: host.adamw.beta2,
+            eps: host.adamw.eps,
+            weight_decay: 0.01,
+        };
+        let spec = MuonSpec {
+            lr: lr * host.muon_scale,
+            adamw: Some(adamw),
+            muon_scale: host.muon_scale,
+            ..MuonSpec::new(lr)
+        };
+        let (f, h, fp, hp) = fused_and_host(FusedRule::Muon(spec), Box::new(host));
+        assert_close(&f, &h, &fp, &hp);
     }
 
     #[test]

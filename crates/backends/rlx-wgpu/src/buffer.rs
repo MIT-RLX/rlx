@@ -436,6 +436,24 @@ pub struct Arena {
     pub weight_offsets: HashMap<NodeId, usize>,
 }
 
+/// In the browser a dropped `wgpu::Buffer` keeps its GPU memory until the
+/// JS garbage collector finds the `GPUBuffer`: a model run in windows, or
+/// run again, piles up arenas of a GB or more each (iOS kills the tab). Free
+/// the activations at once. (Weight buffers can be adopted by another
+/// executable — `adopt_weights` — so they are left to the collector.)
+#[cfg(target_family = "wasm")]
+impl Drop for Arena {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+        for b in &self.extra_shards {
+            b.destroy();
+        }
+        if let Some(b) = &self.f16_buffer {
+            b.destroy();
+        }
+    }
+}
+
 /// How to bind a storage window onto an [`Arena`] (possibly sharded).
 pub struct ArenaBindSpec<'a> {
     pub buffer: &'a wgpu::Buffer,
@@ -2046,6 +2064,14 @@ impl Arena {
 pub struct ReadbackStaging {
     buffer: wgpu::Buffer,
     capacity: usize,
+}
+
+/// Freed at once in the browser, like [`Arena`]'s activations.
+#[cfg(target_family = "wasm")]
+impl Drop for ReadbackStaging {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+    }
 }
 
 /// Fixed 256 B MAP_READ staging for scalar (≤16 B) readback — avoids

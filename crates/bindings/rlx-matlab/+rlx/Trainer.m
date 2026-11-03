@@ -9,9 +9,10 @@ classdef Trainer < rlx.internal.Handle
     % Trains a graph's parameters: forward, backward, optimizer, on one device.
     methods
         function self = Trainer(varargin)
-            % Takes `graph` (consumed): its first output is the loss. `wrt` are the
-            % trainable params; `initial` their starting values. options: {optimizer,
-            % device, resident, clip_norm, …}.
+            % Takes `graph` (consumed): its first output is the loss (further outputs
+            % reach step_with by name). `wrt` are the trainable params; `initial`
+            % their starting values. options: {optimizer, device, resident, clip_norm,
+            % schedule, accumulate, loss_scale, …}.
             if nargin == 2 && isequal(varargin{1}, 'rlx:handle')
                 h = varargin{2};
             else

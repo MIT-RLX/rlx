@@ -108,8 +108,8 @@ def test_optimizer_moves_weights_downhill():
 
 @training
 def test_every_optimizer_kind_constructs_and_steps():
-    kinds = ["sgd", "adam", "adamw", "lion", "muon", "radam", "nadamw", "lamb", "mars",
-             "soap", "sophia", "qhadamw", "adafactor"]
+    kinds = ["sgd", "adam", "adamw", "lion", "muon", "muon_adamw", "radam", "nadamw", "lamb",
+             "mars", "soap", "sophia", "qhadamw", "adafactor"]
     for kind in kinds:
         out = rlx.Optimizer(kind, lr=1e-2).step(
             {"w": (np.ones((4, 4), np.float32), np.ones((4, 4), np.float32))}
@@ -185,6 +185,100 @@ def test_trainer_freezes_and_checkpoints(tmp_path):
                     optimizer="lion").load(ck)
 
 
+def bias_graph():
+    """``mean((x·w + b - t)²)``: ``w`` a matrix (Muon's under ``muon_adamw``),
+    ``b`` a ``[1, 2]`` row (AdamW's)."""
+    g = rlx.Graph("bias")
+    x = g.input("x", [1, 2], "f32")
+    t = g.input("t", [1, 2], "f32")
+    w = g.param("w", [2, 2], "f32")
+    b = g.param("b", [1, 2], "f32")
+    d = g.sub(g.add(g.matmul(x, w), b), t)
+    g.set_outputs([g.mean(g.mul(d, d), [0, 1], False)])
+    return g
+
+
+BIAS_INIT = {"w": np.array([0.3, -0.2, 0.1, 0.4], np.float32), "b": np.zeros(2, np.float32)}
+BIAS_BATCH = {"x": np.array([1, 2], np.float32), "t": np.array([1, -1], np.float32)}
+
+
+@training
+@pytest.mark.parametrize("opts", [
+    {"kind": "adamw", "lr": 0.05, "weight_decay": 0.01},
+    {"kind": "muon_adamw", "lr": 0.05, "weight_decay": 0.01},
+])
+def test_trainer_step_with_its_own_optimizer_reproduces_step(opts):
+    plain = rlx.Trainer(bias_graph(), wrt=["w", "b"], init=BIAS_INIT, optimizer=opts,
+                        clip_norm=0.5)
+    hooked = rlx.Trainer(bias_graph(), wrt=["w", "b"], init=BIAS_INIT, optimizer=opts,
+                         clip_norm=0.5)
+    opt = rlx.Optimizer(**opts)
+
+    def update(params, grads, step):
+        out = opt.step({n: (params[n], grads[n]) for n in params})
+        for n in params:
+            params[n][...] = out[n]
+
+    for _ in range(12):
+        assert plain.step(BIAS_BATCH) == hooked.step_with(BIAS_BATCH, update)
+    for n, v in plain.params().items():
+        np.testing.assert_array_equal(hooked.params()[n], v)
+    assert hooked.steps() == plain.steps() == 12
+
+
+@training
+def test_trainer_step_with_hands_over_unfrozen_params_and_takes_back_replacements():
+    t = rlx.Trainer(bias_graph(), wrt=["w", "b"], init=BIAS_INIT, optimizer="sgd")
+    t.freeze(["b"])
+    seen = []
+
+    def update(params, grads, step):
+        seen.append((list(params), params["w"].shape, grads["w"].dtype, step))
+        params["w"] = params["w"] + 1.0  # a replacement, not an in-place write
+
+    t.step_with(BIAS_BATCH, update)
+    t.step_with(BIAS_BATCH, update)
+    assert seen == [(["w"], (2, 2), np.float32, 1), (["w"], (2, 2), np.float32, 2)]
+    np.testing.assert_allclose(t.params()["w"], BIAS_INIT["w"].reshape(2, 2) + 2.0)
+    np.testing.assert_array_equal(t.params()["b"].ravel(), BIAS_INIT["b"])
+    assert t.steps() == 2
+
+
+@training
+def test_trainer_step_with_writes_nothing_back_when_the_update_fails():
+    t = rlx.Trainer(bias_graph(), wrt=["w", "b"], init=BIAS_INIT, optimizer="sgd")
+    before = {n: v.copy() for n, v in t.params().items()}
+
+    class RuleError(Exception):
+        pass
+
+    def raises(params, grads, step):
+        params["w"][...] = 9.0
+        raise RuleError("bad rule")
+
+    def wrong_shape(params, grads, step):
+        params["b"][...] = 9.0
+        params["w"] = np.zeros(3, np.float32)
+
+    def wrong_dtype(params, grads, step):
+        params["w"] = params["w"].astype(np.float64)
+
+    def removes(params, grads, step):
+        del params["b"]
+
+    with pytest.raises(RuleError, match="bad rule"):
+        t.step_with(BIAS_BATCH, raises)
+    with pytest.raises(ValueError, match=r"shape \[3\]; the param is \[2, 2\]"):
+        t.step_with(BIAS_BATCH, wrong_shape)
+    with pytest.raises(ValueError, match="dtype float32"):
+        t.step_with(BIAS_BATCH, wrong_dtype)
+    with pytest.raises(ValueError, match="removed 'b'"):
+        t.step_with(BIAS_BATCH, removes)
+    for n, v in t.params().items():
+        np.testing.assert_array_equal(v, before[n])
+    assert t.steps() == 0
+
+
 @training
 def test_trainer_names_its_params_when_wrt_is_wrong():
     with pytest.raises(ValueError, match=r"not a Param in this graph — it has \[w\]"):
@@ -254,3 +348,43 @@ def test_streaming_decode_matches_a_full_decode():
     ids = tok.encode(text_in, add_special=False)
     streamed = "".join(tok.decode_incremental(i) for i in ids) + tok.finish_stream()
     assert streamed == tok.decode(ids)
+
+
+@training
+def test_trainer_schedules_accumulates_and_scales_like_torch_training(tmp_path):
+    sched = {"kind": "cosine", "total_steps": 20, "warmup_steps": 4, "min_factor": 0.1}
+    t = rlx.Trainer(bias_graph(), wrt=["w", "b"], init=BIAS_INIT, optimizer={"kind": "adamw", "lr": 0.1},
+                    schedule=sched)
+    rates = []
+    for _ in range(20):
+        t.step(BIAS_BATCH)
+        rates.append(t.lr())
+    assert rates[0] == 0.0 and abs(max(rates) - 0.1) < 1e-6 and rates[-1] < 0.02
+
+    acc = rlx.Trainer(bias_graph(), wrt=["w", "b"], init=BIAS_INIT, optimizer="sgd", accumulate=3)
+    for _ in range(7):
+        acc.step(BIAS_BATCH)
+    assert acc.steps() == 2
+
+    scaled = rlx.Trainer(bias_graph(), wrt=["w", "b"], init=BIAS_INIT, optimizer="adamw", loss_scale="dynamic")
+    plain = rlx.Trainer(bias_graph(), wrt=["w", "b"], init=BIAS_INIT, optimizer="adamw")
+    for _ in range(10):
+        assert scaled.step(BIAS_BATCH) == plain.step(BIAS_BATCH)
+    assert scaled.loss_scale() == 65536.0 and scaled.skipped_updates() == 0
+    assert plain.loss_scale() is None
+    with pytest.raises(ValueError, match="triangle"):
+        rlx.Trainer(bias_graph(), wrt=["w", "b"], init=BIAS_INIT, schedule={"kind": "triangle"})
+
+
+@training
+def test_trainer_run_evaluates_keeps_the_best_and_stops_early(tmp_path):
+    t = rlx.Trainer(bias_graph(), wrt=["w", "b"], init=BIAS_INIT, optimizer={"kind": "sgd", "lr": 0.05})
+    # The evaluation batch's target is unreachable, so its loss stops improving.
+    held_out = {"x": np.array([1, 2], np.float32), "t": np.array([5, -3], np.float32)}
+    summary = t.run(500, lambda i: BIAS_BATCH, eval_batch=held_out, eval_every=10, patience=3,
+                    checkpoint=str(tmp_path / "ck"), checkpoint_every=50)
+    assert summary["stopped"] and summary["steps"] < 500
+    assert summary["best_step"] is not None and len(summary["evals"]) >= 4
+    assert (tmp_path / "ck" / "best.gguf").exists()
+    with pytest.raises(ValueError, match="eval_batch"):
+        t.run(5, lambda i: BIAS_BATCH, eval_every=2)

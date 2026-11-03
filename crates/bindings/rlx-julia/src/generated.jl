@@ -1170,9 +1170,10 @@ function set_lr(self::Optimizer, lr)
 end
 
 """
-Takes `graph` (consumed): its first output is the loss. `wrt` are the
-trainable params; `initial` their starting values. options: {optimizer,
-device, resident, clip_norm, …}.
+Takes `graph` (consumed): its first output is the loss (further outputs
+reach step_with by name). `wrt` are the trainable params; `initial`
+their starting values. options: {optimizer, device, resident, clip_norm,
+schedule, accumulate, loss_scale, …}.
 """
 function Trainer(graph, wrt, initial; options=nothing)
     _a_wrt_b, _a_wrt_p = _cstrs(wrt)

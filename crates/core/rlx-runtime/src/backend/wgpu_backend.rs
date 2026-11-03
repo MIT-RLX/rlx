@@ -309,10 +309,9 @@ impl ExecutableGraph for WgpuExecutableWrapper {
             });
         }
         Box::pin(async move {
-            Ok(self
-                .inner
-                .run_read_outputs_async(inputs, read_indices)
-                .await)
+            self.inner
+                .try_run_read_outputs_async(inputs, read_indices)
+                .await
         })
     }
 }

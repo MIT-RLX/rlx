@@ -33,6 +33,9 @@ gguf-onnx = ["gguf-convert", "rlx-gguf-convert/onnx"]
 # `Optimizer` / `Trainer` (rlx-optim; the resident path needs rlx-runtime's
 # training support). Checkpoints need `gguf-io` as well.
 training = ["runtime", "dep:rlx-optim", "rlx-runtime/training"]
+# `runtime::agent` — a coding agent rewriting the optimizer while the model
+# trains (OPAL's protocol over `Trainer::step_with`).
+agent = ["training", "dep:rlx-agent"]
 # Tokenizers, sampling and chat templates (rlx-text).
 text = ["runtime", "dep:rlx-text"]
 # `export_fpga` — SystemVerilog export (rlx-fpga).
@@ -41,6 +44,11 @@ fpga = ["runtime", "rlx-runtime/fpga", "dep:rlx-fpga"]
 # downstream collections) — `runtime::model`.
 models = ["runtime", "dep:anyhow", "rlx-runtime/model-io", "rlx-runtime/model-plugins"]
 weights = ["runtime", "dep:anyhow", "dep:rlx-pkg", "dep:rlx-mlx-io", "dep:rlx-dduf", "dep:rlx-nemo"]
+
+[[bin]]
+name = "rlx-agent-opt"
+path = "src/bin/rlx-agent-opt.rs"
+required-features = ["agent"]
 
 [dependencies]
 rlx-ir   = { workspace = true }
@@ -58,6 +66,7 @@ rlx-dduf    = { workspace = true, optional = true }
 rlx-nemo    = { workspace = true, optional = true }
 rlx-text    = { workspace = true, optional = true }
 rlx-optim   = { workspace = true, optional = true }
+rlx-agent   = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The IR drift check parses rlx-ir's sources to list its public builders.

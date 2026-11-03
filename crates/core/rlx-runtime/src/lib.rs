@@ -243,7 +243,7 @@ pub use backend::{Backend, ExecutableGraph, compile_hir, compile_module};
 pub use backends_manifest::BackendsManifest;
 pub use browser::{
     BrowserCompiledGraph, BrowserError, BrowserSession, browser_block_reason, init_webgpu,
-    supports_browser_graph,
+    supports_browser_graph, webgpu_lost,
 };
 pub use browser_support::{
     collective_block_reason, passes_browser_preflight, select_browser_device_for_graph,

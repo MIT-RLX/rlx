@@ -1712,9 +1712,10 @@ type TrainerOpts struct {
 	Options map[string]any
 }
 
-// NewTrainer: Takes `graph` (consumed): its first output is the loss. `wrt` are the
-// trainable params; `initial` their starting values. options: {optimizer,
-// device, resident, clip_norm, …}.
+// NewTrainer: Takes `graph` (consumed): its first output is the loss (further outputs
+// reach step_with by name). `wrt` are the trainable params; `initial`
+// their starting values. options: {optimizer, device, resident, clip_norm,
+// schedule, accumulate, loss_scale, …}.
 func NewTrainer(graph *Graph, wrt []string, initial map[string][]float32, opts *TrainerOpts) (res *Trainer, err error) {
 	var options map[string]any
 	if opts != nil {

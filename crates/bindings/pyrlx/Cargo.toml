@@ -48,7 +48,7 @@ gpu             = ["rlx-runtime/gpu"]
 cuda            = ["rlx-runtime/cuda"]
 fpga            = ["rlx-runtime/fpga", "dep:rlx-fpga"]
 # `pyrlx.Trainer` / `pyrlx.Optimizer` — Adam, AdamW, Muon, SOAP, … (rlx-optim).
-training        = ["rlx-runtime/training", "rlx-bind/training"]
+training        = ["rlx-runtime/training", "rlx-bind/training", "rlx-bind/agent"]
 # `pyrlx.load_tokenizer` / `render_chat` / `Sampler` — the LM text layer (rlx-text).
 text            = ["rlx-bind/text"]
 # `Model` — models from any provider (`.rlxp`, plugins).

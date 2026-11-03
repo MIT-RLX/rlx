@@ -5042,16 +5042,18 @@ public final class RLX {
         }
 
         /**
-         * Takes `graph` (consumed): its first output is the loss. `wrt` are the
-         * trainable params; `initial` their starting values. options: {optimizer,
-         * device, resident, clip_norm, …}.
+         * Takes `graph` (consumed): its first output is the loss (further outputs
+         * reach step_with by name). `wrt` are the trainable params; `initial`
+         * their starting values. options: {optimizer, device, resident, clip_norm,
+         * schedule, accumulate, loss_scale, …}.
          */
         public Trainer(Graph graph, String[] wrt, Map<String, float[]> initial) { this(graph, wrt, initial, (TrainerOpts) null); }
 
         /**
-         * Takes `graph` (consumed): its first output is the loss. `wrt` are the
-         * trainable params; `initial` their starting values. options: {optimizer,
-         * device, resident, clip_norm, …}.
+         * Takes `graph` (consumed): its first output is the loss (further outputs
+         * reach step_with by name). `wrt` are the trainable params; `initial`
+         * their starting values. options: {optimizer, device, resident, clip_norm,
+         * schedule, accumulate, loss_scale, …}.
          */
         public Trainer(Graph graph, String[] wrt, Map<String, float[]> initial, TrainerOpts opts) {
             this(makeTrainer(graph, wrt, initial, opts));

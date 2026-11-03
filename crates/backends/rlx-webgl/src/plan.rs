@@ -764,7 +764,7 @@ fn require_last_axis(axis: i32, rank: usize, op: &str) -> Result<()> {
     Ok(())
 }
 
-fn map_act(a: Activation) -> Result<Act> {
+pub(crate) fn map_act(a: Activation) -> Result<Act> {
     Ok(match a {
         Activation::Relu => Act::Relu,
         Activation::Neg => Act::Neg,

@@ -627,7 +627,7 @@ fn trainer_round_trips_weights_through_set_params() {
 #[test]
 fn trainer_rejects_a_graph_that_is_not_a_scalar_loss() {
     // `grad` seeds d_output with 1, which only means "differentiate the loss"
-    // when the graph ends on one output.
+    // when the first output is one number (further outputs may follow it).
     let err = eval_err(
         r#"
         const g = new rlx.Graph("two");
@@ -638,7 +638,7 @@ fn trainer_rejects_a_graph_that_is_not_a_scalar_loss() {
         "#,
     );
     assert!(
-        err.contains("exactly one output"),
+        err.contains("first output must be the scalar loss"),
         "want the scalar-loss message, got: {err}"
     );
 }

@@ -1,0 +1,14 @@
+# Regenerates ../src/onnx.rs from ../onnx.proto. Not a workspace member and not
+# published; run it by hand when the schema or the protobuf version changes:
+#   cargo run --manifest-path crates/io/rlx-onnx-proto/regen/Cargo.toml
+[package]
+name = "rlx-onnx-proto-regen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+# Must equal the `protobuf` pin in ../Cargo.toml.
+protobuf-codegen = "=3.7.2"

@@ -3227,9 +3227,10 @@ final class Trainer extends _Handle {
   static final _fin = NativeFinalizer(_free.cast());
   Trainer._(Pointer<Void> h) : super(h, _free, _fin);
 
-  /// Takes `graph` (consumed): its first output is the loss. `wrt` are the
-  /// trainable params; `initial` their starting values. options: {optimizer,
-  /// device, resident, clip_norm, …}.
+  /// Takes `graph` (consumed): its first output is the loss (further outputs
+  /// reach step_with by name). `wrt` are the trainable params; `initial`
+  /// their starting values. options: {optimizer, device, resident, clip_norm,
+  /// schedule, accumulate, loss_scale, …}.
   factory Trainer(Graph graph, List<String> wrt, Map<String, List<double>> initial, {Object? options}) {
     return using(($a) {
       final inInitial = _inputs($a, initial);

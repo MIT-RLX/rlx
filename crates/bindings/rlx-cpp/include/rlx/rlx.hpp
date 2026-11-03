@@ -1817,9 +1817,10 @@ class Trainer : public detail::Handle<RlxTrainer, ::rlx_trainer_free>, public de
 public:
     explicit Trainer(RlxTrainer* h) : Handle(h) {}
 
-    /// Takes `graph` (consumed): its first output is the loss. `wrt` are the
-    /// trainable params; `initial` their starting values. options: {optimizer,
-    /// device, resident, clip_norm, …}.
+    /// Takes `graph` (consumed): its first output is the loss (further outputs
+    /// reach step_with by name). `wrt` are the trainable params; `initial`
+    /// their starting values. options: {optimizer, device, resident, clip_norm,
+    /// schedule, accumulate, loss_scale, …}.
     explicit Trainer(Graph& graph, const std::vector<std::string>& wrt, const Inputs& initial, const TrainerInitOpts& opts = {});
 
     /// One optimizer step on a batch; returns the loss.

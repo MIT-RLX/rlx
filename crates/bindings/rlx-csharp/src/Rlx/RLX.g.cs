@@ -3380,9 +3380,10 @@ public static partial class RLX
         protected override void Free(IntPtr h) => Native.rlx_trainer_free(h);
 
         /// <summary>
-        /// Takes `graph` (consumed): its first output is the loss. `wrt` are the
-        /// trainable params; `initial` their starting values. options: {optimizer,
-        /// device, resident, clip_norm, …}.
+        /// Takes `graph` (consumed): its first output is the loss (further outputs
+        /// reach step_with by name). `wrt` are the trainable params; `initial`
+        /// their starting values. options: {optimizer, device, resident, clip_norm,
+        /// schedule, accumulate, loss_scale, …}.
         /// </summary>
         public Trainer(Graph graph, string[] wrt, IDictionary<string, float[]> initial, object? options = null) : this(Make(graph, wrt, initial, options)) { }
 

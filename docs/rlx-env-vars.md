@@ -13,7 +13,7 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 808  
+**Registered names:** 809  
 **Unregistered mentions (migration leftovers):** 142
 
 ## Groups
@@ -22,7 +22,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [coreml](#coreml) — 20
 - [cpu](#cpu) — 39
 - [cuda](#cuda) — 77
-- [debug](#debug) — 20
+- [debug](#debug) — 21
 - [device](#device) — 4
 - [egpu](#egpu) — 8
 - [fft](#fft) — 13
@@ -235,6 +235,7 @@ semantics. Curated Public list: `just env-catalog`.
 
 | Name | Stability | Kind | Layer | Summary |
 |------|-----------|------|-------|---------|
+| `RLX_AGENT_REAL_CLI` | Internal | Bool | Tooling | Run rlx-bind's agent test against the real Claude Code CLI (billed; with `-- --ignored`) |
 | `RLX_ALLOW_THROTTLE` | Public | Bool | Tooling | Skip thermal gate for one-off benches (prefer `just throttle`) |
 | `RLX_BLESS_RLXMODEL` | Internal | Bool | Tooling | Rewrite the every-op `.rlxmodel` test fixture instead of comparing against it |
 | `RLX_CHECK` | Bisect | String | Runtime | Static-check breadth: off | all | strict |

@@ -347,16 +347,24 @@ class Optimizer [feature=training]
     step(params: param_grads) [manual]
     /// Change the learning rate.
     set_lr(lr: f32)
+    /// The algorithm's state {step, buffers} for a checkpoint; none when it cannot save it.
+    state_dict() -> object? [manual c=- js=- swift=- why="returns and takes float32 arrays keyed by name; so far only Python's agent programs (pyrlx.AgentOptimizer) checkpoint through it"]
+    /// Restore state_dict's snapshot; returns whether the algorithm took it.
+    load_state_dict(state: value) -> bool [manual c=- js=- swift=- why="returns and takes float32 arrays keyed by name; so far only Python's agent programs (pyrlx.AgentOptimizer) checkpoint through it"]
 end
 
 /// Trains a graph's parameters: forward, backward, optimizer, on one device.
 class Trainer [feature=training]
-    /// Takes `graph` (consumed): its first output is the loss. `wrt` are the
-    /// trainable params; `initial` their starting values. options: {optimizer,
-    /// device, resident, clip_norm, …}.
+    /// Takes `graph` (consumed): its first output is the loss (further outputs
+    /// reach step_with by name). `wrt` are the trainable params; `initial`
+    /// their starting values. options: {optimizer, device, resident, clip_norm,
+    /// schedule, accumulate, loss_scale, …}.
     new(graph: graph, wrt: strs, initial: inputs, options: json?)
     /// One optimizer step on a batch; returns the loss.
     step(batch: inputs) -> f32
+    /// One step whose update `update(params, grads, step)` makes in place,
+    /// instead of the trainer's optimizer; returns the loss.
+    step_with(batch: inputs, update: callback) -> f32 [manual c=- js=- swift=- why="the update rule runs as host code in the caller's language; so far only Python drives it (OPAL-style agent-written optimizers)"]
     /// The loss on a batch, no update.
     evaluate(batch: inputs) -> f32
     /// Train `steps` steps, pulling batches from a callback; returns a summary.
@@ -381,6 +389,16 @@ class Trainer [feature=training]
     set_lr(lr: f32)
     /// Steps taken.
     steps() -> u64
+    /// The learning rate the last update used (the schedule's, under one).
+    lr() -> f32 [c=- js=- swift=- why="read-backs of the schedule and loss scaling, so far used from Python only; every binding sets them through the options"]
+    /// The loss scale now, under loss_scale.
+    loss_scale() -> f32? [c=- js=- swift=- why="read-backs of the schedule and loss scaling, so far used from Python only; every binding sets them through the options"]
+    /// Train data-parallel over `group` (DDP): rank 0's params are broadcast; each update uses the mean gradient over the ranks.
+    set_data_parallel(group: Group&) [c=- js=- swift=- why="data-parallel training is driven from Python so far; the C and JS Group handles do not reach the Trainer yet"]
+    /// Whether every rank holds the same params.
+    replicas_agree() -> bool [c=- js=- swift=- why="data-parallel training is driven from Python so far; the C and JS Group handles do not reach the Trainer yet"]
+    /// Updates skipped for non-finite gradients under loss_scale.
+    skipped_updates() -> u64 [c=- js=- swift=- why="read-backs of the schedule and loss scaling, so far used from Python only; every binding sets them through the options"]
     /// The device it trains on.
     device() -> str
     /// Checkpoint parameters + optimizer state as GGUF; returns tensors written.
@@ -543,7 +561,7 @@ end
 
 # ── language-native helpers (not rows) ───────────────────────────────────────
 
-host py: Graph Node graph dsl jacfwd run set_param dtype_str numpy_dtype batch_narrow_relu_graph from_torch export_torch_ir torch_import FusionOptions DevicePolicy DeviceCandidate DeviceBenchResult GgufConvertReport
-    why="graph construction (op table), NumPy dtype helpers, PyTorch import, and typed builders/results for options the other bindings pass as objects"
+host py: Graph Node graph dsl jacfwd run set_param dtype_str numpy_dtype batch_narrow_relu_graph from_torch export_torch_ir torch_import FusionOptions DevicePolicy DeviceCandidate DeviceBenchResult GgufConvertReport AgentOptimizer
+    why="graph construction (op table), NumPy dtype helpers, PyTorch import, typed builders/results for options the other bindings pass as objects, and AgentOptimizer (a coding agent rewriting a Trainer's optimizer: its programs run as Python in the training process and the agent CLI is launched from it)"
 host js: Graph Tensor dsl env console fileExists fileSize listDir mkdirs readFile readFileInto readFileRange readText removeFile writeFile sleep toFloat32 oneHot gatherRows
     why="graph construction (op table + Tensor DSL) and the script host's own file system, timers and typed-array helpers"

@@ -9,42 +9,43 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use protobuf::Message;
-use rlx_onnx_proto::onnx::{
-    AttributeProto_AttributeType, ModelProto, TensorProto, TensorProto_DataType, TypeProto_Tensor,
-};
+use protobuf::UnknownValueRef;
+use rlx_onnx_proto::onnx::attribute_proto::AttributeType;
+use rlx_onnx_proto::onnx::tensor_proto::DataType;
+use rlx_onnx_proto::onnx::{ModelProto, StringStringEntryProto, TensorProto, type_proto};
 use serde_json::json;
 
 use crate::bundle::{BundleManifest, BundleNode, IoMeta, TensorMeta};
 use crate::lower::{ImportOptions, ImportReport, build_hir_from_parts};
 use crate::shape_propagate::propagate_shapes;
 
-fn tensor_dtype(elem: TensorProto_DataType) -> String {
+fn tensor_dtype(elem: DataType) -> String {
     match elem {
-        TensorProto_DataType::FLOAT => "f32".to_string(),
-        TensorProto_DataType::INT64 => "i64".to_string(),
-        TensorProto_DataType::INT32 => "i32".to_string(),
-        TensorProto_DataType::BOOL => "bool".to_string(),
+        DataType::FLOAT => "f32".to_string(),
+        DataType::INT64 => "i64".to_string(),
+        DataType::INT32 => "i32".to_string(),
+        DataType::BOOL => "bool".to_string(),
         other => format!("type_{other:?}"),
     }
 }
 
-fn shape_from_tensor_type(tt: &TypeProto_Tensor) -> Vec<serde_json::Value> {
-    if !tt.has_shape() {
+fn shape_from_tensor_type(tt: &type_proto::Tensor) -> Vec<serde_json::Value> {
+    let Some(shape) = tt.shape.as_ref() else {
         return vec![json!("?")];
-    }
-    tt.get_shape()
-        .get_dim()
+    };
+    shape
+        .dim
         .iter()
         .map(|d| {
             if d.has_dim_value() {
-                let v = d.get_dim_value();
+                let v = d.dim_value();
                 if v > 0 { json!(v) } else { json!("?") }
-            } else if d.has_dim_param() && !d.get_dim_param().is_empty() {
+            } else if d.has_dim_param() && !d.dim_param().is_empty() {
                 // Preserve the symbolic NAME (e.g. `batch_size`, `text_length`) so
                 // the resolver can tell a batch dim (→1) from a length dim (→seq).
                 // Dropping it to "?" made every dynamic dim resolve to seq_len,
                 // mangling batch (see resolve_dim_ir named-dim handling).
-                json!(d.get_dim_param())
+                json!(d.dim_param())
             } else {
                 json!("?")
             }
@@ -65,29 +66,49 @@ fn f32_from_raw(raw: &[u8], n: usize) -> Option<Vec<f32>> {
     )
 }
 
+/// The tensor's `data_type` as the raw ONNX number. Values this (older) schema has
+/// no enum variant for, e.g. BFLOAT16 = 16, are kept as-is rather than collapsing
+/// to `UNDEFINED` the way `TensorProto::data_type()` does.
+fn raw_dtype(t: &TensorProto) -> i32 {
+    t.data_type.map_or(0, |d| d.value())
+}
+
 fn tensor_to_f32(name: &str, t: &TensorProto) -> Result<Vec<f32>> {
-    if t.get_dims().contains(&0) {
+    if t.dims.contains(&0) {
         return Ok(Vec::new());
     }
-    let n = t.get_dims().iter().product::<i64>().max(1) as usize;
-    if !t.get_float_data().is_empty() {
-        return Ok(t.get_float_data().to_vec());
+    let n = t.dims.iter().product::<i64>().max(1) as usize;
+    if !t.float_data.is_empty() {
+        return Ok(t.float_data.to_vec());
     }
-    if let Some(v) = f32_from_raw(t.get_raw_data(), n) {
+    if let Some(v) = f32_from_raw(t.raw_data(), n) {
         return Ok(v);
     }
-    let dt = t.get_data_type();
+    let dt = t.data_type();
     match dt {
-        TensorProto_DataType::FLOAT | TensorProto_DataType::UNDEFINED => {
-            if let Some(v) = f32_from_raw(t.get_raw_data(), n) {
+        _ if raw_dtype(t) == 16 => {
+            // BFLOAT16. Not in the vendored enum, so `dt` reads as UNDEFINED —
+            // this arm must come before the FLOAT | UNDEFINED one.
+            let raw = t.raw_data();
+            if raw.len() == n * 2 {
+                return Ok(raw
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_bits((u32::from(c[0]) | (u32::from(c[1]) << 8)) << 16))
+                    .collect());
+            }
+        }
+        DataType::FLOAT | DataType::UNDEFINED => {
+            if let Some(v) = f32_from_raw(t.raw_data(), n) {
                 return Ok(v);
             }
         }
-        TensorProto_DataType::INT64 => {
-            let ints: Vec<i64> = if !t.get_int64_data().is_empty() {
-                t.get_int64_data().to_vec()
-            } else if t.get_raw_data().len() == n * 8 {
-                t.get_raw_data()
+        DataType::INT64 => {
+            let ints: Vec<i64> = if !t.int64_data.is_empty() {
+                t.int64_data.to_vec()
+            } else if t.raw_data().len() == n * 8 {
+                t.raw_data()
                     .as_chunks::<8>()
                     .0
                     .iter()
@@ -98,8 +119,8 @@ fn tensor_to_f32(name: &str, t: &TensorProto) -> Result<Vec<f32>> {
             };
             return Ok(ints.into_iter().map(|x| x as f32).collect());
         }
-        TensorProto_DataType::INT32 => {
-            let raw = t.get_raw_data();
+        DataType::INT32 => {
+            let raw = t.raw_data();
             if raw.len() == n * 4 {
                 return Ok(raw
                     .as_chunks::<4>()
@@ -109,31 +130,19 @@ fn tensor_to_f32(name: &str, t: &TensorProto) -> Result<Vec<f32>> {
                     .collect());
             }
         }
-        TensorProto_DataType::UINT8 | TensorProto_DataType::INT8 => {
-            let raw = t.get_raw_data();
+        DataType::UINT8 | DataType::INT8 => {
+            let raw = t.raw_data();
             return Ok(raw.iter().map(|&b| b as f32).collect());
         }
-        _ if dt as i32 == 10 => {
+        _ if raw_dtype(t) == 10 => {
             // FLOAT16
-            let raw = t.get_raw_data();
+            let raw = t.raw_data();
             if raw.len() == n * 2 {
                 return Ok(raw
                     .as_chunks::<2>()
                     .0
                     .iter()
                     .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                    .collect());
-            }
-        }
-        _ if dt as i32 == 16 => {
-            // BFLOAT16 (not in older protobuf enums)
-            let raw = t.get_raw_data();
-            if raw.len() == n * 2 {
-                return Ok(raw
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| f32::from_bits((u32::from(c[0]) | (u32::from(c[1]) << 8)) << 16))
                     .collect());
             }
         }
@@ -145,18 +154,18 @@ fn tensor_to_f32(name: &str, t: &TensorProto) -> Result<Vec<f32>> {
 fn tensor_to_i64(name: &str, t: &TensorProto) -> Result<Vec<i64>> {
     // A genuinely empty tensor (a dim of 0, e.g. a `Reshape`-to-scalar target `[]`)
     // has no data — return the empty vector rather than bailing on the byte check.
-    if t.get_dims().contains(&0) {
+    if t.dims.contains(&0) {
         return Ok(Vec::new());
     }
-    let n = t.get_dims().iter().product::<i64>().max(1) as usize;
-    if !t.get_int64_data().is_empty() {
-        return Ok(t.get_int64_data().to_vec());
+    let n = t.dims.iter().product::<i64>().max(1) as usize;
+    if !t.int64_data.is_empty() {
+        return Ok(t.int64_data.to_vec());
     }
-    if !t.get_int32_data().is_empty() {
-        return Ok(t.get_int32_data().iter().map(|&x| x as i64).collect());
+    if !t.int32_data.is_empty() {
+        return Ok(t.int32_data.iter().map(|&x| x as i64).collect());
     }
-    let raw = t.get_raw_data();
-    match t.get_data_type() as i32 {
+    let raw = t.raw_data();
+    match raw_dtype(t) {
         7 if raw.len() == n * 8 => {
             return Ok(raw
                 .as_chunks::<8>()
@@ -182,26 +191,26 @@ fn tensor_to_i64(name: &str, t: &TensorProto) -> Result<Vec<i64>> {
 }
 
 fn parse_attribute(a: &rlx_onnx_proto::onnx::AttributeProto) -> Option<serde_json::Value> {
-    use AttributeProto_AttributeType::*;
-    let name = a.get_name();
-    match a.get_field_type() {
-        INT => Some(json!(a.get_i())),
-        INTS => Some(json!(a.get_ints().to_vec())),
-        FLOAT => Some(json!(a.get_f())),
-        FLOATS => Some(json!(a.get_floats().to_vec())),
+    use AttributeType::*;
+    let name = a.name();
+    match a.type_() {
+        INT => Some(json!(a.i())),
+        INTS => Some(json!(a.ints.to_vec())),
+        FLOAT => Some(json!(a.f())),
+        FLOATS => Some(json!(a.floats.to_vec())),
         STRING => {
-            let s = a.get_s();
+            let s = a.s();
             Some(json!(String::from_utf8_lossy(s).into_owned()))
         }
         STRINGS => Some(json!(
-            a.get_strings()
+            a.strings
                 .iter()
                 .map(|s| String::from_utf8_lossy(s).into_owned())
                 .collect::<Vec<_>>()
         )),
         TENSOR => {
-            let t = a.get_t();
-            let dims: Vec<i64> = t.get_dims().to_vec();
+            let t = &*a.t;
+            let dims: Vec<i64> = t.dims.to_vec();
             // Also capture the scalar value for small tensors. The metadata-only
             // form dropped the data, so `ConstantOfShape(value=1)` (all-ones mask
             // prefix) silently became 0. Cheap and additive — larger tensor attrs
@@ -217,7 +226,7 @@ fn parse_attribute(a: &rlx_onnx_proto::onnx::AttributeProto) -> Option<serde_jso
             Some(json!({
                 "tensor": {
                     "dims": dims,
-                    "dtype": tensor_dtype(t.get_data_type()),
+                    "dtype": tensor_dtype(t.data_type()),
                     "scalar": scalar,
                 }
             }))
@@ -290,23 +299,23 @@ fn fold_constant_node(
     const_shapes: &mut HashMap<String, Vec<usize>>,
     folded_constants: &mut HashSet<String>,
 ) {
-    if n.get_op_type() != "Constant" || n.get_output().is_empty() {
+    if n.op_type() != "Constant" || n.output.is_empty() {
         return;
     }
-    let out = n.get_output()[0].to_string();
+    let out = n.output[0].to_string();
     let mut shape: Option<Vec<usize>> = None;
-    for a in n.get_attribute() {
+    for a in &n.attribute {
         // `value_int`/`value_float` are always rank-0 scalars.
-        if matches!(a.get_name(), "value_int" | "value_float") {
+        if matches!(a.name(), "value_int" | "value_float") {
             SCALAR_CONSTS.with(|c| {
                 c.borrow_mut().insert(out.clone());
             });
         }
-        match a.get_name() {
+        match a.name() {
             "value" => {
-                let t = a.get_t();
-                let dims: Vec<usize> = t.get_dims().iter().map(|&d| d.max(1) as usize).collect();
-                if t.get_dims().is_empty() {
+                let t = &*a.t;
+                let dims: Vec<usize> = t.dims.iter().map(|&d| d.max(1) as usize).collect();
+                if t.dims.is_empty() {
                     SCALAR_CONSTS.with(|c| {
                         c.borrow_mut().insert(out.clone());
                     });
@@ -314,7 +323,7 @@ fn fold_constant_node(
                 // Fold non-fatally: a Constant we cannot convert (external data,
                 // exotic dtype) is left in the graph for `lower_constant` rather
                 // than failing the whole import — folding is an optimization.
-                let folded = match t.get_data_type() as i32 {
+                let folded = match raw_dtype(t) {
                     6 | 7 | 9 => match tensor_to_i64(&out, t) {
                         Ok(v) => {
                             i64_params.insert(out.clone(), v);
@@ -335,20 +344,20 @@ fn fold_constant_node(
                 }
             }
             "value_float" => {
-                params.insert(out.clone(), vec![a.get_f()]);
+                params.insert(out.clone(), vec![a.f()]);
                 shape = Some(vec![1]);
             }
             "value_int" => {
-                i64_params.insert(out.clone(), vec![a.get_i()]);
+                i64_params.insert(out.clone(), vec![a.i()]);
                 shape = Some(vec![1]);
             }
             "value_floats" => {
-                let v = a.get_floats().to_vec();
+                let v = a.floats.to_vec();
                 shape = Some(vec![v.len().max(1)]);
                 params.insert(out.clone(), v);
             }
             "value_ints" => {
-                let v = a.get_ints().to_vec();
+                let v = a.ints.to_vec();
                 shape = Some(vec![v.len().max(1)]);
                 i64_params.insert(out.clone(), v);
             }
@@ -362,13 +371,12 @@ fn fold_constant_node(
 }
 
 fn output_meta_from_value_info(v: &rlx_onnx_proto::onnx::ValueInfoProto) -> serde_json::Value {
-    if v.has_field_type() {
-        let tp = v.get_field_type();
+    if let Some(tp) = v.type_.as_ref() {
         if tp.has_tensor_type() {
-            let tt = tp.get_tensor_type();
+            let tt = tp.tensor_type();
             return json!({
                 "shape": shape_from_tensor_type(tt),
-                "dtype": tensor_dtype(tt.get_elem_type()),
+                "dtype": tensor_dtype(tt.elem_type()),
             });
         }
     }
@@ -379,21 +387,20 @@ fn build_value_info_map(
     graph: &rlx_onnx_proto::onnx::GraphProto,
 ) -> HashMap<String, serde_json::Value> {
     let mut map = HashMap::new();
-    for v in graph.get_input() {
-        map.insert(v.get_name().to_string(), output_meta_from_value_info(v));
+    for v in &graph.input {
+        map.insert(v.name().to_string(), output_meta_from_value_info(v));
     }
-    for v in graph.get_output() {
-        map.insert(v.get_name().to_string(), output_meta_from_value_info(v));
+    for v in &graph.output {
+        map.insert(v.name().to_string(), output_meta_from_value_info(v));
     }
-    for v in graph.get_value_info() {
-        map.insert(v.get_name().to_string(), output_meta_from_value_info(v));
+    for v in &graph.value_info {
+        map.insert(v.name().to_string(), output_meta_from_value_info(v));
     }
-    for init in graph.get_initializer() {
-        let shape: Vec<serde_json::Value> =
-            init.get_dims().iter().map(|&d| json!(d.max(1))).collect();
+    for init in &graph.initializer {
+        let shape: Vec<serde_json::Value> = init.dims.iter().map(|&d| json!(d.max(1))).collect();
         map.insert(
-            init.get_name().to_string(),
-            json!({"shape": shape, "dtype": tensor_dtype(init.get_data_type())}),
+            init.name().to_string(),
+            json!({"shape": shape, "dtype": tensor_dtype(init.data_type())}),
         );
     }
     map
@@ -412,7 +419,7 @@ fn io_meta_from_value_info(v: &rlx_onnx_proto::onnx::ValueInfoProto) -> IoMeta {
         .unwrap_or("f32")
         .to_string();
     IoMeta {
-        name: v.get_name().to_string(),
+        name: v.name().to_string(),
         meta: TensorMeta { shape, dtype },
     }
 }
@@ -425,7 +432,6 @@ fn io_meta_from_value_info(v: &rlx_onnx_proto::onnx::ValueInfoProto) -> IoMeta {
 /// that carries them we read `<onnx_dir>/<location>[offset .. offset+length]` and
 /// set it as `raw_data`, so the tensor becomes indistinguishable from an inline one.
 fn resolve_external_initializers(model: &mut ModelProto, onnx_path: &Path) -> Result<()> {
-    use rlx_onnx_proto::onnx::StringStringEntryProto;
     const EXTERNAL_DATA_FIELD: u32 = 13;
     const DATA_LOCATION_FIELD: u32 = 14;
     let dir = onnx_path
@@ -433,30 +439,36 @@ fn resolve_external_initializers(model: &mut ModelProto, onnx_path: &Path) -> Re
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| Path::new(".").to_path_buf());
     let mut cache: HashMap<String, Vec<u8>> = HashMap::new();
-    for init in model.mut_graph().mut_initializer().iter_mut() {
-        if !init.get_raw_data().is_empty() {
+    for init in model.graph.mut_or_insert_default().initializer.iter_mut() {
+        if !init.raw_data().is_empty() {
             continue; // already inline
         }
-        let uf = init.get_unknown_fields();
-        let entries: Vec<Vec<u8>> = uf
-            .get(EXTERNAL_DATA_FIELD)
-            .map(|v| v.length_delimited.clone())
-            .unwrap_or_default();
-        let is_external = uf
-            .get(DATA_LOCATION_FIELD)
-            .and_then(|v| v.varint.first().copied())
-            == Some(1)
-            || !entries.is_empty();
+        // `UnknownFields::get` yields only one value per field number, but
+        // `external_data` is repeated — walk them all.
+        let mut entries: Vec<&[u8]> = Vec::new();
+        let mut data_location = None;
+        for (field, value) in init.special_fields.unknown_fields().iter() {
+            match (field, value) {
+                (EXTERNAL_DATA_FIELD, UnknownValueRef::LengthDelimited(bytes)) => {
+                    entries.push(bytes)
+                }
+                (DATA_LOCATION_FIELD, UnknownValueRef::Varint(v)) if data_location.is_none() => {
+                    data_location = Some(v)
+                }
+                _ => {}
+            }
+        }
+        let is_external = data_location == Some(1) || !entries.is_empty();
         if !is_external {
             continue;
         }
         let (mut location, mut offset, mut length) = (String::new(), 0usize, None::<usize>);
-        for e in &entries {
-            if let Ok(entry) = protobuf::parse_from_bytes::<StringStringEntryProto>(e) {
-                match entry.get_key() {
-                    "location" => location = entry.get_value().to_string(),
-                    "offset" => offset = entry.get_value().trim().parse().unwrap_or(0),
-                    "length" => length = entry.get_value().trim().parse().ok(),
+        for e in entries {
+            if let Ok(entry) = StringStringEntryProto::parse_from_bytes(e) {
+                match entry.key() {
+                    "location" => location = entry.value().to_string(),
+                    "offset" => offset = entry.value().trim().parse().unwrap_or(0),
+                    "length" => length = entry.value().trim().parse().ok(),
                     _ => {}
                 }
             }
@@ -480,7 +492,7 @@ fn resolve_external_initializers(model: &mut ModelProto, onnx_path: &Path) -> Re
         anyhow::ensure!(
             !slice.is_empty(),
             "external initializer {} resolved to empty ({location}[{offset}..{:?}])",
-            init.get_name(),
+            init.name(),
             length
         );
         init.set_raw_data(slice);
@@ -514,23 +526,23 @@ pub fn prepare_onnx_file(
     // export.
     resolve_external_initializers(&mut model, path)
         .with_context(|| format!("resolve external data for {}", path.display()))?;
-    let graph = model.get_graph();
+    let graph = &*model.graph;
 
     let mut params = HashMap::new();
     let mut i64_params = HashMap::new();
-    for init in graph.get_initializer() {
-        let name = init.get_name().to_string();
+    for init in &graph.initializer {
+        let name = init.name().to_string();
         // Rank-0 scalar initializers (empty `dims`) must be tracked like folded
         // Constant scalars so Gather can drop the gathered axis. ChatterBox
         // speech_encoder's `/Gather_2(audio, /Constant_1=0)` is the canonical case:
         // without the squeeze, Shape sees `[1, L]` and n_frames becomes
         // `(1-400)/160+1 = -1`, collapsing the STFT framing mask.
-        if init.get_dims().is_empty() {
+        if init.dims.is_empty() {
             SCALAR_CONSTS.with(|c| {
                 c.borrow_mut().insert(name.clone());
             });
         }
-        match init.get_data_type() as i32 {
+        match raw_dtype(init) {
             6 | 7 | 9 => {
                 i64_params.insert(name.clone(), tensor_to_i64(&name, init)?);
             }
@@ -546,7 +558,7 @@ pub fn prepare_onnx_file(
     // them into params/i64_params exactly like initializers, then drop the node.
     let mut const_shapes: HashMap<String, Vec<usize>> = HashMap::new();
     let mut folded_constants: HashSet<String> = HashSet::new();
-    for n in graph.get_node() {
+    for n in &graph.node {
         fold_constant_node(
             n,
             &mut params,
@@ -560,13 +572,13 @@ pub fn prepare_onnx_file(
     // output is a cached constant table (e.g. the Zipformer relative-position
     // embedding, a `then`-branch `Constant`), its data must be a param. Subgraph
     // tensor names are globally unique, so they share the top-level param maps.
-    for n in graph.get_node() {
-        if n.get_op_type() != "If" {
+    for n in &graph.node {
+        if n.op_type() != "If" {
             continue;
         }
-        for a in n.get_attribute() {
-            if matches!(a.get_field_type(), AttributeProto_AttributeType::GRAPH) {
-                for sn in a.get_g().get_node() {
+        for a in &n.attribute {
+            if matches!(a.type_(), AttributeType::GRAPH) {
+                for sn in &a.g.node {
                     fold_constant_node(
                         sn,
                         &mut params,
@@ -580,61 +592,53 @@ pub fn prepare_onnx_file(
     }
 
     let inputs: Vec<IoMeta> = graph
-        .get_input()
+        .input
         .iter()
-        .filter(|i| !params.contains_key(i.get_name()))
+        .filter(|i| !params.contains_key(i.name()))
         .map(io_meta_from_value_info)
         .collect();
 
-    let outputs: Vec<IoMeta> = graph
-        .get_output()
-        .iter()
-        .map(io_meta_from_value_info)
-        .collect();
+    let outputs: Vec<IoMeta> = graph.output.iter().map(io_meta_from_value_info).collect();
 
     let value_info = build_value_info_map(graph);
 
     let is_folded = |n: &rlx_onnx_proto::onnx::NodeProto| -> bool {
-        n.get_op_type() == "Constant"
-            && !n.get_output().is_empty()
-            && folded_constants.contains(n.get_output()[0].as_str())
+        n.op_type() == "Constant"
+            && !n.output.is_empty()
+            && folded_constants.contains(n.output[0].as_str())
     };
     // Build one `BundleNode` from an ONNX node — reused for the top-level graph AND
     // for `If`-branch subgraph nodes (so `lower_if` can inline a computed branch).
     let build_node = |n: &rlx_onnx_proto::onnx::NodeProto| -> BundleNode {
         let mut attrs = HashMap::new();
-        for a in n.get_attribute() {
+        for a in &n.attribute {
             if let Some(v) = parse_attribute(a) {
-                attrs.insert(a.get_name().to_string(), v);
+                attrs.insert(a.name().to_string(), v);
             }
         }
         // For `If`, record each branch's output tensor names so `lower_if` can map
         // the taken branch's outputs to the `If`'s outputs.
-        if n.get_op_type() == "If" {
-            for a in n.get_attribute() {
-                let key = match a.get_name() {
+        if n.op_type() == "If" {
+            for a in &n.attribute {
+                let key = match a.name() {
                     "then_branch" => "_then_outputs",
                     "else_branch" => "_else_outputs",
                     _ => continue,
                 };
-                if matches!(a.get_field_type(), AttributeProto_AttributeType::GRAPH) {
-                    let outs: Vec<String> = a
-                        .get_g()
-                        .get_output()
-                        .iter()
-                        .map(|o| o.get_name().to_string())
-                        .collect();
+                if matches!(a.type_(), AttributeType::GRAPH) {
+                    let outs: Vec<String> =
+                        a.g.output.iter().map(|o| o.name().to_string()).collect();
                     attrs.insert(key.to_string(), json!(outs));
                 }
             }
         }
-        let name = if n.get_name().is_empty() {
-            n.get_op_type().to_string()
+        let name = if n.name().is_empty() {
+            n.op_type().to_string()
         } else {
-            n.get_name().to_string()
+            n.name().to_string()
         };
         let output_meta: Vec<serde_json::Value> = n
-            .get_output()
+            .output
             .iter()
             .map(|out| {
                 value_info
@@ -650,16 +654,16 @@ pub fn prepare_onnx_file(
         };
         BundleNode {
             name,
-            op: n.get_op_type().to_string(),
-            inputs: n.get_input().to_vec(),
-            outputs: n.get_output().to_vec(),
+            op: n.op_type().to_string(),
+            inputs: n.input.to_vec(),
+            outputs: n.output.to_vec(),
             attrs,
             output_meta,
         }
     };
 
     let mut nodes: Vec<BundleNode> = graph
-        .get_node()
+        .node
         .iter()
         .filter(|n| !is_folded(n))
         .map(&build_node)
@@ -668,30 +672,30 @@ pub fn prepare_onnx_file(
     // Capture each `If`'s branch subgraph nodes (minus already-folded Constants) so
     // `lower_if` can INLINE the taken branch when its output is computed, not a
     // folded constant (MOSS codec's `If(shape[1]==1, squeeze(wave), wave)`).
-    for n in graph.get_node() {
-        if n.get_op_type() != "If" {
+    for n in &graph.node {
+        if n.op_type() != "If" {
             continue;
         }
         let mut then_nodes = Vec::new();
         let mut else_nodes = Vec::new();
-        for a in n.get_attribute() {
-            let target = match a.get_name() {
+        for a in &n.attribute {
+            let target = match a.name() {
                 "then_branch" => &mut then_nodes,
                 "else_branch" => &mut else_nodes,
                 _ => continue,
             };
-            if matches!(a.get_field_type(), AttributeProto_AttributeType::GRAPH) {
-                for sn in a.get_g().get_node() {
+            if matches!(a.type_(), AttributeType::GRAPH) {
+                for sn in &a.g.node {
                     if !is_folded(sn) {
                         target.push(build_node(sn));
                     }
                 }
             }
         }
-        let if_name = if n.get_name().is_empty() {
+        let if_name = if n.name().is_empty() {
             "If".to_string()
         } else {
-            n.get_name().to_string()
+            n.name().to_string()
         };
         IF_BRANCHES.with(|c| c.borrow_mut().insert(if_name, (then_nodes, else_nodes)));
     }
@@ -709,10 +713,10 @@ pub fn prepare_onnx_file(
     };
 
     let mut init_shapes = HashMap::new();
-    for init in graph.get_initializer() {
+    for init in &graph.initializer {
         init_shapes.insert(
-            init.get_name().to_string(),
-            init.get_dims().iter().map(|&d| d.max(1) as usize).collect(),
+            init.name().to_string(),
+            init.dims.iter().map(|&d| d.max(1) as usize).collect(),
         );
     }
     init_shapes.extend(const_shapes);
@@ -875,5 +879,56 @@ mod tests {
         assert!(params.contains_key("w"));
         assert!(params.contains_key("b"));
         assert!(init_shapes.contains_key("w"));
+    }
+
+    #[test]
+    fn bfloat16_initializer_survives_parse_and_decodes() {
+        // BFLOAT16 (16) has no variant in the vendored schema. The parsed tensor
+        // must keep the raw number so `tensor_to_f32` takes the BF16 arm.
+        let values = [1.5f32, -2.0];
+        let mut t = TensorProto::new();
+        t.dims = vec![2];
+        t.data_type = Some(protobuf::EnumOrUnknown::from_i32(16));
+        t.set_raw_data(
+            values
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect(),
+        );
+        let parsed = TensorProto::parse_from_bytes(&t.write_to_bytes().unwrap()).unwrap();
+        assert_eq!(raw_dtype(&parsed), 16);
+        assert_eq!(parsed.data_type(), DataType::UNDEFINED);
+        assert_eq!(tensor_to_f32("bf16", &parsed).unwrap(), values);
+    }
+
+    #[test]
+    fn external_data_entries_are_all_read() {
+        // `external_data` (field 13) is repeated and unknown to the schema; every
+        // entry must be seen, not just the one `UnknownFields::get` returns.
+        let dir = std::env::temp_dir().join(format!("rlx-onnx-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("w.bin"), [0u8, 0, 0, 0, 0, 0, 128, 63, 9, 9]).unwrap();
+        let mut init = TensorProto::new();
+        init.set_name("w".into());
+        init.dims = vec![1];
+        let entry = |k: &str, v: &str| {
+            let mut e = StringStringEntryProto::new();
+            e.set_key(k.into());
+            e.set_value(v.into());
+            e.write_to_bytes().unwrap()
+        };
+        let uf = init.special_fields.mut_unknown_fields();
+        uf.add_length_delimited(13, entry("location", "w.bin"));
+        uf.add_length_delimited(13, entry("offset", "4"));
+        uf.add_length_delimited(13, entry("length", "4"));
+        uf.add_varint(14, 1);
+        let mut model = ModelProto::new();
+        model.graph.mut_or_insert_default().initializer.push(init);
+        let mut model = ModelProto::parse_from_bytes(&model.write_to_bytes().unwrap()).unwrap();
+        resolve_external_initializers(&mut model, &dir.join("m.onnx")).unwrap();
+        let init = &model.graph.initializer[0];
+        assert_eq!(init.raw_data(), &[0, 0, 128, 63]);
+        assert_eq!(tensor_to_f32("w", init).unwrap(), [1.0]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -193,6 +193,17 @@ impl WgpuDevice {
             .request_device(&device_descriptor(required_features, limits))
             .await
             .ok()?;
+        // A lost device (iOS Safari loses it when the tab's GPU memory runs
+        // out) and uncaptured errors (out-of-memory, validation) are recorded
+        // rather than panicking, so a run can return them as its error and a
+        // caller can fall back to another backend.
+        device.set_device_lost_callback(|reason, msg| {
+            DEVICE_LOST.store(true, std::sync::atomic::Ordering::SeqCst);
+            record_gpu_error(format!("WebGPU device lost ({reason:?}): {msg}"));
+        });
+        device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
+            record_gpu_error(format!("WebGPU error: {e}"));
+        }));
 
         Some(Self {
             instance,
@@ -315,6 +326,38 @@ pub async fn init_wgpu_device() -> bool {
     let available = dev.is_some();
     let _ = WASM_DEVICE.set(dev);
     available
+}
+
+#[cfg(target_family = "wasm")]
+static DEVICE_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_family = "wasm")]
+static GPU_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Keep the first error since the last [`take_gpu_error`]: later ones are
+/// usually its consequences.
+#[cfg(target_family = "wasm")]
+fn record_gpu_error(msg: String) {
+    if let Ok(mut e) = GPU_ERROR.lock() {
+        e.get_or_insert(msg);
+    }
+}
+
+/// The first device-lost or uncaptured WebGPU error since the last call.
+#[cfg(target_family = "wasm")]
+pub fn take_gpu_error() -> Option<String> {
+    GPU_ERROR.lock().ok().and_then(|mut e| e.take())
+}
+
+/// Whether the browser lost the WebGPU device: nothing more runs on it.
+#[cfg(target_family = "wasm")]
+pub fn device_lost() -> bool {
+    DEVICE_LOST.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// No browser device natively.
+#[cfg(not(target_family = "wasm"))]
+pub fn device_lost() -> bool {
+    false
 }
 
 /// Get the wgpu device. On wasm this returns `None` until

@@ -39,6 +39,18 @@ pub async fn init_webgpu() -> bool {
     rlx_wgpu::device::init_wgpu_device().await
 }
 
+/// Whether the browser lost the WebGPU device (iOS Safari does when a tab's
+/// GPU memory runs out): nothing more runs on WebGPU in this worker.
+#[cfg(feature = "gpu")]
+pub fn webgpu_lost() -> bool {
+    rlx_wgpu::device::device_lost()
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn webgpu_lost() -> bool {
+    false
+}
+
 #[cfg(not(all(feature = "gpu", target_family = "wasm")))]
 pub async fn init_webgpu() -> bool {
     #[cfg(feature = "gpu")]

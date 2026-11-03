@@ -208,7 +208,7 @@ fn checkint(iy: u32) -> u32 {
 }
 
 fn zeroinfnan(ix: u32) -> bool {
-    (2 * ix).wrapping_sub(1) >= 2 * 0x7f80_0000 - 1
+    ix.wrapping_mul(2).wrapping_sub(1) >= 2 * 0x7f80_0000 - 1
 }
 
 fn issignaling(x: f32) -> bool {
@@ -223,19 +223,19 @@ pub fn powf(x: f32, y: f32) -> f32 {
     let iy = y.to_bits();
     if ix.wrapping_sub(0x0080_0000) >= 0x7f80_0000 - 0x0080_0000 || zeroinfnan(iy) {
         if zeroinfnan(iy) {
-            if 2 * iy == 0 {
+            if iy.wrapping_mul(2) == 0 {
                 return if issignaling(x) { x + y } else { 1.0 };
             }
             if ix == 0x3f80_0000 {
                 return if issignaling(y) { x + y } else { 1.0 };
             }
-            if 2 * ix > 2 * 0x7f80_0000 || 2 * iy > 2 * 0x7f80_0000 {
+            if ix.wrapping_mul(2) > 2 * 0x7f80_0000 || iy.wrapping_mul(2) > 2 * 0x7f80_0000 {
                 return x + y;
             }
-            if 2 * ix == 2 * 0x3f80_0000 {
+            if ix.wrapping_mul(2) == 2 * 0x3f80_0000 {
                 return 1.0;
             }
-            if (2 * ix < 2 * 0x3f80_0000) == (iy & 0x8000_0000 == 0) {
+            if (ix.wrapping_mul(2) < 2 * 0x3f80_0000) == (iy & 0x8000_0000 == 0) {
                 return 0.0;
             }
             return y * y;
@@ -246,7 +246,7 @@ pub fn powf(x: f32, y: f32) -> f32 {
                 x2 = -x2;
                 sign_bias = 1;
             }
-            if 2 * ix == 0 && iy & 0x8000_0000 != 0 {
+            if ix.wrapping_mul(2) == 0 && iy & 0x8000_0000 != 0 {
                 // __math_divzerof: (sign ? -1 : 1) / 0
                 return if sign_bias != 0 {
                     f32::NEG_INFINITY

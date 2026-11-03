@@ -2834,9 +2834,10 @@ class Optimizer internal constructor(h: Long) : Handle(h, Native::rlx_optimizer_
  */
 class Trainer internal constructor(h: Long) : Handle(h, Native::rlx_trainer_free), TrainerRows {
     /**
-     * Takes `graph` (consumed): its first output is the loss. `wrt` are the
-     * trainable params; `initial` their starting values. options: {optimizer,
-     * device, resident, clip_norm, …}.
+     * Takes `graph` (consumed): its first output is the loss (further outputs
+     * reach step_with by name). `wrt` are the trainable params; `initial`
+     * their starting values. options: {optimizer, device, resident, clip_norm,
+     * schedule, accumulate, loss_scale, …}.
      */
     constructor(graph: Graph, wrt: List<String>, initial: Map<String, FloatArray>, options: Any? = null) : this(make(graph, wrt, initial, options))
 

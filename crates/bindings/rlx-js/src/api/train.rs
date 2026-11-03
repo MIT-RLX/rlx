@@ -29,7 +29,9 @@ use quickrs_core::context::Context;
 use quickrs_core::gc::Gc;
 use quickrs_core::object::{JsObject, PropFlags};
 use quickrs_core::value::{JsResult, Value};
-use rlx_bind::runtime::train::{Optimizer, Resident, RunStats, StepItem, Trainer, TrainerConfig};
+use rlx_bind::runtime::train::{
+    Optimizer, Resident, RunStats, StepItem, Trainer, TrainerConfig, TrainingOptions,
+};
 
 use crate::api::bind::{lift, report, to_json};
 use crate::api::graph::take_graph;
@@ -163,6 +165,17 @@ fn trainer_new(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsR
     let resident_v = field(ctx, &options, "resident")?;
     let resident_json = to_json(ctx, &resident_v)?;
     let resident = lift(ctx, Resident::from_json(&resident_json))?;
+    let mut training_json = rlx_bind::runtime::serde_json::Map::new();
+    for key in ["schedule", "accumulate", "lossScale"] {
+        let v = field(ctx, &options, key)?;
+        if !is_nullish(&v) {
+            training_json.insert(key.into(), to_json(ctx, &v)?);
+        }
+    }
+    let training = lift(
+        ctx,
+        TrainingOptions::from_json(&rlx_bind::runtime::Value::Object(training_json)),
+    )?;
     // Every conversion that can run script happens before the graph moves.
     let init_bag = field(ctx, &options, "init")?;
     let init = read_f32_map(ctx, &init_bag, "init")?;
@@ -175,6 +188,7 @@ fn trainer_new(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsR
         policy,
         clip_norm,
         resident,
+        training,
     };
     let trainer = lift(ctx, Trainer::new(forward, cfg))?;
     Ok(handle::wrap(

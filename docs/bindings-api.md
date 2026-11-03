@@ -332,8 +332,11 @@ is a binding without it (the reason follows the table).
 | `Optimizer.new` | `Optimizer` | `Optimizer` | `rlx_optimizer_new` | `Optimizer.init` |
 | `Optimizer.step` | `Optimizer.step` | `Optimizer.step` | `rlx_optimizer_step` | `Optimizer.step` |
 | `Optimizer.set_lr` | `Optimizer.set_lr` | `Optimizer.setLr` | `rlx_optimizer_set_lr` | `Optimizer.setLr` |
+| `Optimizer.state_dict` | `Optimizer.state_dict` | — | — | — |
+| `Optimizer.load_state_dict` | `Optimizer.load_state_dict` | — | — | — |
 | `Trainer.new` | `Trainer` | `Trainer` | `rlx_trainer_new` | `Trainer.init` |
 | `Trainer.step` | `Trainer.step` | `Trainer.step` | `rlx_trainer_step` | `Trainer.step` |
+| `Trainer.step_with` | `Trainer.step_with` | — | — | — |
 | `Trainer.evaluate` | `Trainer.evaluate` | `Trainer.evaluate` | `rlx_trainer_evaluate` | `Trainer.evaluate` |
 | `Trainer.run` | `Trainer.run` | `Trainer.run` | `rlx_trainer_run` | `Trainer.run` |
 | `Trainer.freeze` | `Trainer.freeze` | `Trainer.freeze` | `rlx_trainer_freeze` | `Trainer.freeze` |
@@ -346,6 +349,11 @@ is a binding without it (the reason follows the table).
 | `Trainer.set_params` | `Trainer.set_params` | `Trainer.setParams` | `rlx_trainer_set_params` | `Trainer.setParams` |
 | `Trainer.set_lr` | `Trainer.set_lr` | `Trainer.setLr` | `rlx_trainer_set_lr` | `Trainer.setLr` |
 | `Trainer.steps` | `Trainer.steps` | `Trainer.steps` | `rlx_trainer_steps` | `Trainer.steps` |
+| `Trainer.lr` | `Trainer.lr` | — | — | — |
+| `Trainer.loss_scale` | `Trainer.loss_scale` | — | — | — |
+| `Trainer.set_data_parallel` | `Trainer.set_data_parallel` | — | — | — |
+| `Trainer.replicas_agree` | `Trainer.replicas_agree` | — | — | — |
+| `Trainer.skipped_updates` | `Trainer.skipped_updates` | — | — | — |
 | `Trainer.device` | `Trainer.device` | `Trainer.device` | `rlx_trainer_device` | `Trainer.device` |
 | `Trainer.save` | `Trainer.save` | `Trainer.save` | `rlx_trainer_save` | `Trainer.save` |
 | `Trainer.load` | `Trainer.load` | `Trainer.load` | `rlx_trainer_load` | `Trainer.load` |
@@ -407,10 +415,14 @@ Where a binding lacks a row:
 
 - Python and JS pass every tensor at once to write_gguf; GgufWriter is that call for languages without dictionaries of arrays
 - takes host arrays keyed by name; C and Swift build the file with GgufWriter
+- returns and takes float32 arrays keyed by name; so far only Python's agent programs (pyrlx.AgentOptimizer) checkpoint through it
+- the update rule runs as host code in the caller's language; so far only Python drives it (OPAL-style agent-written optimizers)
+- read-backs of the schedule and loss scaling, so far used from Python only; every binding sets them through the options
+- data-parallel training is driven from Python so far; the C and JS Group handles do not reach the Trainer yet
 
 Names a binding exports that are not rows:
 
-- **py**: `Graph`, `Node`, `graph`, `dsl`, `jacfwd`, `run`, `set_param`, `dtype_str`, `numpy_dtype`, `batch_narrow_relu_graph`, `from_torch`, `export_torch_ir`, `torch_import`, `FusionOptions`, `DevicePolicy`, `DeviceCandidate`, `DeviceBenchResult`, `GgufConvertReport` — graph construction (op table), NumPy dtype helpers, PyTorch import, and typed builders/results for options the other bindings pass as objects
+- **py**: `Graph`, `Node`, `graph`, `dsl`, `jacfwd`, `run`, `set_param`, `dtype_str`, `numpy_dtype`, `batch_narrow_relu_graph`, `from_torch`, `export_torch_ir`, `torch_import`, `FusionOptions`, `DevicePolicy`, `DeviceCandidate`, `DeviceBenchResult`, `GgufConvertReport`, `AgentOptimizer` — graph construction (op table), NumPy dtype helpers, PyTorch import, typed builders/results for options the other bindings pass as objects, and AgentOptimizer (a coding agent rewriting a Trainer's optimizer: its programs run as Python in the training process and the agent CLI is launched from it)
 - **js**: `Graph`, `Tensor`, `dsl`, `env`, `console`, `fileExists`, `fileSize`, `listDir`, `mkdirs`, `readFile`, `readFileInto`, `readFileRange`, `readText`, `removeFile`, `writeFile`, `sleep`, `toFloat32`, `oneHot`, `gatherRows` — graph construction (op table + Tensor DSL) and the script host's own file system, timers and typed-array helpers
 
 ## License

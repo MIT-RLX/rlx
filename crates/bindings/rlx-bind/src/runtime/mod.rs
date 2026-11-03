@@ -10,6 +10,8 @@
 //! and reports cross as JSON ([`serde_json::Value`]), so the shape of every
 //! options object is decided once, here.
 
+#[cfg(feature = "agent")]
+pub mod agent;
 pub mod autodiff;
 pub mod check;
 pub mod compose;

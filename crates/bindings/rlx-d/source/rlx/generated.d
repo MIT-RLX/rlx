@@ -2534,9 +2534,10 @@ final class Trainer : Handle
 {
     package this(void* h, Adopt) { super(h, &capi.rlx_trainer_free); }
 
-    /// Takes `graph` (consumed): its first output is the loss. `wrt` are the
-    /// trainable params; `initial` their starting values. options: {optimizer,
-    /// device, resident, clip_norm, …}.
+    /// Takes `graph` (consumed): its first output is the loss (further outputs
+    /// reach step_with by name). `wrt` are the trainable params; `initial`
+    /// their starting values. options: {optimizer, device, resident, clip_norm,
+    /// schedule, accumulate, loss_scale, …}.
     this(Graph graph, const(string)[] wrt, const(float[])[string] initial, JSONValue options = JSONValue.init)
     {
         auto a_wrt = cstrs(wrt);

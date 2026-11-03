@@ -23,6 +23,43 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ## [Unreleased]
 
+### Fixed
+
+- `rlx_libm::reference::*` now honours `platform::use_linux_reference()`.
+  Before, on Apple targets with the `libm` feature it chose Apple's libm at
+  compile time, so the runtime switch never reached it. A browser/native
+  comparison showed the cost: exgb's native `portable` build on macOS computed
+  Apple's `logf` on 55 of 12288 probe inputs, against the browser's glibc
+  values. The Apple arms (`apple_or!`, `erfc`, `cexp`, `csqrt`) now take the
+  system libm only while `apple_reference()` holds; `sincos` and
+  `sincosf_merged` only while `macos_reference()` holds. Pinned by
+  `tests/linux_reference_switch.rs`, which fails with the switch ignored.
+- `flt32.rs`: `zeroinfnan` and `powf`'s special-case tests double `u32` bit
+  patterns as glibc does, relying on wrapping. Debug builds panicked on every
+  negative input. They now use `wrapping_mul`, which computes what release
+  builds already did. The same pattern in `dbl64.rs` (line 256) still panics
+  in debug builds.
+- `rlx-onnx-import` now decodes BFLOAT16 initializers. The vendored schema has
+  no BFLOAT16 variant, so `data_type` read as `UNDEFINED`, the
+  `FLOAT | UNDEFINED` arm in `tensor_to_f32` matched first, and the BF16 arm
+  below it never ran — every BF16 weight failed the import. The arm now runs
+  first on the raw ONNX number. Pinned by
+  `bfloat16_initializer_survives_parse_and_decodes`.
+
+### Security
+
+- `rlx-onnx-proto` / `rlx-onnx-import`: `protobuf` 1.7.5 → 3.7.2, fixing
+  CVE-2019-15544 (GHSA-mh6h-f25p-98f8, uncontrolled memory consumption) and
+  CVE-2025-53605 (GHSA-2gh3-rmm4-6rq5, crash from uncontrolled recursion);
+  both are reachable by parsing an untrusted `.onnx` file. `src/onnx.rs` is
+  regenerated from `onnx.proto`, recovered from the 1.x bindings' embedded
+  descriptor, so the schema is unchanged; `regen/` reproduces it byte-for-byte
+  with the pure-Rust parser (no `protoc`). The 3.x API replaces `get_*`
+  getters with public fields and plain getters (`ModelProto::ir_version()`),
+  and nested types move into modules (`tensor_proto::DataType`).
+  `prepare_onnx_file` output is identical before and after on 17 real models,
+  external-data ones included.
+
 ## [0.2.20] — 2026-11-02
 
 ### Added

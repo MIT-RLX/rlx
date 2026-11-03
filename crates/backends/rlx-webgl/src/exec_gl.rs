@@ -949,6 +949,36 @@ pub struct GlBackend {
     idx_cache: std::cell::RefCell<HashMap<(usize, u8), WebGlTexture>>,
     /// Column count of each [`GlBackend::cached_linear_int`] texture.
     idx_cols: std::cell::RefCell<HashMap<(usize, u8), usize>>,
+    /// Which plan the caches above hold ([`GlBackend::use_plan`]): one
+    /// backend (one context, its programs compiled once) serves many.
+    plan: std::cell::Cell<u64>,
+    /// `getUniformLocation` answers by uniform name, then program: in
+    /// Safari it is a synchronous trip to the GPU process, and it was asked
+    /// for every uniform of every draw.
+    uniforms:
+        std::cell::RefCell<HashMap<String, Vec<(WebGlProgram, Option<WebGlUniformLocation>)>>>,
+    /// Target sizes whose framebuffer was found complete (the check is a
+    /// synchronous trip too, and was made every draw).
+    complete: std::cell::RefCell<std::collections::HashSet<(usize, usize)>>,
+    /// Whether a float target reads back as RED (one float a texel) rather
+    /// than RGBA, asked once.
+    read_red: std::cell::Cell<Option<bool>>,
+    /// Runs submitted ([`GlBackend::submit`]) and not yet collected, by plan.
+    pending: std::cell::RefCell<HashMap<u64, std::collections::VecDeque<Pending>>>,
+    /// Float textures this backend made, with their `(w, h, format)`, and
+    /// those free to hand out again: a model run in slabs asks for the same
+    /// few sizes run after run, and made and dropped each time the browser
+    /// allocated GPU memory every run.
+    sized: std::cell::RefCell<Vec<(WebGlTexture, (usize, usize, u32))>>,
+    free: std::cell::RefCell<Vec<(WebGlTexture, (usize, usize, u32))>>,
+    /// Pixel-pack buffers free to hand out again, with their bytes.
+    free_pbos: std::cell::RefCell<Vec<(web_sys::WebGlBuffer, usize)>>,
+    /// The half-precision inputs of the run in progress ([`Self::submit_half`]).
+    half_inputs: std::cell::RefCell<Vec<(String, Vec<u16>)>>,
+    /// Inputs of the run in progress already on the GPU ([`resident`]).
+    gpu_inputs: std::cell::RefCell<Vec<(String, WebGlTexture)>>,
+    /// [`resident`]'s programs, compiled on first use.
+    resident: std::cell::RefCell<resident::Programs>,
     fbo: web_sys::WebGlFramebuffer,
     unary: WebGlProgram,
     actback: WebGlProgram,
@@ -988,6 +1018,37 @@ pub struct GlBackend {
 
 fn err<T: std::fmt::Debug>(ctx: &str, e: T) -> WebglError {
     WebglError(format!("{ctx}: {e:?}"))
+}
+
+#[path = "resident.rs"]
+mod resident;
+pub use resident::{Gather, PendingStats, ResidentStore};
+
+/// A submitted run's outputs, in pixel-pack buffers.
+struct Pending {
+    reads: Vec<PendingRead>,
+}
+
+struct PendingRead {
+    buf: web_sys::WebGlBuffer,
+    bytes: usize,
+    texels: usize,
+    len: usize,
+    red: bool,
+}
+
+/// Give the context back at once: a browser keeps only so many (Safari 16)
+/// and drops the oldest past that, and a model run a layer at a time makes
+/// one backend a layer.
+impl Drop for GlBackend {
+    fn drop(&mut self) {
+        if let Ok(Some(ext)) = self.gl.get_extension("WEBGL_lose_context")
+            && let Ok(f) = js_sys::Reflect::get(&ext, &"loseContext".into())
+            && let Ok(f) = f.dyn_into::<js_sys::Function>()
+        {
+            let _ = f.call0(&ext);
+        }
+    }
 }
 
 impl GlBackend {
@@ -1034,6 +1095,17 @@ impl GlBackend {
             param_slots: Default::default(),
             idx_cache: Default::default(),
             idx_cols: Default::default(),
+            plan: Default::default(),
+            uniforms: Default::default(),
+            complete: Default::default(),
+            read_red: Default::default(),
+            pending: Default::default(),
+            sized: Default::default(),
+            free: Default::default(),
+            free_pbos: Default::default(),
+            half_inputs: Default::default(),
+            gpu_inputs: Default::default(),
+            resident: Default::default(),
             unary: with_act(FS_UNARY)?,
             actback: with_act(FS_ACTBACK)?,
             binary: plain(FS_BINARY)?,
@@ -1114,7 +1186,14 @@ impl GlBackend {
     }
 
     fn uniform(&self, p: &WebGlProgram, name: &str) -> Option<WebGlUniformLocation> {
-        self.gl.get_uniform_location(p, name)
+        let mut cache = self.uniforms.borrow_mut();
+        let progs = cache.entry(name.to_string()).or_default();
+        if let Some((_, loc)) = progs.iter().find(|(q, _)| q == p) {
+            return loc.clone();
+        }
+        let loc = self.gl.get_uniform_location(p, name);
+        progs.push((p.clone(), loc.clone()));
+        loc
     }
 
     /// A tensor laid out as `h` rows of `w` must fit one texture.
@@ -1132,10 +1211,6 @@ impl GlBackend {
     fn data_texture(&self, w: usize, h: usize, data: &[f32]) -> Result<WebGlTexture> {
         self.check_size(w, h)?;
         let gl = &self.gl;
-        let tex = gl
-            .create_texture()
-            .ok_or_else(|| WebglError("create_texture".into()))?;
-        gl.bind_texture(GL::TEXTURE_2D, Some(&tex));
         // Single-channel R32F: one float per texel. (RGBA32F with the value in
         // R spent 16 bytes per value, plus a 4x staging copy on upload — a
         // 230M-parameter model needed ~3.7 GB of textures.) Shaders read `.r`
@@ -1149,6 +1224,31 @@ impl GlBackend {
         } else {
             &data[..w * h]
         };
+        // one of this size free: new contents, the same storage
+        if let Some(tex) = self.acquire((w, h, GL::R32F)) {
+            gl.bind_texture(GL::TEXTURE_2D, Some(&tex));
+            // SAFETY: the view is consumed by tex_sub_image_2d before any JS alloc.
+            unsafe {
+                let view = js_sys::Float32Array::view(data);
+                gl.tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_array_buffer_view(
+                    GL::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    GL::RED,
+                    GL::FLOAT,
+                    Some(&view),
+                )
+                .map_err(|e| err("tex_sub_image_2d(r32f)", e))?;
+            }
+            return Ok(tex);
+        }
+        let tex = gl
+            .create_texture()
+            .ok_or_else(|| WebglError("create_texture".into()))?;
+        gl.bind_texture(GL::TEXTURE_2D, Some(&tex));
         // SAFETY: the view is consumed by tex_image_2d before any JS alloc.
         unsafe {
             let view = js_sys::Float32Array::view(data);
@@ -1166,7 +1266,120 @@ impl GlBackend {
             .map_err(|e| err("tex_image_2d(r32f)", e))?;
         }
         self.set_nearest();
+        self.sized
+            .borrow_mut()
+            .push((tex.clone(), (w, h, GL::R32F)));
         Ok(tex)
+    }
+
+    /// [`Self::data_texture`] from IEEE half bits: an R16F texture.
+    fn half_texture(&self, w: usize, h: usize, data: &[u16]) -> Result<WebGlTexture> {
+        self.check_size(w, h)?;
+        let gl = &self.gl;
+        let mut padded;
+        let data = if data.len() < w * h {
+            padded = data.to_vec();
+            padded.resize(w * h, 0);
+            &padded[..]
+        } else {
+            &data[..w * h]
+        };
+        let (tex, fresh) = match self.acquire((w, h, GL::R16F)) {
+            Some(t) => (t, false),
+            None => {
+                let t = gl
+                    .create_texture()
+                    .ok_or_else(|| WebglError("create_texture".into()))?;
+                self.sized.borrow_mut().push((t.clone(), (w, h, GL::R16F)));
+                (t, true)
+            }
+        };
+        gl.bind_texture(GL::TEXTURE_2D, Some(&tex));
+        // SAFETY: the view is consumed by the upload before any JS alloc.
+        unsafe {
+            let view = js_sys::Uint16Array::view(data);
+            if fresh {
+                gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
+                    GL::TEXTURE_2D,
+                    0,
+                    GL::R16F as i32,
+                    w as i32,
+                    h as i32,
+                    0,
+                    GL::RED,
+                    GL::HALF_FLOAT,
+                    Some(&view),
+                )
+                .map_err(|e| err("tex_image_2d(r16f)", e))?;
+                self.set_nearest();
+            } else {
+                gl.tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_array_buffer_view(
+                    GL::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    GL::RED,
+                    GL::HALF_FLOAT,
+                    Some(&view),
+                )
+                .map_err(|e| err("tex_sub_image_2d(r16f)", e))?;
+            }
+        }
+        Ok(tex)
+    }
+
+    /// A free texture of `key` = `(w, h, internal format)`, if there is one.
+    fn acquire(&self, key: (usize, usize, u32)) -> Option<WebGlTexture> {
+        let mut free = self.free.borrow_mut();
+        let i = free.iter().position(|(_, k)| *k == key)?;
+        Some(free.swap_remove(i).0)
+    }
+
+    /// Done with `t`: free to hand out again if this backend sized it, else
+    /// deleted. The free ones are capped in bytes, the oldest going first —
+    /// GPU memory counts against a phone's tab, and textures of sizes no
+    /// longer asked for would sit there for nothing.
+    fn release(&self, t: WebGlTexture) {
+        const KEEP_BYTES: usize = 96 << 20;
+        let key = self
+            .sized
+            .borrow()
+            .iter()
+            .find(|(s, _)| *s == t)
+            .map(|(_, k)| *k);
+        let Some(k) = key else {
+            self.gl.delete_texture(Some(&t));
+            return;
+        };
+        let bytes = |k: &(usize, usize, u32)| {
+            k.0 * k.1
+                * match k.2 {
+                    GL::RGBA32F => 16,
+                    GL::R16F => 2,
+                    _ => 4,
+                }
+        };
+        let mut free = self.free.borrow_mut();
+        free.push((t, k));
+        let mut held: usize = free.iter().map(|(_, k)| bytes(k)).sum();
+        while held > KEEP_BYTES && !free.is_empty() {
+            let (old, k) = free.remove(0);
+            held -= bytes(&k);
+            self.sized.borrow_mut().retain(|(s, _)| *s != old);
+            self.gl.delete_texture(Some(&old));
+        }
+    }
+
+    /// Delete every free texture (another plan's sizes).
+    fn drain_free(&self) {
+        let old: Vec<_> = self.free.borrow_mut().drain(..).collect();
+        let mut sized = self.sized.borrow_mut();
+        for (t, _) in old {
+            sized.retain(|(s, _)| *s != t);
+            self.gl.delete_texture(Some(&t));
+        }
     }
 
     fn int_texture(&self, w: usize, h: usize, data: &[i32]) -> Result<WebGlTexture> {
@@ -1207,10 +1420,16 @@ impl GlBackend {
         format: u32,
     ) -> Result<WebGlTexture> {
         self.check_size(w, h)?;
+        if let Some(tex) = self.acquire((w, h, internal)) {
+            return Ok(tex);
+        }
         let gl = &self.gl;
         let tex = gl
             .create_texture()
             .ok_or_else(|| WebglError("create_texture".into()))?;
+        self.sized
+            .borrow_mut()
+            .push((tex.clone(), (w, h, internal)));
         gl.bind_texture(GL::TEXTURE_2D, Some(&tex));
         gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
             GL::TEXTURE_2D,
@@ -1248,11 +1467,32 @@ impl GlBackend {
             Some(tex),
             0,
         );
-        if gl.check_framebuffer_status(GL::FRAMEBUFFER) != GL::FRAMEBUFFER_COMPLETE {
-            return Err(WebglError("framebuffer incomplete".into()));
+        if !self.complete.borrow().contains(&(w, h)) {
+            if gl.check_framebuffer_status(GL::FRAMEBUFFER) != GL::FRAMEBUFFER_COMPLETE {
+                return Err(WebglError("framebuffer incomplete".into()));
+            }
+            self.complete.borrow_mut().insert((w, h));
         }
         gl.viewport(0, 0, w as i32, h as i32);
         Ok(())
+    }
+
+    /// Whether the bound float target can be read as RED floats.
+    fn reads_red(&self) -> bool {
+        if let Some(r) = self.read_red.get() {
+            return r;
+        }
+        let q = |p| {
+            self.gl
+                .get_parameter(p)
+                .ok()
+                .and_then(|v| v.as_f64())
+                .map(|v| v as u32)
+        };
+        let r = q(GL::IMPLEMENTATION_COLOR_READ_FORMAT) == Some(GL::RED)
+            && q(GL::IMPLEMENTATION_COLOR_READ_TYPE) == Some(GL::FLOAT);
+        self.read_red.set(Some(r));
+        r
     }
 
     fn bind_tex_unit(&self, prog: &WebGlProgram, name: &str, unit: u32, tex: &WebGlTexture) {
@@ -1302,21 +1542,51 @@ impl GlBackend {
     fn read_back(&self, tex: &WebGlTexture, w: usize, h: usize) -> Result<Vec<f32>> {
         let gl = &self.gl;
         self.bind_target(tex, w, h)?;
-        let mut rgba = vec![0f32; w * h * 4];
-        unsafe {
-            let view = js_sys::Float32Array::view_mut_raw(rgba.as_mut_ptr(), rgba.len());
-            gl.read_pixels_with_opt_array_buffer_view(
-                0,
-                0,
-                w as i32,
-                h as i32,
-                GL::RGBA,
-                GL::FLOAT,
-                Some(&view),
-            )
-            .map_err(|e| err("read_pixels", e))?;
+        if self.reads_red() {
+            let mut out = vec![0f32; w * h];
+            unsafe {
+                let view = js_sys::Float32Array::view_mut_raw(out.as_mut_ptr(), out.len());
+                gl.read_pixels_with_opt_array_buffer_view(
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    GL::RED,
+                    GL::FLOAT,
+                    Some(&view),
+                )
+                .map_err(|e| err("read_pixels", e))?;
+            }
+            return Ok(out);
         }
-        Ok((0..w * h).map(|i| rgba[i * 4]).collect())
+        // RGBA floats (what every WebGL2 can read a float target as), a band
+        // of rows at a time: read whole, the staging was four times the
+        // tensor — a phone's tab ran out on a 3-D net's slab.
+        const BAND_TEXELS: usize = 1 << 20;
+        let rows = (BAND_TEXELS / w.max(1)).clamp(1, h.max(1));
+        let mut rgba = vec![0f32; w * rows * 4];
+        let mut out = Vec::with_capacity(w * h);
+        let mut y = 0;
+        while y < h {
+            let n = rows.min(h - y);
+            let band = &mut rgba[..w * n * 4];
+            unsafe {
+                let view = js_sys::Float32Array::view_mut_raw(band.as_mut_ptr(), band.len());
+                gl.read_pixels_with_opt_array_buffer_view(
+                    0,
+                    y as i32,
+                    w as i32,
+                    n as i32,
+                    GL::RGBA,
+                    GL::FLOAT,
+                    Some(&view),
+                )
+                .map_err(|e| err("read_pixels", e))?;
+            }
+            out.extend(band.chunks_exact(4).map(|p| p[0]));
+            y += n;
+        }
+        Ok(out)
     }
 
     /// Start a render pass into a fresh target of size `w×h` with `prog` bound.
@@ -1329,11 +1599,51 @@ impl GlBackend {
 
     /// Drop the cached texture of param `name` (its value changed); it is
     /// uploaded again on the next run.
-    pub fn forget_param(&self, name: &str) {
-        if let Some(slot) = self.param_slots.borrow_mut().remove(name)
-            && let Some(t) = self.leaf_cache.borrow_mut().remove(&slot)
-        {
+    /// Hold `plan`'s caches from now on: another plan's slots mean other
+    /// tensors, so its textures go. A backend is a context and some fifty
+    /// compiled programs — share one rather than make one a plan (a model
+    /// run a layer at a time is a plan a layer).
+    pub fn use_plan(&self, plan: u64) {
+        if self.plan.replace(plan) == plan {
+            return;
+        }
+        // another plan: its weights and the sizes it asked for go
+        let leaves: Vec<_> = self
+            .leaf_cache
+            .borrow_mut()
+            .drain()
+            .map(|(_, t)| t)
+            .collect();
+        for t in leaves {
+            self.sized.borrow_mut().retain(|(s, _)| *s != t);
             self.gl.delete_texture(Some(&t));
+        }
+        self.drain_free();
+        for (b, _) in self.free_pbos.borrow_mut().drain(..) {
+            self.gl.delete_buffer(Some(&b));
+        }
+        for (_, t) in self.idx_cache.borrow_mut().drain() {
+            self.gl.delete_texture(Some(&t));
+        }
+        self.param_slots.borrow_mut().clear();
+        self.idx_cols.borrow_mut().clear();
+    }
+
+    /// [`Self::forget_param`] when `plan` is the one cached.
+    pub fn forget_param_of(&self, plan: u64, name: &str) {
+        if self.plan.get() == plan {
+            self.forget_param(name);
+        }
+    }
+
+    pub fn forget_param(&self, name: &str) {
+        let t = self
+            .param_slots
+            .borrow_mut()
+            .remove(name)
+            .and_then(|slot| self.leaf_cache.borrow_mut().remove(&slot));
+        if let Some(t) = t {
+            self.release(t);
         }
     }
 
@@ -1386,6 +1696,170 @@ impl GlBackend {
 
     /// Execute `plan` with the given named inputs/params on the GPU.
     pub fn run(&self, plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> {
+        let tex = self.exec(plan, inputs)?;
+        let outs = self.read_outputs(plan, tex);
+        // A lost context (iOS drops it when the tab's GPU memory runs out)
+        // reads back zeros without an error, and an allocation that failed
+        // leaves only OUT_OF_MEMORY behind: neither is a result.
+        self.check_alive()?;
+        outs
+    }
+
+    fn check_alive(&self) -> Result<()> {
+        if self.context_lost() {
+            return Err(WebglError("the WebGL2 context was lost".into()));
+        }
+        if self.gl.get_error() == GL::OUT_OF_MEMORY {
+            return Err(WebglError("WebGL2 ran out of memory".into()));
+        }
+        Ok(())
+    }
+
+    /// [`Self::run`] without waiting for the GPU: the outputs are copied
+    /// into pixel-pack buffers and [`Self::collect`] (the oldest run of
+    /// `plan_id` first) maps them. Meanwhile the CPU can prepare the next
+    /// run — a run that waited for its read-back left the GPU idle while
+    /// the caller gathered the next input and stored the last output.
+    pub fn submit(&self, plan_id: u64, plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<()> {
+        let tex = self.exec(plan, inputs)?;
+        let gl = &self.gl;
+        let mut reads = Vec::new();
+        for &slot in &plan.outputs {
+            let (h, w) = plan.slot_dims[slot];
+            self.bind_target(self.tex(&tex, slot)?, w, h)?;
+            let red = self.reads_red();
+            let floats = w * h * if red { 1 } else { 4 };
+            let bytes = floats * 4;
+            let reuse = {
+                let mut free = self.free_pbos.borrow_mut();
+                free.iter()
+                    .position(|(_, b)| *b == bytes)
+                    .map(|i| free.swap_remove(i).0)
+            };
+            let buf = match reuse {
+                Some(b) => {
+                    gl.bind_buffer(GL::PIXEL_PACK_BUFFER, Some(&b));
+                    b
+                }
+                None => {
+                    let b = gl
+                        .create_buffer()
+                        .ok_or_else(|| WebglError("create_buffer".into()))?;
+                    gl.bind_buffer(GL::PIXEL_PACK_BUFFER, Some(&b));
+                    gl.buffer_data_with_i32(GL::PIXEL_PACK_BUFFER, bytes as i32, GL::STREAM_READ);
+                    b
+                }
+            };
+            gl.read_pixels_with_i32(
+                0,
+                0,
+                w as i32,
+                h as i32,
+                if red { GL::RED } else { GL::RGBA },
+                GL::FLOAT,
+                0,
+            )
+            .map_err(|e| err("read_pixels(pack)", e))?;
+            reads.push(PendingRead {
+                buf,
+                bytes,
+                texels: w * h,
+                len: plan.slot_len[slot],
+                red,
+            });
+        }
+        gl.bind_buffer(GL::PIXEL_PACK_BUFFER, None);
+        self.free_run_textures(tex);
+        // send it to the GPU now: queued, it would wait for the next call
+        // that waits (the collect), and nothing would overlap
+        gl.flush();
+        self.pending
+            .borrow_mut()
+            .entry(plan_id)
+            .or_default()
+            .push_back(Pending { reads });
+        Ok(())
+    }
+
+    /// [`Self::submit`] with some inputs as IEEE half bits (`half`), sent
+    /// as R16F textures: half the bytes of f32.
+    pub fn submit_half(
+        &self,
+        plan_id: u64,
+        plan: &Plan,
+        inputs: &[(&str, &[f32])],
+        half: Vec<(String, Vec<u16>)>,
+    ) -> Result<Vec<(String, Vec<u16>)>> {
+        *self.half_inputs.borrow_mut() = half;
+        let r = self.submit(plan_id, plan, inputs);
+        // the buffers back to the caller, for its next window
+        let half = std::mem::take(&mut *self.half_inputs.borrow_mut());
+        r.map(|()| half)
+    }
+
+    /// The outputs of `plan_id`'s oldest [`Self::submit`]ted run (waiting
+    /// for the GPU if it is not done).
+    pub fn collect(&self, plan_id: u64) -> Result<Vec<Vec<f32>>> {
+        let run = self
+            .pending
+            .borrow_mut()
+            .get_mut(&plan_id)
+            .and_then(|q| q.pop_front())
+            .ok_or_else(|| WebglError("collect: nothing submitted".into()))?;
+        let gl = &self.gl;
+        let mut outs = Vec::with_capacity(run.reads.len());
+        for r in run.reads {
+            gl.bind_buffer(GL::PIXEL_PACK_BUFFER, Some(&r.buf));
+            let mut out = vec![0f32; r.texels];
+            if r.red {
+                unsafe {
+                    let view = js_sys::Float32Array::view_mut_raw(out.as_mut_ptr(), out.len());
+                    gl.get_buffer_sub_data_with_i32_and_array_buffer_view(
+                        GL::PIXEL_PACK_BUFFER,
+                        0,
+                        &view,
+                    );
+                }
+            } else {
+                // RGBA a band at a time (whole, four times the tensor)
+                const BAND: usize = 1 << 20;
+                let mut rgba = vec![0f32; BAND.min(r.texels) * 4];
+                let mut at = 0;
+                while at < r.texels {
+                    let n = BAND.min(r.texels - at);
+                    let band = &mut rgba[..n * 4];
+                    unsafe {
+                        let view =
+                            js_sys::Float32Array::view_mut_raw(band.as_mut_ptr(), band.len());
+                        gl.get_buffer_sub_data_with_i32_and_array_buffer_view(
+                            GL::PIXEL_PACK_BUFFER,
+                            (at * 16) as i32,
+                            &view,
+                        );
+                    }
+                    for (o, p) in out[at..at + n].iter_mut().zip(band.chunks_exact(4)) {
+                        *o = p[0];
+                    }
+                    at += n;
+                }
+            }
+            gl.bind_buffer(GL::PIXEL_PACK_BUFFER, None);
+            // kept for the next run (two in flight at most)
+            let mut free = self.free_pbos.borrow_mut();
+            if free.len() < 4 {
+                free.push((r.buf, r.bytes));
+            } else {
+                gl.delete_buffer(Some(&r.buf));
+            }
+            out.truncate(r.len);
+            outs.push(out);
+        }
+        self.check_alive()?;
+        Ok(outs)
+    }
+
+    /// Run `plan`'s steps; the textures by slot (outputs among them).
+    fn exec(&self, plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Option<WebGlTexture>>> {
         let input_map: HashMap<&str, &[f32]> = inputs.iter().copied().collect();
         let mut tex: Vec<Option<WebGlTexture>> = (0..plan.slot_len.len()).map(|_| None).collect();
         // The step that reads each slot last: its texture goes after it. A
@@ -1431,7 +1905,7 @@ impl GlBackend {
                     && !self.leaf_cache.borrow().contains_key(&s)
                     && let Some(t) = tex[s].take()
                 {
-                    self.gl.delete_texture(Some(&t));
+                    self.release(t);
                 }
             }
         }
@@ -1447,7 +1921,12 @@ impl GlBackend {
             }
             web_sys::console::log_1(&msg.into());
         }
-        self.read_outputs(plan, tex)
+        Ok(tex)
+    }
+
+    /// Whether the browser lost this context: nothing more runs on it.
+    pub fn context_lost(&self) -> bool {
+        self.gl.is_context_lost()
     }
 
     fn run_step(
@@ -1467,15 +1946,45 @@ impl GlBackend {
                         tex[*out] = Some(t.clone());
                         return Ok(());
                     }
-                    let data: Vec<f32> = match src {
-                        LeafSource::Input(name) | LeafSource::Param(name) => input_map
-                            .get(name.as_str())
-                            .map(|d| d.to_vec())
-                            .ok_or_else(|| WebglError(format!("missing input/param '{name}'")))?,
-                        LeafSource::Const(d) => d.clone(),
-                    };
                     let (r, c) = dims(*out);
-                    let t = self.data_texture(c, r, &data)?;
+                    // an input already on the GPU, laid out as this slot
+                    if let LeafSource::Input(name) = src
+                        && let Some(t) = self
+                            .gpu_inputs
+                            .borrow()
+                            .iter()
+                            .find(|(n, _)| n == name)
+                            .map(|(_, t)| t.clone())
+                    {
+                        tex[*out] = Some(t);
+                        return Ok(());
+                    }
+                    // an input given in half precision: an R16F texture, half
+                    // the bytes to send (the shaders read `.r` either way)
+                    let half = match src {
+                        LeafSource::Input(name) => self
+                            .half_inputs
+                            .borrow()
+                            .iter()
+                            .position(|(n, _)| n == name),
+                        _ => None,
+                    };
+                    let t = if let Some(i) = half {
+                        let halves = self.half_inputs.borrow();
+                        self.half_texture(c, r, &halves[i].1)?
+                    } else {
+                        // (the slice itself: a copy of each input every run was
+                        // a slab window duplicated)
+                        let data: &[f32] = match src {
+                            LeafSource::Input(name) | LeafSource::Param(name) => {
+                                input_map.get(name.as_str()).copied().ok_or_else(|| {
+                                    WebglError(format!("missing input/param '{name}'"))
+                                })?
+                            }
+                            LeafSource::Const(d) => d,
+                        };
+                        self.data_texture(c, r, data)?
+                    };
                     if persistent {
                         self.leaf_cache.borrow_mut().insert(*out, t.clone());
                         if let LeafSource::Param(name) = src {
@@ -2028,7 +2537,7 @@ impl GlBackend {
                             self.set_i32(pp, "uMode", i32::from(first && mean.is_some()));
                             self.draw_banded(pc, pr, CHUNK);
                             if let Some(t) = cur.replace(partial) {
-                                self.gl.delete_texture(Some(&t));
+                                self.release(t);
                             }
                             (cols, len, first) = (pc, chunks, false);
                         }
@@ -2040,7 +2549,7 @@ impl GlBackend {
                         self.set_i32(ps, "uNChunks", 1);
                         self.set_i32(ps, "uRun", run as i32);
                         self.draw();
-                        self.gl.delete_texture(Some(&sums));
+                        self.release(sums);
                         Ok(st)
                     };
                     let mean = stat(None)?;
@@ -2063,8 +2572,8 @@ impl GlBackend {
                     self.set_f32(pa, "uEps", *eps);
                     self.set_i32(pa, "uAct", act.map_or(-1, act_code));
                     self.draw();
-                    self.gl.delete_texture(Some(&mean));
-                    self.gl.delete_texture(Some(&var));
+                    self.release(mean);
+                    self.release(var);
                     tex[*out] = Some(t);
                 }
                 Step::Concat {
@@ -2350,10 +2859,10 @@ impl GlBackend {
                 gl.disable(GL::SCISSOR_TEST);
             }
         }
-        for q in &targets {
-            gl.delete_texture(Some(q));
+        for q in targets {
+            self.release(q);
         }
-        gl.delete_texture(Some(&w4));
+        self.release(w4);
         Ok(t)
     }
 
@@ -2372,17 +2881,21 @@ impl GlBackend {
                 Ok(v)
             })
             .collect();
-        // Free this run's own textures (inputs and intermediates); the cached
-        // weights and index textures stay.
+        self.free_run_textures(tex);
+        outs
+    }
+
+    /// Free a run's own textures (inputs, intermediates, outputs); the
+    /// cached weights and index textures stay.
+    fn free_run_textures(&self, tex: Vec<Option<WebGlTexture>>) {
         let cache = self.leaf_cache.borrow();
-        for (slot, t) in tex.iter().enumerate() {
+        for (slot, t) in tex.into_iter().enumerate() {
             if let Some(t) = t
                 && !cache.contains_key(&slot)
             {
-                self.gl.delete_texture(Some(t));
+                self.release(t);
             }
         }
-        outs
     }
 
     fn tex<'a>(&self, tex: &'a [Option<WebGlTexture>], slot: usize) -> Result<&'a WebGlTexture> {

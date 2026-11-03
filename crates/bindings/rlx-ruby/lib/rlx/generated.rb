@@ -2868,9 +2868,10 @@ module RLX
   class Trainer < Handle
     FREE = :rlx_trainer_free
 
-    # Takes `graph` (consumed): its first output is the loss. `wrt` are the
-    # trainable params; `initial` their starting values. options: {optimizer,
-    # device, resident, clip_norm, …}.
+    # Takes `graph` (consumed): its first output is the loss (further outputs
+    # reach step_with by name). `wrt` are the trainable params; `initial`
+    # their starting values. options: {optimizer, device, resident, clip_norm,
+    # schedule, accumulate, loss_scale, …}.
     def initialize(graph, wrt, initial, options: nil)
       a_wrt = RLX.cstrs(wrt)
       a_initial = RLX.inputs(initial)

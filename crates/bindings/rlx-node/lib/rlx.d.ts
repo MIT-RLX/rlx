@@ -990,9 +990,10 @@ export class Trainer {
   /** Free the handle now (also `using x = …`). */
   close(): void;
   /**
-   * Takes `graph` (consumed): its first output is the loss. `wrt` are the
-   * trainable params; `initial` their starting values. options: {optimizer,
-   * device, resident, clip_norm, …}.
+   * Takes `graph` (consumed): its first output is the loss (further outputs
+   * reach step_with by name). `wrt` are the trainable params; `initial`
+   * their starting values. options: {optimizer, device, resident, clip_norm,
+   * schedule, accumulate, loss_scale, …}.
    */
   constructor(graph: Graph, wrt: string[], initial: Inputs, opts?: { options?: unknown });
   /**

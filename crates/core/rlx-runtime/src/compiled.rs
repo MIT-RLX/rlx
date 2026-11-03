@@ -579,6 +579,13 @@ impl CompiledGraph {
     }
 
     fn run_untapped(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        self.try_run_untapped(inputs)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`Self::run_untapped`] with the backend's [`ExecutableGraph::try_run`]
+    /// on the plain paths (the dataflow and narrowed paths still panic).
+    fn try_run_untapped(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>, String> {
         if self.df.is_some() {
             let bytes: Vec<(&str, Vec<u8>)> = inputs
                 .iter()
@@ -588,11 +595,11 @@ impl CompiledGraph {
                 .iter()
                 .map(|(n, b)| (*n, b.as_slice(), rlx_ir::DType::F32))
                 .collect();
-            return self
+            return Ok(self
                 .run_df(&typed)
                 .into_iter()
                 .map(|(b, dt)| crate::backend::widen_bytes_to_f32(&b, dt))
-                .collect();
+                .collect());
         }
         // Any input declared narrower than f32 has to be converted before it
         // reaches the backend. `run_typed` is the path that carries a dtype per
@@ -602,7 +609,7 @@ impl CompiledGraph {
             .iter()
             .any(|(n, _)| self.narrow_boundary(n).is_some())
         {
-            return self.run_narrowed(inputs);
+            return Ok(self.run_narrowed(inputs));
         }
         self.ensure_prepared();
         match self.staging.as_ref() {
@@ -613,9 +620,9 @@ impl CompiledGraph {
                 for (name, vals) in st.boundary.iter().zip(st.values.iter()) {
                     merged.push((name.as_str(), vals.as_slice()));
                 }
-                self.inner.run(&merged)
+                self.inner.try_run(&merged)
             }
-            _ => self.inner.run(inputs),
+            _ => self.inner.try_run(inputs),
         }
     }
 
@@ -653,10 +660,60 @@ impl CompiledGraph {
     /// to forward the inputs straight to the backend, so in the browser a
     /// tapped graph never reported its pre-head features and every exgb
     /// frozen-encoder trial embedded to the same vector.)
+    /// Start a run whose outputs [`Self::collect`] takes later, where the
+    /// backend can (WebGL2), so the caller works while the GPU does. `None`:
+    /// not here (another backend, or a graph with staged weights, taps or
+    /// narrowed inputs) — run it.
+    pub fn submit(&mut self, inputs: &[(&str, &[f32])]) -> Option<Result<(), String>> {
+        if self.df.is_some() || self.tap_extra != 0 || self.staging.is_some() {
+            return None;
+        }
+        if inputs
+            .iter()
+            .any(|(n, _)| self.narrow_boundary(n).is_some())
+        {
+            return None;
+        }
+        let inputs = match self.upload_param_inputs(inputs) {
+            Ok(i) => i,
+            Err(e) => return Some(Err(e.to_string())),
+        };
+        if let Err(e) = self.check_f32_run(&inputs) {
+            return Some(Err(e.to_string()));
+        }
+        self.inner.try_submit(&inputs)
+    }
+
+    /// [`Self::submit`] with the inputs as IEEE half bits, where the
+    /// backend can take them so (WebGL2); the buffers come back for the next
+    /// run. `None`: not here — submit or run in f32.
+    #[allow(clippy::type_complexity)]
+    pub fn submit_half(
+        &mut self,
+        inputs: Vec<(String, Vec<u16>)>,
+    ) -> Option<Result<Vec<(String, Vec<u16>)>, String>> {
+        if self.df.is_some() || self.tap_extra != 0 || self.staging.is_some() {
+            return None;
+        }
+        self.inner.try_submit_half(inputs)
+    }
+
+    /// The outputs of the oldest [`Self::submit`]ted run.
+    pub fn collect(&mut self) -> Result<Vec<Vec<f32>>, String> {
+        self.inner.try_collect()
+    }
+
     #[cfg(target_family = "wasm")]
     pub async fn run_async(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>, String> {
         if !matches!(self.device, Device::WebGpu | Device::Gpu) {
-            return Ok(self.run(inputs));
+            // a WebGL2 context the browser refuses, or loses, is an error
+            // here rather than a panic
+            let inputs = self
+                .upload_param_inputs(inputs)
+                .map_err(|e| e.to_string())?;
+            self.check_f32_run(&inputs).map_err(|e| e.to_string())?;
+            let outs = self.try_run_untapped(&inputs)?;
+            return Ok(crate::taps::on_run(outs, self.tap_extra));
         }
         let inputs = self
             .upload_param_inputs(inputs)

@@ -4,7 +4,8 @@
 
 //! Vendored pure-Rust ONNX protobuf types — no `protoc`, no build script.
 //!
-//! [`onnx`] is the checked-in `rust-protobuf` output for the ONNX schema.
+//! [`onnx`] is the checked-in `rust-protobuf` 3.7.2 output for the ONNX
+//! schema in `onnx.proto`.
 //! The crates.io `onnx` crate code-generates the same module at build time
 //! by shelling out to an external `protoc` binary; carrying the generated
 //! source instead keeps `cargo build` hermetic and toolchain-free, which
@@ -18,15 +19,14 @@
 //! use rlx_onnx_proto::onnx::ModelProto;
 //!
 //! let model = ModelProto::new();
-//! assert_eq!(model.get_ir_version(), 0);
+//! assert_eq!(model.ir_version(), 0);
 //! ```
 //!
 //! # Regenerating
 //!
-//! Only needed when the ONNX schema itself changes. Run `rust-protobuf` 1.x
-//! over `onnx.proto`, then rewrite the bare `::std::any::Any` trait-object
-//! references to `dyn ::std::any::Any` so the output builds on a modern
-//! edition.
+//! Only needed when the ONNX schema or the `protobuf` version changes:
+//! `cargo run --manifest-path crates/io/rlx-onnx-proto/regen/Cargo.toml`
+//! (pure-Rust parser, no `protoc`). See the crate README.
 //!
 //! [`rlx-onnx-import`]: https://docs.rs/rlx-onnx-import
 

@@ -36,6 +36,8 @@
 //! Python for dtype-aware NumPy I/O without manual byte packing.
 use pyo3::prelude::*;
 
+#[cfg(feature = "training")]
+mod agent;
 mod autodiff;
 mod bind;
 mod check;
@@ -157,6 +159,9 @@ fn _pyrlx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_class::<train::PyOptimizer>()?;
         m.add_class::<train::PyTrainer>()?;
+        m.add_class::<agent::PyAgentOptimizer>()?;
+        m.add_function(wrap_pyfunction!(agent::serve_workspace_mcp, m)?)?;
+        m.add_function(wrap_pyfunction!(agent::agent_cli, m)?)?;
     }
     #[cfg(feature = "models")]
     {

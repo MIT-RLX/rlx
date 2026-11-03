@@ -2949,9 +2949,10 @@ pub const Trainer = struct {
     pub const InitOpts = struct {
         options: ?[:0]const u8 = null,
     };
-    /// Takes `graph` (consumed): its first output is the loss. `wrt` are the
-    /// trainable params; `initial` their starting values. options: {optimizer,
-    /// device, resident, clip_norm, …}.
+    /// Takes `graph` (consumed): its first output is the loss (further outputs
+    /// reach step_with by name). `wrt` are the trainable params; `initial`
+    /// their starting values. options: {optimizer, device, resident, clip_norm,
+    /// schedule, accumulate, loss_scale, …}.
     pub fn init(alloc: std.mem.Allocator, graph_: Graph, wrt: []const [*:0]const u8, initial: []const Input, opts: InitOpts) Error!Trainer {
         const initial_c = try support.cInputs(alloc, initial);
         defer initial_c.deinit(alloc);
