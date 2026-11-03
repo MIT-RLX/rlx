@@ -2109,7 +2109,7 @@ fn run_dtypes(label: &str) {
             })
             .collect()
     };
-    let tf32 = if std::env::var("RLX_CUDA_NO_TF32").is_ok() {
+    let tf32 = if rlx_ir::env::var("RLX_CUDA_NO_TF32").is_some() {
         "off"
     } else {
         "default"

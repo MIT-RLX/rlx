@@ -9,15 +9,15 @@
 //! sites (BLAS tiling, SDPA, LayerNorm, …) pick up Rayon without
 //! changes.
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use rayon::prelude::*;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use std::sync::Once;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 static POOL_INIT: Once = Once::new();
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn ensure_pool() {
     POOL_INIT.call_once(|| {
         let cfg = crate::config::RuntimeConfig::global();
@@ -48,15 +48,32 @@ fn ensure_pool() {
 ///
 /// On wasm there is no thread pool — the browser is single-threaded — so
 /// this is always 1.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub fn num_threads() -> usize {
     ensure_pool();
     rayon::current_num_threads()
 }
 
-#[cfg(target_arch = "wasm32")]
+/// On wasm the browser gives no threads unless the module is built with
+/// shared memory (`+atomics`) and the page starts a rayon pool of Web Workers
+/// (wasm-bindgen-rayon's `initThreadPool`); it then reports the pool here and
+/// the kernels split their rows over it as natively (results unchanged: the
+/// kernels split rows, never a reduction). Until then everything runs inline,
+/// since touching rayon with no pool would try to spawn threads.
+#[cfg(target_family = "wasm")]
+static WASM_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// Report the rayon pool a shared-memory wasm build's page started (`n`
+/// workers). A no-op off wasm, and on wasm without `+atomics`.
+pub fn set_wasm_threads(n: usize) {
+    #[cfg(all(target_family = "wasm", target_feature = "atomics"))]
+    WASM_THREADS.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+    let _ = n;
+}
+
+#[cfg(target_family = "wasm")]
 pub fn num_threads() -> usize {
-    1
+    WASM_THREADS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Parallel for: split `total` items across threads. `f(off, cnt)` is
@@ -69,11 +86,17 @@ pub fn num_threads() -> usize {
 /// because tasks may run on Rayon workers natively.
 #[inline]
 pub fn par_range<F: Fn(usize) + Sync + Send>(n: usize, f: F) {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_family = "wasm", target_feature = "atomics"))]
+    if num_threads() > 1 {
+        use rayon::prelude::*;
+        (0..n).into_par_iter().for_each(f);
+        return;
+    }
+    #[cfg(target_family = "wasm")]
     {
         (0..n).for_each(f);
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     {
         (0..n).into_par_iter().for_each(f);
     }
@@ -131,14 +154,29 @@ pub fn par_for<F: Fn(usize, usize) + Sync>(total: usize, min_per_thread: usize, 
     if total == 0 {
         return;
     }
-    // wasm is single-threaded: run the whole range inline. (Rayon's
-    // work-stealing scheduler needs OS threads, which the browser lacks.)
-    #[cfg(target_arch = "wasm32")]
+    // wasm: over the page's rayon pool in a shared-memory build that started
+    // one (`set_wasm_threads`), else inline (no threads to spawn).
+    #[cfg(all(target_family = "wasm", target_feature = "atomics"))]
+    if num_threads() > 1 {
+        use rayon::prelude::*;
+        let n_threads = (total / min_per_thread.max(1)).max(1).min(num_threads());
+        if n_threads > 1 {
+            let chunk = total.div_ceil(n_threads);
+            (0..n_threads).into_par_iter().for_each(|t| {
+                let off = t * chunk;
+                if off < total {
+                    f(off, (off + chunk).min(total) - off);
+                }
+            });
+            return;
+        }
+    }
+    #[cfg(target_family = "wasm")]
     {
         let _ = min_per_thread;
         f(0, total);
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     {
         ensure_pool();
         let grain = min_per_thread.max(1);

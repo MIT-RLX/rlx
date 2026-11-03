@@ -137,6 +137,7 @@ LAST_PUBLISH_ERR=""      # temp log from the last failed publish attempt
 # now diffs this list against `cargo metadata` and fails loudly on divergence,
 # so the next addition cannot reproduce that.
 SKIPPED=(
+    libm
     pyrlx
     rlx-bind
     rlx-bindgen
@@ -196,7 +197,12 @@ SKIPPED=(
 #     GPU backends, so it rides tier 0 *before* rlx-gpu-kernels. Its dir has no
 #     hyphen, so validate_publish_order's `rlx-*` glob skips it — cargo publish
 #     still enforces the order, so keep it first.
-#   rlx-dduf / rlx-hub are dep-free leaves → tier 0. So is rlx-mcu (libm only). rlx-mlx-io (rlx-ir) → tier 1.
+#   rlx-dduf / rlx-hub are dep-free leaves → tier 0. rlx-mcu (rlx-libm only)
+#     rides the same tier, after rlx-libm's. rlx-mlx-io (rlx-ir) → tier 1.
+#   `libm` (crates/numerics/libm-shim) is the workspace's `[patch.crates-io]`
+#     stand-in for crates.io's libm, forwarding to rlx-libm; publish = false
+#     (SKIPPED). Published crates keep depending on crates.io's libm through
+#     naga; the patch only shapes this workspace's builds.
 #   rlx-pkg (rlx-ir/rlx-gguf/rlx-nemo/rlx-mlx-io/rlx-dduf) → tier 2. rlx-runtime
 #     now has [dependencies] on rlx-pkg/rlx-mlx-io/rlx-dduf (+ optional rlx-xdna),
 #     so all four must precede tier 7 — they do.
@@ -218,7 +224,8 @@ SKIPPED=(
 #     `rlx` checkout mandatory just to load that workspace.
 # The first two tiers: leaf numerics with no rlx dependency, then the two
 # built on them (rlx-rng / rlx-numpy / rlx-special / rlx-pocketfft below, and
-# rlx-cpu, depend on rlx-libm and rlx-linux-ref). Comments go here, not inside
+# rlx-cpu, depend on rlx-libm and rlx-linux-ref). rlx-libm itself has no
+# dependencies at all; rlx-ir, rlx-mcu, rlx-spectral and rlxsl (dev) take it. Comments go here, not inside
 # the array: `validate_publish_order` parses it as quoted lines only.
 TIERS=(
     "rlx-libm rlx-fastmath"

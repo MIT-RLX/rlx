@@ -25,7 +25,9 @@ struct Params {
     x_off: u32,
     dy_off: u32,
     dx_off: u32,
-    _pad0: u32,
+    // nonzero: the store is `max(dx, x)` (`unfuse::UNPOOL_MAX`: an unpool
+    // maxed with the pool's own input, as FastSurfer's decoders do)
+    with_max: u32,
     _pad1: u32,
     _pad2: u32,
     _pad3: u32,
@@ -113,6 +115,9 @@ fn maxpool3d_backward(
                 }
             }
         }
+    }
+    if (params.with_max != 0u) {
+        acc = max(acc, arena[params.x_off + idx]);
     }
     arena[params.dx_off + idx] = acc;
 }

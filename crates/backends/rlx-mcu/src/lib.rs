@@ -7,7 +7,7 @@
 //! int4 matrix kernels ([`kernels`]), the NeMo log-mel frontend ([`mel`]),
 //! PCM input ([`Pcm`], cut at pauses with [`next_cut`]), paged weights
 //! ([`Pager`]) and layer pipelines across chips ([`split`]). Everything numeric goes
-//! through `libm`, so a host build and an MCU build produce the same bits.
+//! through `rlx-libm`, so a host build and an MCU build produce the same bits.
 //!
 //! The model crates built on it (Conformer-CTC, Citrinet, Moonshine
 //! streaming, Kroko) live in `rlx-models`.

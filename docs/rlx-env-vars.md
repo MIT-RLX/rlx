@@ -13,19 +13,19 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 797  
-**Unregistered mentions (migration leftovers):** 146
+**Registered names:** 808  
+**Unregistered mentions (migration leftovers):** 142
 
 ## Groups
 
 - [compile](#compile) — 32
 - [coreml](#coreml) — 20
-- [cpu](#cpu) — 38
+- [cpu](#cpu) — 39
 - [cuda](#cuda) — 77
 - [debug](#debug) — 20
 - [device](#device) — 4
 - [egpu](#egpu) — 8
-- [fft](#fft) — 12
+- [fft](#fft) — 13
 - [gpu](#gpu) — 8
 - [gpu-host](#gpu-host) — 1
 - [metal](#metal) — 210
@@ -36,11 +36,11 @@ semantics. Curated Public list: `just env-catalog`.
 - [qnn](#qnn) — 1
 - [quant](#quant) — 1
 - [rocm](#rocm) — 35
-- [runtime](#runtime) — 27
+- [runtime](#runtime) — 29
 - [tpu](#tpu) — 4
 - [vulkan](#vulkan) — 19
 - [webgl](#webgl) — 2
-- [wgpu](#wgpu) — 104
+- [wgpu](#wgpu) — 111
 - [xdna](#xdna) — 20
 
 ## compile
@@ -144,6 +144,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_Q4K_EXACT_GEMV` | Internal | Bool | Backend(cpu) | Q4_K decode GEMV dequantizes to f32 per block instead of quantizing the activation to Q8_K (exact, slower) |
 | `RLX_Q4K_FUSED_MIN_N` | Internal | String | Backend(cpu) | n above which the fused Q4_K kernel is used instead of dequant |
 | `RLX_Q4K_NO_DOTPROD` | Internal | String | Backend(cpu) | Force the baseline Q4_K path instead of the dotprod intrinsics |
+| `RLX_SDPA_BLOCK_MIN` | Bisect | U64 | Backend(cpu) | Score-matrix size (floats, default 4M) above which CPU attention runs row-blocked |
 | `RLX_SDPA_THRESHOLD` | Bisect | U64 | Backend(cpu) | Sequence length above which SDPA switches from NEON dots to BLAS sgemm |
 | `RLX_VMATH_ACCURATE` | Public | BoolOr | Backend(cpu) | CPU vmath exp/tanh/log/sqrt: use Accelerate/libm accurate path (default 0 = SIMD *_fast) |
 | `RLX_WORKERS` | Bisect | U64 | Backend(cpu) | Thread-pool size (0 = auto) |
@@ -281,6 +282,7 @@ semantics. Curated Public list: `just env-catalog`.
 
 | Name | Stability | Kind | Layer | Summary |
 |------|-----------|------|-------|---------|
+| `RLX_FFT` | Public | Enum | Compile | Which FFT a default (Native) Op::Fft runs: native (each backend's own, fastest), portable (pocketfft as the Linux x86-64 SciPy wheel: the same bits on every device), scipy (this platform's scipy.fft), pocketfft-nofma |
 | `RLX_FFT_CPU_PARALLEL` | Bisect | Bool | Tooling | Rayon-parallelize the CPU FFT batch loop; set 0 to serialize |
 | `RLX_FFT_CUFFT` | Bisect | Bool | Tooling | Use cuFFT; set 0 to fall back to rlx's own FFT kernels |
 | `RLX_FFT_FORCE_MIXED` | Bisect | Bool | Tooling | Force the precompiled mixed-radix FFT instead of the generated kernel |
@@ -763,6 +765,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_COLLECTIVE_TIMEOUT` | Public | U64 | Runtime | Seconds a collective waits on one peer before failing and naming that rank (unset = no limit; a closed peer fails at once) |
 | `RLX_CONFIG` | Public | Path | Runtime | Path to a settings file (KEY = value, [profile.NAME] sections); below explicit env vars |
 | `RLX_CONNECT_WAIT` | Public | String | Runtime | Seconds a mesh dial to a peer keeps trying (default 10; 0 = until it answers, as a persistent node waiting for its next job) |
+| `RLX_CPU_PORTABLE` | Public | Bool | Runtime | CPU backend computes with the wasm build's arithmetic (rlx_cpu::config::portable) |
 | `RLX_DEBUG` | Public | String | Runtime | Comma list: each token T sets RLX_T_DEBUG (e.g. rope,lstm) |
 | `RLX_DETERMINISTIC_REDUCE` | Public | Bool | Runtime | Deterministic (non-ring) collective reduce; set on every rank |
 | `RLX_DISABLE` | Public | String | Runtime | Comma list: each token T sets RLX_DISABLE_T (e.g. cse,sccp) |
@@ -780,6 +783,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_PLACEMENT_CACHE` | Public | Path | Runtime | File that remembers measured-placement decisions across runs |
 | `RLX_PROFILE` | Public | String | Runtime | Comma list of profiles (debug, nans, parity, deterministic, ci, or [profile.NAME] from RLX_CONFIG); later wins |
 | `RLX_PROGRAM_LOG` | Public | Bool | Runtime | Print package-program (WASM) stdout/stderr |
+| `RLX_REPRODUCIBLE` | Public | Bool | Runtime | Fixed device and kernel choices instead of host-dependent ones (see rlx_ir::reproducible) |
 | `RLX_STAGE_KEEP_WARM` | Public | Bool | Runtime | A distributed worker keeps its device busy with a small matmul while its stage waits for the next request, so an integrated GPU does not power down between requests (opt-in; costs power) |
 | `RLX_STAGE_PROFILE` | Internal | Bool | Runtime | Distributed inference stages print where a step's time goes (state in, run, state out), every 16 steps |
 | `RLX_TRACE` | Public | String | Runtime | Comma list: each token T sets RLX_T_TRACE (e.g. metal,gguf) |
@@ -832,15 +836,13 @@ semantics. Curated Public list: `just env-catalog`.
 |------|-----------|------|-------|---------|
 | `RLX_WGPU_ACTIVE_TRACE` | Bisect | Bool | Backend(wgpu) | Trace each wgpu dispatch as it is submitted |
 | `RLX_WGPU_ALLOW_SHARD` | Bisect | Bool | Backend(wgpu) | Warn instead of refusing when the activation arena would be striped across buffers (wrong results) |
+| `RLX_WGPU_ALLOW_SOFTWARE` | Public | Bool | Backend(wgpu) | Keep software adapters (llvmpipe, WARP) instead of skipping them |
 | `RLX_WGPU_ALL_PARAMS_WEIGHT` | Internal | Bool | Backend(wgpu) | Park every parameter in the weight arena rather than splitting |
 | `RLX_WGPU_ARENA_REPORT` | Internal | Bool | Backend(wgpu) | Report which tensors dominate the activation arena after planning |
 | `RLX_WGPU_ATTENTION_SERIAL` | Bisect | Bool | Backend(wgpu) | Attention with one thread per (batch, head, query) row for every step, instead of a workgroup per row while rows are few |
 | `RLX_WGPU_CONCAT_HOST` | Bisect | Bool | Backend(wgpu) | Run Concat on the host instead of a wgpu kernel |
 | `RLX_WGPU_CONV3D_NO_C8` | Bisect | Bool | Backend(wgpu) | Tile Conv3D over four output channels per thread instead of eight (conv3d_ctile_w4, not conv3d_ctile_w4c8) |
 | `RLX_WGPU_CONV3D_NO_K3` | Bisect | Bool | Backend(wgpu) | Run 2-D 3x3 Conv3D (kernel [1,3,3], pad [0,1,1]) on the eight-channel tile instead of conv3d_k3_c8 (weights in workgroup memory) |
-| `RLX_WGPU_NO_FOLD_PRELU` | Bisect | Bool | Backend(wgpu) | Keep an element-wise PReLU (max(x,0)+a*min(x,0), ONNX relu(x)-a*relu(-x)) as its ops instead of one rlx_wgpu.prelu pass |
-| `RLX_WGPU_NO_FOLD_CONV_PRELU` | Bisect | Bool | Backend(wgpu) | Keep a PReLU read only by 2-D 3x3 convs as its own pass instead of applying it in their loads (rlx_wgpu.conv3d_k3) |
-| `RLX_WGPU_NO_FOLD_CONV_MAX` | Bisect | Bool | Backend(wgpu) | Keep an element-wise max over a 2-D 3x3 conv's output as its own pass instead of taking it in the conv's store (rlx_wgpu.conv3d_k3) |
 | `RLX_WGPU_CONV3D_NO_W2` | Bisect | Bool | Backend(wgpu) | Tile Conv3D over one W position per thread instead of four (conv3d_ctile, not conv3d_ctile_w4) |
 | `RLX_WGPU_CONV3D_SCALAR` | Bisect | Bool | Backend(wgpu) | Force the one-element-per-thread Conv3D kernel instead of the 4-channel tiled one |
 | `RLX_WGPU_CONV3D_W2` | Bisect | Bool | Backend(wgpu) | Tile Conv3D over two W positions per thread instead of four (conv3d_ctile_w2, not conv3d_ctile_w4) |
@@ -870,6 +872,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_DUMP_NODES` | Bisect | Bool | Backend(wgpu) | Dump per-node output buffers for cross-backend diffing |
 | `RLX_WGPU_DUMP_NODES_LIMIT` | Bisect | U64 | Backend(wgpu) | Cap how many nodes the wgpu dump writes (default 40) |
 | `RLX_WGPU_DUMP_TAIL` | Bisect | Bool | Backend(wgpu) | Dump the tail of each buffer rather than the head |
+| `RLX_WGPU_DUMP_WGSL` | Internal | Path | Tooling | Write every shader module's WGSL source to this directory (native only) |
 | `RLX_WGPU_EXPAND_HOST` | Internal | Bool | Backend(wgpu) | Run Expand on the host instead of a wgpu kernel |
 | `RLX_WGPU_F16_MIRROR` | Bisect | Bool | Backend(wgpu) | Always use the f16 weight mirror (default: only past the binding-size limit) |
 | `RLX_WGPU_F16_WEIGHTS` | Bisect | Bool | Backend(wgpu) | Store wgpu weights in f16 to halve weight bandwidth |
@@ -901,14 +904,19 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_NAN_TRACE` | Bisect | Bool | Backend(wgpu) | Legacy wgpu NaN trace (prefer RLX_DEBUG_NANS) |
 | `RLX_WGPU_NO_COOP_F16_VK` | Bisect | Bool | Backend(wgpu) | Disable f16 cooperative matrices in the wgpu Vulkan backend |
 | `RLX_WGPU_NO_COOP_F32` | Bisect | Bool | Backend(wgpu) | Disable f32 cooperative matrices |
+| `RLX_WGPU_NO_COOP_F32_EDGE` | Bisect | Bool | Backend(wgpu) | Restore the param-and-aligned-only gate for the f32 cooperative-matrix GEMM |
 | `RLX_WGPU_NO_COOP_PROBE` | Bisect | Bool | Backend(wgpu) | Skip the cooperative-matrix self-check and trust the kernels |
 | `RLX_WGPU_NO_F16_MIRROR` | Bisect | Bool | Backend(wgpu) | Do not keep an f16 mirror of f32 weights |
 | `RLX_WGPU_NO_F16_SHADOW` | Bisect | Bool | Backend(wgpu) | Do not allocate the f16 shadow buffer |
 | `RLX_WGPU_NO_FOLD_CONV_ACT` | Internal | Bool | Backend(wgpu) | Disable folding an activation into the rank-5 conv it reads (applied in the conv3d store) |
 | `RLX_WGPU_NO_FOLD_CONV_ARGMAX` | Internal | Bool | Backend(wgpu) | Disable fusing a 1x1x1 conv3d and the channel argmax reading it (the logits are never stored) |
+| `RLX_WGPU_NO_FOLD_CONV_MAX` | Bisect | Bool | Backend(wgpu) | Keep an element-wise max over a 2-D 3x3 conv's output as its own pass instead of taking it in the conv's store (rlx_wgpu.conv3d_k3) |
+| `RLX_WGPU_NO_FOLD_CONV_PRELU` | Bisect | Bool | Backend(wgpu) | Keep a PReLU read only by 2-D 3x3 convs as its own pass instead of applying it in their loads (rlx_wgpu.conv3d_k3) |
 | `RLX_WGPU_NO_FOLD_MMBA` | Internal | Bool | Backend(wgpu) | Disable folding matmul+bias+activation into one node |
 | `RLX_WGPU_NO_FOLD_NORM_ACT` | Internal | Bool | Backend(wgpu) | Disable folding an activation into the group norm it reads (applied in the norm's write-back) |
+| `RLX_WGPU_NO_FOLD_PRELU` | Bisect | Bool | Backend(wgpu) | Keep an element-wise PReLU (max(x,0)+a*min(x,0), ONNX relu(x)-a*relu(-x)) as its ops instead of one rlx_wgpu.prelu pass |
 | `RLX_WGPU_NO_FOLD_RESLN` | Internal | Bool | Backend(wgpu) | Disable folding residual add into LayerNorm |
+| `RLX_WGPU_NO_FOLD_UNPOOL_MAX` | Bisect | Bool | Backend(wgpu) | Keep max(MaxPool3dBackward(x, dy), x) as two passes instead of taking the max in the backward kernel's store (rlx_wgpu.unpool_max) |
 | `RLX_WGPU_NO_GEMV` | Bisect | Bool | Backend(wgpu) | Use the tiled matmul for m <= 4 too, instead of the decode GEMV kernel |
 | `RLX_WGPU_NO_PACKED_BSHD_ATTN` | Bisect | Bool | Backend(wgpu) | Disable the packed BSHD attention kernel on wgpu |
 | `RLX_WGPU_NO_STRIDED_BMM` | Bisect | Bool | Backend(wgpu) | Disable fold_strided_bmm (attention matmuls read Q/K/V through strided views of the qkv projection) |
@@ -1087,7 +1095,6 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_ROCM_PATH` | `scripts/gen-rlx-env-vars.py` |
 | `RLX_R_SUPPORT_CALLS` | `crates/tooling/rlx-bindgen/src/r.rs` |
 | `RLX_SCALAR_ACT_FNS` | `crates/backends/rlx-metal/src/icb.rs` |
-| `RLX_SDPA_BLOCK_MIN` | `crates/backends/rlx-cpu/src/thunk/exec_dispatch.rs` |
 | `RLX_SDPA_DECODE_M1` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_SGEMM_TILES` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_SHFL_ALL_LANES` | `crates/backends/rlx-rocm/src/backend/run.rs` |
@@ -1109,9 +1116,6 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_USE_MPS_GRAPH` | `crates/backends/rlx-metal/src/mps_graph.rs` |
 | `RLX_VERBSE` | `crates/core/rlx-ir/src/env_registry.rs` |
 | `RLX_VERSION` | `crates/core/rlx-ir/src/rlxmodel/mod.rs` |
-| `RLX_WGPU_DUMP_WGSL` | `crates/backends/rlx-wgpu/src/kernels/mod.rs` |
-| `RLX_WGPU_NO_COOP_F32_EDGE` | `crates/backends/rlx-wgpu/src/backend/mod.rs` |
-| `RLX_WGPU_NO_FOLD_CONV_PRELU` | `crates/backends/rlx-wgpu/src/unfuse.rs` |
 | `RLX_WHISPER_DIR` | `rig.sh` |
 | `RLX_XCFRAMEWORK` | `Justfile` |
 | `RLX_ZZZZZZZZZZZZZZZZZZZZ` | `crates/core/rlx-ir/src/env_registry.rs` |

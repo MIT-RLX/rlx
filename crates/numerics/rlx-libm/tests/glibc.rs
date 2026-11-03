@@ -1,6 +1,14 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Against the platform's glibc itself (x86_64 Linux on a CPU with FMA, where
 //! glibc runs the `*_fma` variants these model). Zero tolerance.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
+// glibc itself, by `dlsym` (see the module: not std, not `extern "C"`).
+#[path = "../src/sys.rs"]
+mod sys;
 
 struct R(u64);
 impl R {
@@ -45,21 +53,21 @@ fn exp_matches_glibc() {
     check(
         "exp",
         rlx_libm::exp,
-        f64::exp,
+        sys::exp,
         &mut |r| -50.0 + 100.0 * r.u(),
         N,
     );
     check(
         "exp wide",
         rlx_libm::exp,
-        f64::exp,
+        sys::exp,
         &mut |r| -745.0 + 1455.0 * r.u(),
         N,
     );
     check(
         "exp bits",
         rlx_libm::exp,
-        f64::exp,
+        sys::exp,
         &mut |r| f64::from_bits(r.bits()),
         N,
     );
@@ -70,21 +78,21 @@ fn log_matches_glibc() {
     check(
         "log",
         rlx_libm::log,
-        f64::ln,
+        sys::log,
         &mut |r| 1e-6 + 1e6 * r.u(),
         N,
     );
     check(
         "log near 1",
         rlx_libm::log,
-        f64::ln,
+        sys::log,
         &mut |r| 0.9 + 0.2 * r.u(),
         N,
     );
     check(
         "log bits",
         rlx_libm::log,
-        f64::ln,
+        sys::log,
         &mut |r| f64::from_bits(r.bits() >> 1),
         N,
     );
@@ -95,21 +103,21 @@ fn log2_matches_glibc() {
     check(
         "log2",
         rlx_libm::log2,
-        f64::log2,
+        sys::log2,
         &mut |r| 1e-6 + 1e6 * r.u(),
         N,
     );
     check(
         "log2 near 1",
         rlx_libm::log2,
-        f64::log2,
+        sys::log2,
         &mut |r| 0.94 + 0.12 * r.u(),
         N,
     );
     check(
         "log2 bits",
         rlx_libm::log2,
-        f64::log2,
+        sys::log2,
         &mut |r| f64::from_bits(r.bits() >> 1),
         N,
     );
@@ -122,7 +130,7 @@ fn check2(name: &str, sample: &mut dyn FnMut(&mut R) -> (f64, f64), n: usize) {
         let (x, y) = sample(&mut r);
         let (a, b) = (
             rlx_libm::pow(x, y),
-            std::hint::black_box(x).powf(std::hint::black_box(y)),
+            sys::pow(std::hint::black_box(x), std::hint::black_box(y)),
         );
         if a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()) {
             bad += 1;
@@ -178,7 +186,7 @@ fn exp_at_rounding_boundaries() {
     check(
         "exp boundaries",
         rlx_libm::exp,
-        f64::exp,
+        sys::exp,
         &mut |_| it.next().unwrap(),
         190000 * 65,
     );
@@ -189,7 +197,7 @@ fn log2_near_one_dense() {
     check(
         "log2 near 1 dense",
         rlx_libm::log2,
-        f64::log2,
+        sys::log2,
         &mut |r| 0.9575 + 0.085 * r.u(),
         200_000_000,
     );
@@ -230,27 +238,21 @@ fn sin_cos_match_glibc() {
     check(
         "sin bits",
         rlx_libm::sin,
-        f64::sin,
+        sys::sin,
         &mut |r| f64::from_bits(r.bits()),
         N / 2,
     );
     check(
         "cos bits",
         rlx_libm::cos,
-        f64::cos,
+        sys::cos,
         &mut |r| f64::from_bits(r.bits()),
         N / 2,
     );
 }
 
-unsafe extern "C" {
-    #[link_name = "erfc"]
-    fn glibc_erfc(x: f64) -> f64;
-}
-
 fn c_erfc(x: f64) -> f64 {
-    // SAFETY: a pure libm function of one double.
-    unsafe { glibc_erfc(x) }
+    sys::erfc(x)
 }
 
 #[test]
@@ -286,6 +288,8 @@ fn erfc_matches_glibc() {
     );
 }
 
+// the hard-case search is `std`-only
+#[cfg(feature = "std")]
 #[test]
 fn erfc_hard_cases_match_glibc() {
     let xs = rlx_libm::erfc_hard_cases();
@@ -313,7 +317,7 @@ fn expm1_log1p_match_glibc() {
         check(
             &format!("expm1 {name}"),
             rlx_libm::expm1,
-            f64::exp_m1,
+            sys::expm1,
             &mut |r| lo + (hi - lo) * r.u(),
             N / 4,
         );
@@ -321,7 +325,7 @@ fn expm1_log1p_match_glibc() {
     check(
         "expm1 bits",
         rlx_libm::expm1,
-        f64::exp_m1,
+        sys::expm1,
         &mut |r| f64::from_bits(r.bits()),
         N / 4,
     );
@@ -334,7 +338,7 @@ fn expm1_log1p_match_glibc() {
         check(
             &format!("log1p {name}"),
             rlx_libm::log1p,
-            f64::ln_1p,
+            sys::log1p,
             &mut |r| lo + (hi - lo) * r.u(),
             N / 4,
         );
@@ -342,7 +346,7 @@ fn expm1_log1p_match_glibc() {
     check(
         "log1p bits",
         rlx_libm::log1p,
-        f64::ln_1p,
+        sys::log1p,
         &mut |r| f64::from_bits(r.bits() >> 1),
         N / 4,
     );
@@ -359,7 +363,7 @@ fn tan_hypot_match_glibc() {
         check(
             &format!("tan {name}"),
             rlx_libm::tan,
-            f64::tan,
+            sys::tan,
             &mut |r| {
                 let x = lo + (hi - lo) * r.u();
                 if r.u() < 0.5 { -x } else { x }
@@ -370,7 +374,7 @@ fn tan_hypot_match_glibc() {
     check(
         "tan bits",
         rlx_libm::tan,
-        f64::tan,
+        sys::tan,
         &mut |r| f64::from_bits(r.bits()),
         N / 4,
     );
@@ -394,7 +398,10 @@ fn check2_named(name: &str, sample: &mut dyn FnMut(&mut R) -> (f64, f64), n: usi
     let (mut bad, mut first) = (0usize, None);
     for _ in 0..n {
         let (x, y) = sample(&mut r);
-        let (a, b) = (rlx_libm::hypot(x, y), std::hint::black_box(x).hypot(y));
+        let (a, b) = (
+            rlx_libm::hypot(x, y),
+            sys::hypot(std::hint::black_box(x), y),
+        );
         if a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()) {
             bad += 1;
             first.get_or_insert((x, y, a, b));
@@ -404,17 +411,7 @@ fn check2_named(name: &str, sample: &mut dyn FnMut(&mut R) -> (f64, f64), n: usi
     assert_eq!(bad, 0, "{name}");
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Cplx {
-    re: f64,
-    im: f64,
-}
-
-unsafe extern "C" {
-    fn cexp(z: Cplx) -> Cplx;
-    fn csqrt(z: Cplx) -> Cplx;
-}
+use sys::Cplx;
 
 #[test]
 fn cexp_csqrt_match_glibc() {
@@ -428,8 +425,7 @@ fn cexp_csqrt_match_glibc() {
             (f64::from_bits(r.bits()), f64::from_bits(r.bits()))
         };
         let z = Cplx { re, im };
-        // SAFETY: pure libm functions of a complex double.
-        let (ge, gs) = unsafe { (cexp(z), csqrt(z)) };
+        let (ge, gs) = (sys::cfn(c"cexp", z), sys::cfn(c"csqrt", z));
         let (oe, os) = (rlx_libm::cexp(re, im), rlx_libm::csqrt(re, im));
         let same = |a: f64, b: f64| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
         if !(same(oe.0, ge.re) && same(oe.1, ge.im)) {
@@ -445,10 +441,6 @@ fn cexp_csqrt_match_glibc() {
     assert!(bad_e == 0 && bad_s == 0);
 }
 
-unsafe extern "C" {
-    fn sincos(x: f64, s: *mut f64, c: *mut f64);
-}
-
 /// glibc's merged `sincos` (what gcc emits for `sin`+`cos` of one argument) equals
 /// the separate ports: the same reduction and kernels.
 #[test]
@@ -461,9 +453,7 @@ fn sincos_equals_sin_and_cos() {
         } else {
             f64::from_bits(r.bits())
         };
-        let (mut s, mut c) = (0.0, 0.0);
-        // SAFETY: libm's `sincos` writes the two outputs.
-        unsafe { sincos(x, &mut s, &mut c) };
+        let (s, c) = sys::sincos(x);
         let (a, b) = (rlx_libm::sin(x), rlx_libm::cos(x));
         if !((a.to_bits() == s.to_bits() || (a.is_nan() && s.is_nan()))
             && (b.to_bits() == c.to_bits() || (b.is_nan() && c.is_nan())))

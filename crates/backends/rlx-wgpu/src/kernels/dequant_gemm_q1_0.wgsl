@@ -41,7 +41,7 @@ fn dq_read_f16(rel: u32) -> f32 {
     var v: f32;
     if (exp == 0u) { v = f32(mant) / 1024.0 * exp2(-14.0); }
     else if (exp == 31u) { v = bitcast<f32>(select(0u, 0x7f800000u, mant == 0u)); }
-    else { v = (1.0 + f32(mant) / 1024.0) * exp2(f32(i32(exp) - 15)); }
+    else { v = (1.0 + f32(mant) / 1024.0) * ldexp(1.0, i32(exp) - 15); }
     return select(v, -v, sign != 0u);
 }
 

@@ -325,7 +325,7 @@ pub fn quant(x: f32) -> i8 {
 pub fn quantize_row(x: &[f32], q: &mut [i8]) -> f32 {
     let mut m = 0.0f32;
     for &v in x {
-        let a = libm::fabsf(v);
+        let a = v.abs();
         if a > m {
             m = a;
         }

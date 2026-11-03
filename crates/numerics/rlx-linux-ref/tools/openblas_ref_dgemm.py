@@ -1,3 +1,7 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Reference for tests/fixtures/openblas_haswell_dgemm.txt: run on the Linux reference
 # (msi: numpy 2.3.5, OpenBLAS 0.3.30 Haswell): python -I tools/openblas_ref_dgemm.py out.txt
 # NumPy routes a 2-D @ 2-D product (m, n > 1, distinct buffers) to cblas_dgemm(RowMajor, …);

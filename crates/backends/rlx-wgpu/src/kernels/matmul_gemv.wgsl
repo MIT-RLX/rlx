@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 // Matrix-vector product for decode: `m ≤ 4` rows of A against a row-major
 // `[K, N]` B, same `Params`, bias + activation epilogue and batch strides as
 // `matmul.wgsl` (so it shares its bind groups).
@@ -50,53 +53,6 @@ const MAX_M: u32 = 4u;
 // [KSPLIT * MAX_M][COLS] partial sums.
 var<workgroup> partial: array<array<f32, 32>, 32>;
 
-// Correctly-rounded `a / b`: a verbatim copy of rlxsl's `rlx_div_rn` (pinned
-// by tests/epilogue_exact_math.rs). WGSL `/` is not correctly rounded, and
-// Metal compiles it differently for native wgpu and for a browser's WebGPU,
-// so a raw `/` in sigmoid / SiLU moved activations by an ULP between them.
-fn epi_div_rn(a: f32, b: f32) -> f32 {
-    let k = abs(a / b) < 0x1p-100f;
-    let a2 = select(a, a * 0x1p64f, k);
-    let q = a2 / b;
-    let ok = q != 0.0 && abs(q) <= 0x1.fffffep+127f;
-    var c = select(q, q + fma(-b, q, a2) / b, ok);
-    // The step rounds its correction before adding it, so near a midpoint
-    // `c` depends on the first quotient. Move to the neighbour on the
-    // quotient's side when the quotient lies past their midpoint (ties to
-    // even): `r = a - b·c` is exact, and `r - b·u/2` has the sign of
-    // `a - b·(c + n)/2`.
-    if (ok && c != 0.0 && abs(c) < 0x1.fffffep+127f) {
-        let r = fma(-b, c, a2);
-        if (r != 0.0) {
-            let up = (r > 0.0) == (b > 0.0);
-            let cb = bitcast<u32>(c);
-            let nb = select(cb - 1u, cb + 1u, up == (c > 0.0));
-            let n = bitcast<f32>(nb);
-            let t = fma(-b, (n - c) * 0.5, r);
-            if ((t != 0.0 && ((t > 0.0) == (b > 0.0)) == up) || (t == 0.0 && (nb & 1u) == 0u)) {
-                c = n;
-            }
-        }
-    }
-    return select(c, c * 0x1p-64f, k);
-}
-
-// `rlxsl::exact`'s `rlx_exp` (the builtin `exp` rounds by math mode).
-fn epi_exp(x: f32) -> f32 {
-    let bx = bitcast<u32>(x);
-    if ((bx & 0x7fffffffu) > 0x7f800000u) { return x; }
-    let xc = clamp(x, -110.0, 89.0);
-    let n = round(xc * 1.44269504);
-    let r = fma(n, -1.428606765330187e-6, fma(n, -0.693145751953125, xc));
-    var p = 1.9875691500e-4;
-    p = fma(p, r, 1.3981999507e-3);
-    p = fma(p, r, 8.3334519073e-3);
-    p = fma(p, r, 4.1665795894e-2);
-    p = fma(p, r, 1.6666665459e-1);
-    p = fma(p, r, 5.0000001201e-1);
-    return ldexp(1.0 + fma(p, r * r, r), i32(n));
-}
-
 // Exact GELU via Abramowitz & Stegun 7.1.26 erf approximation.
 // Mirrors `scalar_gelu` in rlx-cpu/src/kernels.rs so wgpu output matches
 // the CPU baseline to f32 precision (~1e-7) instead of the ~5e-4 drift
@@ -105,12 +61,12 @@ fn gelu_erf(x: f32) -> f32 {
     let arg = x * 0.70710678118654752;       // x / sqrt(2)
     let s = select(-1.0, 1.0, arg >= 0.0);
     let xa = abs(arg);
-    let t = epi_div_rn(1.0, fma(0.3275911, xa, 1.0));
+    let t = rlx_div_rn(1.0, fma(0.3275911, xa, 1.0));
     // explicit fma: an uncontracted chain is contracted differently by
     // different shader compilers
     let poly = t * fma(t, fma(t, fma(t, fma(t, 1.061405429, -1.453152027), 1.421413741),
                 -0.284496736), 0.254829592);
-    let e = s * fma(-poly, epi_exp(-xa * xa), 1.0);
+    let e = s * fma(-poly, rlx_exp(-xa * xa), 1.0);
     return 0.5 * x * (1.0 + e);
 }
 
@@ -121,9 +77,9 @@ fn apply_act(v_in: f32) -> f32 {
     switch (params.act_id) {
         case 0xFFFFu: {}                                                   // none
         case 0u: { v = max(v, 0.0); }                                      // relu
-        case 1u: { v = epi_div_rn(1.0, 1.0 + epi_exp(-clamp(v, -88.0, 88.0))); }        // sigmoid
-        case 2u: { v = tanh(clamp(v, -15.0, 15.0)); }                      // tanh
-        case 5u: { v = sqrt(v); }
+        case 1u: { v = rlx_div_rn(1.0, 1.0 + rlx_exp(-clamp(v, -88.0, 88.0))); }        // sigmoid
+        case 2u: { v = rlx_tanh(clamp(v, -15.0, 15.0)); }                      // tanh
+        case 5u: { v = rlx_sqrt_rn(v); }
         case 7u: { v = -v; }
         case 8u: { v = abs(v); }
         case 9u: { v = gelu_erf(v); }                                      // exact gelu
@@ -132,12 +88,12 @@ fn apply_act(v_in: f32) -> f32 {
             let c = 0.7978845608028654;
             let x3 = v * v * v;
             let inner = clamp(c * fma(0.044715, x3, v), -15.0, 15.0);
-            v = 0.5 * v * (1.0 + tanh(inner));
+            v = 0.5 * v * (1.0 + rlx_tanh(inner));
         }
         case 10u: {
             // SiLU = x · sigmoid(x)
             let nx = clamp(-v, -88.0, 88.0);
-            v = epi_div_rn(v, 1.0 + epi_exp(nx));
+            v = rlx_div_rn(v, 1.0 + rlx_exp(nx));
         }
         default: {}
     }

@@ -88,6 +88,8 @@ blas-mkl = ["cpu", "rlx-cpu/blas-mkl"]              # Intel/AMD: MKL instead of 
 amx-sme = ["cpu", "rlx-cpu/amx-sme"]                # Apple M4+: direct ARM SME2 GEMM microkernel
 amx-bnns = ["cpu", "rlx-cpu/amx-bnns"]                # Apple: BNNS bf16/f16 low-precision matmul
 cpu-wave-exec = ["cpu", "rlx-cpu/wave-exec"]           # CPU: run independent thunks concurrently
+rust-libm = ["cpu", "rlx-cpu/rust-libm"]               # std float math → rlx-libm's Rust ports (executables)
+pure-rust = ["cpu", "rlx-cpu/pure-rust"]               # CPU: no native libraries, no C libm
 assoc-scan = ["rlx-opt/assoc-scan"]                    # Metal: affine Scan → log-depth prefix scan
 blas-openblas = ["cpu"]                            # Linux/Windows: OpenBLAS (rlx-cpu default)
 
@@ -264,10 +266,10 @@ wasmi = { version = "2", optional = true }
 # Referenced weight files' checksums (`model.weights[].sha256`); already in
 # the `model-io` tree through the archive crates.
 sha2 = { version = "0.10", optional = true }
-rlx-mlx-io = { workspace = true, optional = true }
+rlx-mlx-io = { workspace = true, optional = true, features = ["io"] }
 rlx-dduf = { workspace = true, optional = true }
-# rlx-gpu = { path = "../rlx-gpu", version = "0.2.19", optional = true }
-# rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.19", optional = true }
+# rlx-gpu = { path = "../rlx-gpu", version = "0.2.20", optional = true }
+# rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.20", optional = true }
 
 # rlx-metal is Apple-only (Metal is an Apple API). Make it a dependency solely on
 # Apple targets — excluding watchOS, which has no Metal compute — so the `metal`
@@ -302,10 +304,10 @@ rlxsl = { workspace = true }
 rlx-flow = { workspace = true }
 rayon = "1"
 # `rlxp_mlx_keep_packed_run` builds its package with the MLX importer.
-rlx-pkg = { workspace = true, features = ["convert"] }
+rlx-pkg = { workspace = true, features = ["write", "convert", "parallel"] }
 rlx-compile = { workspace = true, features = ["training"] }
 # rlx-splat moved out of tree; splat examples/tests below are disabled until it returns.
-# rlx-splat = { path = "../rlx-splat", version = "0.2.19", default-features = false, features = ["test-support", "io"] }
+# rlx-splat = { path = "../rlx-splat", version = "0.2.20", default-features = false, features = ["test-support", "io"] }
 # Downstream demonstration packages used in integration tests.
 # `metal`/`mlx` are enabled ONLY on macOS (see the target-specific
 # dev-dependencies below) — those backends exist solely on Apple, and on a

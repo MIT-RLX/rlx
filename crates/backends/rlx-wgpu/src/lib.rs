@@ -31,9 +31,9 @@ pub use backend::bf16_packed_dispatch_count;
 /// Host-step planning: what a compiled schedule asks the CPU to do, and which
 /// of those asks are independent enough to share a sync point.
 pub use backend::{HostBatch, HostGroup, HostIo, HostPlan, Region};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub mod step_profile;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 #[path = "step_profile_wasm.rs"]
 pub mod step_profile;
 pub mod supported_ops;
@@ -95,6 +95,6 @@ pub fn is_available() -> bool {
 }
 
 pub use buffer::{arena_binding_limit, planned_arena_bytes, planned_largest_tensor_bytes};
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub use device::init_wgpu_device;
 pub use device::{is_vulkan_available, select_vulkan_backend, wgpu_device};

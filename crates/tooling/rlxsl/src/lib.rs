@@ -921,6 +921,8 @@ impl Lang {
             },
             (_, Intr::Log) => match self {
                 Cuda => "logf",
+                // WGSL's `log` rounds by the compiler's math mode; see `exact`.
+                Wgsl => "rlx_log",
                 _ => "log",
             },
             (_, Intr::Sqrt) => match self {
@@ -937,6 +939,7 @@ impl Lang {
             },
             (_, Intr::Tanh) => match self {
                 Cuda => "tanhf",
+                Wgsl => "rlx_tanh",
                 _ => "tanh",
             },
             (_, Intr::Sin) => match self {
@@ -1504,7 +1507,7 @@ mod tests {
         // truth (measured ~5e-7). This is the real precision guard — the 5e-3
         // parity tolerance elsewhere exists only to absorb cross-vendor GPU
         // intrinsic differences, and would NOT catch a coarser polynomial here.
-        let true_erf = |x: f64| libm::erf(x);
+        let true_erf = |x: f64| rlx_libm::erf(x);
         let true_gelu = |x: f64| 0.5 * x * (1.0 + true_erf(x / std::f64::consts::SQRT_2));
         let true_gelu_grad = |x: f64| {
             let phi = 0.5 * (1.0 + true_erf(x / std::f64::consts::SQRT_2));

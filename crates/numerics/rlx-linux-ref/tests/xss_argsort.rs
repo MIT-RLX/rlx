@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `rlx_linux_ref::xss` against NumPy 2.3.5's `np.argsort` on AVX2 (msi):
 //! `tests/fixtures/xss_argsort.txt` from `tools/xss_ref_argsort.py`.
 

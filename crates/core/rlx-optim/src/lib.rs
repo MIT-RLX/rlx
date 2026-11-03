@@ -36,6 +36,7 @@
 //! | [`Soap`]        | SOAP (Shampoo-in-Adam-basis)  |
 //! | [`KronPsgd`]    | Kron / PSGD                   |
 //! | [`Muon`]        | Muon (Newton–Schulz orth.)    |
+//! | [`MuonAdamW`]   | Muon on matrices, AdamW rest  |
 //! | [`Sophia`]      | Sophia-H                      |
 //! | [`Mars`]        | MARS (variance-reduced)       |
 //! | [`Stiefel`]     | Riemannian SGD on St(m,n)     |
@@ -73,7 +74,7 @@ pub use kron_psgd::KronPsgd;
 pub use lamb::Lamb;
 pub use lion::Lion;
 pub use mars::Mars;
-pub use muon::{Muon, newton_schulz_orth};
+pub use muon::{Muon, MuonAdamW, newton_schulz_orth};
 pub use nadamw::NAdamW;
 pub use qhadamw::QHAdamW;
 pub use radam::RAdam;
@@ -292,6 +293,32 @@ mod state_dict_tests {
     #[test]
     fn lion_resumes_bit_exactly() {
         resume_matches_uninterrupted(|| Lion::new(0.1));
+    }
+
+    #[test]
+    fn muon_resumes_bit_exactly() {
+        resume_matches_uninterrupted(|| Muon::new(0.1));
+    }
+
+    #[test]
+    fn muon_adamw_resumes_bit_exactly() {
+        resume_matches_uninterrupted(|| MuonAdamW::new(0.1).with_weight_decay(0.01));
+    }
+
+    #[test]
+    fn muon_adamw_routes_by_shape() {
+        let g = [0.5f32, -0.25, 0.125, 1.0];
+        let mut both = MuonAdamW::new(0.1);
+        let (mut mat, mut vec) = ([1.0f32; 4], [1.0f32; 4]);
+        both.step("w", &[2, 2], &mut mat, &g);
+        both.step("b", &[4], &mut vec, &g);
+        let (mut mat_ref, mut vec_ref) = ([1.0f32; 4], [1.0f32; 4]);
+        Muon::new(0.1 * 0.2).step("w", &[2, 2], &mut mat_ref, &g);
+        AdamW::new(0.1)
+            .with_weight_decay(0.0)
+            .step("b", &[4], &mut vec_ref, &g);
+        assert_eq!(mat, mat_ref);
+        assert_eq!(vec, vec_ref);
     }
 
     #[test]

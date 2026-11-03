@@ -3,7 +3,7 @@
     "description": "PHP bindings for rlx over its C ABI: graphs, sessions, device selection, autodiff, training, weights, text and distributed nodes.",
     "type": "library",
     "license": ["MIT", "Apache-2.0"],
-    "version": "0.2.19",
+    "version": "0.2.20",
     "require": {
         "php": ">=8.1",
         "ext-ffi": "*"

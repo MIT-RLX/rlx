@@ -60,6 +60,6 @@ fn pool1d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
             }
         }
     }
-    if (params.op == 1u) { acc = acc / f32(params.kl); }
+    if (params.op == 1u) { acc = rlx_div_rn(acc, f32(params.kl)); }
     arena[params.out_off + i] = acc;
 }

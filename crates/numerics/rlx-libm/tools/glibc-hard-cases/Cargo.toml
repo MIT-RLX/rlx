@@ -1,0 +1,16 @@
+# Validation tool, not part of the workspace or of rlx: finds the hard-case
+# tables of `src/core_math_f32.rs` against glibc itself (Linux, glibc 2.43):
+#   cargo run --release --manifest-path tools/glibc-hard-cases/Cargo.toml
+[package]
+name = "glibc-hard-cases"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rlx-libm = { path = "../.." }
+
+[profile.release]
+opt-level = 3
+
+[workspace]

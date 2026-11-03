@@ -1,3 +1,7 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Reference for tests/fixtures/openblas_haswell_dgesdd.txt: run on the Linux reference
 # (msi: scipy 1.17.1, OpenBLAS 0.3.30 + its reference LAPACK): python -I tools/openblas_ref_dgesdd.py out.txt
 # scipy.linalg.svd(A, full_matrices=False) → dgesdd('S'). One line per case:

@@ -58,6 +58,7 @@ fn options(algo: FftAlgo) -> Option<Options> {
             FftTwiddles::Platform => Twiddles::Platform,
             FftTwiddles::AppleSinCos => Twiddles::AppleSinCos,
             FftTwiddles::Separate => Twiddles::Separate,
+            FftTwiddles::Linux => Twiddles::Linux,
         },
     })
 }
@@ -153,9 +154,17 @@ impl MatchRewrite for LowerPocketFft {
             return None;
         }
         // pocketfft's `fct`: the norm scale rounded to the element type
+        // (`Linux` twiddles pair with the x87 `long double` on every host)
+        let fct_of = |i: u8| {
+            if opt.twiddles == Twiddles::Linux {
+                rlx_pocketfft::norm_fct_as(i, n, true)
+            } else {
+                rlx_pocketfft::norm_fct(i, n)
+            }
+        };
         let scale = match (norm, inverse) {
-            (FftNorm::Ortho, _) => rlx_pocketfft::norm_fct(1, n),
-            (FftNorm::Forward, true) => rlx_pocketfft::norm_fct(2, n),
+            (FftNorm::Ortho, _) => fct_of(1),
+            (FftNorm::Forward, true) => fct_of(2),
             _ => 1.0,
         };
         let fct = if dt == DType::F32 {

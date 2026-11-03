@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ns per transform: rlx-spectral vs rustfft (complex, f32), and real FFTs,
 //! best of N over a batch of frames.
 use rlx_spectral::{Complex, FftPlan, RealFftPlan};

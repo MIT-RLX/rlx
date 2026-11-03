@@ -38,7 +38,7 @@ struct SharedWeightBuffers {
 // wasm is single-threaded so the shared static is never actually accessed from
 // another thread — assert `Send` there so it fits the `static Mutex`. On native
 // `wgpu::Buffer` is already `Send` (no impl needed / would conflict).
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 unsafe impl Send for SharedWeightBuffers {}
 
 static SHARED_WEIGHTS: Mutex<Option<SharedWeightBuffers>> = Mutex::new(None);
@@ -1021,7 +1021,7 @@ impl Arena {
         // act window; in the browser that copy would wait on a buffer map the
         // single thread can never deliver (the page spins forever). There, park
         // only packed quant — the fused GEMV binds the weight buffer in place.
-        let host_staging_ok = !cfg!(target_arch = "wasm32");
+        let host_staging_ok = !cfg!(target_family = "wasm");
         let park_all_params = rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT")
             || (host_staging_ok
                 && (new_plan.arena_size + param_bytes_est + scratch_aligned) > bind_cap
@@ -2303,7 +2303,7 @@ pub fn decode_mapped_readback_f32(
 /// callback fires from a microtask once the copy completes, stores the
 /// result, and wakes the awaiting task. No `device.poll` is needed (and it
 /// would be a no-op on the WebGPU backend anyway).
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub mod wasm_async {
     use std::cell::RefCell;
     use std::future::Future;

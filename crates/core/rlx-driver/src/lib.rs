@@ -32,7 +32,7 @@ pub mod arena;
 #[cfg(all(
     feature = "ble",
     not(target_os = "windows"),
-    not(target_arch = "wasm32")
+    not(target_family = "wasm")
 ))]
 pub mod ble;
 pub mod buffer;

@@ -10,13 +10,30 @@
 //! (`__exp_fma`, …) on any CPU with FMA, and gcc (`-ffp-contract=fast`) turns a
 //! multiply into FMAs when every use of the product is an add or subtract. These
 //! are those functions — the algorithms are ARM's optimized-routines (which glibc
-//! carries verbatim; tables in [`tables`] are its data, as compiled) with each
+//! carries verbatim; the `tables` module holds its data, as compiled) with each
 //! FMA where gcc's build has one (gcc fuses a product only when every use of it is
 //! an add/subtract in the product's own basic block) — so a wasm or non-glibc build reproduces the
 //! Linux reference exactly. Verified against glibc 2.43 on x86_64 (Alder Lake).
 //!
 //! Exceptions and `errno` are not modelled; the returned values are.
+//!
+//! ## Verification
+//!
+//! Against glibc 2.43 itself, zero tolerance, on two builds: x86-64 with FMA
+//! (the root functions) and aarch64 ([`aarch64`] holds the five functions
+//! that build rounds differently).
+//!
+//! * `tests/glibc_2_43_vectors.rs` — hashed glibc outputs for every exported
+//!   function over sampled input sets, both builds, replayed in pure Rust on
+//!   any OS; it fails on an export with no vectors.
+//! * `tests/f32_exhaustive.rs` (`just test-libm-exhaustive`) — every
+//!   one-argument f32 function on all 2^32 inputs, against stored hashes of
+//!   both builds' outputs; `tools/glibc-exhaustive` regenerates them on Linux
+//!   and lists any mismatch (`--f64 N`: the f64 functions, sampled).
+//! * `tests/glibc.rs` — live against the platform's glibc (x86-64 Linux).
+//! * `tools/vs-musl` — an independent second opinion (musl, a few ULPs).
 
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![allow(clippy::excessive_precision, clippy::unreadable_literal)]
 // Deliberate in a bit-exact port, flagged by clippy 1.99:
 // - `x - x`, `(x - x) / (x - x)`: the IEEE idioms that turn ±inf into NaN
@@ -32,26 +49,62 @@
     clippy::manual_div_ceil
 )]
 
+mod acosh;
+mod asin;
+mod asinh;
+mod atan;
+mod atanh;
 mod complex;
+mod core_math_f32;
+mod dbl64;
+mod dd;
 mod erfc;
+mod flt32;
 mod fma;
-pub use fma::fma_emulated;
+pub use fma::{fma_emulated, fma_exact, fmaf};
+pub mod aarch64;
 mod expm1_log1p;
+mod fp;
+mod lgamma;
 pub mod platform;
 mod sin;
+#[cfg(any(all(test, unix), all(target_vendor = "apple", feature = "libm")))]
+mod sys;
 mod tables;
+#[cfg(not(any(test, feature = "std")))]
+#[allow(unused_imports)]
+use fp::Fp as _;
+mod tgamma;
 #[cfg(any(
-    all(feature = "wasm-glibc", target_arch = "wasm32"),
+    all(feature = "wasm-glibc", target_family = "wasm"),
     feature = "export-glibc"
 ))]
 mod wasm_glibc;
+pub use acosh::acosh;
+pub use asin::{acos, asin};
+pub use asinh::asinh;
+pub use atan::{atan, atan2};
+pub use atanh::atanh;
 pub use complex::{cexp, csqrt, hypot};
-pub use erfc::erfc;
+pub use core_math_f32::{
+    acosf, acoshf, asinf, asinhf, atanf, atanhf, cbrtf, coshf, erfcf, erff, expm1f, lgammaf,
+    log10f, sinhf, tanf, tanhf, tgammaf,
+};
+pub use dbl64::{cbrt, cosh, exp2, exp10, log10, sinh, tanh};
 #[doc(hidden)]
+#[cfg(feature = "std")]
 pub use erfc::hard_cases as erfc_hard_cases;
+pub use erfc::{erf, erfc};
 pub use expm1_log1p::{expm1, log1p};
+pub use flt32::{atan2f, exp2f, exp10f, hypotf, log2f, powf};
+pub use fp::{
+    ceil, ceilf, fdim, fdimf, floor, floorf, fmod, fmodf, rint, rintf, round, roundf, sqrt, sqrtf,
+    trunc, truncf,
+};
+pub use lgamma::{lgamma, lgamma_r};
 pub use sin::{cos, sin, tan};
 use tables::*;
+pub use tgamma::tgamma;
 
 #[inline(always)]
 fn d(bits: u64) -> f64 {
@@ -703,13 +756,6 @@ pub fn sincosf(y: f32) -> (f32, f32) {
     (nan, nan)
 }
 
-/// glibc's `tanhf`: CORE-MATH's since 2.41, correctly rounded, and `tanh` in
-/// double rounded once lands on it everywhere. Checked against glibc 2.43 on
-/// every one of the 2^32 inputs: 0 mismatches.
-pub fn tanhf(x: f32) -> f32 {
-    libm_crate::tanh(x as f64) as f32
-}
-
 /// glibc's `log1pf`. Since 2.41 that is CORE-MATH's, correctly rounded, so
 /// any correctly rounded `log1pf` is it: `log1p` in double, rounded once,
 /// except on 9 inputs where the double's error straddles a float rounding
@@ -739,6 +785,13 @@ pub fn log1pf(x: f32) -> f32 {
 /// multiply into the add that consumes it). `2^(i/32)` is entry `4i` of the
 /// double `exp` table, which carries `2^(j/128)` with the same rounding.
 pub fn expf(x: f32) -> f32 {
+    expf_impl::<false>(x)
+}
+
+/// `expf`; `TOINT`: glibc's aarch64 build, `k` by `round` / `lround`
+/// (`TOINT_INTRINSICS`: ties away from zero) from the unfused `z = x·N/ln2`,
+/// which then also feeds `round` — so gcc no longer fuses it into the adds.
+fn expf_impl<const TOINT: bool>(x: f32) -> f32 {
     const N: u64 = 32;
     const INVLN2N: f64 = f64::from_bits(0x3ff71547652b82fe) * 32.0;
     const SHIFT: f64 = f64::from_bits(0x4338000000000000); // 0x1.8p52
@@ -763,11 +816,16 @@ pub fn expf(x: f32) -> f32 {
             return f32::from_bits(0x10000000) * f32::from_bits(0x10000000);
         }
     }
-    // z = InvLn2N*x feeds two adds (+ Shift, - kd): gcc fuses both
-    let kd0 = fma(INVLN2N, xd, SHIFT);
-    let ki = kd0.to_bits();
-    let kd = kd0 - SHIFT;
-    let r = fma(INVLN2N, xd, -kd);
+    let (ki, r) = if TOINT {
+        let z = INVLN2N * xd;
+        let kd = round(z);
+        (kd as i64 as u64, z - kd)
+    } else {
+        // z = InvLn2N*x feeds two adds (+ Shift, - kd): gcc fuses both
+        let kd0 = fma(INVLN2N, xd, SHIFT);
+        let kd = kd0 - SHIFT;
+        (kd0.to_bits(), fma(INVLN2N, xd, -kd))
+    };
     let t = EXP_DATA[EXP_TAB + 2 * (4 * (ki % N)) as usize + 1].wrapping_add(ki << (52 - 5));
     let s = d(t);
     let z = fma(C0, r, C1);
@@ -782,81 +840,83 @@ pub fn expf(x: f32) -> f32 {
 /// bit) by default on every target; with the `libm` feature, Apple's system
 /// libm on Apple targets (the macOS reference).
 pub mod reference {
-    const APPLE: bool = cfg!(all(target_vendor = "apple", feature = "libm"));
+    /// The platform libm on Apple with the `libm` feature (validation against
+    /// NumPy / SciPy on macOS), the ports everywhere else.
+    macro_rules! apple_or {
+        ($apple:expr, $port:expr) => {{
+            #[cfg(all(target_vendor = "apple", feature = "libm"))]
+            {
+                $apple
+            }
+            #[cfg(not(all(target_vendor = "apple", feature = "libm")))]
+            {
+                $port
+            }
+        }};
+    }
 
     /// `log(x)`.
     pub fn log(x: f64) -> f64 {
-        if APPLE { x.ln() } else { super::log(x) }
+        apple_or!(crate::sys::log(x), super::log(x))
     }
     /// `exp(x)`.
     pub fn exp(x: f64) -> f64 {
-        if APPLE { x.exp() } else { super::exp(x) }
+        apple_or!(crate::sys::exp(x), super::exp(x))
     }
     /// `log2(x)`.
     pub fn log2(x: f64) -> f64 {
-        if APPLE { x.log2() } else { super::log2(x) }
+        apple_or!(crate::sys::log2(x), super::log2(x))
     }
     /// `pow(x, y)`.
     pub fn pow(x: f64, y: f64) -> f64 {
-        if APPLE { x.powf(y) } else { super::pow(x, y) }
+        apple_or!(crate::sys::pow(x, y), super::pow(x, y))
     }
     /// `sin(x)`.
     pub fn sin(x: f64) -> f64 {
-        if APPLE { x.sin() } else { super::sin(x) }
+        apple_or!(crate::sys::sin(x), super::sin(x))
     }
     /// `cos(x)`.
     pub fn cos(x: f64) -> f64 {
-        if APPLE { x.cos() } else { super::cos(x) }
+        apple_or!(crate::sys::cos(x), super::cos(x))
     }
     /// `erfc(x)` (glibc's is correctly rounded since 2.42).
     pub fn erfc(x: f64) -> f64 {
         #[cfg(all(target_vendor = "apple", feature = "libm"))]
-        {
-            unsafe extern "C" {
-                #[link_name = "erfc"]
-                fn c_erfc(x: f64) -> f64;
-            }
-            // SAFETY: a pure libm function of one double.
-            unsafe { c_erfc(x) }
-        }
+        return crate::sys::erfc(x);
         #[cfg(not(all(target_vendor = "apple", feature = "libm")))]
         super::erfc(x)
     }
     /// `tan(x)`.
     pub fn tan(x: f64) -> f64 {
-        if APPLE { x.tan() } else { super::tan(x) }
+        apple_or!(crate::sys::tan(x), super::tan(x))
     }
     /// `hypot(x, y)`.
     pub fn hypot(x: f64, y: f64) -> f64 {
-        if APPLE {
-            x.hypot(y)
-        } else {
-            super::hypot(x, y)
-        }
+        apple_or!(crate::sys::hypot(x, y), super::hypot(x, y))
     }
     /// `expm1(x)`.
     pub fn expm1(x: f64) -> f64 {
-        if APPLE { x.exp_m1() } else { super::expm1(x) }
+        apple_or!(crate::sys::expm1(x), super::expm1(x))
     }
     /// `log1p(x)`.
     pub fn log1p(x: f64) -> f64 {
-        if APPLE { x.ln_1p() } else { super::log1p(x) }
+        apple_or!(crate::sys::log1p(x), super::log1p(x))
     }
     /// `logf(x)`.
     pub fn logf(x: f32) -> f32 {
-        if APPLE { x.ln() } else { super::logf(x) }
+        apple_or!(crate::sys::logf(x), super::logf(x))
     }
     /// `log1pf(x)`.
     pub fn log1pf(x: f32) -> f32 {
-        if APPLE { x.ln_1p() } else { super::log1pf(x) }
+        apple_or!(crate::sys::log1pf(x), super::log1pf(x))
     }
     /// `expf(x)`.
     pub fn expf(x: f32) -> f32 {
-        if APPLE { x.exp() } else { super::expf(x) }
+        apple_or!(crate::sys::expf(x), super::expf(x))
     }
     /// `tanhf(x)`.
     pub fn tanhf(x: f32) -> f32 {
-        if APPLE { x.tanh() } else { super::tanhf(x) }
+        apple_or!(crate::sys::tanhf(x), super::tanhf(x))
     }
     /// `(sin(x), cos(x))` from one call: Apple's `__sincos_stret` (what
     /// clang turns an adjacent `sin` + `cos` into, so macOS-built C such as
@@ -864,30 +924,50 @@ pub mod reference {
     /// Rust ports otherwise.
     pub fn sincos(x: f64) -> (f64, f64) {
         #[cfg(all(target_os = "macos", feature = "libm"))]
-        {
-            #[repr(C)]
-            struct SinCos {
-                sin: f64,
-                cos: f64,
-            }
-            unsafe extern "C" {
-                fn __sincos_stret(x: f64) -> SinCos;
-            }
-            // SAFETY: a pure libm function of one double.
-            let r = unsafe { __sincos_stret(x) };
-            (r.sin, r.cos)
-        }
+        return crate::sys::sincos(x);
         #[cfg(not(all(target_os = "macos", feature = "libm")))]
-        (sin(std::hint::black_box(x)), cos(std::hint::black_box(x)))
+        (sin(core::hint::black_box(x)), cos(core::hint::black_box(x)))
     }
     /// `(sinf(x), cosf(x))` — glibc's `sinf` / `cosf` share `sincosf`'s
     /// reduction and polynomials, so one call gives both bit for bit.
     pub fn sincosf(x: f32) -> (f32, f32) {
-        if APPLE {
-            (x.sin(), x.cos())
-        } else {
+        apple_or!(
+            (crate::sys::sinf(x), crate::sys::cosf(x)),
             super::sincosf(x)
+        )
+    }
+    /// `sincosf` as clang merges an adjacent `sinf` + `cosf`: Apple's
+    /// `__sincosf_stret` with the `libm` feature on macOS (what torch's
+    /// macOS wheel computes); glibc's `sincosf` otherwise.
+    pub fn sincosf_merged(x: f32) -> (f32, f32) {
+        #[cfg(all(target_os = "macos", feature = "libm"))]
+        return crate::sys::sincosf_stret(x);
+        #[cfg(not(all(target_os = "macos", feature = "libm")))]
+        super::sincosf(x)
+    }
+    /// `asin(x)`.
+    pub fn asin(x: f64) -> f64 {
+        apple_or!(crate::sys::asin(x), super::asin(x))
+    }
+    /// `cexp(re + i·im)` → `(re, im)`.
+    pub fn cexp(re: f64, im: f64) -> (f64, f64) {
+        #[cfg(all(target_vendor = "apple", feature = "libm"))]
+        {
+            let z = crate::sys::cfn(c"cexp", crate::sys::Cplx { re, im });
+            (z.re, z.im)
         }
+        #[cfg(not(all(target_vendor = "apple", feature = "libm")))]
+        super::cexp(re, im)
+    }
+    /// `csqrt(re + i·im)` → `(re, im)`.
+    pub fn csqrt(re: f64, im: f64) -> (f64, f64) {
+        #[cfg(all(target_vendor = "apple", feature = "libm"))]
+        {
+            let z = crate::sys::cfn(c"csqrt", crate::sys::Cplx { re, im });
+            (z.re, z.im)
+        }
+        #[cfg(not(all(target_vendor = "apple", feature = "libm")))]
+        super::csqrt(re, im)
     }
 }
 
@@ -900,17 +980,14 @@ mod tests {
     /// `expf` against the platform's (glibc's on Linux, where the port was also
     /// checked on all 2^32 inputs: 0 mismatches) on every 257th bit pattern.
     // `reference` IS the platform libm only off Apple, or on Apple with `libm`.
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        any(not(target_vendor = "apple"), feature = "libm")
-    ))]
+    #[cfg(all(unix, any(not(target_vendor = "apple"), feature = "libm")))]
     #[test]
     fn reference_expf_is_the_platform_expf() {
         let mut bad = Vec::new();
         let mut i: u64 = 0;
         while i < (1u64 << 32) {
             let x = f32::from_bits(i as u32);
-            let (a, b) = (super::reference::expf(x), x.exp());
+            let (a, b) = (super::reference::expf(x), crate::sys::expf(x));
             if a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()) {
                 bad.push((x, a, b));
             }
@@ -943,12 +1020,12 @@ mod tests {
             let x = f32::from_bits(b);
             assert_eq!(
                 super::log1pf(x).to_bits(),
-                x.ln_1p().to_bits(),
+                crate::sys::log1pf(x).to_bits(),
                 "log1pf({x:e})"
             );
             assert_ne!(
                 (super::log1p(x as f64) as f32).to_bits(),
-                x.ln_1p().to_bits(),
+                crate::sys::log1pf(x).to_bits(),
                 "{b:#x} is not hard"
             );
         }
@@ -956,17 +1033,14 @@ mod tests {
 
     /// `tanhf` against the platform's (glibc 2.43's on Linux, where the port
     /// was also checked on all 2^32 inputs) on every 257th bit pattern.
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        any(not(target_vendor = "apple"), feature = "libm")
-    ))]
+    #[cfg(all(unix, any(not(target_vendor = "apple"), feature = "libm")))]
     #[test]
     fn reference_tanhf_is_the_platform_tanhf() {
         let mut bad = Vec::new();
         let mut i: u64 = 0;
         while i < (1u64 << 32) {
             let x = f32::from_bits(i as u32);
-            let (a, b) = (super::reference::tanhf(x), x.tanh());
+            let (a, b) = (super::reference::tanhf(x), crate::sys::tanhf(x));
             if a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()) {
                 bad.push((x, a, b));
             }
@@ -982,17 +1056,14 @@ mod tests {
 
     /// `log1pf` against the platform's (glibc 2.43's on Linux, where the port
     /// was also checked on all 2^32 inputs) on every 257th bit pattern.
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        any(not(target_vendor = "apple"), feature = "libm")
-    ))]
+    #[cfg(all(unix, any(not(target_vendor = "apple"), feature = "libm")))]
     #[test]
     fn reference_log1pf_is_the_platform_log1pf() {
         let mut bad = Vec::new();
         let mut i: u64 = 0;
         while i < (1u64 << 32) {
             let x = f32::from_bits(i as u32);
-            let (a, b) = (super::reference::log1pf(x), x.ln_1p());
+            let (a, b) = (super::reference::log1pf(x), crate::sys::log1pf(x));
             if a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()) {
                 bad.push((x, a, b));
             }
@@ -1007,10 +1078,7 @@ mod tests {
     }
 
     // `reference` IS the platform libm only off Apple, or on Apple with `libm`.
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        any(not(target_vendor = "apple"), feature = "libm")
-    ))]
+    #[cfg(all(unix, any(not(target_vendor = "apple"), feature = "libm")))]
     #[test]
     fn reference_is_the_platform_libm_on_fft_twiddle_angles() {
         use super::reference as r;
@@ -1022,15 +1090,17 @@ mod tests {
                 for k in 0..n.min(4096) {
                     let theta = sign * std::f64::consts::PI * (k as f64) / (n as f64);
                     for t in [step, theta] {
-                        if r::cos(t).to_bits() != t.cos().to_bits()
-                            || r::sin(t).to_bits() != t.sin().to_bits()
+                        if r::cos(t).to_bits() != crate::sys::cos(t).to_bits()
+                            || r::sin(t).to_bits() != crate::sys::sin(t).to_bits()
                         {
                             bad.push(t);
                         }
                     }
                     let tf = theta as f32;
                     let (s, c) = r::sincosf(tf);
-                    if s.to_bits() != tf.sin().to_bits() || c.to_bits() != tf.cos().to_bits() {
+                    if s.to_bits() != crate::sys::sinf(tf).to_bits()
+                        || c.to_bits() != crate::sys::cosf(tf).to_bits()
+                    {
                         bad.push(theta);
                     }
                 }

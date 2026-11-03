@@ -243,7 +243,7 @@ fn gguf_matmul_bt_ex(
         return;
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     if allow_parallel
         && k.is_multiple_of(block_elems)
         && block_elems <= QK_K
@@ -369,7 +369,7 @@ const CACHED_BLAS_MIN_WEIGHT_ELEMS: usize = 32 * 32;
 /// Its only caller is the rayon arm of `gguf_matmul_bt_m1_parallel`, itself
 /// `cfg(not(wasm32))` — so gate it the same way as `dot256` above rather than
 /// let it warn as dead code on the wasm build.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn q4k_exact_gemv() -> bool {
     rlx_ir::env::flag("RLX_Q4K_EXACT_GEMV")
 }
@@ -400,6 +400,11 @@ fn prefer_cached_blas(k: usize, n: usize, m: usize) -> bool {
     // fused path no longer loses to BLAS once "cached" means re-dequantizing the
     // whole model on every call plus allocator churn. Both do the same total
     // dequant work; only the fused one skips the cache bookkeeping.
+    // Reproducible runs keep one path whatever the memory budget: thrashing
+    // is the host's, and the fused kernel sums in another order.
+    if rlx_ir::reproducible::reproducible() {
+        return true;
+    }
     if crate::dequant_cache::cache_thrashing() {
         return false;
     }
@@ -423,6 +428,10 @@ pub fn gguf_matmul_bt_cached(
 ) {
     assert_eq!(x.len(), m * k);
     assert_eq!(out.len(), m * n);
+    // Portable runs take the BLAS-less build's path, the fused blocks.
+    if crate::config::portable() {
+        return gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
+    }
     let w_f32 = crate::dequant_cache::gguf_weight_f32(w_off, w_bytes, k, n, scheme);
     if m == 1 {
         out.fill(0.0);
@@ -487,6 +496,7 @@ pub fn gguf_matmul_bt_dispatch_at(
         && k.is_multiple_of(QK_K)
         && n >= q4k_fused_decode_min_n()
         && crate::pool::num_threads() > 1
+        && !rlx_ir::reproducible::reproducible()
     {
         gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
         return;
@@ -602,7 +612,7 @@ fn gguf_grouped_matmul_bt_ex(
     } else if jobs.len() > 1 {
         // Parallelize over unique experts; serial fused GEMM per group so Rayon
         // is not nested. Batches tokens that share an expert (`count > 1`).
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             use rayon::prelude::*;
             let chunks: Vec<(usize, Vec<f32>)> = jobs
@@ -620,7 +630,7 @@ fn gguf_grouped_matmul_bt_ex(
                 packed_out[start * n..(start + count) * n].copy_from_slice(&local);
             }
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             for &(e, start, count) in &jobs {
                 let in_slice = &packed_in[start * k..(start + count) * k];
@@ -810,7 +820,7 @@ fn gguf_matmul_bt_m1_sequential(
 /// Both callers are the rayon-parallel `gguf_qk_kernels!` GEMV/GEMM, which are
 /// themselves `cfg(not(wasm32))` — so on wasm this is dead code. Gate it the
 /// same way rather than let it warn there.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 #[inline(always)]
 fn dot256(xs: &[f32], blk: &[f32; QK_K]) -> f32 {
     let (mut a0, mut a1, mut a2, mut a3) = (0f32, 0f32, 0f32, 0f32);
@@ -829,7 +839,7 @@ macro_rules! gguf_qk_kernels {
     ($( $scheme:path => ($gemv:ident, $gemm:ident, $dq:path) ),+ $(,)?) => {
         $(
             /// Row-parallel GEMV (`m == 1`) specialized to one precision.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             fn $gemv(x_row: &[f32], w_bytes: &[u8], out: &mut [f32], k: usize, block_bytes: usize) {
                 use rayon::prelude::*;
                 let blocks_per_row = k / QK_K;
@@ -852,7 +862,7 @@ macro_rules! gguf_qk_kernels {
 
             /// Row-parallel GEMM (`m > 1`) specialized to one precision. Each block
             /// is dequantized ONCE and reused across all `m` rows.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             #[allow(clippy::too_many_arguments)]
             fn $gemm(
                 x: &[f32], w_bytes: &[u8], out: &mut [f32],
@@ -884,7 +894,7 @@ macro_rules! gguf_qk_kernels {
         )+
 
         /// Route to a specialized GEMV when one exists. `false` ⇒ caller falls back.
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         fn gguf_gemv_specialized(
             scheme: QuantScheme, x_row: &[f32], w_bytes: &[u8], out: &mut [f32],
             k: usize, block_bytes: usize,
@@ -896,7 +906,7 @@ macro_rules! gguf_qk_kernels {
         }
 
         /// Route to a specialized GEMM when one exists. `false` ⇒ caller falls back.
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         #[allow(clippy::too_many_arguments)]
         fn gguf_gemm_specialized(
             scheme: QuantScheme, x: &[f32], w_bytes: &[u8], out: &mut [f32],
@@ -935,7 +945,7 @@ gguf_qk_kernels! {
 /// so no division is needed at all. Rows are independent, so this parallelizes
 /// over `n` exactly like the Q4_K path, and the inner loop is a contiguous
 /// f32 dot the autovectorizer can handle.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn gguf_matmul_bt_m1_rows_generic(
     x_row: &[f32],
     w_bytes: &[u8],
@@ -986,7 +996,7 @@ fn gguf_matmul_bt_m1_rows_generic(
 /// The point is to beat cached BLAS *when the dequant cache is thrashing*, where
 /// "cached" degenerates into re-dequantizing the whole model per call plus
 /// allocator churn. With a healthy cache, BLAS still wins and callers keep it.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn gguf_matmul_bt_rows_generic_gemm(
     x: &[f32],
     w_bytes: &[u8],
@@ -1063,7 +1073,7 @@ fn gguf_matmul_bt_m1_parallel(
     }
     if scheme == QuantScheme::GgufQ4K && k.is_multiple_of(QK_K) && block_elems == QK_K {
         // Independent output rows — no n-wide partial reduction.
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             use rayon::prelude::*;
             let blocks_per_row = k / QK_K;
@@ -1126,7 +1136,7 @@ fn gguf_matmul_bt_m1_parallel(
             });
             return;
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             q4k_gemv_rowmajor(x_row, w_bytes, out, k);
             return;
@@ -1134,13 +1144,13 @@ fn gguf_matmul_bt_m1_parallel(
     }
     // Every other scheme (Q5_K / Q6_K / Q2_K / Q3_K / Q8_0 / IQ*): row-parallel,
     // division-free generic GEMV whenever `k` is a whole number of blocks.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     if k.is_multiple_of(block_elems) && block_elems <= QK_K && out.len() == n {
         gguf_matmul_bt_m1_rows_generic(x_row, w_bytes, out, k, scheme, block_bytes, block_elems);
         return;
     }
     // wasm: single-threaded serial accumulate (no Rayon thread pool).
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     {
         let _ = n;
         for v in out.iter_mut() {
@@ -1159,7 +1169,7 @@ fn gguf_matmul_bt_m1_parallel(
             }
         }
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     {
         use rayon::prelude::*;
 
@@ -1582,7 +1592,7 @@ fn q2_0_gemv_parallel(x: &[f32], w_bytes: &[u8], out: &mut [f32], k: usize) {
     let mut x_q8 = vec![0u8; blocks_per_row * Q8_0_G128_BYTES];
     rlx_gguf::q2_dequant::quantize_q8_0_g128_row(&x[..k], &mut x_q8);
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     {
         use rayon::prelude::*;
         out.par_iter_mut().enumerate().for_each(|(j, slot)| {
@@ -1590,7 +1600,7 @@ fn q2_0_gemv_parallel(x: &[f32], w_bytes: &[u8], out: &mut [f32], k: usize) {
             *slot = q2_0_dot_row_q8(row, &x_q8, blocks_per_row);
         });
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     {
         for (j, slot) in out.iter_mut().enumerate() {
             let row = &w_bytes[j * row_bytes..(j + 1) * row_bytes];

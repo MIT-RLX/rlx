@@ -1,3 +1,7 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Reference for tests/fixtures/openblas_haswell_l1.txt: run on the Linux reference
 # (msi: SciPy 1.17.1 on OpenBLAS 0.3.30 Haswell): python -I tools/openblas_ref_l1.py out.txt
 # scipy.linalg.blas dnrm2 / drot on xorshift inputs scaled by 2^k. One line per case:

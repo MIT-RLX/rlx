@@ -1,0 +1,43 @@
+diff -ru a/src/metal/device.rs b/src/metal/device.rs
+--- a/src/metal/device.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/metal/device.rs	2026-11-02 16:09:52.883113920 -0500
+@@ -271,6 +271,7 @@
+ 
+                 let options = MTLCompileOptions::new();
+                 options.setLanguageVersion(self.shared.private_caps.msl_version);
++                super::apply_math_mode(&options);
+ 
+                 // https://developer.apple.com/documentation/metal/mtlcompileoptions/preserveinvariance
+                 if available!(macos = 11.0, ios = 13.0, tvos = 14.0, visionos = 1.0) {
+diff -ru a/src/metal/mod.rs b/src/metal/mod.rs
+--- a/src/metal/mod.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/metal/mod.rs	2026-11-02 16:09:52.883577960 -0500
+@@ -1408,3 +1408,28 @@
+     Tvos,
+     VisionOs,
+ }
++
++
++/// `WGPU_METAL_MATH_MODE=safe|relaxed|fast` (unset: Metal's default, fast):
++/// the math mode WGSL→MSL libraries are compiled in. Safe also selects the
++/// precise transcendental functions.
++fn apply_math_mode(options: &objc2_metal::MTLCompileOptions) {
++    use objc2_metal::{MTLMathFloatingPointFunctions, MTLMathMode};
++    let Ok(mode) = std::env::var("WGPU_METAL_MATH_MODE") else {
++        return;
++    };
++    let (m, precise) = match mode.as_str() {
++        "safe" => (MTLMathMode::Safe, true),
++        "relaxed" => (MTLMathMode::Relaxed, false),
++        _ => (MTLMathMode::Fast, false),
++    };
++    if objc2::available!(macos = 15.0, ios = 18.0, tvos = 18.0, visionos = 2.0) {
++        options.setMathMode(m);
++        if precise {
++            options.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Precise);
++        }
++    } else {
++        #[allow(deprecated)]
++        options.setFastMathEnabled(m == MTLMathMode::Fast);
++    }
++}

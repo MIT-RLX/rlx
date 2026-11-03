@@ -34,12 +34,12 @@ impl From<String> for BrowserError {
 
 /// Initialize the WebGPU device on wasm. Idempotent; returns `true` when an
 /// adapter is available. No-op on native (uses blocking device discovery).
-#[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+#[cfg(all(feature = "gpu", target_family = "wasm"))]
 pub async fn init_webgpu() -> bool {
     rlx_wgpu::device::init_wgpu_device().await
 }
 
-#[cfg(not(all(feature = "gpu", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "gpu", target_family = "wasm")))]
 pub async fn init_webgpu() -> bool {
     #[cfg(feature = "gpu")]
     {
@@ -175,7 +175,7 @@ impl BrowserCompiledGraph {
     /// host-executed steps, which it refuses. Checkable right after
     /// [`BrowserSession::compile`], so an unrunnable pairing of graph and
     /// backend is a setup-time decision instead of a per-step error.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     pub fn requires_host_execution(&self) -> bool {
         self.inner.requires_host_execution()
     }
@@ -192,7 +192,7 @@ impl BrowserCompiledGraph {
     }
 
     /// Async run on wasm WebGPU; sync fallback for WebGL/CPU.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     pub async fn run_async(
         &mut self,
         inputs: &[(&str, &[f32])],
@@ -205,7 +205,7 @@ impl BrowserCompiledGraph {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub async fn run_async(
         &mut self,
         inputs: &[(&str, &[f32])],

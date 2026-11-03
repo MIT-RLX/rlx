@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Analysis windows, built in f64 and rounded once.
 
 use crate::float::Float;
@@ -30,12 +34,14 @@ impl Window {
             .map(|i| {
                 let v = match self {
                     Window::HannPeriodic => {
-                        let s = libm::sin(pi * i as f64 / n as f64);
+                        let s = rlx_libm::sin(pi * i as f64 / n as f64);
                         s * s
                     }
-                    Window::HannSymmetric => 0.5 - 0.5 * libm::cos(2.0 * pi * sym(i)),
-                    Window::HammingSymmetric => 0.54 - 0.46 * libm::cos(2.0 * pi * sym(i)),
-                    Window::Povey => libm::pow(0.5 - 0.5 * libm::cos(2.0 * pi * sym(i)), 0.85),
+                    Window::HannSymmetric => 0.5 - 0.5 * rlx_libm::cos(2.0 * pi * sym(i)),
+                    Window::HammingSymmetric => 0.54 - 0.46 * rlx_libm::cos(2.0 * pi * sym(i)),
+                    Window::Povey => {
+                        rlx_libm::pow(0.5 - 0.5 * rlx_libm::cos(2.0 * pi * sym(i)), 0.85)
+                    }
                     Window::Rectangular => 1.0,
                 };
                 T::from_f64(v)

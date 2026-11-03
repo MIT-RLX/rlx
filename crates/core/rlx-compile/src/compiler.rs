@@ -483,38 +483,38 @@ impl CompilePipeline {
         }
         // Phase timing needs `Instant`, which panics on wasm32-unknown-unknown;
         // the whole block is cfg'd out there, so the flag would be unread.
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let dbg = rlx_ir::env::var("RLX_PHASE_TIMING").is_some();
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let t = if dbg {
             Some(std::time::Instant::now())
         } else {
             None
         };
         let mir = Self::lower_hir(hir)?;
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         if let Some(t) = t {
             eprintln!("[phase]   lower_hir = {}ms", t.elapsed().as_millis());
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let t = if dbg {
             Some(std::time::Instant::now())
         } else {
             None
         };
         let (mir, fusion) = self.optimize_with_report(mir);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         if let Some(t) = t {
             eprintln!("[phase]   optimize = {}ms", t.elapsed().as_millis());
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let t = if dbg {
             Some(std::time::Instant::now())
         } else {
             None
         };
         let r = self.finish(mir, fusion);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         if let Some(t) = t {
             eprintln!("[phase]   finish(plan+lir) = {}ms", t.elapsed().as_millis());
         }

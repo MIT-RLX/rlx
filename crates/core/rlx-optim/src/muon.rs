@@ -44,8 +44,8 @@
 
 use std::collections::HashMap;
 
-use crate::Optimizer;
 use crate::common::zeros_entry;
+use crate::{AdamW, OptItem, Optimizer, OptimizerState};
 
 /// Muon — Momentum-Orthogonalized-by-Newton-Schulz.
 ///
@@ -112,6 +112,17 @@ impl Optimizer for Muon {
         self.lr = lr;
     }
 
+    fn state_dict(&self) -> Option<OptimizerState> {
+        let mut out = OptimizerState::default();
+        out.extend_slot("m", &self.m);
+        Some(out)
+    }
+
+    fn load_state_dict(&mut self, state: &OptimizerState) -> bool {
+        state.take_slot("m", &mut self.m);
+        true
+    }
+
     fn step(&mut self, name: &str, shape: &[usize], param: &mut [f32], grad: &[f32]) {
         debug_assert_eq!(param.len(), grad.len());
         let mu = self.momentum;
@@ -153,6 +164,96 @@ impl Optimizer for Muon {
         for i in 0..param.len() {
             param[i] -= lr * (s * ortho[i] + wd * param[i]);
         }
+    }
+}
+
+/// Muon for the 2-D weight matrices, AdamW for every other parameter
+/// (biases, norm scales, conv kernels) — the usual way to train with Muon.
+///
+/// One learning rate drives both: Muon's update is scaled by
+/// [`Self::muon_scale`] (default `0.2`, Moonlight's rule) so its per-element
+/// RMS matches a typical AdamW update and an AdamW schedule carries over
+/// unchanged. Decoupled weight decay is the same `lr·λ·θ` for both groups.
+#[derive(Debug, Clone)]
+pub struct MuonAdamW {
+    /// The matrix group.
+    pub muon: Muon,
+    /// Every other parameter.
+    pub adamw: AdamW,
+    /// Muon's learning rate relative to AdamW's.
+    pub muon_scale: f32,
+}
+
+impl MuonAdamW {
+    /// Both groups at `lr`, AdamW's defaults otherwise, no weight decay.
+    pub fn new(lr: f32) -> Self {
+        let muon_scale = 0.2;
+        Self {
+            muon: Muon::new(lr * muon_scale),
+            adamw: AdamW::new(lr).with_weight_decay(0.0),
+            muon_scale,
+        }
+    }
+
+    /// Decoupled weight decay `λ` for both groups.
+    pub fn with_weight_decay(mut self, wd: f32) -> Self {
+        self.adamw.weight_decay = wd;
+        // Muon applies `lr_muon·λ_muon·θ` with `lr_muon = muon_scale·lr`.
+        self.muon.weight_decay = wd / self.muon_scale;
+        self
+    }
+
+    /// Whether `shape` goes to Muon: a matrix with both sides above 1.
+    pub fn is_matrix(shape: &[usize]) -> bool {
+        shape.len() == 2 && shape[0] > 1 && shape[1] > 1
+    }
+}
+
+impl Optimizer for MuonAdamW {
+    fn set_lr(&mut self, lr: f32) {
+        self.adamw.set_lr(lr);
+        self.muon.set_lr(lr * self.muon_scale);
+    }
+
+    fn step(&mut self, name: &str, shape: &[usize], param: &mut [f32], grad: &[f32]) {
+        if Self::is_matrix(shape) {
+            self.muon.step(name, shape, param, grad);
+        } else {
+            self.adamw.step(name, shape, param, grad);
+        }
+    }
+
+    fn step_batch(&mut self, items: &mut [OptItem<'_>]) {
+        // The groups share no parameters and no state: run them side by side.
+        let (mut mats, mut rest): (Vec<_>, Vec<_>) =
+            items.iter_mut().partition(|it| Self::is_matrix(it.shape));
+        let (muon, adamw) = (&mut self.muon, &mut self.adamw);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for it in mats.iter_mut() {
+                    muon.step(it.name, it.shape, it.param, it.grad);
+                }
+            });
+            for it in rest.iter_mut() {
+                adamw.step(it.name, it.shape, it.param, it.grad);
+            }
+        });
+    }
+
+    fn end_iteration(&mut self) {
+        self.muon.end_iteration();
+        self.adamw.end_iteration();
+    }
+
+    fn state_dict(&self) -> Option<OptimizerState> {
+        let mut out = self.adamw.state_dict()?;
+        out.extend_slot("muon_m", &self.muon.m);
+        Some(out)
+    }
+
+    fn load_state_dict(&mut self, state: &OptimizerState) -> bool {
+        state.take_slot("muon_m", &mut self.muon.m);
+        self.adamw.load_state_dict(state)
     }
 }
 
@@ -276,6 +377,22 @@ mod accel {
     }
 }
 
+/// Dot product with eight independent partial sums, so it vectorizes (one
+/// accumulator fixes the addition order and keeps the loop scalar).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let (ac, ar) = a.as_chunks::<8>();
+    let (bc, br) = b.as_chunks::<8>();
+    for (x, y) in ac.iter().zip(bc) {
+        for l in 0..8 {
+            acc[l] += x[l] * y[l];
+        }
+    }
+    let tail: f32 = ar.iter().zip(br).map(|(x, y)| x * y).sum();
+    acc.iter().sum::<f32>() + tail
+}
+
 /// Newton–Schulz semi-orthogonalization. Operates on a row-major
 /// `rows × cols` matrix and returns its closest semi-orthogonal matrix
 /// (up to the polynomial truncation). The input is first scaled by its
@@ -344,12 +461,7 @@ pub fn newton_schulz_orth(
             par_rows(&mut a_mat, r, |i, arow| {
                 let xi = &x_mat[i * k..i * k + k];
                 for (j, aij) in arow.iter_mut().enumerate() {
-                    let xj = &x_mat[j * k..j * k + k];
-                    let mut s = 0.0f32;
-                    for p in 0..k {
-                        s += xi[p] * xj[p];
-                    }
-                    *aij = s;
+                    *aij = dot(xi, &x_mat[j * k..j * k + k]);
                 }
             });
             // A² = A · A.

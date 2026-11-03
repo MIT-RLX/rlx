@@ -31,7 +31,9 @@ struct Params {
 var<workgroup> sh: array<vec2<f32>, 4096>;
 
 fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+    // explicit fma: a plain `a*b - c*d` is contracted by one compiler's math mode
+    // and not another's (native Metal fast math vs a browser's safe math)
+    return vec2<f32>(fma(a.x, b.x, -(a.y * b.y)), fma(a.x, b.y, a.y * b.x));
 }
 
 // In-register 4-point DFT (radix-4 butterfly core). rs=+1 forward, -1 inverse.
@@ -81,7 +83,7 @@ fn fft_radix2_big(
     loop {
         if (len > n) { break; }
         let h2 = len >> 1u;
-        let theta_base = sgn * TWO_PI / f32(len);
+        let theta_base = rlx_div_rn(sgn * TWO_PI, f32(len));
         var b = tid;
         loop {
             if (b >= n / 2u) { break; }
@@ -90,7 +92,7 @@ fn fft_radix2_big(
             let i_lo = group * len + kin;
             let i_hi = i_lo + h2;
             let theta = theta_base * f32(kin);
-            let t = cmul(vec2<f32>(cos(theta), sin(theta)), sh[i_hi]);
+            let t = cmul(vec2<f32>(rlx_cos(theta), rlx_sin(theta)), sh[i_hi]);
             let ulo = sh[i_lo];
             sh[i_lo] = ulo + t;
             sh[i_hi] = ulo - t;
@@ -154,10 +156,10 @@ fn fft_radix4_big(
             var u1 = sh[base + dist];
             var u2 = sh[base + 2u * dist];
             var u3 = sh[base + 3u * dist];
-            let a = sgn * TWO_PI * f32(kk) / f32(l);
-            u1 = cmul(u1, vec2<f32>(cos(a), sin(a)));
-            u2 = cmul(u2, vec2<f32>(cos(2.0 * a), sin(2.0 * a)));
-            u3 = cmul(u3, vec2<f32>(cos(3.0 * a), sin(3.0 * a)));
+            let a = rlx_div_rn(sgn * TWO_PI * f32(kk), f32(l));
+            u1 = cmul(u1, vec2<f32>(rlx_cos(a), rlx_sin(a)));
+            u2 = cmul(u2, vec2<f32>(rlx_cos(2.0 * a), rlx_sin(2.0 * a)));
+            u3 = cmul(u3, vec2<f32>(rlx_cos(3.0 * a), rlx_sin(3.0 * a)));
             let y = dft4(u0, u1, u2, u3, rs);
             sh[base] = y[0];
             sh[base + dist] = y[1];
@@ -178,8 +180,8 @@ fn fft_radix4_big(
             let base = (j / dist) * l + kk;
             let u0 = sh[base];
             var u1 = sh[base + dist];
-            let a = sgn * TWO_PI * f32(kk) / f32(l);
-            u1 = cmul(u1, vec2<f32>(cos(a), sin(a)));
+            let a = rlx_div_rn(sgn * TWO_PI * f32(kk), f32(l));
+            u1 = cmul(u1, vec2<f32>(rlx_cos(a), rlx_sin(a)));
             sh[base] = u0 + u1;
             sh[base + dist] = u0 - u1;
             j = j + tg;
@@ -239,10 +241,10 @@ fn fft_radix8_big(
             let base = (j / dist) * l + kk;
             var u: array<vec2<f32>, 8>;
             for (var i = 0u; i < 8u; i = i + 1u) { u[i] = sh[base + i * dist]; }
-            let a = sgn * TWO_PI * f32(kk) / f32(l);
+            let a = rlx_div_rn(sgn * TWO_PI * f32(kk), f32(l));
             for (var i = 1u; i < 8u; i = i + 1u) {
                 let ang = f32(i) * a;
-                u[i] = cmul(u[i], vec2<f32>(cos(ang), sin(ang)));
+                u[i] = cmul(u[i], vec2<f32>(rlx_cos(ang), rlx_sin(ang)));
             }
             let e = dft4(u[0], u[2], u[4], u[6], rs);
             let o = dft4(u[1], u[3], u[5], u[7], rs);

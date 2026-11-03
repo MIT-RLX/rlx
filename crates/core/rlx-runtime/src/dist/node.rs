@@ -285,7 +285,7 @@ pub const fn platform_tag() -> &'static str {
         "linux"
     } else if cfg!(target_os = "windows") {
         "windows"
-    } else if cfg!(target_arch = "wasm32") {
+    } else if cfg!(target_family = "wasm") {
         "wasm"
     } else {
         "unknown"
@@ -441,7 +441,7 @@ impl NodeConfig {
     /// Read the same variables the CLI node driver uses (`RANK`, `WORLD`,
     /// `PEERS` / `DISCOVER`, `TOPOLOGY`, `HEAP_MB`, `DEVICE`). Provided for
     /// parity; prefer the builder on platforms without a shell environment.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn from_env() -> Result<Self, String> {
         let var = |k: &str| rlx_ir::env::read(k).ok();
         let rank: u32 = var("RANK")
@@ -492,14 +492,14 @@ impl NodeConfig {
         #[cfg(all(
             feature = "ble",
             not(target_os = "windows"),
-            not(target_arch = "wasm32")
+            not(target_family = "wasm")
         ))]
         static BLE_SERVED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         #[cfg(all(
             feature = "ble",
             not(target_os = "windows"),
-            not(target_arch = "wasm32")
+            not(target_family = "wasm")
         ))]
         if let Ok(name) = rlx_ir::env::read("RLX_BLE_SERVE")
             && !name.is_empty()

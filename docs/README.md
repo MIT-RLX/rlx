@@ -39,7 +39,7 @@
 | [benchmarks/coreml-training.md](benchmarks/coreml-training.md) | CoreML on-device training: RLX vs native `MLUpdateTask`, compute-unit sweep, overhead- vs compute-bound regimes (why `cpu`≥`ane`, and why the result flips with model size) |
 | [benchmarks/frameworks-and-backends.md](benchmarks/frameworks-and-backends.md) | MNIST-training comparison **matrix**: every framework × backend, verified/rig/candidate status, `torch.compile`/Keras/MPSGraph/ORT runners, and the CUDA runbook |
 
-Release notes: [`CHANGELOG.md`](../CHANGELOG.md) (workspace **0.2.19**).
+Release notes: [`CHANGELOG.md`](../CHANGELOG.md) (workspace **0.2.20**).
 
 Related repo docs:
 

@@ -473,9 +473,9 @@ fn ibeta_imp(mut a: f64, mut b: f64, mut x: f64, inv: bool) -> f64 {
     }
     if a == 0.5 && b == 0.5 {
         return if invert {
-            y.sqrt().asin() / FRAC_PI_2
+            rlx_libm::reference::asin(y.sqrt()) / FRAC_PI_2
         } else {
-            x.sqrt().asin() / FRAC_PI_2
+            rlx_libm::reference::asin(x.sqrt()) / FRAC_PI_2
         };
     }
     if a == 1.0 {
@@ -622,9 +622,10 @@ fn ibeta_imp(mut a: f64, mut b: f64, mut x: f64, inv: bool) -> f64 {
                 if a == b {
                     use_asym = true;
                 } else {
-                    powers = (rlx_libm::reference::log(x / (a / (a + b))))
-                        .fmac(a, rlx_libm::reference::log(y / (b / (a + b))) * b)
-                        .exp();
+                    powers = rlx_libm::reference::exp(
+                        (rlx_libm::reference::log(x / (a / (a + b))))
+                            .fmac(a, rlx_libm::reference::log(y / (b / (a + b))) * b),
+                    );
                     if powers < EPSILON {
                         use_asym = true;
                     }

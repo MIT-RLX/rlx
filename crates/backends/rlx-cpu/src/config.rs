@@ -287,6 +287,87 @@ impl RuntimeConfig {
     }
 }
 
+// ── Portable arithmetic ─────────────────────────────────────────────────
+
+/// 0: not decided yet; 1: off; 2: on. Decided once — by [`set_portable`], or
+/// by the first [`portable`] from `RLX_CPU_PORTABLE` — and fixed from then on:
+/// the cost model and every compiled graph keep the kernels picked under the
+/// mode they saw, so a later change would mix the two arithmetics in one run.
+static PORTABLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether the CPU backend computes with the wasm build's arithmetic — the
+/// AVX2-mirror / portable arms instead of NEON and AVX, the in-order FMA GEMM
+/// instead of the vendor BLAS, glibc's libm (rlx-libm) instead of the host's —
+/// so a run rounds the same on macOS, Linux, x86-64 and in a browser. Always
+/// on with the `portable` feature; otherwise [`set_portable`], else
+/// `RLX_CPU_PORTABLE`. Slower; for runs that must agree bit for bit across
+/// hosts.
+#[inline]
+pub fn portable() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if cfg!(rlx_cpu_portable) {
+        return true;
+    }
+    match PORTABLE.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let want = if rlx_ir::env::flag("RLX_CPU_PORTABLE") {
+                2
+            } else {
+                1
+            };
+            // first reader decides; a concurrent `set_portable` may win
+            match PORTABLE.compare_exchange(0, want, Relaxed, Relaxed) {
+                Ok(_) => want == 2,
+                Err(v) => v == 2,
+            }
+        }
+    }
+}
+
+/// [`set_portable`] after the mode was already fixed the other way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortableFixed {
+    /// The mode in force, which stays.
+    pub portable: bool,
+}
+
+impl std::fmt::Display for PortableFixed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rlx-cpu portable arithmetic is already {} for this process; set it \
+             before the first compile (or with RLX_CPU_PORTABLE)",
+            if self.portable { "on" } else { "off" }
+        )
+    }
+}
+
+impl std::error::Error for PortableFixed {}
+
+/// Choose the portable arithmetic for the process. Call it before the first
+/// compile: the mode is fixed by the first [`set_portable`] or [`portable`],
+/// and asking for the other one afterwards is an error (`Ok` when it asks for
+/// the mode already in force). Under the `portable` feature only `true` is
+/// possible — the native kernels are compiled out.
+pub fn set_portable(on: bool) -> Result<(), PortableFixed> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if cfg!(rlx_cpu_portable) {
+        return if on {
+            Ok(())
+        } else {
+            Err(PortableFixed { portable: true })
+        };
+    }
+    let want = if on { 2 } else { 1 };
+    match PORTABLE.compare_exchange(0, want, Relaxed, Relaxed) {
+        Ok(_) => Ok(()),
+        Err(v) if v == want => Ok(()),
+        Err(v) => Err(PortableFixed { portable: v == 2 }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

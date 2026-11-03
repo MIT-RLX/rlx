@@ -29,7 +29,9 @@ struct Params {
 var<workgroup> sh16: array<vec2<f32>, 2048>; // 16 KB
 
 fn cmul16(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+    // explicit fma: a plain `a*b - c*d` is contracted by one compiler's math mode
+    // and not another's (native Metal fast math vs a browser's safe math)
+    return vec2<f32>(fma(a.x, b.x, -(a.y * b.y)), fma(a.x, b.y, a.y * b.x));
 }
 
 fn dft4_16(x0: vec2<f32>, x1: vec2<f32>, x2: vec2<f32>, x3: vec2<f32>, rs: f32) -> array<vec2<f32>, 4> {
@@ -90,10 +92,10 @@ fn fft_radix4_16k(
             var u1 = sh16[base + dist];
             var u2 = sh16[base + 2u * dist];
             var u3 = sh16[base + 3u * dist];
-            let a = sgn * TWO_PI_16 * f32(kk) / f32(l);
-            u1 = cmul16(u1, vec2<f32>(cos(a), sin(a)));
-            u2 = cmul16(u2, vec2<f32>(cos(2.0 * a), sin(2.0 * a)));
-            u3 = cmul16(u3, vec2<f32>(cos(3.0 * a), sin(3.0 * a)));
+            let a = rlx_div_rn(sgn * TWO_PI_16 * f32(kk), f32(l));
+            u1 = cmul16(u1, vec2<f32>(rlx_cos(a), rlx_sin(a)));
+            u2 = cmul16(u2, vec2<f32>(rlx_cos(2.0 * a), rlx_sin(2.0 * a)));
+            u3 = cmul16(u3, vec2<f32>(rlx_cos(3.0 * a), rlx_sin(3.0 * a)));
             let y = dft4_16(u0, u1, u2, u3, rs);
             sh16[base] = y[0];
             sh16[base + dist] = y[1];
@@ -114,8 +116,8 @@ fn fft_radix4_16k(
             let base = (j / dist) * l + kk;
             let u0 = sh16[base];
             var u1 = sh16[base + dist];
-            let a = sgn * TWO_PI_16 * f32(kk) / f32(l);
-            u1 = cmul16(u1, vec2<f32>(cos(a), sin(a)));
+            let a = rlx_div_rn(sgn * TWO_PI_16 * f32(kk), f32(l));
+            u1 = cmul16(u1, vec2<f32>(rlx_cos(a), rlx_sin(a)));
             sh16[base] = u0 + u1;
             sh16[base + dist] = u0 - u1;
             j = j + tg;

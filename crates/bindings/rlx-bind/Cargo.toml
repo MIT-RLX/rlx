@@ -52,8 +52,8 @@ rlx-fpga    = { workspace = true, optional = true }
 serde_json  = { version = "1", optional = true }
 anyhow      = { version = "1", optional = true }
 rlx-gguf-convert = { path = "../../io/rlx-gguf-convert", version = "0.2.18", default-features = false, features = ["safetensors"], optional = true }
-rlx-pkg     = { workspace = true, optional = true }
-rlx-mlx-io  = { workspace = true, optional = true }
+rlx-pkg     = { workspace = true, optional = true, features = ["write", "convert", "parallel"] }
+rlx-mlx-io  = { workspace = true, optional = true, features = ["io"] }
 rlx-dduf    = { workspace = true, optional = true }
 rlx-nemo    = { workspace = true, optional = true }
 rlx-text    = { workspace = true, optional = true }

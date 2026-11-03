@@ -57,7 +57,7 @@ fn gated_delta_net(
 
     let bi = gid / h;
     let hi = gid % h;
-    let scale = inverseSqrt(f32(n));
+    let scale = rlx_rsqrt_rn(f32(n));
     let s_base = params.state_off + (bi * h + hi) * n * n;
     let hs_n = h * n;
 
@@ -74,7 +74,7 @@ fn gated_delta_net(
         let q_row = params.q_off + qkv_step;
         let k_row = params.k_off + qkv_step;
         let v_row = params.v_off + qkv_step;
-        let g_exp = exp(arena[params.g_off + gb_step]);
+        let g_exp = rlx_exp(arena[params.g_off + gb_step]);
         let beta_t = arena[params.beta_off + gb_step];
         let per_channel = params.gate_per_channel != 0u;
         // Per-channel decay rows: g is [b,s,h,n] (Kimi-K3 KDA).
@@ -83,7 +83,7 @@ fn gated_delta_net(
         // Pass 1: decay column j and accumulate Σ_i S[i,j]·k_i.
         var acc: f32 = 0.0;
         for (var i: u32 = 0u; i < n; i = i + 1u) {
-            let a = select(g_exp, exp(arena[g_pc_base + i]), per_channel);
+            let a = select(g_exp, rlx_exp(arena[g_pc_base + i]), per_channel);
             let sv = arena[s_base + i * n + j] * a;
             arena[s_base + i * n + j] = sv;
             acc = acc + sv * arena[k_row + i];

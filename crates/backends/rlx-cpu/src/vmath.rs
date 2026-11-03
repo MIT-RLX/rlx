@@ -63,17 +63,13 @@ pub fn vvexpf(y: &mut [f32], x: &[f32]) {
         not(feature = "pure-rust"),
         not(rlx_cpu_portable)
     ))]
-    {
+    if !crate::config::portable() {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvexpf(y.as_mut_ptr(), x.as_ptr(), &n);
         }
+        return;
     }
-    #[cfg(not(all(
-        target_vendor = "apple",
-        not(feature = "pure-rust"),
-        not(rlx_cpu_portable)
-    )))]
     {
         #[cfg(feature = "parity")]
         for (yi, &xi) in y.iter_mut().zip(x.iter()) {
@@ -92,17 +88,13 @@ pub fn vvexpf_inplace(y: &mut [f32]) {
         not(feature = "pure-rust"),
         not(rlx_cpu_portable)
     ))]
-    {
+    if !crate::config::portable() {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvexpf(y.as_mut_ptr(), y.as_ptr(), &n);
         }
+        return;
     }
-    #[cfg(not(all(
-        target_vendor = "apple",
-        not(feature = "pure-rust"),
-        not(rlx_cpu_portable)
-    )))]
     {
         #[cfg(feature = "parity")]
         for yi in y.iter_mut() {
@@ -294,13 +286,13 @@ fn vvexpf_poly(y: &mut [f32], x: &[f32]) {
 pub fn vvexpf_fast(y: &mut [f32], x: &[f32]) {
     assert_eq!(y.len(), x.len());
     #[cfg(rlx_cpu_neon)]
-    {
+    if !crate::config::portable() {
         vvexpf_neon(y, x);
+        return;
     }
-    #[cfg(not(rlx_cpu_neon))]
     {
         #[cfg(rlx_cpu_x86)]
-        {
+        if !crate::config::portable() {
             if std::arch::is_x86_feature_detected!("avx2")
                 && std::arch::is_x86_feature_detected!("fma")
             {
@@ -312,19 +304,36 @@ pub fn vvexpf_fast(y: &mut [f32], x: &[f32]) {
         // slow and unvectorizable, so a pre-AVX2 x86 (every Atom through
         // Tremont) got no SIMD at all on the hottest activation primitive.
         #[cfg(rlx_cpu_x86)]
-        vvexpf_poly(y, x);
-        // wasm / riscv: the AVX2 kernel's arithmetic, so they round like
-        // Linux x86-64.
-        #[cfg(not(rlx_cpu_x86))]
+        if !crate::config::portable() {
+            vvexpf_poly(y, x);
+            return;
+        }
+        // wasm / riscv / portable: the AVX2 kernel's arithmetic, so they
+        // round like Linux x86-64.
         crate::avx2_mirror::vvexpf(y, x, acc_expf);
+    }
+}
+
+/// Runs the out-of-place kernel `f` in place. Calling `f(y, y)` through a
+/// `&*(y as *const [f32])` cast is undefined behaviour — a live `&mut` and `&`
+/// to the same memory — so each block of `y` is copied to the stack first.
+/// `IN_PLACE_BLOCK` is a multiple of every SIMD width here, so an element takes
+/// the same vector or tail path as in one whole-slice call: bit-identical.
+#[inline(always)]
+fn in_place(y: &mut [f32], f: impl Fn(&mut [f32], &[f32])) {
+    const IN_PLACE_BLOCK: usize = 256;
+    let mut buf = [0f32; IN_PLACE_BLOCK];
+    for c in y.chunks_mut(IN_PLACE_BLOCK) {
+        let x = &mut buf[..c.len()];
+        x.copy_from_slice(c);
+        f(c, x);
     }
 }
 
 /// In-place fast SIMD `exp`.
 #[inline]
 pub fn vvexpf_fast_inplace(y: &mut [f32]) {
-    let x = unsafe { &*(y as *const [f32]) };
-    vvexpf_fast(y, x);
+    in_place(y, vvexpf_fast);
 }
 
 /// `exp` selected for CPU activation hot paths.
@@ -635,17 +644,13 @@ pub fn vvtanhf(y: &mut [f32], x: &[f32]) {
         not(feature = "pure-rust"),
         not(rlx_cpu_portable)
     ))]
-    {
+    if !crate::config::portable() {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvtanhf(y.as_mut_ptr(), x.as_ptr(), &n);
         }
+        return;
     }
-    #[cfg(not(all(
-        target_vendor = "apple",
-        not(feature = "pure-rust"),
-        not(rlx_cpu_portable)
-    )))]
     {
         #[cfg(feature = "parity")]
         for (yi, &xi) in y.iter_mut().zip(x.iter()) {
@@ -664,17 +669,13 @@ pub fn vvtanhf_inplace(y: &mut [f32]) {
         not(feature = "pure-rust"),
         not(rlx_cpu_portable)
     ))]
-    {
+    if !crate::config::portable() {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvtanhf(y.as_mut_ptr(), y.as_ptr(), &n);
         }
+        return;
     }
-    #[cfg(not(all(
-        target_vendor = "apple",
-        not(feature = "pure-rust"),
-        not(rlx_cpu_portable)
-    )))]
     {
         #[cfg(feature = "parity")]
         for yi in y.iter_mut() {
@@ -689,13 +690,13 @@ pub fn vvtanhf_inplace(y: &mut [f32]) {
 pub fn vvtanhf_fast(y: &mut [f32], x: &[f32]) {
     assert_eq!(y.len(), x.len());
     #[cfg(rlx_cpu_neon)]
-    {
+    if !crate::config::portable() {
         vvtanhf_neon(y, x);
+        return;
     }
-    #[cfg(not(rlx_cpu_neon))]
     {
         #[cfg(rlx_cpu_x86)]
-        {
+        if !crate::config::portable() {
             if std::arch::is_x86_feature_detected!("avx2")
                 && std::arch::is_x86_feature_detected!("fma")
             {
@@ -706,11 +707,13 @@ pub fn vvtanhf_fast(y: &mut [f32], x: &[f32]) {
         // Same `(e^2x − 1) / (e^2x + 1)` form as `vvtanhf_avx2`, over the
         // auto-vectorizing `exp_poly` instead of a libm `tanhf` per element.
         #[cfg(rlx_cpu_x86)]
-        for (yi, &xi) in y.iter_mut().zip(x.iter()) {
-            *yi = tanh_poly(xi);
+        if !crate::config::portable() {
+            for (yi, &xi) in y.iter_mut().zip(x.iter()) {
+                *yi = tanh_poly(xi);
+            }
+            return;
         }
-        // wasm / riscv: the AVX2 kernel's arithmetic.
-        #[cfg(not(rlx_cpu_x86))]
+        // wasm / riscv / portable: the AVX2 kernel's arithmetic.
         crate::avx2_mirror::vvtanhf(y, x, acc_tanhf);
     }
 }
@@ -718,8 +721,7 @@ pub fn vvtanhf_fast(y: &mut [f32], x: &[f32]) {
 /// In-place fast SIMD `tanh`.
 #[inline]
 pub fn vvtanhf_fast_inplace(y: &mut [f32]) {
-    let x = unsafe { &*(y as *const [f32]) };
-    vvtanhf_fast(y, x);
+    in_place(y, vvtanhf_fast);
 }
 
 /// `tanh` selected for CPU activation hot paths.
@@ -746,13 +748,13 @@ pub fn vvtanhf_hot_inplace(y: &mut [f32]) {
 pub fn vvrecf(y: &mut [f32], x: &[f32]) {
     assert_eq!(y.len(), x.len());
     #[cfg(rlx_cpu_neon)]
-    {
+    if !crate::config::portable() {
         vvrecf_neon(y, x);
+        return;
     }
-    #[cfg(not(rlx_cpu_neon))]
     {
         #[cfg(rlx_cpu_x86)]
-        {
+        if !crate::config::portable() {
             if std::arch::is_x86_feature_detected!("avx2") {
                 unsafe { vvrecf_avx2(y, x) };
                 return;
@@ -767,16 +769,7 @@ pub fn vvrecf(y: &mut [f32], x: &[f32]) {
 /// In-place `y[i] = 1 / y[i]`.
 #[inline]
 pub fn vvrecf_inplace(y: &mut [f32]) {
-    #[cfg(rlx_cpu_neon)]
-    {
-        let x = unsafe { &*(y as *const [f32]) };
-        vvrecf_neon(y, x);
-    }
-    #[cfg(not(rlx_cpu_neon))]
-    {
-        let x = unsafe { &*(y as *const [f32]) };
-        vvrecf(y, x);
-    }
+    in_place(y, vvrecf);
 }
 
 /// `y[i] = ln(x[i])`. Lengths must match. Aliasing OK.
@@ -787,17 +780,13 @@ pub fn vvlogf(y: &mut [f32], x: &[f32]) {
         not(feature = "pure-rust"),
         not(rlx_cpu_portable)
     ))]
-    {
+    if !crate::config::portable() {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvlogf(y.as_mut_ptr(), x.as_ptr(), &n);
         }
+        return;
     }
-    #[cfg(not(all(
-        target_vendor = "apple",
-        not(feature = "pure-rust"),
-        not(rlx_cpu_portable)
-    )))]
     {
         #[cfg(feature = "parity")]
         for (yi, &xi) in y.iter_mut().zip(x.iter()) {
@@ -816,17 +805,13 @@ pub fn vvlogf_inplace(y: &mut [f32]) {
         not(feature = "pure-rust"),
         not(rlx_cpu_portable)
     ))]
-    {
+    if !crate::config::portable() {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvlogf(y.as_mut_ptr(), y.as_ptr(), &n);
         }
+        return;
     }
-    #[cfg(not(all(
-        target_vendor = "apple",
-        not(feature = "pure-rust"),
-        not(rlx_cpu_portable)
-    )))]
     {
         #[cfg(feature = "parity")]
         for yi in y.iter_mut() {
@@ -845,7 +830,7 @@ pub fn vvsqrtf(y: &mut [f32], x: &[f32]) {
         not(feature = "pure-rust"),
         not(rlx_cpu_portable)
     ))]
-    if vmath_accurate() {
+    if vmath_accurate() && !crate::config::portable() {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvsqrtf(y.as_mut_ptr(), x.as_ptr(), &n);
@@ -863,15 +848,14 @@ pub fn vvsqrtf_inplace(y: &mut [f32]) {
         not(feature = "pure-rust"),
         not(rlx_cpu_portable)
     ))]
-    if vmath_accurate() {
+    if vmath_accurate() && !crate::config::portable() {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvsqrtf(y.as_mut_ptr(), y.as_ptr(), &n);
         }
         return;
     }
-    let x = unsafe { &*(y as *const [f32]) };
-    vvsqrtf_simd(y, x);
+    in_place(y, vvsqrtf_simd);
 }
 
 /// `y[i] = 1 / sqrt(x[i])`. Lengths must match. Aliasing OK.
@@ -882,7 +866,7 @@ pub fn vvrsqrtf(y: &mut [f32], x: &[f32]) {
         not(feature = "pure-rust"),
         not(rlx_cpu_portable)
     ))]
-    if vmath_accurate() {
+    if vmath_accurate() && !crate::config::portable() {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvrsqrtf(y.as_mut_ptr(), x.as_ptr(), &n);
@@ -900,15 +884,14 @@ pub fn vvrsqrtf_inplace(y: &mut [f32]) {
         not(feature = "pure-rust"),
         not(rlx_cpu_portable)
     ))]
-    if vmath_accurate() {
+    if vmath_accurate() && !crate::config::portable() {
         let n = y.len() as i32;
         unsafe {
             accelerate::vvrsqrtf(y.as_mut_ptr(), y.as_ptr(), &n);
         }
         return;
     }
-    let x = unsafe { &*(y as *const [f32]) };
-    vvrsqrtf_simd(y, x);
+    in_place(y, vvrsqrtf_simd);
 }
 
 /// `y[i] = 1 / (1 + exp(-x[i]))` (logistic sigmoid).
@@ -943,13 +926,13 @@ mod accelerate {
 
 fn vvsqrtf_simd(y: &mut [f32], x: &[f32]) {
     #[cfg(rlx_cpu_neon)]
-    {
+    if !crate::config::portable() {
         vvsqrtf_neon(y, x);
+        return;
     }
-    #[cfg(not(rlx_cpu_neon))]
     {
         #[cfg(rlx_cpu_x86)]
-        if std::arch::is_x86_feature_detected!("avx") {
+        if !crate::config::portable() && std::arch::is_x86_feature_detected!("avx") {
             unsafe { vvsqrtf_avx(y, x) };
             return;
         }
@@ -961,13 +944,13 @@ fn vvsqrtf_simd(y: &mut [f32], x: &[f32]) {
 
 fn vvrsqrtf_simd(y: &mut [f32], x: &[f32]) {
     #[cfg(rlx_cpu_neon)]
-    {
+    if !crate::config::portable() {
         vvrsqrtf_neon(y, x);
+        return;
     }
-    #[cfg(not(rlx_cpu_neon))]
     {
         #[cfg(rlx_cpu_x86)]
-        if std::arch::is_x86_feature_detected!("avx") {
+        if !crate::config::portable() && std::arch::is_x86_feature_detected!("avx") {
             unsafe { vvrsqrtf_avx(y, x) };
             return;
         }
@@ -1489,6 +1472,34 @@ mod tests {
         vvexpf_inplace(&mut z);
         assert!((z[0] - 1.0).abs() < 1e-5);
         assert!((z[1] - 1.0f32.exp()).abs() < 1e-5);
+    }
+
+    /// The in-place wrappers block through a stack copy; across block
+    /// boundaries and odd tails they must match the out-of-place kernel bit
+    /// for bit.
+    #[test]
+    fn inplace_matches_out_of_place_bitwise() {
+        type K = (fn(&mut [f32], &[f32]), fn(&mut [f32]));
+        let kernels: [(&str, K); 5] = [
+            ("exp_fast", (vvexpf_fast, vvexpf_fast_inplace)),
+            ("tanh_fast", (vvtanhf_fast, vvtanhf_fast_inplace)),
+            ("rec", (vvrecf, vvrecf_inplace)),
+            ("sqrt", (vvsqrtf, vvsqrtf_inplace)),
+            ("rsqrt", (vvrsqrtf, vvrsqrtf_inplace)),
+        ];
+        for n in [1usize, 3, 255, 256, 257, 1027] {
+            let x: Vec<f32> = (0..n)
+                .map(|i| 0.01 + (i as f32 * 0.37).sin().abs() * 4.0)
+                .collect();
+            for (name, (out, inp)) in kernels {
+                let mut want = vec![0.0; n];
+                out(&mut want, &x);
+                let mut got = x.clone();
+                inp(&mut got);
+                let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&got), bits(&want), "{name} n={n}");
+            }
+        }
     }
 
     #[test]

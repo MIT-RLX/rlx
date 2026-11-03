@@ -13,10 +13,8 @@
 //! checked against glibc 2.43 on x86-64: the f32 ones on all 2^32 inputs, the
 //! f64 ones on 3.2·10^8 samples each, with 0 mismatches.
 //!
-//! Functions with no port here (`powf`, `atan2`, …) stay musl's, unless
-//! `export-glibc` is on: then they are the `libm` crate's (pure Rust, the
-//! same code on every target), and the whole set is exported natively too, so
-//! a macOS or Linux binary rounds as the browser does.
+//! With `export-glibc` the same set is exported natively too, so a macOS or
+//! Linux binary rounds as the browser does.
 #![allow(unsafe_code)]
 
 macro_rules! export {
@@ -53,54 +51,79 @@ export! {
     "log1p" => fn glibc_log1p(x: f64) -> f64 = crate::log1p;
     "hypot" => fn glibc_hypot(x: f64, y: f64) -> f64 = crate::hypot;
     "erfc" => fn glibc_erfc(x: f64) -> f64 = crate::erfc;
+    "tanh" => fn glibc_tanh(x: f64) -> f64 = crate::tanh;
+    "cbrt" => fn glibc_cbrt(x: f64) -> f64 = crate::cbrt;
+    "cosh" => fn glibc_cosh(x: f64) -> f64 = crate::cosh;
+    "sinh" => fn glibc_sinh(x: f64) -> f64 = crate::sinh;
+    "log10" => fn glibc_log10(x: f64) -> f64 = crate::log10;
+    "exp2" => fn glibc_exp2(x: f64) -> f64 = crate::exp2;
+    "exp10" => fn glibc_exp10(x: f64) -> f64 = crate::exp10;
+    "__exp10" => fn glibc_apple_exp10(x: f64) -> f64 = crate::exp10;
+    "erf" => fn glibc_erf(x: f64) -> f64 = crate::erf;
+    "atan" => fn glibc_atan(x: f64) -> f64 = crate::atan;
+    "asin" => fn glibc_asin(x: f64) -> f64 = crate::asin;
+    "acos" => fn glibc_acos(x: f64) -> f64 = crate::acos;
+    "atanh" => fn glibc_atanh(x: f64) -> f64 = crate::atanh;
+    "asinh" => fn glibc_asinh(x: f64) -> f64 = crate::asinh;
+    "acosh" => fn glibc_acosh(x: f64) -> f64 = crate::acosh;
+    "tgamma" => fn glibc_tgamma(x: f64) -> f64 = crate::tgamma;
+    "lgamma" => fn glibc_lgamma(x: f64) -> f64 = crate::lgamma;
+    "atan2" => fn glibc_atan2(y: f64, x: f64) -> f64 = crate::atan2;
+    "powf" => fn glibc_powf(x: f32, y: f32) -> f32 = crate::powf;
+    "exp2f" => fn glibc_exp2f(x: f32) -> f32 = crate::exp2f;
+    "exp10f" => fn glibc_exp10f(x: f32) -> f32 = crate::exp10f;
+    "__exp10f" => fn glibc_apple_exp10f(x: f32) -> f32 = crate::exp10f;
+    "log2f" => fn glibc_log2f(x: f32) -> f32 = crate::log2f;
+    "hypotf" => fn glibc_hypotf(x: f32, y: f32) -> f32 = crate::hypotf;
+    "atan2f" => fn glibc_atan2f(y: f32, x: f32) -> f32 = crate::atan2f;
+    "acosf" => fn glibc_acosf(x: f32) -> f32 = crate::acosf;
+    "asinf" => fn glibc_asinf(x: f32) -> f32 = crate::asinf;
+    "atanf" => fn glibc_atanf(x: f32) -> f32 = crate::atanf;
+    "acoshf" => fn glibc_acoshf(x: f32) -> f32 = crate::acoshf;
+    "asinhf" => fn glibc_asinhf(x: f32) -> f32 = crate::asinhf;
+    "atanhf" => fn glibc_atanhf(x: f32) -> f32 = crate::atanhf;
+    "cbrtf" => fn glibc_cbrtf(x: f32) -> f32 = crate::cbrtf;
+    "coshf" => fn glibc_coshf(x: f32) -> f32 = crate::coshf;
+    "sinhf" => fn glibc_sinhf(x: f32) -> f32 = crate::sinhf;
+    "tanf" => fn glibc_tanf(x: f32) -> f32 = crate::tanf;
+    "expm1f" => fn glibc_expm1f(x: f32) -> f32 = crate::expm1f;
+    "log10f" => fn glibc_log10f(x: f32) -> f32 = crate::log10f;
+    "erff" => fn glibc_erff(x: f32) -> f32 = crate::erff;
+    "erfcf" => fn glibc_erfcf(x: f32) -> f32 = crate::erfcf;
+    "lgammaf" => fn glibc_lgammaf(x: f32) -> f32 = crate::lgammaf;
+    "tgammaf" => fn glibc_tgammaf(x: f32) -> f32 = crate::tgammaf;
 }
 
-/// The functions with no glibc port: the `libm` crate's, on every target.
+/// `sincos` / `__sincos_stret`, which LLVM merges a sin and cos of one
+/// argument into, and the libcalls std's other float methods lower to off
+/// wasm (`%` → `fmod`, `abs_sub` → `fdim`, and on x86-64 without SSE4.1 / FMA
+/// `floor` … `rint` and `fma`): exported natively under `export-glibc`, so
+/// no float operation of the binary reaches the platform's C libm.
 #[cfg(feature = "export-glibc")]
 mod rest {
-    use libm_crate as m;
     export! {
-        "acos" => fn x_acos(x: f64) -> f64 = m::acos;
-        "acosf" => fn x_acosf(x: f32) -> f32 = m::acosf;
-        "asin" => fn x_asin(x: f64) -> f64 = m::asin;
-        "asinf" => fn x_asinf(x: f32) -> f32 = m::asinf;
-        "atan" => fn x_atan(x: f64) -> f64 = m::atan;
-        "atanf" => fn x_atanf(x: f32) -> f32 = m::atanf;
-        "atan2" => fn x_atan2(y: f64, x: f64) -> f64 = m::atan2;
-        "atan2f" => fn x_atan2f(y: f32, x: f32) -> f32 = m::atan2f;
-        "acosh" => fn x_acosh(x: f64) -> f64 = m::acosh;
-        "acoshf" => fn x_acoshf(x: f32) -> f32 = m::acoshf;
-        "asinh" => fn x_asinh(x: f64) -> f64 = m::asinh;
-        "asinhf" => fn x_asinhf(x: f32) -> f32 = m::asinhf;
-        "atanh" => fn x_atanh(x: f64) -> f64 = m::atanh;
-        "atanhf" => fn x_atanhf(x: f32) -> f32 = m::atanhf;
-        "cbrt" => fn x_cbrt(x: f64) -> f64 = m::cbrt;
-        "cbrtf" => fn x_cbrtf(x: f32) -> f32 = m::cbrtf;
-        "cosh" => fn x_cosh(x: f64) -> f64 = m::cosh;
-        "coshf" => fn x_coshf(x: f32) -> f32 = m::coshf;
-        "sinh" => fn x_sinh(x: f64) -> f64 = m::sinh;
-        "sinhf" => fn x_sinhf(x: f32) -> f32 = m::sinhf;
-        "tanh" => fn x_tanh(x: f64) -> f64 = m::tanh;
-        "tanf" => fn x_tanf(x: f32) -> f32 = m::tanf;
-        "exp2" => fn x_exp2(x: f64) -> f64 = m::exp2;
-        "exp2f" => fn x_exp2f(x: f32) -> f32 = m::exp2f;
-        "exp10" => fn x_exp10(x: f64) -> f64 = m::exp10;
-        "exp10f" => fn x_exp10f(x: f32) -> f32 = m::exp10f;
-        "__exp10" => fn x_apple_exp10(x: f64) -> f64 = m::exp10;
-        "__exp10f" => fn x_apple_exp10f(x: f32) -> f32 = m::exp10f;
-        "expm1f" => fn x_expm1f(x: f32) -> f32 = m::expm1f;
-        "log10" => fn x_log10(x: f64) -> f64 = m::log10;
-        "log10f" => fn x_log10f(x: f32) -> f32 = m::log10f;
-        "log2f" => fn x_log2f(x: f32) -> f32 = m::log2f;
-        "powf" => fn x_powf(x: f32, y: f32) -> f32 = m::powf;
-        "hypotf" => fn x_hypotf(x: f32, y: f32) -> f32 = m::hypotf;
-        "erf" => fn x_erf(x: f64) -> f64 = m::erf;
-        "erff" => fn x_erff(x: f32) -> f32 = m::erff;
-        "erfcf" => fn x_erfcf(x: f32) -> f32 = m::erfcf;
-        "lgamma" => fn x_lgamma(x: f64) -> f64 = m::lgamma;
-        "lgammaf" => fn x_lgammaf(x: f32) -> f32 = m::lgammaf;
-        "tgamma" => fn x_tgamma(x: f64) -> f64 = m::tgamma;
-        "tgammaf" => fn x_tgammaf(x: f32) -> f32 = m::tgammaf;
+        "fmod" => fn x_fmod(x: f64, y: f64) -> f64 = crate::fmod;
+        "fmodf" => fn x_fmodf(x: f32, y: f32) -> f32 = crate::fmodf;
+        "fdim" => fn x_fdim(x: f64, y: f64) -> f64 = crate::fdim;
+        "fdimf" => fn x_fdimf(x: f32, y: f32) -> f32 = crate::fdimf;
+        "fmaf" => fn x_fmaf(a: f32, b: f32, c: f32) -> f32 = crate::fmaf;
+        "floor" => fn x_floor(x: f64) -> f64 = crate::floor;
+        "floorf" => fn x_floorf(x: f32) -> f32 = crate::floorf;
+        "ceil" => fn x_ceil(x: f64) -> f64 = crate::ceil;
+        "ceilf" => fn x_ceilf(x: f32) -> f32 = crate::ceilf;
+        "trunc" => fn x_trunc(x: f64) -> f64 = crate::trunc;
+        "truncf" => fn x_truncf(x: f32) -> f32 = crate::truncf;
+        "round" => fn x_round(x: f64) -> f64 = crate::round;
+        "roundf" => fn x_roundf(x: f32) -> f32 = crate::roundf;
+        "rint" => fn x_rint(x: f64) -> f64 = crate::rint;
+        "rintf" => fn x_rintf(x: f32) -> f32 = crate::rintf;
+        "roundeven" => fn x_roundeven(x: f64) -> f64 = crate::rint;
+        "roundevenf" => fn x_roundevenf(x: f32) -> f32 = crate::rintf;
+    }
+    // wasm's `fma` is `wasm-fma`'s (the same function).
+    #[cfg(not(all(feature = "wasm-fma", target_family = "wasm")))]
+    export! {
+        "fma" => fn x_fma(a: f64, b: f64, c: f64) -> f64 = crate::fma_emulated;
     }
 
     // A sin and a cos of one argument: LLVM merges them into one call.

@@ -224,11 +224,11 @@ fn detected_versions() -> Vec<(&'static str, (u32, u32, u32))> {
 }
 
 fn wgpu_host_routed() -> bool {
-    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
     {
         is_available(Device::Gpu) && rlx_wgpu::device::coop_discrete_backend()
     }
-    #[cfg(not(all(feature = "gpu", not(target_arch = "wasm32"))))]
+    #[cfg(not(all(feature = "gpu", not(target_family = "wasm"))))]
     {
         false
     }
@@ -372,7 +372,7 @@ fn toolchain_probe(device: Device) -> (Option<String>, Option<String>) {
     if device == Device::Vulkan {
         return (rlx_vulkan::device_name(), None);
     }
-    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
     if device == Device::Gpu {
         return (rlx_wgpu::device::adapter_name(), None);
     }

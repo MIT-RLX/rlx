@@ -9,6 +9,9 @@
 
 #[path = "erfc_data.rs"]
 mod data;
+#[cfg(not(any(test, feature = "std")))]
+#[allow(unused_imports)]
+use crate::fp::Fp as _;
 use data::*;
 
 #[inline]
@@ -140,8 +143,23 @@ fn cr_erf_fast(z: f64) -> (f64, f64, f64) {
     (h, l, f64::from_bits(0x3ba1_1000_0000_0000)) // 0x1.11p-69
 }
 
-/// `__cr_erf_accurate_tiny(z, false)` for `|z| < 1/8`.
-fn cr_erf_accurate_tiny(z: f64) -> (f64, f64) {
+/// `__cr_erf_accurate_tiny(z, exceptions)` for `|z| < 1/8`: `erf` checks its
+/// tiny-argument exceptions first, `erfc` does not.
+fn cr_erf_accurate_tiny(z: f64, exceptions: bool) -> (f64, f64) {
+    if exceptions {
+        let (mut i, mut j) = (0usize, EXCEPTIONS_TINY.len());
+        while i + 1 < j {
+            let k = (i + j) / 2;
+            if EXCEPTIONS_TINY[k][0] <= z {
+                i = k;
+            } else {
+                j = k;
+            }
+        }
+        if z == EXCEPTIONS_TINY[i][0] {
+            return (EXCEPTIONS_TINY[i][1], EXCEPTIONS_TINY[i][2]);
+        }
+    }
     let z2 = z * z;
     let mut h = P[21 / 2 + 4];
     let mut a = 19;
@@ -179,10 +197,18 @@ fn cr_erf_accurate_tiny(z: f64) -> (f64, f64) {
     (h, fma(l, z, tl))
 }
 
-/// `cr_erf_accurate(z)` for `0 ≤ z ≤ 0x1.7afb48dc96626p+2`.
-fn cr_erf_accurate(z: f64) -> (f64, f64) {
+/// `cr_erf_accurate(z)` for `0 ≤ z ≤ 0x1.7afb48dc96626p+2`; `erf`'s
+/// (`exceptions`) checks its exception list first, `erfc`'s does not.
+fn cr_erf_accurate(z: f64, exceptions: bool) -> (f64, f64) {
+    if exceptions {
+        for e in &EXCEPTIONS_ERF {
+            if z == e[0] {
+                return (e[1], e[2]);
+            }
+        }
+    }
     if z < 0.125 {
-        return cr_erf_accurate_tiny(z);
+        return cr_erf_accurate_tiny(z, exceptions);
     }
     let v = (8.0 * z).floor();
     let i = (8.0 * z) as u32;
@@ -434,7 +460,7 @@ fn cr_erfc_accurate(x: f64) -> f64 {
                 return e[1] + e[2];
             }
         }
-        let (h, l) = cr_erf_accurate(-x);
+        let (h, l) = cr_erf_accurate(-x, false);
         let (h, t) = fast_two_sum(1.0, h);
         return h + (t + l);
     } else if x <= f64::from_bits(0x3ffb_59ff_b450_828c) {
@@ -443,11 +469,55 @@ fn cr_erfc_accurate(x: f64) -> f64 {
                 return e[1] + e[2];
             }
         }
-        let (h, l) = cr_erf_accurate(x);
+        let (h, l) = cr_erf_accurate(x, false);
         let (h, t) = fast_two_sum(1.0, -h);
         return h + (t - l);
     }
     erfc_asympt_accurate(x)
+}
+
+/// glibc 2.43's `erf`: CORE-MATH's correctly rounded binary64 `erf`
+/// (`s_erf.c`), statement for statement.
+pub fn erf(x: f64) -> f64 {
+    // 2/sqrt(pi) as a double-double
+    const CH: f64 = f64::from_bits(0x3ff20dd750429b6d);
+    const CL: f64 = f64::from_bits(0x3c71ae3a914fed80);
+    const SIGN: u64 = 1 << 63;
+    let z = x.abs();
+    let ux = z.to_bits();
+    if ux > 0x4017_afb4_8dc9_6626 {
+        let os = 1.0f64.copysign(x);
+        if ux > 0x7ff0_0000_0000_0000 {
+            return x + x;
+        }
+        if ux == 0x7ff0_0000_0000_0000 {
+            return os;
+        }
+        return os - f64::from_bits(0x3c90_0000_0000_0000) * os; // 0x1p-54
+    }
+    if z < f64::from_bits(0x3c20_0000_0000_0000) {
+        // |x| < 2^-61
+        if x == 0.0 {
+            return x;
+        }
+        let y = CH * x;
+        let sx = x * f64::from_bits(0x4690_0000_0000_0000); // 2^106
+        let (h, l) = a_mul(CH, sx);
+        let mut l = fma(CL, sx, l);
+        l += h - y * f64::from_bits(0x4690_0000_0000_0000);
+        return fma(l, f64::from_bits(0x3950_0000_0000_0000), y); // 2^-106
+    }
+    let (h, l, err) = cr_erf_fast(z);
+    let t = x.to_bits();
+    let uf = f64::from_bits(h.to_bits() ^ (t & SIGN));
+    let vf = f64::from_bits(l.to_bits() ^ (t & SIGN));
+    let left = uf + fma(err, -uf, vf);
+    let right = uf + fma(err, uf, vf);
+    if left == right {
+        return left;
+    }
+    let (h, l) = cr_erf_accurate(z, true);
+    if x >= 0.0 { h + l } else { (-h) + (-l) }
 }
 
 /// glibc `erfc(x)` (≥ 2.42: correctly rounded).
@@ -493,6 +563,7 @@ pub fn erfc(x: f64) -> f64 {
 /// The hard-to-round inputs CORE-MATH tabulates (for tests of the slow path),
 /// plus their neighbours.
 #[doc(hidden)]
+#[cfg(feature = "std")]
 pub fn hard_cases() -> Vec<f64> {
     let mut v = vec![];
     for t in [

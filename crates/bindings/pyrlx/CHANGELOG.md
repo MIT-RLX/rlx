@@ -6,6 +6,13 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.20] — 2026-11-02
+
+### Changed
+
+- Built on rlx 0.2.20 (see the workspace `CHANGELOG.md`): the CPU backend's
+  scalar math is rlx-libm's pure-Rust glibc ports. No pyrlx API changes.
+
 ## [0.2.19] — 2026-10-24
 
 ### Added

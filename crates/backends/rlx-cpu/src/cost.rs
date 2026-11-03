@@ -48,21 +48,23 @@ pub struct HwModel {
 impl HwModel {
     /// Build from runtime config and platform defaults.
     pub fn from_config(cfg: &RuntimeConfig) -> Self {
-        // Platform-calibrated constants
+        // Platform-calibrated constants. Portable runs take the model a
+        // portable build compiles in, so the kernel choices (and with them
+        // the arithmetic) are its too.
         #[cfg(all(rlx_cpu_neon, target_vendor = "apple"))]
-        let model = HwModel {
-            neon_flops: 72e9,            // ~72 GFLOP/s NEON FMA throughput (M4 Pro P-core)
-            blas_flops: 1000e9,          // ~1 TFLOP/s AMX peak (effective varies with tile fill)
-            blas_overhead_ns: 500.0,     // ~0.5µs per cblas_sgemm call
-            par_for_overhead_ns: 5000.0, // ~5µs spin-wait dispatch
-            l1_bytes: 65536,             // 64KB L1d (refined by sysctl at runtime)
-            l2_bytes: 4 * 1024 * 1024,   // 4MB L2 per core
-            mem_bw: 50.0,                // ~50 GB/s = 50 B/ns
-            num_threads: cfg.pool_workers + 1,
-        };
-
-        #[cfg(not(all(rlx_cpu_neon, target_vendor = "apple")))]
-        let model = HwModel {
+        if !crate::config::portable() {
+            return HwModel {
+                neon_flops: 72e9,            // ~72 GFLOP/s NEON FMA throughput (M4 Pro P-core)
+                blas_flops: 1000e9, // ~1 TFLOP/s AMX peak (effective varies with tile fill)
+                blas_overhead_ns: 500.0, // ~0.5µs per cblas_sgemm call
+                par_for_overhead_ns: 5000.0, // ~5µs spin-wait dispatch
+                l1_bytes: 65536,    // 64KB L1d (refined by sysctl at runtime)
+                l2_bytes: 4 * 1024 * 1024, // 4MB L2 per core
+                mem_bw: 50.0,       // ~50 GB/s = 50 B/ns
+                num_threads: cfg.pool_workers + 1,
+            };
+        }
+        HwModel {
             neon_flops: 32e9,
             blas_flops: 200e9,
             blas_overhead_ns: 300.0,
@@ -71,16 +73,19 @@ impl HwModel {
             l2_bytes: 1024 * 1024,
             mem_bw: 30.0,
             num_threads: cfg.pool_workers + 1,
-        };
-
-        model
+        }
     }
 
     // ── Dispatch decisions ──────────────────────────────────────────
 
     /// Should we use NEON sgemm instead of BLAS for this matrix multiply?
     /// Returns true when BLAS overhead dominates the compute.
+    /// Never under [`rlx_ir::reproducible`]: the calibrated estimate is
+    /// the host's, so which kernel (and summation order) a shape gets would be.
     pub fn prefer_neon_sgemm(&self, m: usize, k: usize, n: usize) -> bool {
+        if rlx_ir::reproducible::reproducible() {
+            return false;
+        }
         let flops = 2.0 * m as f64 * k as f64 * n as f64;
         let blas_time = flops / self.blas_flops + self.blas_overhead_ns * 1e-9;
         let neon_time = flops / self.neon_flops;

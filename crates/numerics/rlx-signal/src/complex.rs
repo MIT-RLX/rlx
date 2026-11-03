@@ -22,12 +22,6 @@ pub struct C {
     pub im: f64,
 }
 
-#[cfg(target_vendor = "apple")]
-unsafe extern "C" {
-    fn cexp(z: C) -> C;
-    fn csqrt(z: C) -> C;
-}
-
 impl C {
     pub const fn new(re: f64, im: f64) -> Self {
         C { re, im }
@@ -138,30 +132,23 @@ pub fn div(a: C, b: C) -> C {
 /// `np.exp(z)` → libm `cexp`: Apple's, or glibc's ([`rlx_libm::cexp`]) elsewhere
 /// (and on Apple targets under `rlx_libm::platform::use_linux_reference`).
 pub fn exp(z: C) -> C {
-    #[cfg(target_vendor = "apple")]
-    if rlx_libm::platform::apple_reference() {
-        // SAFETY: `cexp` is a pure libm function; `C` is `repr(C)` with the layout and
-        // calling convention of `double _Complex` (an HFA of two doubles).
-        return unsafe { cexp(z) };
-    }
-    {
-        let (re, im) = rlx_libm::cexp(z.re, z.im);
-        C::new(re, im)
-    }
+    let (re, im) = if rlx_libm::platform::apple_reference() {
+        rlx_libm::reference::cexp(z.re, z.im)
+    } else {
+        rlx_libm::cexp(z.re, z.im)
+    };
+    C::new(re, im)
 }
 
 /// `np.sqrt(z)` → libm `csqrt`: Apple's, or glibc's ([`rlx_libm::csqrt`]) elsewhere
 /// (and on Apple targets under `rlx_libm::platform::use_linux_reference`).
 pub fn sqrt(z: C) -> C {
-    #[cfg(target_vendor = "apple")]
-    if rlx_libm::platform::apple_reference() {
-        // SAFETY: as for `exp`.
-        return unsafe { csqrt(z) };
-    }
-    {
-        let (re, im) = rlx_libm::csqrt(z.re, z.im);
-        C::new(re, im)
-    }
+    let (re, im) = if rlx_libm::platform::apple_reference() {
+        rlx_libm::reference::csqrt(z.re, z.im)
+    } else {
+        rlx_libm::csqrt(z.re, z.im)
+    };
+    C::new(re, im)
 }
 
 /// `np.prod(v)` of a non-empty complex array: a left-to-right `multiply.reduce`

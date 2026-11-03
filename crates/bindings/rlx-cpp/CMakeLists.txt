@@ -3,7 +3,7 @@
 # The header-only `rlx::rlx` target over librlx_capi, its tests and examples.
 #   cmake -B build -DRLX_CAPI_LIB_DIR=<dir with librlx_capi> && cmake --build build && ctest --test-dir build
 cmake_minimum_required(VERSION 3.20)
-project(rlx_cpp VERSION 0.2.19 LANGUAGES CXX)
+project(rlx_cpp VERSION 0.2.20 LANGUAGES CXX)
 
 # A packaged release bundles librlx_capi under native/<os>-<arch>/; a checkout
 # uses the workspace build. RLX_CAPI_LIB_DIR overrides either.

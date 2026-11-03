@@ -167,19 +167,8 @@ impl RandomState {
 /// `rlx_libm::platform::use_linux_reference`) glibc's (torch on Linux), ported in
 /// [`rlx_libm`] so a wasm or non-glibc build draws the same values.
 fn sincosf(x: f32) -> (f32, f32) {
-    #[cfg(target_os = "macos")]
     if rlx_libm::platform::macos_reference() {
-        #[repr(C)]
-        struct SinCos {
-            s: f32,
-            c: f32,
-        }
-        unsafe extern "C" {
-            fn __sincosf_stret(x: f32) -> SinCos;
-        }
-        // SAFETY: a pure libm function returning a two-float struct by value.
-        let r = unsafe { __sincosf_stret(x) };
-        return (r.s, r.c);
+        return rlx_libm::reference::sincosf_merged(x);
     }
     rlx_libm::sincosf(x)
 }
@@ -187,7 +176,7 @@ fn sincosf(x: f32) -> (f32, f32) {
 /// `std::log(float)`: Apple's `logf` on macOS, glibc's ([`rlx_libm::logf`]) elsewhere.
 fn logf(x: f32) -> f32 {
     if rlx_libm::platform::macos_reference() {
-        x.ln()
+        rlx_libm::reference::logf(x)
     } else {
         rlx_libm::logf(x)
     }
@@ -347,27 +336,16 @@ impl RandomState {
     }
 }
 
-/// `sincos(x)` → `(sin, cos)` as the platform's merged call computes it.
-#[cfg(target_os = "macos")]
+/// `sincos(x)` → `(sin, cos)` as the platform's merged call computes it:
+/// Apple's `__sincos_stret` on macOS (rlx-libm's `reference`, with its `libm`
+/// feature); off macOS glibc's, which equals its separate `sin` and `cos`
+/// (measured), ported in [`rlx_libm`].
 fn sincos(x: f64) -> (f64, f64) {
-    #[repr(C)]
-    struct SinCos {
-        s: f64,
-        c: f64,
+    if cfg!(target_os = "macos") {
+        rlx_libm::reference::sincos(x)
+    } else {
+        (rlx_libm::sin(x), rlx_libm::cos(x))
     }
-    unsafe extern "C" {
-        fn __sincos_stret(x: f64) -> SinCos;
-    }
-    // SAFETY: a pure libm function returning a two-double struct by value.
-    let r = unsafe { __sincos_stret(x) };
-    (r.s, r.c)
-}
-
-/// `sincos(x)` → `(sin, cos)` as the platform's merged call computes it: off macOS
-/// glibc's, which equals its separate `sin` and `cos` (measured), ported in [`rlx_libm`].
-#[cfg(not(target_os = "macos"))]
-fn sincos(x: f64) -> (f64, f64) {
-    (rlx_libm::sin(x), rlx_libm::cos(x))
 }
 
 /// How one parameter is initialised by its module's `reset_parameters` (or

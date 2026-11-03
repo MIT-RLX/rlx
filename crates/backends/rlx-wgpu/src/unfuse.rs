@@ -70,9 +70,9 @@ pub fn unfuse(graph: Graph) -> Graph {
 /// [`is_folded`]).
 pub fn unfuse_with(graph: Graph, folds: bool) -> Graph {
     let g = if folds {
-        fold_conv_max(fold_conv_input_prelu(fold_conv_argmax(
+        fold_unpool_max(fold_conv_max(fold_conv_input_prelu(fold_conv_argmax(
             fold_norm_activation(fold_conv_activation(fold_prelu(graph))),
-        )))
+        ))))
     } else {
         graph
     };
@@ -269,6 +269,7 @@ pub fn is_folded(node: &rlx_ir::Node) -> bool {
                 || name == CONV3D_TOPK
                 || name == PRELU
                 || name == CONV3D_K3
+                || name == UNPOOL_MAX
         }
         _ => false,
     }
@@ -515,6 +516,118 @@ pub const TOPK_ACT: u32 = 0xFFFC;
 /// rest), then the `k` channels, f32-encoded. Built by the caller (no fold
 /// makes it); `k` at most 8.
 pub const CONV3D_TOPK: &str = "rlx_wgpu.conv3d_topk";
+
+/// `Op::Custom` name of a `MaxPool3dBackward(x, dy)` — the unpool of `dy` to
+/// the positions of `x`'s window maxima — maxed with `x` itself, in one pass:
+/// the max-pool backward kernel takes the `max` in its store (the binary
+/// kernel's `max`, so the same values). Inputs `x`, `dy`; attrs: kernel,
+/// stride, padding (3 each). See [`fold_unpool_max`].
+pub const UNPOOL_MAX: &str = "rlx_wgpu.unpool_max";
+
+/// `(kernel, stride, padding, max with x)` of a `MaxPool3dBackward` or an
+/// [`UNPOOL_MAX`].
+#[allow(clippy::type_complexity)]
+pub fn maxpool3d_backward_geometry(op: &Op) -> Option<([usize; 3], [usize; 3], [usize; 3], bool)> {
+    let a3 = |v: &[usize]| [v[0], v[1], v[2]];
+    match op {
+        Op::MaxPool3dBackward {
+            kernel_size,
+            stride,
+            padding,
+        } => Some((a3(kernel_size), a3(stride), a3(padding), false)),
+        Op::Custom { name, attrs, .. } if name == UNPOOL_MAX => {
+            let w: Vec<usize> = attrs
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b) as usize)
+                .collect();
+            Some((
+                [w[0], w[1], w[2]],
+                [w[3], w[4], w[5]],
+                [w[6], w[7], w[8]],
+                true,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Fold `max(MaxPool3dBackward(x, dy), x)` — the backward the `max`'s only
+/// reader, either operand order — into one [`UNPOOL_MAX`]: a full-size
+/// write and two reads gone per decoder (FastSurfer's unpooling, maxed with
+/// its skip connection; 4 a batch). `RLX_WGPU_NO_FOLD_UNPOOL_MAX=1` keeps it.
+fn fold_unpool_max(g: Graph) -> Graph {
+    use rlx_ir::op::BinaryOp;
+    if rlx_ir::env::flag("RLX_WGPU_NO_FOLD_UNPOOL_MAX") {
+        return g;
+    }
+    let mut readers: HashMap<NodeId, usize> = HashMap::new();
+    for n in g.nodes() {
+        for &i in &n.inputs {
+            *readers.entry(i).or_default() += 1;
+        }
+    }
+    // max node -> the backward node
+    let mut folds: HashMap<NodeId, NodeId> = HashMap::new();
+    for n in g.nodes() {
+        if !matches!(n.op, Op::Binary(BinaryOp::Max)) || n.inputs.len() != 2 {
+            continue;
+        }
+        for (u, x) in [(n.inputs[0], n.inputs[1]), (n.inputs[1], n.inputs[0])] {
+            let un = g.node(u);
+            if matches!(un.op, Op::MaxPool3dBackward { .. })
+                && un.inputs[0] == x
+                && un.inputs[1] != x
+                && readers.get(&u) == Some(&1)
+                && !g.outputs.contains(&u)
+                && un.shape == n.shape
+                && g.node(x).shape == n.shape
+                && n.shape.dtype() == rlx_ir::DType::F32
+            {
+                folds.insert(n.id, u);
+                break;
+            }
+        }
+    }
+    if folds.is_empty() {
+        return g;
+    }
+    let gone: std::collections::HashSet<NodeId> = folds.values().copied().collect();
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        if gone.contains(&node.id) {
+            continue;
+        }
+        let (op, ins) = match folds.get(&node.id) {
+            Some(&u) => {
+                let un = g.node(u);
+                let (k, s, p, _) = maxpool3d_backward_geometry(&un.op).unwrap();
+                (
+                    Op::Custom {
+                        name: UNPOOL_MAX.to_string(),
+                        num_inputs: 2,
+                        attrs: k
+                            .iter()
+                            .chain(&s)
+                            .chain(&p)
+                            .flat_map(|&v| (v as u32).to_le_bytes())
+                            .collect(),
+                    },
+                    un.inputs.iter().map(|i| id_map[i]).collect(),
+                )
+            }
+            None => (
+                node.op.clone(),
+                node.inputs.iter().map(|i| id_map[i]).collect(),
+            ),
+        };
+        id_map.insert(node.id, out.add_node(op, ins, node.shape.clone()));
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
 
 /// `Op::Custom` name of a 2-D 3×3 conv (`conv3d_k3_c8`'s shape) with the
 /// element-wise op on either side of it folded in:

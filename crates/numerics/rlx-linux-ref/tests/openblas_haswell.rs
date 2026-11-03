@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `numpy_openblas` against NumPy 2.3.5 on OpenBLAS 0.3.30 Haswell (msi, 20 threads):
 //! `tests/fixtures/openblas_haswell_*.txt`, from `tools/openblas_ref_*.py`. Zero tolerance.
 

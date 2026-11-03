@@ -55,7 +55,7 @@ fn mamba2(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
     for (var si: u32 = 0u; si < params.seq; si = si + 1u) {
         let bsh = (bi * params.seq_stride + si) * params.heads + hi;
         let dt_t = arena[params.dt_off + bsh];
-        let da = exp(dt_t * ah);
+        let da = rlx_exp(dt_t * ah);
         let dtx = dt_t * arena[params.x_off + bsh * p + pi];
         let bc = bsh * n;
         var acc: f32 = 0.0;

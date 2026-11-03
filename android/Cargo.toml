@@ -8,9 +8,14 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-version = "0.2.19"
+version = "0.2.20"
 
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
+
+# The `libm` naga and num-traits depend on, answered by rlx-libm (as in the
+# main workspace): no musl copy in the build.
+[patch.crates-io]
+libm = { path = "../crates/numerics/libm-shim" }

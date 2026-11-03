@@ -40,7 +40,7 @@ remote = ["dep:ureq"]
 [dependencies]
 rlx-ir = { workspace = true, features = ["serialize"] }
 rlx-gguf = { workspace = true, optional = true }
-rlx-mlx-io = { workspace = true, optional = true }
+rlx-mlx-io = { workspace = true, optional = true, features = ["io"] }
 rlx-dduf = { workspace = true, optional = true }
 rlx-nemo = { workspace = true, optional = true }
 anyhow = "1"
@@ -63,7 +63,7 @@ ureq = { version = "2", optional = true, default-features = true }
 
 # libzstd is C (and cannot build for wasm32): only behind `zstd-native`.
 # >= 0.14.3: RUSTSEC-2026-0391 / -0403.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 zstd = { version = "0.14.3", optional = true }
 
 [dev-dependencies]
@@ -74,7 +74,7 @@ safetensors = "0.7"
 # libzstd and ruzstd as independent decoders/encoder in the codec interop test.
 ruzstd = "0.9.1"
 
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 zstd = "0.14.3"
 
 [[bench]]

@@ -70,7 +70,7 @@ fn rng_normal_philox(
     var u1 = u32_to_unit(buf[lane0]);
     let u2 = u32_to_unit(buf[lane0 + 1u]);
     if (u1 < 1.17549435e-38) { u1 = 1.17549435e-38; } // f32::MIN_POSITIVE
-    let r = sqrt(-2.0 * log(u1));
+    let r = rlx_sqrt_rn(-2.0 * rlx_log(u1));
     let theta = 6.283185307179586 * u2;
     arena[params.out_off + i] = params.a + params.b * (r * cos(theta));
 }

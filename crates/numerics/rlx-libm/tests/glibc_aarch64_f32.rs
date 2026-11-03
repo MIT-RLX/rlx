@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `logf` / `sincosf` against glibc on Linux aarch64 (the torch reference), on
 //! every platform: `tests/vectors/glibc_aarch64_f32.txt` holds FNV-1a hashes of
 //! glibc's output bits over strided ranges of input bit patterns

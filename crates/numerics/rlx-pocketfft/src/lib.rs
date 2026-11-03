@@ -68,6 +68,16 @@ pub fn norm_fct(inorm: u8, n: usize) -> f64 {
     }
 }
 
+/// [`norm_fct`] with the `long double` fixed: `x87 = true` is the Linux x86-64
+/// reference on every host (what [`engine::Twiddles::Linux`] pairs with).
+pub fn norm_fct_as(inorm: u8, n: usize, x87: bool) -> f64 {
+    match inorm {
+        0 => 1.0,
+        1 => x87::recip_sqrt_as(n, x87),
+        _ => x87::recip_as(n, x87),
+    }
+}
+
 /// `x` zero-padded or truncated to `n` (SciPy's `_fix_shape`).
 fn fix<T: Copy + Default>(x: &[T], n: usize) -> Vec<T> {
     let mut v: Vec<T> = x.iter().take(n).copied().collect();

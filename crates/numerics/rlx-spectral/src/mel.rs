@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Mel scales and triangular filterbanks (`[n_mels, n_fft/2 + 1]`, mel-major),
 //! built in f64 and rounded once into the working precision.
 
@@ -16,15 +20,15 @@ pub enum MelScale {
 impl MelScale {
     pub fn hz_to_mel(self, hz: f64) -> f64 {
         match self {
-            MelScale::Htk => 2595.0 * libm::log10(1.0 + hz / 700.0),
-            MelScale::Kaldi => 1127.0 * libm::log(1.0 + hz / 700.0),
+            MelScale::Htk => 2595.0 * rlx_libm::log10(1.0 + hz / 700.0),
+            MelScale::Kaldi => 1127.0 * rlx_libm::log(1.0 + hz / 700.0),
             MelScale::Slaney => {
                 let f_sp = 200.0 / 3.0;
                 let min_log_hz = 1000.0;
                 let min_log_mel = min_log_hz / f_sp;
-                let logstep = libm::log(6.4) / 27.0;
+                let logstep = rlx_libm::log(6.4) / 27.0;
                 if hz >= min_log_hz {
-                    min_log_mel + libm::log(hz / min_log_hz) / logstep
+                    min_log_mel + rlx_libm::log(hz / min_log_hz) / logstep
                 } else {
                     hz / f_sp
                 }
@@ -34,15 +38,15 @@ impl MelScale {
 
     pub fn mel_to_hz(self, mel: f64) -> f64 {
         match self {
-            MelScale::Htk => 700.0 * (libm::pow(10.0, mel / 2595.0) - 1.0),
-            MelScale::Kaldi => 700.0 * (libm::exp(mel / 1127.0) - 1.0),
+            MelScale::Htk => 700.0 * (rlx_libm::pow(10.0, mel / 2595.0) - 1.0),
+            MelScale::Kaldi => 700.0 * (rlx_libm::exp(mel / 1127.0) - 1.0),
             MelScale::Slaney => {
                 let f_sp = 200.0 / 3.0;
                 let min_log_hz = 1000.0;
                 let min_log_mel = min_log_hz / f_sp;
-                let logstep = libm::log(6.4) / 27.0;
+                let logstep = rlx_libm::log(6.4) / 27.0;
                 if mel >= min_log_mel {
-                    min_log_hz * libm::exp(logstep * (mel - min_log_mel))
+                    min_log_hz * rlx_libm::exp(logstep * (mel - min_log_mel))
                 } else {
                     mel * f_sp
                 }

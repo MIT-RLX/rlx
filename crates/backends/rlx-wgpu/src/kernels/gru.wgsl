@@ -77,9 +77,9 @@ fn gru(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid:
                 xi[g] = ax;
                 hipart[g] = ah;
             }
-            let rg = 1.0 / (1.0 + exp(-(xi[0] + hipart[0])));
-            let zg = 1.0 / (1.0 + exp(-(xi[1] + hipart[1])));
-            let ng = tanh(xi[2] + rg * hipart[2]);
+            let rg = rlx_div_rn(1.0, 1.0 + rlx_exp(-(xi[0] + hipart[0])));
+            let zg = rlx_div_rn(1.0, 1.0 + rlx_exp(-(xi[1] + hipart[1])));
+            let ng = rlx_tanh(xi[2] + rg * hipart[2]);
             h_k = (1.0 - zg) * ng + zg * h_sh[k];
         }
         // Uniform barrier: all threads finished reading the old h_sh.

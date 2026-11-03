@@ -460,7 +460,7 @@ impl CompiledGraph {
     ///
     /// Compile succeeds for such a graph and only `run_async` fails, so without
     /// this a caller learns about it once per step rather than once at setup.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     pub fn requires_host_execution(&self) -> bool {
         self.inner.wgpu_requires_host()
     }
@@ -653,7 +653,7 @@ impl CompiledGraph {
     /// to forward the inputs straight to the backend, so in the browser a
     /// tapped graph never reported its pre-head features and every exgb
     /// frozen-encoder trial embedded to the same vector.)
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     pub async fn run_async(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>, String> {
         if !matches!(self.device, Device::WebGpu | Device::Gpu) {
             return Ok(self.run(inputs));
@@ -670,7 +670,7 @@ impl CompiledGraph {
     /// `read_indices` (all outputs for `None`), and moves bound GPU handles
     /// forward from their fed outputs on the device — a decode loop's state
     /// never leaves the GPU. Other backends run synchronously.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     pub async fn run_read_outputs_async(
         &mut self,
         inputs: &[(&str, &[f32])],
@@ -684,7 +684,7 @@ impl CompiledGraph {
 
     /// The async WebGPU run with staged weights fed as [`Self::run_read_outputs`]
     /// feeds them.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     async fn run_staged_async(
         &mut self,
         inputs: &[(&str, &[f32])],
@@ -717,7 +717,7 @@ impl CompiledGraph {
     }
 
     /// [`Self::ensure_prepared`] with the prepare graph's run awaited.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     async fn ensure_prepared_async(&mut self) -> Result<(), String> {
         let Some(st) = self.staging.as_mut() else {
             return Ok(());

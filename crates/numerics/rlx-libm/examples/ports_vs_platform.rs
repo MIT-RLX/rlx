@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! How often the pure-Rust ports differ from the platform libm (std calls it):
 //! bit mismatches and max ulp over pseudo-random inputs per function.
 fn ulps(a: f64, b: f64) -> u64 {

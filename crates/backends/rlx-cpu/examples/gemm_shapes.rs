@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! sgemm throughput on whisper large-v3 / wav2vec2-large shapes, min of N
 //! runs (robust to a loaded machine). Compare builds: default (vendor BLAS)
 //! vs `--features pure-rust` (SME2 / `gemm` crate). `RLX_CPU_SME=0` turns the

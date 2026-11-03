@@ -355,12 +355,12 @@ impl Node {
             ANNOUNCE_PORT, announce, find, parse_rendezvous, register, serve, serve_open,
         };
         let timeout = Duration::from_secs(
-            rlx_ir::env::read("RENDEZVOUS_TIMEOUT")
+            std::env::var("RENDEZVOUS_TIMEOUT")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
         );
-        let announce_port: u16 = rlx_ir::env::read("RENDEZVOUS_ANNOUNCE_PORT")
+        let announce_port: u16 = std::env::var("RENDEZVOUS_ANNOUNCE_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(ANNOUNCE_PORT);
@@ -409,7 +409,7 @@ impl Node {
             if self.world == 0 {
                 // WORLD=auto: whoever registers within the window.
                 let window = Duration::from_secs(
-                    rlx_ir::env::read("RENDEZVOUS_WINDOW")
+                    std::env::var("RENDEZVOUS_WINDOW")
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(10),

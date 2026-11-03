@@ -114,7 +114,7 @@ fn sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
     let base = params.in_off + row * params.inner;
     let temp = bitcast<f32>(params.temp_bits);
     let top_p = bitcast<f32>(params.top_p_bits);
-    let inv_temp = 1.0 / max(temp, 1e-6);
+    let inv_temp = rlx_div_rn(1.0, max(temp, 1e-6));
 
     // 1. Apply temperature; track row max.
     var m: f32 = NEG_INF;
@@ -126,11 +126,11 @@ fn sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
     // 2. exp / sum → probabilities.
     var sum_e: f32 = 0.0;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-        let e = exp(arena[base + i] - m);
+        let e = rlx_exp(arena[base + i] - m);
         arena[base + i] = e;
         sum_e = sum_e + e;
     }
-    let inv_sum = 1.0 / sum_e;
+    let inv_sum = rlx_div_rn(1.0, sum_e);
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
         arena[base + i] = arena[base + i] * inv_sum;
     }
@@ -175,7 +175,7 @@ fn sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
                 arena[base + i] = 0.0;
             }
         }
-        let inv_new = 1.0 / max(new_sum, 1e-12);
+        let inv_new = rlx_div_rn(1.0, max(new_sum, 1e-12));
         for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
             arena[base + i] = arena[base + i] * inv_new;
         }
@@ -208,8 +208,8 @@ fn sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
         let u: f32 = f32(rng2.x >> 8u) / 16777216.0;
         // Avoid log(0) = -inf if u rolled exactly 0.
         let u_safe: f32 = max(u, 1e-30);
-        let g: f32 = -log(-log(u_safe));
-        let score: f32 = log(p) + g;
+        let g: f32 = -rlx_log(-rlx_log(u_safe));
+        let score: f32 = rlx_log(p) + g;
         if (score > best_score) {
             best_score = score;
             picked = i;

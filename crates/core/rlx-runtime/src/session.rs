@@ -94,7 +94,9 @@ impl Session {
     ///
     /// On ANE with `RLX_COREML_NATIVE_FLEX=1`, dynamic graphs compile once with
     /// CoreML `ShapeRange` and infer shapes at predict time instead.
-    pub fn compile(&self, graph: Graph) -> CompiledGraph {
+    pub fn compile(&self, mut graph: Graph) -> CompiledGraph {
+        // `RLX_FFT` / `rlx_ir::set_fft_policy`: the FFT a default `Op::Fft` runs
+        rlx_ir::apply_fft_policy(&mut graph);
         crate::taps::tapped(graph, |g| self.compile_untapped(g))
     }
 
@@ -180,7 +182,8 @@ impl Session {
     /// Most callers use `compile()` and configure the session via
     /// `new_with_precision` / `with_policy`. This escape hatch is for
     /// callers that need finer control (e.g., disable DCE for debugging).
-    pub fn compile_with(&self, graph: Graph, options: &crate::CompileOptions) -> CompiledGraph {
+    pub fn compile_with(&self, mut graph: Graph, options: &crate::CompileOptions) -> CompiledGraph {
+        rlx_ir::apply_fft_policy(&mut graph);
         crate::taps::tapped(graph, |g| self.compile_with_untapped(g, options))
     }
 

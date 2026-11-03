@@ -29,7 +29,9 @@ struct Params {
 var<workgroup> shm: array<vec2<f32>, 2048>; // 16 KB
 
 fn cmulm(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+    // explicit fma: a plain `a*b - c*d` is contracted by one compiler's math mode
+    // and not another's (native Metal fast math vs a browser's safe math)
+    return vec2<f32>(fma(a.x, b.x, -(a.y * b.y)), fma(a.x, b.y, a.y * b.x));
 }
 
 @compute @workgroup_size(256)
@@ -67,7 +69,7 @@ fn fft_multirow(
     loop {
         if (len > n) { break; }
         let h2 = len >> 1u;
-        let theta_base = sgn * two_pi / f32(len);
+        let theta_base = rlx_div_rn(sgn * two_pi, f32(len));
         // rows * (n/2) butterflies, threads strided across all rows.
         var b = tid;
         loop {
@@ -78,7 +80,7 @@ fn fft_multirow(
             let kin = bb % h2;
             let i = r * n + group * len + kin;
             let j = i + h2;
-            let t = cmulm(vec2<f32>(cos(theta_base * f32(kin)), sin(theta_base * f32(kin))), shm[j]);
+            let t = cmulm(vec2<f32>(rlx_cos(theta_base * f32(kin)), rlx_sin(theta_base * f32(kin))), shm[j]);
             let u = shm[i];
             shm[i] = u + t;
             shm[j] = u - t;

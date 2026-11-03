@@ -101,7 +101,7 @@ fn decode_e4m3(byte: u32) -> f32 {
         v = 0.0;
     } else {
         let m = 1.0 + f32(mant) / 8.0;
-        v = m * exp2(f32(i32(exp) - 7));
+        v = m * ldexp(1.0, i32(exp) - 7);
     }
     if (sign != 0u) { v = -v; }
     return v;
@@ -122,7 +122,7 @@ fn decode_e5m2(byte: u32) -> f32 {
         v = 0.0;
     } else {
         let m = 1.0 + f32(mant) / 4.0;
-        v = m * exp2(f32(i32(exp) - 15));
+        v = m * ldexp(1.0, i32(exp) - 15);
     }
     if (sign != 0u) { v = -v; }
     return v;

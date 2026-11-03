@@ -64,9 +64,18 @@ def workspace_members() -> list[str]:
 
 
 def is_third_party_licence(path: Path) -> bool:
-    """A vendored project's own licence (LICENSE-POCKETFFT.md, …): third-party
-    text, never ours to stamp."""
-    return path.name.startswith("LICENSE-")
+    """A vendored project's own licence (LICENSE-POCKETFFT.md, …), or a file
+    generated from a third-party source whose first line names it ("Generated
+    from … (… licence)", rlx-libm's glibc / ARM / CORE-MATH data tables):
+    third-party text, never ours to stamp."""
+    if path.name.startswith("LICENSE-"):
+        return True
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            first = f.readline() + f.readline()
+    except OSError:
+        return False
+    return "Generated from" in first and re.search(r"licen[cs]e|MIT|Apache", first) is not None
 
 
 def iter_targets() -> list[Path]:

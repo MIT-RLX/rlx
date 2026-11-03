@@ -67,3 +67,6 @@ Group scales exist because one scale per row is sometimes not enough. In
 Moonshine's frontend convs, per-row int8 lost 1.3% (cosine), which the
 encoder amplified into a 23% miss one layer later. One scale per 16 values
 brought the stage back to 0.9997.
+## License
+
+MIT OR Apache-2.0.

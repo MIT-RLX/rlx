@@ -16,7 +16,10 @@
 //! multiply-add ([`crate::avx2_mirror::simd::fused`]), each term is one
 //! hardware FMA instead: every element of C is then the in-order FMA chain
 //! (as on the GPU kernels), and the multiply-add pair becomes one
-//! instruction.
+//! instruction. Under `portable` an engine without it (no relaxed-simd, or a
+//! `relaxed_madd` that does not fuse — Safari) takes the same chain with each
+//! term an exact software FMA ([`crate::avx2_mirror::simd::fma_f32x4`]):
+//! slower, but the result of every other portable build.
 
 use core::arch::wasm32::*;
 
@@ -26,6 +29,14 @@ const NR: usize = 8;
 const PACK_MIN_M: usize = 8;
 /// From this many columns a fused few-row product streams B rows.
 const STREAM_MIN_N: usize = 32;
+
+/// How each term `s + a·b` is formed: one multiply and one add …
+const PLAIN: u8 = 0;
+/// … one hardware fused multiply-add (`relaxed_madd` where it fuses) …
+#[cfg(target_feature = "relaxed-simd")]
+const HW_FMA: u8 = 1;
+/// … or one exact software fused multiply-add.
+const SOFT_FMA: u8 = 2;
 
 /// How the fallback it replaces starts and finishes each element.
 #[derive(Clone, Copy)]
@@ -62,47 +73,62 @@ pub(crate) unsafe fn sgemm(
     #[cfg(target_feature = "relaxed-simd")]
     if crate::avx2_mirror::simd::fused() {
         unsafe {
-            sgemm_with::<true>(
+            sgemm_with::<HW_FMA>(
                 m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
             )
         };
         return;
     }
+    if crate::config::portable() {
+        unsafe {
+            sgemm_with::<SOFT_FMA>(
+                m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
+            )
+        };
+        return;
+    }
+    #[allow(unreachable_code)]
     unsafe {
-        sgemm_with::<false>(
+        sgemm_with::<PLAIN>(
             m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
         )
     };
 }
 
-/// One term of an element's sum: `s + a·b`, fused when `HW` (one lane of
-/// the hardware `relaxed_madd`: `HW` is only chosen where that is fused).
+/// One term of an element's sum: `s + a·b`, fused unless `F` is [`PLAIN`]
+/// (in hardware, one lane of `relaxed_madd`, only chosen where that is fused).
 #[inline(always)]
-fn term<const HW: bool>(s: f32, a: f32, b: f32) -> f32 {
+fn term<const F: u8>(s: f32, a: f32, b: f32) -> f32 {
     #[cfg(target_feature = "relaxed-simd")]
-    if HW {
+    if F == HW_FMA {
         return f32x4_extract_lane::<0>(f32x4_relaxed_madd(
             f32x4_splat(a),
             f32x4_splat(b),
             f32x4_splat(s),
         ));
     }
+    if F == SOFT_FMA {
+        return crate::avx2_mirror::fmaf(a, b, s);
+    }
     s + a * b
 }
 
 /// [`term`] on four lanes.
 #[inline(always)]
-fn term4<const HW: bool>(s: v128, a: v128, b: v128) -> v128 {
+fn term4<const F: u8>(s: v128, a: v128, b: v128) -> v128 {
     #[cfg(target_feature = "relaxed-simd")]
-    if HW {
+    if F == HW_FMA {
         return f32x4_relaxed_madd(a, b, s);
+    }
+    if F == SOFT_FMA {
+        return crate::avx2_mirror::simd::fma_f32x4(a, b, s);
     }
     f32x4_add(s, f32x4_mul(a, b))
 }
 
-/// [`sgemm`]; `HW`: every term one fused multiply-add.
+/// [`sgemm`] with each term formed as `F` says.
 #[allow(clippy::too_many_arguments)]
-unsafe fn sgemm_with<const HW: bool>(
+unsafe fn sgemm_with<const F: u8>(
     m: usize,
     n: usize,
     k: usize,
@@ -125,7 +151,7 @@ unsafe fn sgemm_with<const HW: bool>(
     // A few rows of an untransposed product: the fallback's i→p→j loop
     // streams whole rows of B and is faster than packing them (decode-shaped
     // m = 1 ran at 0.7x through the tiles).
-    if matches!(mode, Mode::Accumulate) && m < PACK_MIN_M && !HW {
+    if matches!(mode, Mode::Accumulate) && m < PACK_MIN_M && F == PLAIN {
         unsafe {
             crate::blas::sgemm_loops(
                 m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
@@ -171,19 +197,19 @@ unsafe fn sgemm_with<const HW: bool>(
                         let cj = crow.add(j) as *mut v128;
                         v128_store(
                             cj,
-                            term4::<HW>(v128_load(cj), sv, v128_load(brow.add(j) as *const v128)),
+                            term4::<F>(v128_load(cj), sv, v128_load(brow.add(j) as *const v128)),
                         );
                     }
                     j += 4;
                 }
                 for j in n4..n {
-                    unsafe { *crow.add(j) = term::<HW>(*crow.add(j), av, *brow.add(j)) };
+                    unsafe { *crow.add(j) = term::<F>(*crow.add(j), av, *brow.add(j)) };
                 }
             }
         }
         return;
     }
-    let k_ = Tile::<_, HW> {
+    let k_ = Tile::<_, F> {
         k,
         alpha,
         beta,
@@ -257,7 +283,7 @@ unsafe fn sgemm_with<const HW: bool>(
             for (p, &av) in ap.iter().enumerate() {
                 let live = f32x4_ne(av, f32x4_splat(0.0));
                 for (t, v) in acc[..tail].iter_mut().enumerate() {
-                    let next = term4::<HW>(*v, av, f32x4_splat(bt(p, full + t)));
+                    let next = term4::<F>(*v, av, f32x4_splat(bt(p, full + t)));
                     *v = match mode {
                         Mode::Accumulate => v128_bitselect(next, *v, live),
                         Mode::Scale => next,
@@ -295,7 +321,7 @@ fn finish(alpha: f32, beta: f32, acc: f32, c: f32) -> f32 {
     }
 }
 
-struct Tile<'a, A: Fn(usize, usize) -> f32, const HW: bool> {
+struct Tile<'a, A: Fn(usize, usize) -> f32, const F: u8> {
     k: usize,
     alpha: f32,
     beta: f32,
@@ -305,7 +331,7 @@ struct Tile<'a, A: Fn(usize, usize) -> f32, const HW: bool> {
     ldc: usize,
 }
 
-impl<A: Fn(usize, usize) -> f32, const HW: bool> Tile<'_, A, HW> {
+impl<A: Fn(usize, usize) -> f32, const F: u8> Tile<'_, A, F> {
     /// Rows `i..i+R`, columns `j0..j0+8`, B rows at `bp + p·bs`.
     #[inline(always)]
     unsafe fn run<const R: usize>(&self, i: usize, j0: usize, bp: *const f32, bs: usize) {
@@ -343,8 +369,8 @@ impl<A: Fn(usize, usize) -> f32, const HW: bool> Tile<'_, A, HW> {
                     Mode::Scale => av,
                 };
                 let s = f32x4_splat(av);
-                acc[r][0] = term4::<HW>(acc[r][0], s, b0);
-                acc[r][1] = term4::<HW>(acc[r][1], s, b1);
+                acc[r][0] = term4::<F>(acc[r][0], s, b0);
+                acc[r][1] = term4::<F>(acc[r][1], s, b1);
             }
         }
         for r in 0..R {
@@ -452,7 +478,7 @@ mod tests {
                             want.as_mut_ptr(),
                             ldc,
                         );
-                        super::sgemm_with::<false>(
+                        super::sgemm_with::<{ super::PLAIN }>(
                             m,
                             n,
                             k,
@@ -484,12 +510,15 @@ mod tests {
         assert_eq!(cases, 8 * 4 * 5);
     }
 
-    /// With relaxed-simd on a fusing engine: every element is the in-order
-    /// chain of fused multiply-adds (the scalar reference below, through the
-    /// exact `fmaf`), from the fallback's start value and with its zero-skip.
-    #[cfg(target_feature = "relaxed-simd")]
+    /// With relaxed-simd on a fusing engine, or under `portable` on any
+    /// engine (each term then an exact software FMA): every element is the
+    /// in-order chain of fused multiply-adds (the scalar reference below,
+    /// through the exact `fmaf`), from the fallback's start value and with
+    /// its zero-skip.
+    #[cfg(any(target_feature = "relaxed-simd", rlx_cpu_portable))]
     #[test]
     fn fused_gemm_is_the_in_order_fma_chain() {
+        #[cfg(not(rlx_cpu_portable))]
         assert!(
             crate::avx2_mirror::simd::fused(),
             "node's V8 fuses relaxed_madd on arm64"

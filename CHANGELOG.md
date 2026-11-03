@@ -23,7 +23,102 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ## [Unreleased]
 
+## [0.2.20] — 2026-11-02
+
 ### Added
+
+- `rlx_libm::aarch64::{expf, exp2, exp10, cbrt, hypot}`: glibc 2.43 as built
+  for Linux aarch64, the five functions where it rounds differently from the
+  x86-64 build the root functions reproduce. `expf` / `exp10` take `k` from
+  `round` (aarch64's `TOINT_INTRINSICS`, ties away from zero) instead of the
+  shift trick; `exp2` / `exp10` / `cbrt` are fused the way gcc fuses them
+  there (x86-64 has no `-mfma` build of these); `hypot` uses the
+  `__FP_FAST_FMA` kernel. Every other export is the same on both builds.
+- `rlx-libm` verification against glibc 2.43 on both builds (Ubuntu 26.04's
+  2.43-2ubuntu2.4: x86-64 on a Linux rig, aarch64 in an arm64 container),
+  zero tolerance:
+  - `tests/glibc_2_43_vectors.rs` replays hashed glibc outputs for **every**
+    exported function (was 41; now also `exp`/`log`/`pow`/`sin`/`cos`/`tan`,
+    `expm1`/`log1p`/`erfc`, `expf`/`logf`/`sinf`/`cosf`/`tanhf`, `fma`/`fmaf`,
+    `fmod`/`fdim`, the rounding functions, `sincos`, trig arguments up to
+    2^1023) on any OS, and `every_export_has_glibc_vectors` fails on an export
+    without them.
+  - `tools/glibc-exhaustive`: each one-argument f32 port against glibc on all
+    2^32 inputs, writing hashes that `tests/f32_exhaustive.rs`
+    (`just test-libm-exhaustive`, ~7 min) re-checks on any OS; `--f64 N`
+    samples the f64 ports. Result: all 32 f32 functions equal on every input
+    on both builds; all 35 f64 functions equal on 10 M samples each.
+  - `just test-libm` (in `just ci`): no_std, `export-glibc`, `libm`, the shim
+    and `just test-libm-vs-musl`, the musl comparison, now a standalone tool
+    (`tools/vs-musl`) so the workspace's `libm` patch does not replace it.
+- `rust-libm` feature (`rlx-cpu`, `rlx-runtime`, `rlx`; part of `pure-rust`,
+  which `rlx-runtime` and `rlx` now forward): std's float methods in every
+  crate of an executable (`f64::sin`, `f32::exp`, `%`, …) run rlx-libm's Rust
+  ports instead of the platform's C libm, through `export-glibc`, which now
+  also defines every libcall std emits: `fmod`/`fmodf` (`%`), `fdim`, `fma` /
+  `fmaf`, and on x86-64 without SSE4.1 `floor`/`ceil`/`trunc`/`round`/`rint` /
+  `roundeven`. `tests/export_glibc.rs` checks std's methods equal the ports.
+  For executables only (a cdylib would export `sin` to its host process).
+- `crates/numerics/libm-shim` and `[patch.crates-io] libm`: the `libm` that
+  naga and num-traits (via `half`) depend on is answered by rlx-libm, so no
+  musl copy is in the dependency tree.
+- `rlx-libm` has no dependencies and builds `no_std` (`std` feature, on by
+  default): pure-Rust correctly rounded `sqrt`, exact `floor`/`ceil`/`trunc` /
+  `round`/`rint`, `fmod`, `fdim` and their f32 forms, the correctly rounded
+  `fmaf` and the integer `fma_exact`. rlx-ir's and rlx-mcu's `no_std` float
+  math, rlx-cpu's f64 `erf` and FFT twiddles and rlx-spectral's windows / mel
+  scales use them instead of the `libm` crate.
+- `rlx_libm::reference::{asin, cexp, csqrt, sincosf_merged}`; rlx-special,
+  rlx-signal and rlx-rng reach Apple's libm only through `reference` (with the
+  `libm` feature) instead of `extern "C"` / std calls.
+- `rlx-libm`: the rest of glibc 2.43's float math in pure Rust — CORE-MATH's
+  correctly rounded `lgamma`/`lgamma_r`/`tgamma`, `atanh`/`asinh`/`acosh`,
+  IBM's `atan`/`atan2`/`asin`/`acos`, `tanh`/`cbrt`/`cosh`/`sinh`/`log10` /
+  `exp2`/`exp10`/`erf`, and f32 `powf`/`exp2f`/`exp10f`/`log2f`/`hypotf` /
+  `atan2f` plus the CORE-MATH f32 set (`acosf` … `tgammaf`).
+- `rlx-cpu`: the portable arithmetic as a run-time switch, `RLX_CPU_PORTABLE=1`
+  or `rlx_cpu::config::set_portable(true)` before the first compile (then
+  fixed for the process): bit-identical to the `portable` feature without
+  unifying it into other crates. `rlx-runtime/tests/cpu_portable_digest.rs`
+  pins one digest on macOS arm64 and Linux x86-64, feature and switch alike.
+- `rlx-ir`: `RLX_REPRODUCIBLE=1` / `set_reproducible`: automatic device
+  selection takes the CPU and the CPU backend one kernel per op on any host
+  (no calibrated BLAS-vs-NEON split, no core-count-dependent GEMM split).
+- `rlx_runtime::taps::NodeDigests` and `first_divergence`: record every tapped
+  node's digest in one run and name the first node where another run differs
+  (`subset` taps only a region's boundary).
+- `just update-mlx [REF] [--build]` (`rlx-mlx-sys/scripts/update-mlx.sh`):
+  moves the vendored MLX to a release tag, `main` or any ref, re-applying and
+  checking rlx's patches.
+- `rlx-wgpu`: `with_numeric_helpers` appends rlxsl's WGSL helpers
+  (`rlxsl/src/wgsl/numeric_helpers.wgsl`, or the fast twin under
+  `set_fast_math`) to any shader that calls them; 32 kernels' private copies
+  (1752 lines) are gone. New `rlx_log` (≤ 1 ULP, subnormal inputs) and
+  `rlx_tanh` (≤ 2 ULP); cross-entropy, sampling, RNG, recurrent and
+  scan kernels use the exact helpers instead of raw builtins.
+- `rlx-wgpu/patches/wgpu-hal-30-metal-math-mode.patch`: Metal safe math,
+  measured, not applied (+37 % on elementwise kernels; fixes only `sin` /
+  `cos` / `pow`).
+
+- `rlx-ir`: `FftPolicy` (`set_fft_policy`, env `RLX_FFT`), the FFT every
+  default `Op::Fft` runs, so a downstream task picks speed or reproducibility
+  without touching the model: `native` (each backend's own, the default),
+  `portable`, `scipy`, `pocketfft-nofma`. `Session::compile` resolves it
+  (`apply_fft_policy`), the autodiff backward FFTs included; an `Op::Fft`
+  built with an explicit algorithm keeps it.
+- `FftAlgo::PORTABLE`: pocketfft as the Linux x86-64 SciPy wheel (no FMA,
+  new `FftTwiddles::Linux`: glibc's `cos`/`sin` through rlx-libm and the x87
+  angle and norm on every host). The CPU runs its row kernel, every other
+  device the elementwise lowering (IEEE `add`/`mul` only), so it is the same
+  bits everywhere: measured equal on the CPU, wgpu, Metal and MLX
+  (`tests/fft_algo.rs`), and on macOS arm64 and Linux x86-64.
+- `rlx-pocketfft`: `Twiddles::Linux` and `norm_fct_as` (the `long double`
+  fixed by the caller).
+- `rlx-cpu`: `pool::set_wasm_threads`: a shared-memory (`+atomics`) wasm
+  build splits its kernels over a rayon pool of Web Workers the page started
+  (wasm-bindgen-rayon); otherwise wasm stays inline. Rows only, so the
+  results do not change with the thread count (measured: exgb cells equal on
+  1 and 8 threads, 1.95x faster training at 8).
 
 - `rlx-cpu`: a `portable` feature, the wasm build's arithmetic on every
   target, so a CPU run rounds the same on macOS, Linux and in a browser. No
@@ -48,6 +143,9 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
   rlx-pocketfft (contraction, `__sincos_stret` twiddles, the x87 angle),
   rlx-signal, rlx-special and rlx-rng consult it. Native rlx-pocketfft then
   equals the wasm build on every tested length.
+- `rlx-runtime`: `taps::NodeHashes`, a tap that makes every computed node an
+  extra output and hashes it, to find the first node where two runs of a
+  model (a browser and a native build) disagree.
 - `rlx-runtime`: `taps::enter`, a `with_tap` scope as a guard, for a caller
   that compiles across an `await`; and `fit_batch_within` (an explicit arena
   budget) with `WGPU_32BIT_ARENA_LIMIT`, so a 64-bit caller can fit the batch
@@ -136,9 +234,9 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
   ≤ 1.07 / 0.84 / 1.33 ulp over all 2^32 inputs, NEON lanes = scalar). exp
   0.67 ns/element against Accelerate's `vvexpf` 0.77 and the platform libm
   2.5; rlx-cpu re-exports it as `rlx_cpu::fastmath`.
-- rlx-cpu feature `parity`: rlx-libm (optional now) for the accurate vector
-  math outside Accelerate builds and the FFT twiddles. Default: `fastmath`
-  and the pure-Rust `libm` crate.
+- rlx-cpu feature `parity`: rlx-libm's reference ports for the accurate
+  vector math outside Accelerate builds and the FFT twiddles. Default:
+  `fastmath`, and rlx-libm's ports for scalar math.
 - rlx-libm feature `libm` (forwarded by rlx-special, rlx-signal,
   rlx-pocketfft, rlx-rng, rlx-linux-ref; rlx-cpu takes `parity` instead): Apple's libm for `reference` (and the
   merged `__sincos_stret`, now `reference::sincos`, that pocketfft's
@@ -457,6 +555,18 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ### Changed
 
+- rlx-wgpu on Windows uses DX12 only. It used to ask wgpu for DX12 or
+  Vulkan, so wgpu could pick a Vulkan adapter: a second GPU API with its own
+  drivers and numerics. Set `WGPU_BACKEND=vulkan` or use `Device::Vulkan` to
+  run on Vulkan.
+- rlx-wgpu no longer uses software adapters: Windows' WARP renderer and
+  Mesa's llvmpipe/lavapipe, which wgpu picks only when there is no real GPU.
+  They run the shaders on the CPU, slower than rlx-cpu and with different
+  numerics, yet counted as an available GPU, so a fallback chain such as
+  CUDA → wgpu → CPU stopped at wgpu on a machine with no GPU. rlx-wgpu now
+  reports no device there and callers reach the CPU backend.
+  `RLX_WGPU_ALLOW_SOFTWARE=1` restores the old behaviour, for testing the GPU
+  path without a GPU.
 - rlx-wgpu on discrete Vulkan/DX12 (NVIDIA) now runs elementwise, norm and
   structural ops on the GPU, as on Metal. They used to run on the CPU there as
   a workaround for a KittenTTS failure whose real causes, the stripe-addressing
@@ -471,24 +581,58 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ### Fixed
 
+- Workspace manifests: `rlx-mlx-io` and `rlx-pkg` were asked for with
+  `default-features = false` (the backends' "dequant kernels only", rlx-runtime's
+  package reader), which Cargo ignores when the workspace entry keeps its
+  defaults, so every backend built rlx-mlx-io's loaders (npyz, zip,
+  safetensors) and rlx-runtime all of rlx-pkg; nightly Cargo rejects it
+  outright (rlx-ps5 failed to load). The workspace entries now drop default
+  features and the crates that want them name them.
+- android and rlx-ps5 (their own workspaces) carry the `libm` patch too.
+- `rlx-mlx-sys`: the MLX build hung when `c++` is a compiler-cache shim whose
+  fallback is sccache (kache): the build script picked sccache as CMake's
+  launcher too, so the sccache server waited on itself. It now takes the
+  environment's `CMAKE_CXX_COMPILER_LAUNCHER` / `CMAKE_C_COMPILER_LAUNCHER`
+  (cargo `[env]`) before guessing sccache or ccache.
+- `rlx-libm`: the pure-Rust `sqrt` (used without `std`) returned NaN for
+  `+inf`.
+- `rlx-libm` tests: the Linux glibc references went through std or
+  `extern "C"`, which a Rust binary can bind to compiler-builtins' musl copies
+  (`log1pf_hard_cases_are_glibcs` compared against musl) or, with
+  `export-glibc`, to the ports themselves. They now look glibc up by `dlsym`
+  (`src/sys.rs`, validation only).
+- `rlx-ir`: the `no_std` build (`just check-no-std`) broke on `FftPolicy`'s
+  process-wide store; the policy functions are now `std`-only.
+- A transpose that a matmul folds into its GEMM flag was elided even when it
+  was also a graph output, so it was never written (any tapped graph): the CPU
+  read-back crashed in debug builds and returned garbage in release. Shared
+  check in `rlx-compile/src/memory.rs` and Metal's opt-in fold.
+- `rlx-cpu`: the in-place vector math (`vvexpf` & co. on one buffer) cast a
+  `&mut` slice to a shared one (aliasing UB); it now stages 256-float blocks.
+- `rlx-wgpu`: `rlx_div_rn` lost its correction under Metal's subnormal flush
+  (2806 of 65 536 small-dividend pairs 1 ULP off); `rlx_exp` built subnormal
+  results through `ldexp`, which the flush zeroed. Both now match the browser.
+- `rlx-cpu`: plain wasm (no relaxed-simd) GEMM takes the fused software FMA
+  path the portable mode specifies, chosen at run time.
 - `rlxsl`: `rlx_div_rn` was not correctly rounded near a midpoint. Its one
   correction step rounds the correction before adding it, so the result kept
   the first quotient's rounding: native Metal's fast-math `1 / 1.99999988`
   stayed 0.5 where Chrome's gave 0.50000006 (BCG-FM's squeeze-excite sigmoid
   at `x = 1.19e-7`). A midpoint test against the neighbour on the remainder's
   side now settles it (`div_is_correctly_rounded_near_midpoints`, 2^16
-  near-midpoint quotients on the GPU; fails without the test). The 18
-  epilogue copies follow.
+  near-midpoint quotients on the GPU; fails without the test).
 - `rlxsl`: WGSL `exp` is `rlx_exp` (Cody–Waite reduction, an `fma`
   polynomial, `ldexp`; within 1 ULP, 99% correctly rounded) instead of the
   builtin, whose rounding follows the compiler's math mode (Apple's fast math
-  natively, safe math in Chrome). The epilogues carry it as `epi_exp`.
+  natively, safe math in Chrome).
 - `rlx-wgpu`: LayerNorm, the fused residual LayerNorm / RMSNorm kernels,
   AdaLN, softmax and attention took `1/n`, `1/sqrt` and `exp` from the WGSL
   builtins, which round by the math mode: BIOT's first LayerNorm differed
-  between native wgpu and Chrome on the same GPU. They now carry verbatim
-  copies of rlxsl's exact helpers (`epi_div_rn`, `epi_rsqrt_rn`,
-  `epi_exp`), pinned by `tests/epilogue_exact_math.rs`.
+  between native wgpu and Chrome on the same GPU. They (and the backward,
+  cross-entropy and group-norm kernels) now call rlxsl's exact helpers
+  (`rlx_div_rn`, `rlx_rsqrt_rn`, `rlx_exp`, `rlx_log`), which
+  `kernel_module` appends once; `tests/epilogue_exact_math.rs` pins that no
+  kernel calls the builtins.
 - `rlx-cpu`: the AVX2 mirror's `vvexpf` / `vvtanhf` copied a buffer onto
   itself when called in place (a `copy_nonoverlapping` of overlapping ranges;
   the debug precondition check aborted `vvsigmoidf` on the mirror arm).
@@ -498,8 +642,8 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
   `a * b + c` chain. Neither is portable: native wgpu and Chrome's WebGPU on
   the same Mac GPU disagreed by ULPs (a BCG-FM squeeze-excite sigmoid in an
   `m = 1` gemv; every fused GELU, up to 180 ULP). The epilogues now divide
-  through `epi_div_rn` (a copy of rlxsl's correctly-rounded `rlx_div_rn`,
-  pinned by `tests/epilogue_exact_math.rs`) and use explicit `fma` in the erf
+  through rlxsl's correctly-rounded `rlx_div_rn` (pinned by
+  `tests/epilogue_exact_math.rs`) and use explicit `fma` in the erf
   polynomial and the tanh-GELU cubic. rlxsl's WGSL `erf` (GELU in the
   elementwise kernels, up to 37 ULP apart) does the same.
 - `rlx-wgpu` on 32-bit targets (the browser): the GPU arena may use 3 GiB of
@@ -1013,7 +1157,7 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
   `rlx_libm::fma_emulated`. It builds the correctly rounded `a·b + c` from
   about 30 `f64` operations (Dekker's product, TwoSum and a round-to-odd add;
   Boldo & Melquiond 2008). Zeros take an exact shortcut, and inputs outside
-  `2^±450` or non-finite fall back to `libm::fma`. With the `wasm-fma`
+  `2^±450` or non-finite fall back to `fma_exact` (integer, exact). With the `wasm-fma`
   feature it also defines the `fma` symbol, replacing the software `fma`
   behind every `f64::mul_add` in a wasm binary with no call-site changes.
   Under V8, a fused `f64` multiply-add drops from 11.6 to 5.8 ns (plain
@@ -7091,7 +7235,8 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 
 Initial release. Tracked at [git history root].
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.19...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.20...HEAD
+[0.2.20]: https://github.com/MIT-RLX/rlx/compare/v0.2.19...v0.2.20
 [0.2.19]: https://github.com/MIT-RLX/rlx/compare/v0.2.18...v0.2.19
 [0.2.18]: https://github.com/MIT-RLX/rlx/compare/v0.2.17...v0.2.18
 [0.2.17]: https://github.com/MIT-RLX/rlx/compare/v0.2.16...v0.2.17

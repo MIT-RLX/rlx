@@ -971,7 +971,7 @@ pub fn run_cpu(plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> 
 /// `NetTransport`) is built on `std::net` TCP sockets, which do not exist on
 /// wasm32/browser — so on wasm this returns a clear error instead of pretending
 /// to run a collective. See the module docs.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn run_custom_collective(
     name: &str,
     input: &[f32],
@@ -994,7 +994,7 @@ fn run_custom_collective(
 
 /// On wasm there is no TCP transport for the process group, so collectives
 /// cannot run. Report that plainly rather than fabricating a result.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 fn run_custom_collective(
     name: &str,
     _input: &[f32],
@@ -1010,14 +1010,14 @@ fn run_custom_collective(
 
 /// Reinterpret an `f32` slice as bytes (little-endian, native layout). The host
 /// helper reads it back through the same `f32`-alignment contract.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn bytemuck_cast(s: &[f32]) -> &[u8] {
     // SAFETY: `f32` has no invalid bit patterns; `[f32]` → `[u8]` is a valid
     // reinterpret and the resulting slice covers exactly `len * 4` bytes.
     unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn bytemuck_cast_mut(s: &mut [f32]) -> &mut [u8] {
     let len = std::mem::size_of_val(s);
     // SAFETY: as above; mutable reinterpret of `[f32]` → `[u8]`.
@@ -1274,7 +1274,7 @@ mod tests {
     // kernel needs no process group, so this exercises the full wiring
     // (build_plan → Step::Custom → host delegate → registered kernel) without a
     // network. This path is native-only: on wasm there is no TCP transport.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn collective_copy_to_parallel_host_delegate() {
         use crate::build_plan;

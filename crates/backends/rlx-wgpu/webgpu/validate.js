@@ -16,6 +16,13 @@
 
 const HERE = new URL(".", import.meta.url).pathname;
 const KERNELS = HERE + "../src/kernels/";
+// rlxsl's numeric helpers (`rlx_div_rn`, `rlx_exp`, …): the kernels call them,
+// and `kernel_module` appends this file to every shader that does.
+const HELPERS = await Deno.readTextFile(HERE + "../../../tooling/rlxsl/src/wgsl/numeric_helpers.wgsl");
+const withHelpers = (src) =>
+  /\brlx_(div_rn|sqrt_rn|rsqrt_rn|exp|log|tanh)\(/.test(src) && !src.includes("fn rlx_div_rn(")
+    ? src + "\n" + HELPERS
+    : src;
 
 const adapter = await navigator.gpu?.requestAdapter();
 if (!adapter) {
@@ -48,7 +55,7 @@ function params({ m, k, n, batch = 1, aOff = 0, bOff, cOff, actId = 0xffff }) {
 }
 
 async function runKernel(file, entry, { m, k, n, wgX, wgY }, A, B) {
-  const src = await Deno.readTextFile(KERNELS + file);
+  const src = withHelpers(await Deno.readTextFile(KERNELS + file));
   // A spec WGSL validator runs here; a browser-illegal construct throws.
   const module = device.createShaderModule({ code: src });
   const info = await module.getCompilationInfo();
@@ -174,7 +181,7 @@ for (const [file, entry, m, k, n, tn, tm] of CASES) {
 // browser from ever seeing them. A silent acceptance would mean the native-only
 // directive had leaked into the spec surface.
 for (const f of ["matmul_coop_f32.wgsl", "matmul_coop16.wgsl", "matmul_qkv_coop_f32.wgsl"]) {
-  const src = await Deno.readTextFile(KERNELS + f);
+  const src = withHelpers(await Deno.readTextFile(KERNELS + f));
   // The rejection is the expected outcome, so catch it in an error scope
   // rather than letting it reach the uncaptured-error handler above.
   device.pushErrorScope("validation");

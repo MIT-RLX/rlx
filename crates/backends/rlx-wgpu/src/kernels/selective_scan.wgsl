@@ -59,7 +59,7 @@ fn selective_scan(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wo
 
         var acc: f32 = 0.0;
         for (var ni: u32 = 0u; ni < params.state_size; ni = ni + 1u) {
-            let da = exp(d * arena[params.a_off + a_base + ni]);
+            let da = rlx_exp(d * arena[params.a_off + a_base + ni]);
             state[ni] = da * state[ni] + d * arena[params.b_off + bc_base + ni] * xv;
             acc = acc + arena[params.c_off + bc_base + ni] * state[ni];
         }

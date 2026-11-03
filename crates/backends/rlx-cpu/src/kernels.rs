@@ -81,6 +81,9 @@ pub unsafe fn avx2_exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m2
 /// Uses Abramowitz & Stegun erf approximation with NEON exp.
 #[cfg(rlx_cpu_neon)]
 pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
+    if crate::config::portable() {
+        return portable_bias_gelu(data, bias, m, n);
+    }
     use std::arch::aarch64::*;
     let chunks = n / 4;
     unsafe {
@@ -208,6 +211,9 @@ fn bias_gelu_scalar(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
 /// `-C target-cpu=native` artifact that SIGILLs on an Atom.
 #[cfg(rlx_cpu_x86)]
 pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
+    if crate::config::portable() {
+        return portable_bias_gelu(data, bias, m, n);
+    }
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         // SAFETY: both feature bits just checked.
         unsafe { bias_gelu_avx2(data, bias, m, n) };
@@ -218,8 +224,12 @@ pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
 
 /// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]), so a wasm run
 /// rounds like Linux x86-64.
+/// The portable build's arm, compiled on every target: `crate::config::portable()`
+/// takes it at run time.
 #[cfg(not(any(rlx_cpu_neon, rlx_cpu_x86)))]
-pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
+pub use self::portable_bias_gelu as bias_gelu;
+
+pub fn portable_bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     crate::avx2_mirror::bias_gelu(data, bias, m, n);
 }
 
@@ -276,6 +286,9 @@ pub fn par_bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
 /// SiLU (Swish) in-place: x / (1 + exp(-x))
 #[cfg(rlx_cpu_neon)]
 pub fn silu_inplace(data: &mut [f32]) {
+    if crate::config::portable() {
+        return portable_silu_inplace(data);
+    }
     use std::arch::aarch64::*;
     let chunks = data.len() / 4;
     unsafe {
@@ -320,6 +333,9 @@ pub(crate) unsafe fn silu_inplace_avx2(data: &mut [f32]) {
 
 #[cfg(rlx_cpu_x86)]
 pub fn silu_inplace(data: &mut [f32]) {
+    if crate::config::portable() {
+        return portable_silu_inplace(data);
+    }
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         unsafe { silu_inplace_avx2(data) };
         return;
@@ -333,8 +349,12 @@ pub fn silu_inplace(data: &mut [f32]) {
 }
 
 /// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]).
+/// The portable build's arm, compiled on every target: `crate::config::portable()`
+/// takes it at run time.
 #[cfg(not(any(rlx_cpu_neon, rlx_cpu_x86)))]
-pub fn silu_inplace(data: &mut [f32]) {
+pub use self::portable_silu_inplace as silu_inplace;
+
+pub fn portable_silu_inplace(data: &mut [f32]) {
     crate::avx2_mirror::silu_inplace(data);
 }
 
@@ -351,6 +371,9 @@ pub fn layer_norm_row(
     h: usize,
     eps: f32,
 ) {
+    if crate::config::portable() {
+        return portable_layer_norm_row(input, gamma, beta, output, h, eps);
+    }
     use std::arch::aarch64::*;
     let inv_hf = 1.0 / h as f32;
     let chunks = h / 4;
@@ -516,6 +539,9 @@ pub fn layer_norm_row(
     h: usize,
     eps: f32,
 ) {
+    if crate::config::portable() {
+        return portable_layer_norm_row(input, gamma, beta, output, h, eps);
+    }
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         // SAFETY: both feature bits just checked.
         unsafe { layer_norm_row_avx2(input, gamma, beta, output, h, eps) };
@@ -525,8 +551,12 @@ pub fn layer_norm_row(
 }
 
 /// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]).
+/// The portable build's arm, compiled on every target: `crate::config::portable()`
+/// takes it at run time.
 #[cfg(not(any(rlx_cpu_neon, rlx_cpu_x86)))]
-pub fn layer_norm_row(
+pub use self::portable_layer_norm_row as layer_norm_row;
+
+pub fn portable_layer_norm_row(
     input: &[f32],
     gamma: &[f32],
     beta: &[f32],
@@ -845,6 +875,9 @@ fn softmax_rows_neon(data: &mut [f32], rows: usize, cols: usize) {
 
 #[cfg(rlx_cpu_neon)]
 pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
+    if crate::config::portable() {
+        return portable_neon_softmax(data, rows, cols);
+    }
     par_softmax_rows(data, rows, cols, &softmax_rows_neon);
 }
 
@@ -981,6 +1014,9 @@ pub(crate) unsafe fn softmax_row_avx2_chunks(row: &mut [f32], live: &[usize]) {
 
 #[cfg(rlx_cpu_x86)]
 pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
+    if crate::config::portable() {
+        return portable_neon_softmax(data, rows, cols);
+    }
     let avx2 =
         std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
     if avx2 {
@@ -1084,8 +1120,12 @@ fn softmax_row_poly(row: &mut [f32]) {
 }
 
 /// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]).
+/// The portable build's arm, compiled on every target: `crate::config::portable()`
+/// takes it at run time.
 #[cfg(not(any(rlx_cpu_neon, rlx_cpu_x86)))]
-pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
+pub use self::portable_neon_softmax as neon_softmax;
+
+pub fn portable_neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
     par_softmax_rows(data, rows, cols, &crate::avx2_mirror::softmax_rows);
 }
 
@@ -1094,6 +1134,9 @@ pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
 /// NEON GELU activation in-place (without bias addition).
 #[cfg(rlx_cpu_neon)]
 pub fn gelu_inplace(data: &mut [f32]) {
+    if crate::config::portable() {
+        return portable_gelu_inplace(data);
+    }
     use std::arch::aarch64::*;
     let len = data.len();
     let chunks = len / 4;
@@ -1186,6 +1229,9 @@ pub(crate) unsafe fn gelu_inplace_avx2(data: &mut [f32]) {
 
 #[cfg(rlx_cpu_x86)]
 pub fn gelu_inplace(data: &mut [f32]) {
+    if crate::config::portable() {
+        return portable_gelu_inplace(data);
+    }
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         unsafe { gelu_inplace_avx2(data) };
         return;
@@ -1196,8 +1242,12 @@ pub fn gelu_inplace(data: &mut [f32]) {
 }
 
 /// The AVX2 kernel's arithmetic ([`crate::avx2_mirror`]).
+/// The portable build's arm, compiled on every target: `crate::config::portable()`
+/// takes it at run time.
 #[cfg(not(any(rlx_cpu_neon, rlx_cpu_x86)))]
-pub fn gelu_inplace(data: &mut [f32]) {
+pub use self::portable_gelu_inplace as gelu_inplace;
+
+pub fn portable_gelu_inplace(data: &mut [f32]) {
     crate::avx2_mirror::gelu_inplace(data);
 }
 
@@ -1225,7 +1275,15 @@ const ACTIVATION_PAR_MIN: usize = 1 << 20;
 pub fn scalar_gelu_approx(x: f32) -> f32 {
     const C: f32 = 0.797_884_6; // √(2/π)
     const A: f32 = 0.044_715;
-    0.5 * x * (1.0 + (C * (x + A * x * x * x)).tanh())
+    let u = C * (x + A * x * x * x);
+    // Portable runs take glibc's `tanhf` (rlx-libm), not the host libm's:
+    // Apple's rounds differently, so the same run would differ by OS.
+    let t = if crate::config::portable() {
+        rlx_libm::tanhf(u)
+    } else {
+        u.tanh()
+    };
+    0.5 * x * (1.0 + t)
 }
 
 pub fn gelu_approx_inplace(data: &mut [f32]) {
@@ -1379,6 +1437,9 @@ pub fn par_silu_inplace(data: &mut [f32]) {
 #[cfg(rlx_cpu_neon)]
 pub fn neon_sgemm_small(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     use std::arch::aarch64::*;
+    if crate::config::portable() {
+        return crate::naive::matmul(a, b, c, m, k, n);
+    }
     let n4 = n / 4;
     unsafe {
         for j4 in 0..n4 {
@@ -1425,6 +1486,11 @@ pub fn neon_sgemm_bias_small(
     k: usize,
     n: usize,
 ) {
+    if crate::config::portable() {
+        crate::naive::matmul(a, b, c, m, k, n);
+        crate::naive::bias_add(c, bias, m, n);
+        return;
+    }
     neon_sgemm_small(a, b, c, m, k, n);
     crate::blas::bias_add(c, bias, m, n);
 }

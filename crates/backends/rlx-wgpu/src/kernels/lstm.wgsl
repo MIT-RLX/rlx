@@ -27,33 +27,12 @@
 // fast `exp` happens to be. Cost is a few ALU ops against an O(hidden^2) matvec
 // per gate, i.e. nothing.
 //
-// Cody-Waite range reduction: exp(x) = 2^k · exp(r), k = round(x·log2e),
-// r = x − k·ln2 with ln2 split hi/lo so `k·ln2` stays exact in f32. |r| ≤ ln2/2
-// ≈ 0.3466, where the degree-6 Taylor below has relative error ≈ r^7/5040 ≈
-// 1.2e-7 — about one f32 ulp.
-const RLX_LOG2E: f32 = 1.4426950408889634;
-const RLX_LN2_HI: f32 = 0.693145751953125;      // exactly representable in f32
-const RLX_LN2_LO: f32 = 1.4286067653301868e-6;
-
-fn rlx_exp_precise(x: f32) -> f32 {
-    let k = round(x * RLX_LOG2E);
-    let r = (x - k * RLX_LN2_HI) - k * RLX_LN2_LO;
-    let p = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666667 + r * (0.041666668
-            + r * (0.008333334 + r * 0.0013888889)))));
-    return ldexp(p, i32(k));
-}
-
+// So the gates take rlxsl's `rlx_exp` (Cody–Waite reduction and a polynomial in
+// explicit `fma`s, within 1 ULP), `rlx_tanh` and the correctly-rounded
+// `rlx_div_rn`, appended by `kernel_module` — not the builtins, and not a
+// local copy whose unfused `a * b + c` chains a browser contracts differently.
 fn rlx_sigmoid_precise(x: f32) -> f32 {
-    return 1.0 / (1.0 + rlx_exp_precise(-x));
-}
-
-// tanh via the numerically stable form: exponentiate only the negative
-// magnitude, so nothing overflows for large |x|.
-fn rlx_tanh_precise(x: f32) -> f32 {
-    let a = abs(x);
-    let e = rlx_exp_precise(-2.0 * a);
-    let t = (1.0 - e) / (1.0 + e);
-    return select(-t, t, x >= 0.0);
+    return rlx_div_rn(1.0, 1.0 + rlx_exp(-x));
 }
 
 struct Params {
@@ -126,10 +105,10 @@ fn lstm(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
             }
             let i_g = rlx_sigmoid_precise(z[0]);
             let f_g = rlx_sigmoid_precise(z[1]);
-            let g_g = rlx_tanh_precise(z[2]);
+            let g_g = rlx_tanh(z[2]);
             let o_g = rlx_sigmoid_precise(z[3]);
             c_k = f_g * c_k + i_g * g_g;
-            h_k = o_g * rlx_tanh_precise(c_k);
+            h_k = o_g * rlx_tanh(c_k);
         }
         // Uniform barrier: all threads finished reading the old h_sh.
         workgroupBarrier();

@@ -95,6 +95,7 @@ members = [
     "crates/numerics/rlx-special",   # Bit-exact Boost.Math special functions as SciPy computes them
     "crates/numerics/rlx-pocketfft", # scipy.fft bit-for-bit (SciPy's pinned pocketfft header)
     "crates/numerics/rlx-libm",      # glibc libm (x86_64 FMA variants) bit-for-bit, pure Rust
+    "crates/numerics/libm-shim",     # crates.io `libm` → rlx-libm (patched in below)
     "crates/numerics/rlx-fastmath",  # Accurate vectorized f32 exp/log/tanh (NEON), pure Rust
     "crates/numerics/rlx-spectral",  # FFT plans, windows, STFT, mel filterbanks, log-mel / fbank (f32 + f64)
     "crates/numerics/rlx-nnpack",    # torch CPU's NNPACK ft16x16 convolution bit-for-bit
@@ -191,7 +192,7 @@ incremental = false
 # Add them as crates reach individual readiness.
 
 [workspace.package]
-version       = "0.2.19"
+version       = "0.2.20"
 edition       = "2024"
 rust-version  = "1.89"  # edition=2024 needs ≥1.85; `is_multiple_of` ≥1.87; AVX-VNNI
                         # `_mm256_dpbusd_*` intrinsics (rlx-cpu x86 Q2_0 dot) ≥1.89
@@ -205,93 +206,93 @@ categories    = ["science", "algorithms", "compilers"]
 [workspace.dependencies]
 # Internal crates — one source of truth for path + version. Members
 # reference these via `{ workspace = true, .. }` (features/optional per-use).
-pyrlx = { path = "crates/bindings/pyrlx", version = "0.2.19" }
-rlx = { path = "crates/rlx", version = "0.2.19" }
-rlx-autodiff = { path = "crates/core/rlx-autodiff", version = "0.2.19" }
-rlx-bake = { path = "crates/io/rlx-bake", version = "0.2.19" }
-rlx-bbo = { path = "crates/numerics/rlx-bbo", version = "0.2.19" }
-rlx-bench = { path = "crates/tooling/rlx-bench", version = "0.2.19" }
-rlx-cerebras = { path = "crates/backends/rlx-cerebras", version = "0.2.19" }
-rlx-check = { path = "crates/tooling/rlx-check", version = "0.2.19" }
-rlx-collectives = { path = "crates/core/rlx-collectives", version = "0.2.19" }
-rlx-compile = { path = "crates/core/rlx-compile", version = "0.2.19" }
-rlx-coreml = { path = "crates/backends/rlx-coreml", version = "0.2.19" }
-rlx-cortexm = { path = "crates/backends/rlx-cortexm", version = "0.2.19" }
-rlx-cortexm-trainer = { path = "crates/backends/rlx-cortexm/trainer", version = "0.2.19" }
-rlx-mcu = { path = "crates/backends/rlx-mcu", version = "0.2.19", default-features = false }
-rlx-cpu = { path = "crates/backends/rlx-cpu", version = "0.2.19" }
-rlx-cuda = { path = "crates/backends/rlx-cuda", version = "0.2.19" }
-rlx-dduf = { path = "crates/io/rlx-dduf", version = "0.2.19" }
-rlx-distributed = { path = "crates/core/rlx-distributed", version = "0.2.19" }
-rlx-driver = { path = "crates/core/rlx-driver", version = "0.2.19" }
-rlx-extend = { path = "crates/core/rlx-extend", version = "0.2.19" }
-rlx-fdm = { path = "crates/numerics/rlx-fdm", version = "0.2.19" }
-rlx-lbm = { path = "crates/numerics/rlx-lbm", version = "0.2.19" }
-rlx-flow = { path = "crates/core/rlx-flow", version = "0.2.19" }
-rlx-fpga = { path = "crates/backends/rlx-fpga", version = "0.2.19" }
-rlx-fusion = { path = "crates/core/rlx-fusion", version = "0.2.19" }
-rlx-geo = { path = "crates/numerics/rlx-geo", version = "0.2.19" }
-rlx-gguf = { path = "crates/io/rlx-gguf", version = "0.2.19" }
-rlx-gguf-convert = { path = "crates/io/rlx-gguf-convert", version = "0.2.19" }
-rlx-gpu-host = { path = "crates/backends/rlx-gpu-host", version = "0.2.19" }
-rlx-gpu-dispatch = { path = "crates/backends/rlx-gpu-dispatch", version = "0.2.19" }
-rlx-gpu-kernels = { path = "crates/backends/rlx-gpu-kernels", version = "0.2.19" }
-rlx-hub = { path = "crates/io/rlx-hub", version = "0.2.19" }
-rlx-hwprofile = { path = "crates/tooling/rlx-hwprofile", version = "0.2.19" }
-rlx-ir = { path = "crates/core/rlx-ir", version = "0.2.19" }
-rlx-linalg = { path = "crates/numerics/rlx-linalg", version = "0.2.19" }
-rlx-peft = { path = "crates/numerics/rlx-peft", version = "0.2.19" }
-rlx-rng = { path = "crates/numerics/rlx-rng", version = "0.2.19" }
-rlx-numpy = { path = "crates/numerics/rlx-numpy", version = "0.2.19" }
-rlx-special = { path = "crates/numerics/rlx-special", version = "0.2.19" }
-rlx-nnpack = { path = "crates/numerics/rlx-nnpack", version = "0.2.19" }
-rlx-pocketfft = { path = "crates/numerics/rlx-pocketfft", version = "0.2.19" }
-rlx-libm = { path = "crates/numerics/rlx-libm", version = "0.2.19" }
-rlx-fastmath = { path = "crates/numerics/rlx-fastmath", version = "0.2.19" }
-rlx-spectral = { path = "crates/numerics/rlx-spectral", version = "0.2.19" }
-rlx-linux-ref = { path = "crates/numerics/rlx-linux-ref", version = "0.2.19" }
-rlx-signal = { path = "crates/numerics/rlx-signal", version = "0.2.19" }
-rlx-search = { path = "crates/numerics/rlx-search", version = "0.2.19" }
-rlx-macros = { path = "crates/core/rlx-macros", version = "0.2.19" }
-rlx-metal = { path = "crates/backends/rlx-metal", version = "0.2.19" }
-rlx-mlx = { path = "crates/backends/rlx-mlx", version = "0.2.19" }
-rlx-mlx-io = { path = "crates/io/rlx-mlx-io", version = "0.2.19" }
-rlx-mlx-sys = { path = "crates/backends/rlx-mlx-sys", version = "0.2.19" }
-rlx-nemo = { path = "crates/io/rlx-nemo", version = "0.2.19" }
-rlx-torch-ckpt = { path = "crates/io/rlx-torch-ckpt", version = "0.2.19" }
-rlx-oneapi = { path = "crates/backends/rlx-oneapi", version = "0.2.19" }
-rlx-onnx = { path = "crates/io/rlx-onnx", version = "0.2.19" }
-rlx-onnx-conformance = { path = "crates/io/rlx-onnx-conformance", version = "0.2.19" }
-rlx-onnx-import = { path = "crates/io/rlx-onnx-import", version = "0.2.19" }
-rlx-onnx-proto = { path = "crates/io/rlx-onnx-proto", version = "0.2.19" }
-rlx-opscope = { path = "crates/tooling/rlx-opscope", version = "0.2.19" }
-rlx-opt = { path = "crates/core/rlx-opt", version = "0.2.19" }
-rlx-optim = { path = "crates/core/rlx-optim", version = "0.2.19" }
-rlx-pkg = { path = "crates/io/rlx-pkg", version = "0.2.19" }
-rlx-qnn = { path = "crates/backends/rlx-qnn", version = "0.2.19" }
-rlx-rl = { path = "crates/numerics/rlx-rl", version = "0.2.19" }
-rlx-rocm = { path = "crates/backends/rlx-rocm", version = "0.2.19" }
-rlx-runtime = { path = "crates/core/rlx-runtime", version = "0.2.19" }
-rlx-sparse = { path = "crates/numerics/rlx-sparse", version = "0.2.19" }
-rlx-tensor = { path = "crates/core/rlx-tensor", version = "0.2.19" }
-rlx-text = { path = "crates/io/rlx-text", version = "0.2.19" }
-rlx-program = { path = "crates/io/rlx-program", version = "0.2.19" }
-rlx-torch-import = { path = "crates/io/rlx-torch-import", version = "0.2.19" }
-rlx-tpu = { path = "crates/backends/rlx-tpu", version = "0.2.19" }
-rlx-stablehlo = { path = "crates/io/rlx-stablehlo", version = "0.2.19" }
-rlx-umap = { path = "crates/numerics/rlx-umap", version = "0.2.19" }
-rlx-unfuse = { path = "crates/core/rlx-unfuse", version = "0.2.19" }
-rlx-vq = { path = "crates/numerics/rlx-vq", version = "0.2.19" }
-rlx-vulkan = { path = "crates/backends/rlx-vulkan", version = "0.2.19" }
-rlx-bind = { path = "crates/bindings/rlx-bind", version = "0.2.19" }
-rlx-ffi = { path = "crates/bindings/rlx-ffi", version = "0.2.19" }
-rlx-js = { path = "crates/bindings/rlx-js", version = "0.2.19" }
-rlx-web = { path = "crates/bindings/rlx-web", version = "0.2.19" }
-rlx-webgl = { path = "crates/backends/rlx-webgl", version = "0.2.19" }
-rlx-wgpu = { path = "crates/backends/rlx-wgpu", version = "0.2.19" }
-rlx-xdna = { path = "crates/backends/rlx-xdna", version = "0.2.19" }
-rlx-egpu = { path = "crates/backends/rlx-egpu", version = "0.2.19" }
-rlxsl = { path = "crates/tooling/rlxsl", version = "0.2.19" }
+pyrlx = { path = "crates/bindings/pyrlx", version = "0.2.20" }
+rlx = { path = "crates/rlx", version = "0.2.20" }
+rlx-autodiff = { path = "crates/core/rlx-autodiff", version = "0.2.20" }
+rlx-bake = { path = "crates/io/rlx-bake", version = "0.2.20" }
+rlx-bbo = { path = "crates/numerics/rlx-bbo", version = "0.2.20" }
+rlx-bench = { path = "crates/tooling/rlx-bench", version = "0.2.20" }
+rlx-cerebras = { path = "crates/backends/rlx-cerebras", version = "0.2.20" }
+rlx-check = { path = "crates/tooling/rlx-check", version = "0.2.20" }
+rlx-collectives = { path = "crates/core/rlx-collectives", version = "0.2.20" }
+rlx-compile = { path = "crates/core/rlx-compile", version = "0.2.20" }
+rlx-coreml = { path = "crates/backends/rlx-coreml", version = "0.2.20" }
+rlx-cortexm = { path = "crates/backends/rlx-cortexm", version = "0.2.20" }
+rlx-cortexm-trainer = { path = "crates/backends/rlx-cortexm/trainer", version = "0.2.20" }
+rlx-mcu = { path = "crates/backends/rlx-mcu", version = "0.2.20", default-features = false }
+rlx-cpu = { path = "crates/backends/rlx-cpu", version = "0.2.20" }
+rlx-cuda = { path = "crates/backends/rlx-cuda", version = "0.2.20" }
+rlx-dduf = { path = "crates/io/rlx-dduf", version = "0.2.20" }
+rlx-distributed = { path = "crates/core/rlx-distributed", version = "0.2.20" }
+rlx-driver = { path = "crates/core/rlx-driver", version = "0.2.20" }
+rlx-extend = { path = "crates/core/rlx-extend", version = "0.2.20" }
+rlx-fdm = { path = "crates/numerics/rlx-fdm", version = "0.2.20" }
+rlx-lbm = { path = "crates/numerics/rlx-lbm", version = "0.2.20" }
+rlx-flow = { path = "crates/core/rlx-flow", version = "0.2.20" }
+rlx-fpga = { path = "crates/backends/rlx-fpga", version = "0.2.20" }
+rlx-fusion = { path = "crates/core/rlx-fusion", version = "0.2.20" }
+rlx-geo = { path = "crates/numerics/rlx-geo", version = "0.2.20" }
+rlx-gguf = { path = "crates/io/rlx-gguf", version = "0.2.20" }
+rlx-gguf-convert = { path = "crates/io/rlx-gguf-convert", version = "0.2.20" }
+rlx-gpu-host = { path = "crates/backends/rlx-gpu-host", version = "0.2.20" }
+rlx-gpu-dispatch = { path = "crates/backends/rlx-gpu-dispatch", version = "0.2.20" }
+rlx-gpu-kernels = { path = "crates/backends/rlx-gpu-kernels", version = "0.2.20" }
+rlx-hub = { path = "crates/io/rlx-hub", version = "0.2.20" }
+rlx-hwprofile = { path = "crates/tooling/rlx-hwprofile", version = "0.2.20" }
+rlx-ir = { path = "crates/core/rlx-ir", version = "0.2.20" }
+rlx-linalg = { path = "crates/numerics/rlx-linalg", version = "0.2.20" }
+rlx-peft = { path = "crates/numerics/rlx-peft", version = "0.2.20" }
+rlx-rng = { path = "crates/numerics/rlx-rng", version = "0.2.20" }
+rlx-numpy = { path = "crates/numerics/rlx-numpy", version = "0.2.20" }
+rlx-special = { path = "crates/numerics/rlx-special", version = "0.2.20" }
+rlx-nnpack = { path = "crates/numerics/rlx-nnpack", version = "0.2.20" }
+rlx-pocketfft = { path = "crates/numerics/rlx-pocketfft", version = "0.2.20" }
+rlx-libm = { path = "crates/numerics/rlx-libm", version = "0.2.20" }
+rlx-fastmath = { path = "crates/numerics/rlx-fastmath", version = "0.2.20" }
+rlx-spectral = { path = "crates/numerics/rlx-spectral", version = "0.2.20" }
+rlx-linux-ref = { path = "crates/numerics/rlx-linux-ref", version = "0.2.20" }
+rlx-signal = { path = "crates/numerics/rlx-signal", version = "0.2.20" }
+rlx-search = { path = "crates/numerics/rlx-search", version = "0.2.20" }
+rlx-macros = { path = "crates/core/rlx-macros", version = "0.2.20" }
+rlx-metal = { path = "crates/backends/rlx-metal", version = "0.2.20" }
+rlx-mlx = { path = "crates/backends/rlx-mlx", version = "0.2.20" }
+rlx-mlx-io = { path = "crates/io/rlx-mlx-io", version = "0.2.20", default-features = false }  # backends: dequant kernels only; loaders opt into `io`
+rlx-mlx-sys = { path = "crates/backends/rlx-mlx-sys", version = "0.2.20" }
+rlx-nemo = { path = "crates/io/rlx-nemo", version = "0.2.20" }
+rlx-torch-ckpt = { path = "crates/io/rlx-torch-ckpt", version = "0.2.20" }
+rlx-oneapi = { path = "crates/backends/rlx-oneapi", version = "0.2.20" }
+rlx-onnx = { path = "crates/io/rlx-onnx", version = "0.2.20" }
+rlx-onnx-conformance = { path = "crates/io/rlx-onnx-conformance", version = "0.2.20" }
+rlx-onnx-import = { path = "crates/io/rlx-onnx-import", version = "0.2.20" }
+rlx-onnx-proto = { path = "crates/io/rlx-onnx-proto", version = "0.2.20" }
+rlx-opscope = { path = "crates/tooling/rlx-opscope", version = "0.2.20" }
+rlx-opt = { path = "crates/core/rlx-opt", version = "0.2.20" }
+rlx-optim = { path = "crates/core/rlx-optim", version = "0.2.20" }
+rlx-pkg = { path = "crates/io/rlx-pkg", version = "0.2.20", default-features = false }  # rlx-runtime takes the reader alone; others list theirs
+rlx-qnn = { path = "crates/backends/rlx-qnn", version = "0.2.20" }
+rlx-rl = { path = "crates/numerics/rlx-rl", version = "0.2.20" }
+rlx-rocm = { path = "crates/backends/rlx-rocm", version = "0.2.20" }
+rlx-runtime = { path = "crates/core/rlx-runtime", version = "0.2.20" }
+rlx-sparse = { path = "crates/numerics/rlx-sparse", version = "0.2.20" }
+rlx-tensor = { path = "crates/core/rlx-tensor", version = "0.2.20" }
+rlx-text = { path = "crates/io/rlx-text", version = "0.2.20" }
+rlx-program = { path = "crates/io/rlx-program", version = "0.2.20" }
+rlx-torch-import = { path = "crates/io/rlx-torch-import", version = "0.2.20" }
+rlx-tpu = { path = "crates/backends/rlx-tpu", version = "0.2.20" }
+rlx-stablehlo = { path = "crates/io/rlx-stablehlo", version = "0.2.20" }
+rlx-umap = { path = "crates/numerics/rlx-umap", version = "0.2.20" }
+rlx-unfuse = { path = "crates/core/rlx-unfuse", version = "0.2.20" }
+rlx-vq = { path = "crates/numerics/rlx-vq", version = "0.2.20" }
+rlx-vulkan = { path = "crates/backends/rlx-vulkan", version = "0.2.20" }
+rlx-bind = { path = "crates/bindings/rlx-bind", version = "0.2.20" }
+rlx-ffi = { path = "crates/bindings/rlx-ffi", version = "0.2.20" }
+rlx-js = { path = "crates/bindings/rlx-js", version = "0.2.20" }
+rlx-web = { path = "crates/bindings/rlx-web", version = "0.2.20" }
+rlx-webgl = { path = "crates/backends/rlx-webgl", version = "0.2.20" }
+rlx-wgpu = { path = "crates/backends/rlx-wgpu", version = "0.2.20" }
+rlx-xdna = { path = "crates/backends/rlx-xdna", version = "0.2.20" }
+rlx-egpu = { path = "crates/backends/rlx-egpu", version = "0.2.20" }
+rlxsl = { path = "crates/tooling/rlxsl", version = "0.2.20" }
 
 [workspace.lints.rust]
 unused = { level = "warn" }
@@ -367,3 +368,9 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "debuginfo"
+
+# The `libm` that naga and num-traits (via half) depend on, answered by
+# rlx-libm: no musl copy in rlx's dependency tree. The real crate remains a
+# validation dev-dependency only (pinned `=0.2.16`, so the patch skips it).
+[patch.crates-io]
+libm = { path = "crates/numerics/libm-shim" }

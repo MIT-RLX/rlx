@@ -39,5 +39,5 @@ fn fused_swiglu(
         up = arena[base + col];
         gate = arena[base + params.n_half + col];
     }
-    arena[params.out_off + i] = up * (gate / (1.0 + exp(-gate)));
+    arena[params.out_off + i] = up * rlx_div_rn(gate, 1.0 + rlx_exp(-gate));
 }

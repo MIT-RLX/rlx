@@ -803,9 +803,7 @@ fn igam_fac(a: f64, x: f64) -> f64 {
     } else {
         let num = x - a - LANCZOS_G + 0.5;
         // `a * log1pmx(num/fac) + x * (0.5 - g) / fac`
-        res *= a
-            .fmac(log1pmx(num / fac), x * (0.5 - LANCZOS_G) / fac)
-            .exp();
+        res *= rlx_libm::reference::exp(a.fmac(log1pmx(num / fac), x * (0.5 - LANCZOS_G) / fac));
     }
     res
 }

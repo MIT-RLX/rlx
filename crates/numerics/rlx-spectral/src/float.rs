@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The precision a front-end computes in. Implemented for `f32` (production)
 //! and `f64` (reference-grade); tables (twiddles, windows, mel weights) are
 //! built in f64 and rounded once into the working type.
@@ -95,10 +99,10 @@ impl Float for f64 {
         f64::sqrt(self)
     }
     fn ln_slice(x: &mut [Self]) {
-        x.iter_mut().for_each(|v| *v = libm::log(*v));
+        x.iter_mut().for_each(|v| *v = rlx_libm::log(*v));
     }
     fn log10_slice(x: &mut [Self]) {
-        x.iter_mut().for_each(|v| *v = libm::log10(*v));
+        x.iter_mut().for_each(|v| *v = rlx_libm::log10(*v));
     }
 }
 
@@ -148,6 +152,9 @@ impl<T: Float> Complex<T> {
     }
     /// `e^{iθ}` built in f64.
     pub fn cis(theta: f64) -> Self {
-        Complex::new(T::from_f64(libm::cos(theta)), T::from_f64(libm::sin(theta)))
+        Complex::new(
+            T::from_f64(rlx_libm::cos(theta)),
+            T::from_f64(rlx_libm::sin(theta)),
+        )
     }
 }

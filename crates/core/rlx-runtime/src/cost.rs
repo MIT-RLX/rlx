@@ -244,6 +244,11 @@ pub fn fastest_device_for_with_policy(
     if candidates.is_empty() {
         return crate::device_ext::fastest_among(&policy.apply(crate::available_devices()));
     }
+    // Reproducible runs (`rlx_ir::reproducible`) do not let the host's GPU,
+    // or its calibration, pick: the CPU when the policy allows it.
+    if rlx_ir::reproducible::reproducible() && candidates.contains(&Device::Cpu) {
+        return Device::Cpu;
+    }
 
     #[cfg(feature = "cpu")]
     let cpu = CpuCostModel::new();

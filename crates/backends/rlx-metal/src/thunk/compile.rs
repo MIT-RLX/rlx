@@ -246,7 +246,8 @@ impl ThunkSchedule {
                     if perm.as_slice() != [1, 0] || n.shape.rank() != 2 {
                         return None;
                     }
-                    if uses.get(&id) != Some(&1) {
+                    // A graph output is read back, so it stays written.
+                    if uses.get(&id) != Some(&1) || graph.outputs.contains(&id) {
                         return None;
                     }
                     let so = off(n.inputs[0]);

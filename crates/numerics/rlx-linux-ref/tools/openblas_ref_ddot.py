@@ -1,3 +1,7 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Reference for tests/fixtures/openblas_haswell_ddot.txt: run on the Linux reference
 # (msi: numpy 2.3.5, OpenBLAS 0.3.30 Haswell, 20 threads): python -I tools/openblas_ref_ddot.py out.txt
 # np.dot on 1-D float64 vectors (OpenBLAS 0.3.30 Haswell ddot) for many lengths/strides.

@@ -207,10 +207,38 @@ impl RocmExecutable {
                 );
             }
             if trace_steps {
-                // Sync first so a *previous* step's async fault surfaces here (crashing
-                // before we print the next name) → the last printed line IS the culprit.
-                unsafe {
-                    let _ = (self.ctx.runtime.hip_stream_sync)(stream);
+                // Sync first so a *previous* step's async fault surfaces here, and
+                // stop there: every launch after a fault fails too, so carrying on
+                // would print names that are not the culprit.
+                let rc = unsafe { (self.ctx.runtime.hip_stream_sync)(stream) };
+                if rc.0 != 0 {
+                    if let Some(Step::Matmul {
+                        m,
+                        k,
+                        n,
+                        a_off_f32,
+                        b_off_f32,
+                        c_off_f32,
+                        batch,
+                        a_batch_stride,
+                        b_batch_stride,
+                        c_batch_stride,
+                        ..
+                    }) = step_i.checked_sub(1).map(|i| &self.schedule[i])
+                    {
+                        eprintln!(
+                            "rlx-rocm: failed matmul m {m} k {k} n {n} batch {batch}, offsets a {a_off_f32} b {b_off_f32} c {c_off_f32}, strides {a_batch_stride}/{b_batch_stride}/{c_batch_stride}, arena {} bytes",
+                            self.arena.size
+                        );
+                    }
+                    panic!(
+                        "rlx-rocm: step {} ({}) failed: hipError {}",
+                        step_i.saturating_sub(1),
+                        step_i
+                            .checked_sub(1)
+                            .map_or("none", |i| step_name(&self.schedule[i])),
+                        rc.0
+                    );
                 }
                 eprintln!("[rocm-step] {}", step_name(step));
             }

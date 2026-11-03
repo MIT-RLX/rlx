@@ -24,7 +24,8 @@ std = []
 dsp = []
 
 [dependencies]
-libm = { version = "0.2", default-features = false }
+# expf / logf / erff / sqrtf / sin / cos, in Rust (glibc 2.43 ports)
+rlx-libm = { path = "../../numerics/rlx-libm", version = "0.2.20", default-features = false }
 
 [lints]
 workspace = true

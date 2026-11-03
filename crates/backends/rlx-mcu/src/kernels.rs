@@ -7,7 +7,7 @@
 //! Weights are int8 (one scale per output channel) or int4 (one scale per
 //! group); activations are quantized to int8 per row on the fly. Integer sums
 //! are exact in any order, so tiling changes no bits. Everything else is f32
-//! through `libm`, so host and MCU builds agree exactly.
+//! through `rlx-libm`, so host and MCU builds agree exactly.
 
 use crate::blob::{MAX_GROUPS, Mat, Q4, Q8, Q8G, quantize_row};
 
@@ -525,7 +525,7 @@ pub fn layer_norm(
             var += c * c;
         }
         var /= d as f32;
-        let inv = 1.0 / libm::sqrtf(var + eps);
+        let inv = 1.0 / rlx_libm::sqrtf(var + eps);
         let yr = &mut y[r * d..(r + 1) * d];
         for i in 0..d {
             yr[i] = (xr[i] - mean) * inv * g[i] + b.map_or(0.0, |b| b[i]);
@@ -536,19 +536,19 @@ pub fn layer_norm(
 /// `x · σ(x)`.
 #[inline]
 pub fn silu(x: f32) -> f32 {
-    x / (1.0 + libm::expf(-x))
+    x / (1.0 + rlx_libm::expf(-x))
 }
 
 /// `1 / (1 + e^-x)`.
 #[inline]
 pub fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + libm::expf(-x))
+    1.0 / (1.0 + rlx_libm::expf(-x))
 }
 
 /// Exact (erf) GELU, PyTorch's default.
 #[inline]
 pub fn gelu(x: f32) -> f32 {
-    0.5 * x * (1.0 + libm::erff(x * core::f32::consts::FRAC_1_SQRT_2))
+    0.5 * x * (1.0 + rlx_libm::erff(x * core::f32::consts::FRAC_1_SQRT_2))
 }
 
 /// In-place softmax. Entries equal to `f32::NEG_INFINITY` get probability 0.
@@ -559,7 +559,7 @@ pub fn softmax(x: &mut [f32]) {
     }
     let mut sum = 0.0f32;
     for v in x.iter_mut() {
-        *v = libm::expf(*v - mx);
+        *v = rlx_libm::expf(*v - mx);
         sum += *v;
     }
     let inv = 1.0 / sum;

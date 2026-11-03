@@ -48,7 +48,7 @@ pub fn dgeev_eigvals(a: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>), String
         return Ok((Vec::new(), Vec::new()));
     }
     #[cfg(rlx_cpu_blas)]
-    {
+    if !crate::config::portable() {
         let mut buf = a.to_vec();
         let (mut wr, mut wi) = (vec![0.0; n], vec![0.0; n]);
         let nn = n as i32;
@@ -79,12 +79,9 @@ pub fn dgeev_eigvals(a: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>), String
         if info != 0 {
             return Err(format!("eigvals: dgeev info={info}"));
         }
-        Ok((wr, wi))
+        return Ok((wr, wi));
     }
-    #[cfg(not(rlx_cpu_blas))]
-    {
-        hqr_eigvals(a, n)
-    }
+    hqr_eigvals(a, n)
 }
 
 /// Reduce row-major `h` (`n × n`) to upper Hessenberg form in place by

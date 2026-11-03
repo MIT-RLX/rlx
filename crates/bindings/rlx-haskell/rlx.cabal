@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               rlx
-version:            0.2.19
+version:            0.2.20
 synopsis:           Haskell bindings for rlx over its C ABI
 description:        Graphs, sessions, device selection, autodiff, training, weights, text and distributed nodes, over librlx_capi.
 license:            MIT OR Apache-2.0

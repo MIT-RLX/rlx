@@ -4,13 +4,13 @@
 
 //! On-disk wgpu calibration for cost-model ranking.
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use rlx_ir::{DType, Graph, Shape, Tick};
 use serde::{Deserialize, Serialize};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use crate::backend::WgpuExecutable;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,7 +21,7 @@ pub struct Calibration {
     pub memory_bw_gbps: f64,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn cache_path(device_name: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let dir = PathBuf::from(home).join(".cache").join("rlx");
@@ -34,20 +34,20 @@ fn cache_path(device_name: &str) -> PathBuf {
 }
 
 impl Calibration {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn load(device_name: &str) -> Option<Self> {
         let raw = std::fs::read_to_string(cache_path(device_name)).ok()?;
         let cal: Calibration = serde_json::from_str(&raw).ok()?;
         (cal.device_name == device_name).then_some(cal)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn save(&self) -> std::io::Result<()> {
         let raw = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(cache_path(&self.device_name), raw)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn measure(device_name: &str) -> Self {
         const M: usize = 512;
         const K: usize = 512;
@@ -87,7 +87,7 @@ impl Calibration {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn load_or_measure() -> Self {
         if !crate::is_available() {
             return Self::defaults("wgpu-unavailable");
@@ -105,7 +105,7 @@ impl Calibration {
     /// blocking `measure` benchmark would deadlock the browser event loop),
     /// so we return conservative defaults — the cost model only needs a
     /// relative ranking of candidate kernels.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     pub fn load_or_measure() -> Self {
         let name = crate::device::adapter_name().unwrap_or_else(|| "wgpu-web".into());
         Self::defaults(&name)

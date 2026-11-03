@@ -22,7 +22,7 @@
 
 #[cfg(all(
     not(all(target_arch = "aarch64", target_vendor = "apple")),
-    not(target_arch = "wasm32")
+    not(target_family = "wasm")
 ))]
 use std::time::Instant;
 
@@ -34,7 +34,7 @@ pub struct Tick {
     // wasm32 carries no field: the tick is a no-op (see `now`/`elapsed_ns`).
     #[cfg(all(
         not(all(target_arch = "aarch64", target_vendor = "apple")),
-        not(target_arch = "wasm32")
+        not(target_family = "wasm")
     ))]
     instant: Instant,
 }
@@ -49,7 +49,7 @@ impl Tick {
                 cycles: read_cntvct(),
             }
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             // `std::time::Instant` panics on wasm32-unknown-unknown, and a real
             // clock here would mean a JS `performance.now()` binding. Until one
@@ -58,7 +58,7 @@ impl Tick {
         }
         #[cfg(all(
             not(all(target_arch = "aarch64", target_vendor = "apple")),
-            not(target_arch = "wasm32")
+            not(target_family = "wasm")
         ))]
         {
             Tick {
@@ -79,14 +79,14 @@ impl Tick {
             let freq = cntfrq_hz();
             ((dt as u128) * 1_000_000_000u128 / freq as u128) as u64
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             let _ = start;
             0
         }
         #[cfg(all(
             not(all(target_arch = "aarch64", target_vendor = "apple")),
-            not(target_arch = "wasm32")
+            not(target_family = "wasm")
         ))]
         {
             self.instant.duration_since(start.instant).as_nanos() as u64

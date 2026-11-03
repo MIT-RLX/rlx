@@ -26,14 +26,14 @@ std = ["rlx-ir/std", "rlx-cortexm/std"]
 # already validates against. The kernels themselves we re-derive (cortexm
 # uses an f32 requantize; FPGA fabric needs integer-only Q0.31).
 [dependencies]
-rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.19", default-features = false }
+rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.20", default-features = false }
 # Not `workspace = true`: an inherited dependency cannot turn default
 # features off, and rlx-ir's default is `std`.
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.19", default-features = false }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.20", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
-rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.19", default-features = false, features = ["std"] }
+rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.20", default-features = false, features = ["std"] }
 
 [lib]
 path = "src/lib.rs"

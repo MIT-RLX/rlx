@@ -4,7 +4,7 @@
 
 Gem::Specification.new do |s|
   s.name = "rlx"
-  s.version = "0.2.19"
+  s.version = "0.2.20"
   s.summary = "Ruby bindings for rlx over its C ABI (stdlib Fiddle)"
   s.description = "Graphs, sessions, device selection, autodiff, training, weights, text and " \
                   "distributed nodes from Ruby. Bundles librlx_capi for common platforms; RLX_CAPI_LIB overrides it."

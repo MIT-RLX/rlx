@@ -32,6 +32,10 @@ fn scalbn(x: f64, n: i32) -> f64 {
     y * p(n)
 }
 
+#[cfg(not(any(test, feature = "std")))]
+#[allow(unused_imports)]
+use crate::fp::Fp as _;
+
 fn hypot_kernel(ax: f64, ay: f64) -> f64 {
     let mut h = (ax * ax + ay * ay).sqrt();
     let (t1, t2);
@@ -48,8 +52,26 @@ fn hypot_kernel(ax: f64, ay: f64) -> f64 {
     h
 }
 
+/// The kernel as gcc builds it where `__FP_FAST_FMA` is defined (aarch64):
+/// `√(2y·x + (x−y)²)` or `√(x² + y²)`, one fused step each.
+fn hypot_kernel_fma(ax: f64, ay: f64) -> f64 {
+    let t1 = ay + ay;
+    let t2 = ax - ay;
+    if t1 >= ax {
+        crate::fma(t1, ax, t2 * t2).sqrt()
+    } else {
+        crate::fma(ax, ax, ay * ay).sqrt()
+    }
+}
+
 /// glibc `hypot(x, y)`.
 pub fn hypot(x: f64, y: f64) -> f64 {
+    hypot_impl::<false>(x, y)
+}
+
+/// `hypot`; `FMA`: glibc's aarch64 build (the `__FP_FAST_FMA` kernel).
+pub(crate) fn hypot_impl<const FMA: bool>(x: f64, y: f64) -> f64 {
+    let hypot_kernel = if FMA { hypot_kernel_fma } else { hypot_kernel };
     const SCALE: f64 = f64::from_bits(0x1a70_0000_0000_0000); // 0x1p-600
     const LARGE_VAL: f64 = f64::from_bits(0x5fe0_0000_0000_0000); // 0x1p+511
     const TINY_VAL: f64 = f64::from_bits(0x2340_0000_0000_0000); // 0x1p-459

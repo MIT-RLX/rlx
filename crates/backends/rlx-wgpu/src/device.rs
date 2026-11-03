@@ -8,15 +8,15 @@
 //! routes subsequent calls to a Vulkan-only instance (for `Device::Vulkan`).
 
 use std::sync::OnceLock;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use std::sync::atomic::{AtomicU8, Ordering};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 const PREF_DEFAULT: u8 = 0;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 const PREF_VULKAN: u8 = 1;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 static BACKEND_PREF: AtomicU8 = AtomicU8::new(PREF_DEFAULT);
 
 /// Detected wgpu adapter + device. We hold them together because
@@ -93,12 +93,28 @@ fn device_descriptor(
 
 impl WgpuDevice {
     /// Native: block on adapter + device discovery via `pollster`.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     fn new_with_backends(backends: wgpu::Backends) -> Option<Self> {
         let instance = make_instance(backends);
         let adapter = pollster::block_on(instance.request_adapter(&ADAPTER_OPTIONS)).ok()?;
 
         let info = adapter.get_info();
+        // Software rasterisers (WARP on Windows, llvmpipe/lavapipe on Linux)
+        // report `DeviceType::Cpu`. They only get picked when there is no real
+        // GPU, and they run the shaders on the CPU: slower than rlx-cpu, with
+        // a third set of numerics. Report no wgpu device instead so callers
+        // fall back to the CPU backend (rlx-hwprofile skips them for the same
+        // reason). RLX_WGPU_ALLOW_SOFTWARE=1 keeps them, for exercising the
+        // GPU path on a machine without a GPU.
+        if info.device_type == wgpu::DeviceType::Cpu
+            && !rlx_ir::env::flag("RLX_WGPU_ALLOW_SOFTWARE")
+        {
+            eprintln!(
+                "[rlx-wgpu] skipping software adapter {:?} ({:?}); set RLX_WGPU_ALLOW_SOFTWARE=1 to use it",
+                info.name, info.backend
+            );
+            return None;
+        }
         let mut limits = adapter.limits();
         // When large buffers are enabled, keep storage *bindings* ≤ ~4 GiB so
         // ops window into the single physical buffer (whole-buffer binds of
@@ -164,7 +180,7 @@ impl WgpuDevice {
     /// WASM: the browser cannot block its event loop, so adapter + device
     /// discovery is genuinely async — callers `.await` [`init_wgpu_device`]
     /// once at startup, after which [`wgpu_device`] returns synchronously.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     async fn new_with_backends_async(backends: wgpu::Backends) -> Option<Self> {
         let instance = make_instance(backends);
         let adapter = instance.request_adapter(&ADAPTER_OPTIONS).await.ok()?;
@@ -188,21 +204,25 @@ impl WgpuDevice {
         })
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     fn new_default() -> Option<Self> {
         Self::new_with_backends(default_backends())
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn default_backends() -> wgpu::Backends {
     if let Some(b) = wgpu::Backends::from_env() {
         return b;
     }
     #[cfg(target_os = "windows")]
     {
-        // Native DX12 first on Windows MSVC; Vulkan remains as fallback.
-        wgpu::Backends::DX12 | wgpu::Backends::VULKAN
+        // DX12 only on Windows: no silent Vulkan fallback onto a second GPU API
+        // with its own drivers and numerics. Without a real DX12 GPU wgpu finds
+        // only WARP, which is skipped (see `new_with_backends`), so there is no
+        // wgpu device and callers use the CPU backend. Opt into Vulkan with
+        // WGPU_BACKEND=vulkan or Device::Vulkan.
+        wgpu::Backends::DX12
     }
     #[cfg(target_os = "linux")]
     {
@@ -225,13 +245,13 @@ fn default_backends() -> wgpu::Backends {
 unsafe impl Send for WgpuDevice {}
 unsafe impl Sync for WgpuDevice {}
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn default_device() -> Option<&'static WgpuDevice> {
     static DEVICE: OnceLock<Option<WgpuDevice>> = OnceLock::new();
     DEVICE.get_or_init(WgpuDevice::new_default).as_ref()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn vulkan_device() -> Option<&'static WgpuDevice> {
     static DEVICE: OnceLock<Option<WgpuDevice>> = OnceLock::new();
     DEVICE
@@ -242,30 +262,30 @@ fn vulkan_device() -> Option<&'static WgpuDevice> {
 /// Prefer the Vulkan-only wgpu instance for `Device::Vulkan` sessions.
 /// Call before the first [`wgpu_device`] use in that process (or use
 /// `Device::Vulkan` via the runtime registry, which calls this).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub fn select_vulkan_backend() {
     BACKEND_PREF.store(PREF_VULKAN, Ordering::SeqCst);
 }
 
 /// No Vulkan path in the browser — the only wasm adapter is WebGPU.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub fn select_vulkan_backend() {}
 
 /// True when a Vulkan adapter is reachable (MoltenVK on macOS, native on Linux/Windows).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub fn is_vulkan_available() -> bool {
     vulkan_device().is_some()
 }
 
 /// No Vulkan in the browser.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub fn is_vulkan_available() -> bool {
     false
 }
 
 /// Get or initialize the global wgpu device singleton. Returns None
 /// on systems with no compatible adapter.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub fn wgpu_device() -> Option<&'static WgpuDevice> {
     if BACKEND_PREF.load(Ordering::SeqCst) == PREF_VULKAN {
         vulkan_device()
@@ -281,12 +301,12 @@ pub fn wgpu_device() -> Option<&'static WgpuDevice> {
 // startup from JS via `wasm-bindgen-futures`). After that completes,
 // [`wgpu_device`] returns the cached device synchronously, so the rest of
 // the (synchronous) backend is unchanged.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 static WASM_DEVICE: OnceLock<Option<WgpuDevice>> = OnceLock::new();
 
 /// Initialize the WebGPU device. Idempotent; returns `true` when a device
 /// is available. Must be awaited before any [`wgpu_device`] call on wasm.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub async fn init_wgpu_device() -> bool {
     if let Some(slot) = WASM_DEVICE.get() {
         return slot.is_some();
@@ -299,7 +319,7 @@ pub async fn init_wgpu_device() -> bool {
 
 /// Get the wgpu device. On wasm this returns `None` until
 /// [`init_wgpu_device`] has been awaited.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub fn wgpu_device() -> Option<&'static WgpuDevice> {
     WASM_DEVICE.get().and_then(|d| d.as_ref())
 }

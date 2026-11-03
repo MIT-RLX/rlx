@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! V-JEPA2-giant's `x · Wᵀ` shape (8192 tokens, 1408 → 6144) repeated, for
 //! profiling the SME route's packing against its kernel.
 fn main() {

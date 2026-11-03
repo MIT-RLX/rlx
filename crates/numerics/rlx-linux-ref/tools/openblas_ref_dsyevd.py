@@ -1,3 +1,7 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Reference for tests/fixtures/openblas_haswell_dsyevd.txt: run on the Linux reference
 # (msi: numpy 2.3.5 / scipy 1.17.1, both scipy-openblas 0.3.30 = OpenBLAS + its reference LAPACK):
 #   python -I tools/openblas_ref_dsyevd.py out.txt

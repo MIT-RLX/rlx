@@ -43,7 +43,7 @@ pub(crate) mod collections {
 }
 
 /// Float methods `core` lacks (they call the platform libm under `std`),
-/// supplied from the pure-Rust `libm` crate for the `no_std` subset.
+/// supplied from rlx-libm's Rust ports for the `no_std` subset.
 /// Inherent methods win where they exist, so this only fills gaps.
 #[cfg(not(any(feature = "std", test)))]
 pub(crate) trait FloatExt: Sized {
@@ -67,40 +67,40 @@ macro_rules! float_ext {
      $rint:ident, $trunc:ident, $log2:ident, $log10:ident, $pow:ident) => {
         impl FloatExt for $t {
             fn sqrt(self) -> Self {
-                libm::$sqrt(self)
+                float_fns::$sqrt(self)
             }
             fn sin(self) -> Self {
-                libm::$sin(self)
+                float_fns::$sin(self)
             }
             fn cos(self) -> Self {
-                libm::$cos(self)
+                float_fns::$cos(self)
             }
             fn floor(self) -> Self {
-                libm::$floor(self)
+                float_fns::$floor(self)
             }
             fn ceil(self) -> Self {
-                libm::$ceil(self)
+                float_fns::$ceil(self)
             }
             fn round(self) -> Self {
-                libm::$round(self)
+                float_fns::$round(self)
             }
             fn round_ties_even(self) -> Self {
-                libm::$rint(self)
+                float_fns::$rint(self)
             }
             fn fract(self) -> Self {
-                self - libm::$trunc(self)
+                self - float_fns::$trunc(self)
             }
             fn log2(self) -> Self {
-                libm::$log2(self)
+                float_fns::$log2(self)
             }
             fn log10(self) -> Self {
-                libm::$log10(self)
+                float_fns::$log10(self)
             }
             fn powf(self, n: Self) -> Self {
-                libm::$pow(self, n)
+                float_fns::$pow(self, n)
             }
             fn powi(self, n: i32) -> Self {
-                libm::$pow(self, n as $t)
+                float_fns::$pow(self, n as $t)
             }
         }
     };
@@ -109,6 +109,17 @@ macro_rules! float_ext {
 float_ext!(
     f32, sqrtf, sinf, cosf, floorf, ceilf, roundf, rintf, truncf, log2f, log10f, powf
 );
+/// rlx-libm has `sincosf` only; each half is the same rounding.
+#[cfg(not(any(feature = "std", test)))]
+mod float_fns {
+    pub use rlx_libm::*;
+    pub fn sinf(x: f32) -> f32 {
+        rlx_libm::sincosf(x).0
+    }
+    pub fn cosf(x: f32) -> f32 {
+        rlx_libm::sincosf(x).1
+    }
+}
 #[cfg(not(any(feature = "std", test)))]
 float_ext!(
     f64, sqrt, sin, cos, floor, ceil, round, rint, trunc, log2, log10, pow
@@ -210,6 +221,7 @@ pub mod quant;
 pub mod region_encode;
 #[cfg(feature = "std")]
 pub mod repr_check;
+pub mod reproducible;
 pub mod residual;
 /// Decode state inside the graph (`stateful_decode`).
 #[cfg(feature = "std")]
@@ -294,9 +306,12 @@ pub use equivalence::{
     IgnoreConfig, fingerprint, node_value_key, ops_deep_eq, structural_hash, structurally_eq,
 };
 pub use fft::{
-    FftAlgo, FftContraction, FftGpuPlan, FftMeta, FftNorm, FftTwiddles, fft_meta, fftn_axes_all,
-    normalize_fftn_axes,
+    FftAlgo, FftContraction, FftGpuPlan, FftMeta, FftNorm, FftPolicy, FftTwiddles, fft_meta,
+    fftn_axes_all, normalize_fftn_axes,
 };
+// The process-wide policy (`RLX_FFT`) needs `std`'s env and locks.
+#[cfg(feature = "std")]
+pub use fft::{apply_fft_policy, fft_policy, resolve_fft_algo, set_fft_policy};
 pub use gdn::GdnBackwardLayout;
 pub use graph::{Graph, Node, NodeId};
 pub use hir::{

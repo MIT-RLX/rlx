@@ -62,7 +62,7 @@ fn dq_read_f16(rel: u32) -> f32 {
     var v: f32;
     if (exp == 0u) { v = f32(mant) / 1024.0 * exp2(-14.0); }
     else if (exp == 31u) { v = bitcast<f32>(select(0u, 0x7f800000u, mant == 0u)); }
-    else { v = (1.0 + f32(mant) / 1024.0) * exp2(f32(i32(exp) - 15)); }
+    else { v = (1.0 + f32(mant) / 1024.0) * ldexp(1.0, i32(exp) - 15); }
     return select(v, -v, sign != 0u);
 }
 
@@ -647,7 +647,7 @@ fn fp8_dec(c: u32, e5: bool) -> f32 {
         let e = (c >> 3u) & 15u;
         let m = c & 7u;
         v = select(bitcast<f32>(((e + 120u) << 23u) | (m << 20u)), f32(m) * 0.001953125, e == 0u);
-        if ((c & 0x7Fu) == 0x7Fu) { v = bitcast<f32>(0x7FC00000u); }
+        if ((c & 0x7Fu) == 0x7Fu) { v = bitcast<f32>((c & 0u) | 0x7FC00000u); }
     }
     return select(v, -v, (c & 0x80u) != 0u);
 }

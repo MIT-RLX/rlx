@@ -10,7 +10,7 @@ defmodule Rlx.MixProject do
   def project do
     [
       app: :rlx,
-      version: "0.2.19",
+      version: "0.2.20",
       elixir: "~> 1.18",
       description: "Elixir bindings for rlx over its C ABI.",
       package: [licenses: ["MIT", "Apache-2.0"], files: ~w(lib c_src Makefile mix.exs README.md)],

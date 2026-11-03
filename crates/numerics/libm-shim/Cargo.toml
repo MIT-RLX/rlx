@@ -1,0 +1,21 @@
+[package]
+name = "libm"
+# Above crates.io's 0.2.16 so `libm = "0.2"` requirements (naga, num-traits)
+# resolve here through the workspace `[patch.crates-io]`; the validation
+# dev-dependencies pin `=0.2.16`, the real musl crate.
+version = "0.2.17"
+edition.workspace      = true
+rust-version.workspace = true
+description = "The `libm` API for rlx's third-party dependencies (naga, num-traits), answered by rlx-libm's Rust ports — no musl copy in the build"
+license.workspace      = true
+publish = false
+
+[lib]
+name = "libm"
+path = "src/lib.rs"
+
+[dependencies]
+rlx-libm = { path = "../rlx-libm", version = "0.2.20", default-features = false }
+
+[lints]
+workspace = true

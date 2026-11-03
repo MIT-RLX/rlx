@@ -254,6 +254,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RLX_MLX_JOBS");
     println!("cargo:rerun-if-env-changed=RLX_MLX_CCACHE");
     println!("cargo:rerun-if-env-changed=RLX_MLX_NO_CCACHE");
+    println!("cargo:rerun-if-env-changed=CMAKE_CXX_COMPILER_LAUNCHER");
+    println!("cargo:rerun-if-env-changed=CMAKE_C_COMPILER_LAUNCHER");
 
     let mut mlx_cfg = cmake::Config::new(&mlx_src);
     mlx_cfg
@@ -747,8 +749,9 @@ fn apply_cmake_parallelism(cfg: &mut cmake::Config) {
 }
 
 /// The compiler cache for MLX's C++/CUDA sources: `RLX_MLX_CCACHE`
-/// (`sccache`, `ccache`, a path, or `off`), else sccache, else ccache — the
-/// first one that runs. Not used on Windows: the Visual Studio generator the
+/// (`sccache`, `ccache`, a path, or `off`), else the environment's
+/// `CMAKE_CXX_COMPILER_LAUNCHER` / `CMAKE_C_COMPILER_LAUNCHER`, else sccache,
+/// else ccache — the first one that runs. Not used on Windows: the Visual Studio generator the
 /// `cmake` crate picks there ignores compiler launchers.
 fn compiler_launcher() -> Option<String> {
     let runs = |exe: &str| {
@@ -778,10 +781,21 @@ fn compiler_launcher() -> Option<String> {
                 None
             }
         }
-        None => ["sccache", "ccache"]
+        // The machine's own launcher (`[env] CMAKE_CXX_COMPILER_LAUNCHER` in
+        // cargo's config, e.g. kache) wins over a guess: picking sccache here
+        // when `c++` is already a cache shim whose fallback is sccache makes
+        // the sccache server wait on itself, and the MLX build hangs.
+        None => ["CMAKE_CXX_COMPILER_LAUNCHER", "CMAKE_C_COMPILER_LAUNCHER"]
             .into_iter()
-            .find(|exe| runs(exe))
-            .map(str::to_string),
+            .filter_map(|k| env::var(k).ok())
+            .map(|v| v.trim().to_string())
+            .find(|v| !v.is_empty() && runs(v))
+            .or_else(|| {
+                ["sccache", "ccache"]
+                    .into_iter()
+                    .find(|exe| runs(exe))
+                    .map(str::to_string)
+            }),
     }
 }
 

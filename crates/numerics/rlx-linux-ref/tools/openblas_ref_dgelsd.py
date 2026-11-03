@@ -1,3 +1,7 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Reference for tests/fixtures/openblas_haswell_dgelsd.txt: run on the Linux reference
 # (msi: numpy 2.3.5, OpenBLAS 0.3.30 + its reference LAPACK): python -I tools/openblas_ref_dgelsd.py out.txt
 # np.linalg.lstsq(A, B, rcond) → dgelsd. One line per case:

@@ -606,12 +606,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libm"
-version = "0.2.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -792,28 +786,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "onig"
-version = "6.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cc3cbf698f9438986c11a880c90a6d04b9de27575afd28bbf45b154b6c709e2"
-dependencies = [
- "bitflags",
- "libc",
- "once_cell",
- "onig_sys",
-]
-
-[[package]]
-name = "onig_sys"
-version = "69.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e68317604e77e53b85896388e1a803c1d21b74c899ec9e5e1112db90735edd7"
-dependencies = [
- "cc",
- "pkg-config",
-]
-
-[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -878,12 +850,6 @@ dependencies = [
  "fixedbitset",
  "indexmap",
 ]
-
-[[package]]
-name = "pkg-config"
-version = "0.3.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "ppv-lite86"
@@ -1163,7 +1129,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rlx-autodiff"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "half",
  "rlx-fusion",
@@ -1173,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bind"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-dduf",
@@ -1192,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-capi"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-bind",
  "rlx-ir",
@@ -1210,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-compile"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-autodiff",
  "rlx-fusion",
@@ -1219,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-coreml"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "bytemuck",
  "cc",
@@ -1236,24 +1202,27 @@ dependencies = [
 
 [[package]]
 name = "rlx-cpu"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "half",
- "libm",
+ "libc",
  "rayon",
+ "rlx-fastmath",
  "rlx-gguf",
  "rlx-ir",
+ "rlx-libm",
  "rlx-linux-ref",
  "rlx-mlx-io",
  "rlx-opt",
  "rlx-pocketfft",
+ "rlx-unfuse",
  "rlxsl",
  "strum_macros",
 ]
 
 [[package]]
 name = "rlx-dduf"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -1264,15 +1233,19 @@ dependencies = [
 
 [[package]]
 name = "rlx-driver"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "half",
  "rlx-ir",
 ]
 
 [[package]]
+name = "rlx-fastmath"
+version = "0.2.20"
+
+[[package]]
 name = "rlx-fusion"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-ir",
  "rlx-pocketfft",
@@ -1280,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gguf"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1293,15 +1266,15 @@ dependencies = [
 
 [[package]]
 name = "rlx-gpu-dispatch"
-version = "0.2.19"
+version = "0.2.20"
 
 [[package]]
 name = "rlx-ir"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "aes",
  "bincode",
- "libm",
+ "rlx-libm",
  "serde",
  "serde_json",
  "smallvec",
@@ -1309,18 +1282,18 @@ dependencies = [
 
 [[package]]
 name = "rlx-libm"
-version = "0.2.19"
+version = "0.2.20"
 
 [[package]]
 name = "rlx-linux-ref"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-libm",
 ]
 
 [[package]]
 name = "rlx-macros"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1329,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx-io"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -1346,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-model-plugin"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -1356,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-nemo"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -1366,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-opt"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -1376,11 +1349,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-optim"
-version = "0.2.19"
+version = "0.2.20"
 
 [[package]]
 name = "rlx-pkg"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1391,17 +1364,17 @@ dependencies = [
  "rlx-ir",
  "rlx-mlx-io",
  "rlx-nemo",
- "ruzstd",
  "serde",
  "serde_json",
  "serde_yaml",
  "xxhash-rust",
  "zip",
+ "zstd-rs",
 ]
 
 [[package]]
 name = "rlx-pocketfft"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-libm",
  "rlx-linux-ref",
@@ -1409,7 +1382,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-runtime"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -1437,11 +1410,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-search"
-version = "0.2.19"
+version = "0.2.20"
 
 [[package]]
 name = "rlx-text"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "minijinja",
@@ -1454,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-torch-ckpt"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "flate2",
@@ -1462,8 +1435,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-unfuse"
+version = "0.2.20"
+dependencies = [
+ "rlx-ir",
+]
+
+[[package]]
 name = "rlxsl"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-ir",
 ]
@@ -1486,15 +1466,6 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
-
-[[package]]
-name = "ruzstd"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
-dependencies = [
- "twox-hash",
-]
 
 [[package]]
 name = "ryu"
@@ -1723,7 +1694,6 @@ dependencies = [
  "log",
  "macro_rules_attribute",
  "monostate",
- "onig",
  "paste",
  "rand",
  "rayon",
@@ -1738,12 +1708,6 @@ dependencies = [
  "unicode-segmentation",
  "unicode_categories",
 ]
-
-[[package]]
-name = "twox-hash"
-version = "2.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typed-path"
@@ -1943,3 +1907,9 @@ dependencies = [
  "log",
  "simd-adler32",
 ]
+
+[[package]]
+name = "zstd-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41514ccc30389f95bb9e6ab6d5634f17121c7b4fead6722a5fceec1c7891d78f"

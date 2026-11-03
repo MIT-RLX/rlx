@@ -65,7 +65,7 @@ For C++, compile `mnist.cpp` with `arm-none-eabi-g++ -std=c++17
 Every build prints:
 
 ```
-rlx-micro 0.2.19
+rlx-micro 0.2.20
 mnist: digit 7 (label 7)
 dense: 1.00 4.00
 ```

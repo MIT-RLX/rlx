@@ -381,7 +381,7 @@ impl WgpuExecutable {
     /// (GGUF dequant, LSTM/GRU, GatedDeltaNet, FFT-host, …) map intermediate
     /// results back mid-graph, which would block the browser. Such graphs
     /// panic with a clear message rather than hang.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     pub async fn run_async(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         self.run_read_outputs_async(inputs, None).await
     }
@@ -389,7 +389,7 @@ impl WgpuExecutable {
     /// [`Self::run_read_outputs`] for the browser: only `read_indices` come
     /// back, and bound GPU handles are fed from their outputs on the device,
     /// so a decode loop's state stays resident between steps.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     pub async fn run_read_outputs_async(
         &mut self,
         inputs: &[(&str, &[f32])],
@@ -401,7 +401,7 @@ impl WgpuExecutable {
         outs
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     async fn run_async_inner(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         // Name what is actually in the way. "Contains host-executed ops (GGUF
         // dequant, LSTM, collectives, FFT-host, …)" listed what it might have
@@ -631,7 +631,7 @@ impl WgpuExecutable {
         // below would spin forever (an exgb sweep sat at 0% CPU in Chrome). Fail
         // with the way out instead. `run_async` and the snapshot replay set
         // `dispatch_only` and read back without blocking.
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         assert!(
             self.dispatch_only,
             "rlx-wgpu: a synchronous `run` on WebGPU cannot read its results back in \

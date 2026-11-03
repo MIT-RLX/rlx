@@ -645,31 +645,34 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                                 for ki in 0..s_k {
                                     let q_off = qi * head_dim;
                                     let k_off = ki * head_dim;
-                                    #[cfg(rlx_cpu_neon)]
-                                    let mut dot;
-                                    #[cfg(not(rlx_cpu_neon))]
                                     let mut dot = 0f32;
-                                    #[cfg(rlx_cpu_neon)]
-                                    unsafe {
-                                        use std::arch::aarch64::*;
-                                        let chunks = head_dim / 4;
-                                        let mut acc = vdupq_n_f32(0.0);
-                                        for c in 0..chunks {
-                                            let vq = vld1q_f32(q_head.as_ptr().add(q_off + c * 4));
-                                            let vk = vld1q_f32(k_head.as_ptr().add(k_off + c * 4));
-                                            acc = vfmaq_f32(acc, vq, vk);
+                                    neon_or!(
+                                        {
+                                            unsafe {
+                                                use std::arch::aarch64::*;
+                                                let chunks = head_dim / 4;
+                                                let mut acc = vdupq_n_f32(0.0);
+                                                for c in 0..chunks {
+                                                    let vq = vld1q_f32(
+                                                        q_head.as_ptr().add(q_off + c * 4),
+                                                    );
+                                                    let vk = vld1q_f32(
+                                                        k_head.as_ptr().add(k_off + c * 4),
+                                                    );
+                                                    acc = vfmaq_f32(acc, vq, vk);
+                                                }
+                                                dot = vaddvq_f32(acc);
+                                                for d in (chunks * 4)..*head_dim {
+                                                    dot += q_head[q_off + d] * k_head[k_off + d];
+                                                }
+                                            }
+                                        },
+                                        {
+                                            for d in 0..*head_dim {
+                                                dot += q_head[q_off + d] * k_head[k_off + d];
+                                            }
                                         }
-                                        dot = vaddvq_f32(acc);
-                                        for d in (chunks * 4)..*head_dim {
-                                            dot += q_head[q_off + d] * k_head[k_off + d];
-                                        }
-                                    }
-                                    #[cfg(not(rlx_cpu_neon))]
-                                    {
-                                        for d in 0..*head_dim {
-                                            dot += q_head[q_off + d] * k_head[k_off + d];
-                                        }
-                                    }
+                                    );
                                     scores[qi * s_k + ki] = dot * scale;
                                 }
                             }
@@ -753,27 +756,33 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                                     if sc > 1e-8 {
                                         let v_off = ki * head_dim;
                                         let o_off = qi * head_dim;
-                                        #[cfg(rlx_cpu_neon)]
-                                        unsafe {
-                                            use std::arch::aarch64::*;
-                                            let vsc = vdupq_n_f32(sc);
-                                            let chunks = head_dim / 4;
-                                            for c in 0..chunks {
-                                                let off = c * 4;
-                                                let vo =
-                                                    vld1q_f32(out_head.as_ptr().add(o_off + off));
-                                                let vv =
-                                                    vld1q_f32(v_head.as_ptr().add(v_off + off));
-                                                vst1q_f32(
-                                                    out_head.as_mut_ptr().add(o_off + off),
-                                                    vfmaq_f32(vo, vsc, vv),
-                                                );
+                                        neon_or!(
+                                            {
+                                                unsafe {
+                                                    use std::arch::aarch64::*;
+                                                    let vsc = vdupq_n_f32(sc);
+                                                    let chunks = head_dim / 4;
+                                                    for c in 0..chunks {
+                                                        let off = c * 4;
+                                                        let vo = vld1q_f32(
+                                                            out_head.as_ptr().add(o_off + off),
+                                                        );
+                                                        let vv = vld1q_f32(
+                                                            v_head.as_ptr().add(v_off + off),
+                                                        );
+                                                        vst1q_f32(
+                                                            out_head.as_mut_ptr().add(o_off + off),
+                                                            vfmaq_f32(vo, vsc, vv),
+                                                        );
+                                                    }
+                                                }
+                                            },
+                                            {
+                                                for d in 0..*head_dim {
+                                                    out_head[o_off + d] += sc * v_head[v_off + d];
+                                                }
                                             }
-                                        }
-                                        #[cfg(not(rlx_cpu_neon))]
-                                        for d in 0..*head_dim {
-                                            out_head[o_off + d] += sc * v_head[v_off + d];
-                                        }
+                                        );
                                     }
                                 }
                             }

@@ -644,6 +644,30 @@ swift-xcframework:
 env-catalog:
     cargo run -q -p rlx-ir --example env_catalog
 
+# rlx-libm's ports against musl's independent algorithms (the real `libm`
+# crate). A standalone workspace: rlx patches crates.io's `libm` with
+# rlx-libm (`crates/numerics/libm-shim`), so the workspace has only that one.
+test-libm-vs-musl:
+    CARGO_TARGET_DIR=target/vs-musl cargo test --release --manifest-path crates/numerics/rlx-libm/tools/vs-musl/Cargo.toml
+
+# rlx-libm against glibc 2.43 in every configuration the workspace `cargo test`
+# skips: no_std, `export-glibc` (std's float methods are the ports), the
+# Apple reference (`libm`), plus the musl second opinion. The hashed vectors
+# (`tests/glibc_2_43_vectors.rs`) cover every exported function on both
+# x86-64 and aarch64 glibc and fail on an export without vectors.
+test-libm: test-libm-vs-musl
+    cargo test --release -p rlx-libm
+    cargo test --release -p rlx-libm --no-default-features
+    cargo test --release -p rlx-libm --features export-glibc
+    cargo test --release -p rlx-libm --features libm,export-glibc
+    cargo test --release -p libm
+
+# Every one-argument f32 port on all 2^32 inputs against the stored glibc
+# hashes (x86-64 and aarch64), on any OS; minutes on every core. Regenerate
+# the hashes on Linux with `tools/glibc-exhaustive` (it lists mismatches).
+test-libm-exhaustive:
+    cargo test --release -p rlx-libm --test f32_exhaustive -- --ignored --test-threads=1 --nocapture
+
 # rlx-fpga once claimed `no_std` while depending on std-only rlx-ir, and no
 # gate built it that way, so nothing noticed (GitHub issue #7).
 # no_std crates (rlx-ir core, rlx-cortexm, rlx-fpga) build for bare metal + host tests
@@ -1104,7 +1128,7 @@ run-verbose CMD:
     RLX_VERBOSE=1 {{CMD}}
 
 # Quick basic test of the workspace: build + test + lint + fast smokes.
-ci: build test fmt-check lint check-no-std check-rlx-env-vars check-example-names check-doc-links check-readme check-rustdoc check-license-headers check-corpus check-bindings check-binding-versions check-wasm test-pyrlx test-third-order-gpu test-rocm leak-check validate-metal-bindings
+ci: build test fmt-check lint check-no-std test-libm check-rlx-env-vars check-example-names check-doc-links check-readme check-rustdoc check-license-headers check-corpus check-bindings check-binding-versions check-wasm test-pyrlx test-third-order-gpu test-rocm leak-check validate-metal-bindings
 
 # ROCm compile check + graph_devices parity (tests skip when HIP unavailable).
 #

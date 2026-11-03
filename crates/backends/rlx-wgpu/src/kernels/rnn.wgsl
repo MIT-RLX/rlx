@@ -67,7 +67,7 @@ fn rnn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid:
             if (params.relu != 0u) {
                 h_k = max(acc, 0.0);
             } else {
-                h_k = tanh(acc);
+                h_k = rlx_tanh(acc);
             }
         }
         workgroupBarrier();

@@ -188,6 +188,10 @@ pub enum Twiddles {
     /// Separate `cos` and `sin` calls: Apple's libm, or glibc's (Linux, and its
     /// pure-Rust port in [`rlx_libm`] on wasm).
     Separate,
+    /// The Linux x86-64 SciPy build's twiddles on every host: separate calls to
+    /// glibc's `cos` / `sin` (rlx-libm's ports) and the x87 `long double` angle.
+    /// The choice for results that must be identical on every platform and device.
+    Linux,
 }
 
 impl Twiddles {
@@ -200,7 +204,7 @@ impl Twiddles {
             // the platform's reference, which `use_linux_reference` can make Linux's
             Twiddles::Platform => rlx_libm::platform::macos_reference(),
             Twiddles::AppleSinCos => cfg!(target_os = "macos"),
-            Twiddles::Separate => false,
+            Twiddles::Separate | Twiddles::Linux => false,
         }
     }
 }
@@ -258,7 +262,13 @@ impl Options {
 
 /// `(cos a, sin a)`.
 #[inline(never)]
-fn cos_sin(a: f64, merged: bool) -> (f64, f64) {
+fn cos_sin(a: f64, merged: bool, linux: bool) -> (f64, f64) {
+    if linux {
+        return (
+            rlx_libm::cos(std::hint::black_box(a)),
+            rlx_libm::sin(std::hint::black_box(a)),
+        );
+    }
     // Apple's merged `__sincos_stret` (the macOS scipy twiddles) with
     // rlx-libm's `libm` feature; the Rust ports otherwise.
     if merged {
@@ -272,9 +282,9 @@ fn cos_sin(a: f64, merged: bool) -> (f64, f64) {
 }
 
 /// `sincos_2pibyn<T>::calc(x, n, ang)` (in `f64`).
-fn calc(x: usize, n: usize, ang: f64, merged: bool) -> Cx<f64> {
+fn calc(x: usize, n: usize, ang: f64, merged: bool, linux: bool) -> Cx<f64> {
     let mut x = x << 3;
-    let c = |v: usize| cos_sin(v as f64 * ang, merged);
+    let c = |v: usize| cos_sin(v as f64 * ang, merged, linux);
     if x < 4 * n {
         if x < 2 * n {
             if x < n {
@@ -323,8 +333,13 @@ struct SinCos2PiByN {
 impl SinCos2PiByN {
     fn new(n: usize, tw: Twiddles) -> Self {
         let merged = tw.merged();
+        let linux = tw == Twiddles::Linux;
         // Thigh(0.25L*pi/n): long double is double on Apple arm64, x87 on x86-64 Linux
-        let ang = crate::x87::quarter_pi_over(n);
+        let ang = if linux {
+            crate::x87::quarter_pi_over_as(n, true)
+        } else {
+            crate::x87::quarter_pi_over(n)
+        };
         let nval = (n + 2) / 2;
         let mut shift = 1u32;
         while (1usize << shift) * (1usize << shift) < nval {
@@ -333,11 +348,11 @@ impl SinCos2PiByN {
         let mask = (1usize << shift) - 1;
         let mut v1 = vec![Cx { r: 1.0, i: 0.0 }; mask + 1];
         for (i, v) in v1.iter_mut().enumerate().skip(1) {
-            *v = calc(i, n, ang, merged);
+            *v = calc(i, n, ang, merged, linux);
         }
         let mut v2 = vec![Cx { r: 1.0, i: 0.0 }; nval.div_ceil(mask + 1)];
         for (i, v) in v2.iter_mut().enumerate().skip(1) {
-            *v = calc(i * (mask + 1), n, ang, merged);
+            *v = calc(i * (mask + 1), n, ang, merged, linux);
         }
         SinCos2PiByN {
             n,

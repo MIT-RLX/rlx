@@ -2467,7 +2467,7 @@ pub unsafe fn execute_gated_delta_net_f32(
         } else {
             for bi in 0..b {
                 owned_state.fill(0.0);
-                #[cfg(not(target_arch = "wasm32"))]
+                #[cfg(not(target_family = "wasm"))]
                 {
                     use rayon::prelude::*;
                     owned_state
@@ -2478,7 +2478,7 @@ pub unsafe fn execute_gated_delta_net_f32(
                             run_head(bi, hi, s_mat, &mut sk_buf[..n]);
                         });
                 }
-                #[cfg(target_arch = "wasm32")]
+                #[cfg(target_family = "wasm")]
                 {
                     owned_state
                         .chunks_mut(n * n)

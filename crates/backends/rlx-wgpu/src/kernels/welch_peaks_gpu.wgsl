@@ -32,7 +32,7 @@ fn welch_peaks_gpu(
 
     let n_fft = params.n_fft;
     let n_bins = params.n_bins;
-    let inv = 1.0 / f32(params.n_segments);
+    let inv = rlx_div_rn(1.0, f32(params.n_segments));
     let row_len = n_fft * 2u;
 
     var psd: array<f32, MAX_BINS>;

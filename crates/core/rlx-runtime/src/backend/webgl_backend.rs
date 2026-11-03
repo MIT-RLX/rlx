@@ -11,7 +11,7 @@ pub struct WebglBackend;
 struct WebglExecutable {
     plan: Plan,
     params: HashMap<String, Vec<f32>>,
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     gl: Option<rlx_webgl::exec_gl::GlBackend>,
 }
 
@@ -32,7 +32,7 @@ impl Backend for WebglBackend {
         // Natively `OpenGl` runs the plan on the CPU, where no texture limit
         // applies — so check the one browsers impose, or a graph that passes
         // every native test fails in the tab. `RLX_WEBGL_MAX_TEXTURE` sets it.
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             let limit = rlx_ir::env::parse_or("RLX_WEBGL_MAX_TEXTURE", 16384usize);
             if let Some((origin, rows, cols)) = plan.largest_texture()
@@ -48,7 +48,7 @@ impl Backend for WebglBackend {
         Box::new(WebglExecutable {
             plan,
             params: HashMap::new(),
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             gl: None,
         })
     }
@@ -66,7 +66,7 @@ impl ExecutableGraph for WebglExecutable {
         self.params.insert(name.to_string(), data.to_vec());
         // The GL side caches param textures across runs; a new value must
         // be uploaded again.
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         if let Some(gl) = &self.gl {
             gl.forget_param(name);
         }
@@ -77,7 +77,7 @@ impl ExecutableGraph for WebglExecutable {
         for (name, data) in &self.params {
             named.push((name.as_str(), data.as_slice()));
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             let gl = self.gl.get_or_insert_with(|| {
                 rlx_webgl::exec_gl::GlBackend::new()
@@ -86,7 +86,7 @@ impl ExecutableGraph for WebglExecutable {
             gl.run(&self.plan, &named)
                 .unwrap_or_else(|e| panic!("rlx-webgl run failed: {}", e.0))
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             rlx_webgl::run_cpu(&self.plan, &named)
                 .unwrap_or_else(|e| panic!("rlx-webgl run_cpu failed: {}", e.0))
@@ -97,7 +97,7 @@ impl ExecutableGraph for WebglExecutable {
         Box::new(WebglExecutable {
             plan: self.plan.clone(),
             params: self.params.clone(),
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             gl: None,
         })
     }

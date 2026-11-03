@@ -1,0 +1,16 @@
+# Validation tool, not part of the workspace or of rlx: the glibc ports
+# against musl's independent algorithms (the real `libm` crate). Its own
+# workspace, so rlx's `[patch.crates-io] libm` (the rlx-libm shim) does not
+# apply and `libm` here is musl. Run with `just test-libm-vs-musl`, or
+#   cargo test --release --manifest-path tools/vs-musl/Cargo.toml
+[package]
+name = "rlx-libm-vs-musl"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dev-dependencies]
+rlx-libm = { path = "../.." }
+libm = "=0.2.16"
+
+[workspace]

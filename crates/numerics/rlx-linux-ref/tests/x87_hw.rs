@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `rlx_linux_ref::x87::F80` against x87 hardware (`tests/fixtures/x87_ops.txt` from
 //! `tools/x87_ref.c` on x86-64 Linux): every 80-bit result and its store to double.
 

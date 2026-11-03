@@ -148,6 +148,7 @@ pub fn is_elidable_bank_transpose_gated(
     if !matches!(&node.op, Op::Transpose { perm } if perm.as_slice() == [0, 2, 1])
         || node.shape.rank() != 3
         || node.shape.dtype() != rlx_ir::DType::F32
+        || graph.outputs.contains(&node.id)
     {
         return false;
     }
@@ -206,7 +207,7 @@ pub const SMALL_M_GROUPED: usize = 4;
 /// Sole use, matching the fold: a transpose read by anything other than the one
 /// matmul must stay materialized.
 pub fn is_elidable_matmul_transpose(graph: &Graph, node: &rlx_ir::Node) -> bool {
-    if !is_matmul_fold_transpose(node) {
+    if !is_matmul_fold_transpose(graph, node) {
         return false;
     }
     let mut reader: Option<&rlx_ir::Node> = None;
@@ -233,16 +234,20 @@ pub fn is_elidable_matmul_transpose_indexed(
     node: &rlx_ir::Node,
     readers: &ReaderIndex,
 ) -> bool {
-    is_matmul_fold_transpose(node)
+    is_matmul_fold_transpose(graph, node)
         && readers
             .sole_reader(node.id)
             .is_some_and(|mm| folds_into_matmul(graph, graph.node(mm)))
 }
 
-/// A 2-D `[1, 0]` transpose: the only kind the matmul fold takes.
-fn is_matmul_fold_transpose(node: &rlx_ir::Node) -> bool {
+/// A 2-D `[1, 0]` transpose: the only kind the matmul fold takes. Never a
+/// graph output: that is read back, so it has to be written (a per-node tap
+/// makes every interior transpose one — folded, it had no slot and the CPU
+/// read-back dereferenced an unplanned offset).
+fn is_matmul_fold_transpose(graph: &Graph, node: &rlx_ir::Node) -> bool {
     matches!(&node.op, Op::Transpose { perm } if perm.as_slice() == [1, 0])
         && node.shape.rank() == 2
+        && !graph.outputs.contains(&node.id)
 }
 
 /// Whether `mm`, the sole reader of a transpose, is a matmul the fold fires

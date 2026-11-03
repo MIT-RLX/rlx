@@ -6,7 +6,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>org.rlx</groupId>
   <artifactId>rlx</artifactId>
-  <version>0.2.19</version>
+  <version>0.2.20</version>
   <name>rlx</name>
   <description>Java bindings for rlx over its C ABI (the FFM API, Java 22+).</description>
   <licenses>

@@ -1,3 +1,7 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Reference for tests/vectors/glibc_aarch64_f32.txt: glibc's logf / sincosf on Linux aarch64 (the torch
 # reference: Docker image exg-ref/fnirsatlas-linux-aarch64, glibc of python:3.12-slim), called through ctypes:
 #   docker run --rm -v $PWD:/w <image> /opt/fnirsatlas-ref/.venv/bin/python -I /w/tools/glibc_ref_f32.py /w/tests/vectors/glibc_aarch64_f32.txt

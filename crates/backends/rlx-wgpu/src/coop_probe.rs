@@ -277,9 +277,10 @@ pub fn probe_source(
     entry: &str,
 ) -> Option<bool> {
     let operands = plan(which).operands;
+    let wgsl = crate::kernels::with_numeric_helpers(wgsl);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("rlx-wgpu coop probe (ad-hoc)"),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        source: wgpu::ShaderSource::Wgsl(wgsl.as_ref().into()),
     });
     let bgl = probe_bgl(device, operands);
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

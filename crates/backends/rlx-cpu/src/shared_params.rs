@@ -15,7 +15,10 @@
 //! still see one buffer and the same offsets.
 //!
 //! The Metal backend does the same with Mach memory entries
-//! (`rlx_metal::shared_weights`); this is the POSIX version.
+//! (`rlx_metal::shared_weights`); this is the POSIX version. Elsewhere (wasm,
+//! Windows) [`SUPPORTED`] is false and the registry is compiled but inert.
+
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};

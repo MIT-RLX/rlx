@@ -1,0 +1,2 @@
+# The standalone validation tools build here when run without CARGO_TARGET_DIR.
+*/target/

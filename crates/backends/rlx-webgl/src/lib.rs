@@ -30,7 +30,7 @@ pub mod host;
 pub mod linalg;
 pub mod plan;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub mod exec_gl;
 
 pub use exec_cpu::run_cpu;

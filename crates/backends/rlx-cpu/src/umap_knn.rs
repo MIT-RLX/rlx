@@ -10,13 +10,13 @@
 //! - **Small `n`**: tight serial row loop (low fixed cost).
 //! - **Large `n`**: Rayon row parallelism when `n * n` is big enough to amortize.
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use rayon::prelude::*;
 
 const INFINITY: f32 = f32::MAX;
 /// Parallelize rows when the pairwise matrix has at least this many elements.
 /// (Unused on wasm — the browser is single-threaded, so rows run serially.)
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 const PARALLEL_MIN_ELEMS: usize = 64 * 64;
 
 /// Forward k-NN: for each row, select `k` smallest off-diagonal distances.
@@ -28,7 +28,7 @@ pub fn knn_forward_packed(pairwise: &[f32], n: usize, k: usize, packed: &mut [f3
     assert_eq!(packed.len(), n * 2 * k);
     assert!(k < n, "k ({k}) must be strictly less than n ({n})");
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     if n * n >= PARALLEL_MIN_ELEMS {
         packed
             .par_chunks_mut(2 * k)
@@ -96,7 +96,7 @@ pub fn knn_backward_pairwise(
     let eps = 1e-8f32;
     d_pairwise.fill(0.0);
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     if n * n >= PARALLEL_MIN_ELEMS {
         d_pairwise
             .par_chunks_mut(n)

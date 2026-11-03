@@ -77,7 +77,7 @@ fn reduce(
                 }
             }
             if (params.op == 1u) {
-                acc = acc / f32(params.reduce_dim);
+                acc = rlx_div_rn(acc, f32(params.reduce_dim));
             }
             arena[params.out_off + outer_idx * params.inner + inner_idx] = acc;
         }
@@ -150,7 +150,7 @@ fn reduce(
     if (tid == 0u) {
         var final_acc = scratch[0];
         if (params.op == 1u) {
-            final_acc = final_acc / f32(params.reduce_dim);
+            final_acc = rlx_div_rn(final_acc, f32(params.reduce_dim));
         }
         arena[params.out_off + outer_idx * params.inner + inner_idx] = final_acc;
     }

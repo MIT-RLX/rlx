@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Reference for tests/fixtures/x87_ops.txt (rlx-libm `x87`): run on an x86-64 Linux host
 // (x87 default precision control = extended):  cc -O0 x87_ref.c -o x87_ref && ./x87_ref > x87_ops.txt
 // Inputs: the xorshift64 stream u = (s >> 11) / 2^53 * 2 - 1, scaled by 2^k (k in -40..40).

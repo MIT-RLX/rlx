@@ -860,7 +860,7 @@ pub trait ExecutableGraph: Send {
 
     /// True when the lowered wgpu schedule contains host-executed steps
     /// (unsupported on browser WebGPU). Default: false.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     fn wgpu_requires_host(&self) -> bool {
         false
     }
@@ -880,7 +880,7 @@ pub trait ExecutableGraph: Send {
     ///
     /// Futures are **not** `Send` on wasm — WebGPU buffer mapping uses
     /// `Rc`/`RefCell` and browser callbacks that are single-threaded.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     fn wgpu_run_async<'a>(
         &'a mut self,
         _inputs: &'a [(&'a str, &'a [f32])],

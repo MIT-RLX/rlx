@@ -59,7 +59,8 @@ unsafe extern "C" {
         ldc: i32,
     );
 
-    fn cblas_sgemv(
+    #[link_name = "cblas_sgemv"]
+    fn vendor_cblas_sgemv(
         order: i32,
         trans: i32,
         m: i32,
@@ -74,7 +75,8 @@ unsafe extern "C" {
         incy: i32,
     );
 
-    fn cblas_sger(
+    #[link_name = "cblas_sger"]
+    fn vendor_cblas_sger(
         order: i32,
         m: i32,
         n: i32,
@@ -87,8 +89,374 @@ unsafe extern "C" {
         lda: i32,
     );
 
-    fn cblas_sscal(n: i32, alpha: f32, x: *mut f32, incx: i32);
+    #[link_name = "cblas_sscal"]
+    fn vendor_cblas_sscal(n: i32, alpha: f32, x: *mut f32, incx: i32);
 }
+
+// ── Vendor / portable dispatch ─────────────────────────────────────────
+
+// Each vendor BLAS / LAPACK entry point, as a function of the same name that
+// takes the portable fallback (`fb_*`) under `crate::config::portable()`, so
+// the call sites are the same with and without a vendor BLAS linked.
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn cblas_sgemv(
+    order: i32,
+    trans: i32,
+    m: i32,
+    n: i32,
+    alpha: f32,
+    a: *const f32,
+    lda: i32,
+    x: *const f32,
+    incx: i32,
+    beta: f32,
+    y: *mut f32,
+    incy: i32,
+) {
+    if crate::config::portable() {
+        unsafe { fb_cblas_sgemv(order, trans, m, n, alpha, a, lda, x, incx, beta, y, incy) }
+    } else {
+        unsafe { vendor_cblas_sgemv(order, trans, m, n, alpha, a, lda, x, incx, beta, y, incy) }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn cblas_sger(
+    order: i32,
+    m: i32,
+    n: i32,
+    alpha: f32,
+    x: *const f32,
+    incx: i32,
+    y: *const f32,
+    incy: i32,
+    a: *mut f32,
+    lda: i32,
+) {
+    if crate::config::portable() {
+        unsafe { fb_cblas_sger(order, m, n, alpha, x, incx, y, incy, a, lda) }
+    } else {
+        unsafe { vendor_cblas_sger(order, m, n, alpha, x, incx, y, incy, a, lda) }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn cblas_sscal(n: i32, alpha: f32, x: *mut f32, incx: i32) {
+    if crate::config::portable() {
+        unsafe { fb_cblas_sscal(n, alpha, x, incx) }
+    } else {
+        unsafe { vendor_cblas_sscal(n, alpha, x, incx) }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn cblas_dgemm(
+    order: i32,
+    transa: i32,
+    transb: i32,
+    m: i32,
+    n: i32,
+    k: i32,
+    alpha: f64,
+    a: *const f64,
+    lda: i32,
+    b: *const f64,
+    ldb: i32,
+    beta: f64,
+    c: *mut f64,
+    ldc: i32,
+) {
+    if crate::config::portable() {
+        unsafe {
+            fb_cblas_dgemm(
+                order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+            )
+        }
+    } else {
+        unsafe {
+            vendor_cblas_dgemm(
+                order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+            )
+        }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn lapack_dgesv(
+    n: *const i32,
+    nrhs: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    ipiv: *mut i32,
+    b: *mut f64,
+    ldb: *const i32,
+    info_out: *mut i32,
+) {
+    if crate::config::portable() {
+        unsafe { fb_lapack_dgesv(n, nrhs, a, lda, ipiv, b, ldb, info_out) }
+    } else {
+        unsafe { vendor_lapack_dgesv(n, nrhs, a, lda, ipiv, b, ldb, info_out) }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn lapack_sgesv(
+    n: *const i32,
+    nrhs: *const i32,
+    a: *mut f32,
+    lda: *const i32,
+    ipiv: *mut i32,
+    b: *mut f32,
+    ldb: *const i32,
+    info_out: *mut i32,
+) {
+    if crate::config::portable() {
+        unsafe { fb_lapack_sgesv(n, nrhs, a, lda, ipiv, b, ldb, info_out) }
+    } else {
+        unsafe { vendor_lapack_sgesv(n, nrhs, a, lda, ipiv, b, ldb, info_out) }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn lapack_dpotrf(
+    uplo: *const i8,
+    n: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    info_out: *mut i32,
+) {
+    if crate::config::portable() {
+        unsafe { fb_lapack_dpotrf(uplo, n, a, lda, info_out) }
+    } else {
+        unsafe { vendor_lapack_dpotrf(uplo, n, a, lda, info_out) }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn lapack_dgetrf(
+    m: *const i32,
+    n: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    ipiv: *mut i32,
+    info_out: *mut i32,
+) {
+    if crate::config::portable() {
+        unsafe { fb_lapack_dgetrf(m, n, a, lda, ipiv, info_out) }
+    } else {
+        unsafe { vendor_lapack_dgetrf(m, n, a, lda, ipiv, info_out) }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn lapack_dsyevd(
+    jobz: *const i8,
+    uplo: *const i8,
+    n: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    w: *mut f64,
+    work: *mut f64,
+    lwork: *const i32,
+    iwork: *mut i32,
+    liwork: *const i32,
+    info_out: *mut i32,
+) {
+    if crate::config::portable() {
+        unsafe {
+            fb_lapack_dsyevd(
+                jobz, uplo, n, a, lda, w, work, lwork, iwork, liwork, info_out,
+            )
+        }
+    } else {
+        unsafe {
+            vendor_lapack_dsyevd(
+                jobz, uplo, n, a, lda, w, work, lwork, iwork, liwork, info_out,
+            )
+        }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn lapack_dgeqrf(
+    m: *const i32,
+    n: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    tau: *mut f64,
+    work: *mut f64,
+    lwork: *const i32,
+    info_out: *mut i32,
+) {
+    if crate::config::portable() {
+        unsafe { fb_lapack_dgeqrf(m, n, a, lda, tau, work, lwork, info_out) }
+    } else {
+        unsafe { vendor_lapack_dgeqrf(m, n, a, lda, tau, work, lwork, info_out) }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn lapack_dorgqr(
+    m: *const i32,
+    n: *const i32,
+    k: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    tau: *const f64,
+    work: *mut f64,
+    lwork: *const i32,
+    info_out: *mut i32,
+) {
+    if crate::config::portable() {
+        unsafe { fb_lapack_dorgqr(m, n, k, a, lda, tau, work, lwork, info_out) }
+    } else {
+        unsafe { vendor_lapack_dorgqr(m, n, k, a, lda, tau, work, lwork, info_out) }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn lapack_dgesvd(
+    jobu: *const i8,
+    jobvt: *const i8,
+    m: *const i32,
+    n: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    s: *mut f64,
+    u: *mut f64,
+    ldu: *const i32,
+    vt: *mut f64,
+    ldvt: *const i32,
+    work: *mut f64,
+    lwork: *const i32,
+    info_out: *mut i32,
+) {
+    if crate::config::portable() {
+        unsafe {
+            fb_lapack_dgesvd(
+                jobu, jobvt, m, n, a, lda, s, u, ldu, vt, ldvt, work, lwork, info_out,
+            )
+        }
+    } else {
+        unsafe {
+            vendor_lapack_dgesvd(
+                jobu, jobvt, m, n, a, lda, s, u, ldu, vt, ldvt, work, lwork, info_out,
+            )
+        }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn lapack_dgesdd(
+    jobz: *const i8,
+    m: *const i32,
+    n: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    s: *mut f64,
+    u: *mut f64,
+    ldu: *const i32,
+    vt: *mut f64,
+    ldvt: *const i32,
+    work: *mut f64,
+    lwork: *const i32,
+    iwork: *mut i32,
+    info_out: *mut i32,
+) {
+    if crate::config::portable() {
+        unsafe {
+            fb_lapack_dgesdd(
+                jobz, m, n, a, lda, s, u, ldu, vt, ldvt, work, lwork, iwork, info_out,
+            )
+        }
+    } else {
+        unsafe {
+            vendor_lapack_dgesdd(
+                jobz, m, n, a, lda, s, u, ldu, vt, ldvt, work, lwork, iwork, info_out,
+            )
+        }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn lapack_dgelsd(
+    m: *const i32,
+    n: *const i32,
+    nrhs: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    b: *mut f64,
+    ldb: *const i32,
+    s: *mut f64,
+    rcond: *const f64,
+    rank: *mut i32,
+    work: *mut f64,
+    lwork: *const i32,
+    iwork: *mut i32,
+    info_out: *mut i32,
+) {
+    if crate::config::portable() {
+        unsafe {
+            fb_lapack_dgelsd(
+                m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work, lwork, iwork, info_out,
+            )
+        }
+    } else {
+        unsafe {
+            vendor_lapack_dgelsd(
+                m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work, lwork, iwork, info_out,
+            )
+        }
+    }
+}
+#[cfg(rlx_cpu_blas)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn cblas_dtrsm(
+    order: i32,
+    side: i32,
+    uplo: i32,
+    transa: i32,
+    diag: i32,
+    m: i32,
+    n: i32,
+    alpha: f64,
+    a: *const f64,
+    lda: i32,
+    b: *mut f64,
+    ldb: i32,
+) {
+    if crate::config::portable() {
+        unsafe { fb_cblas_dtrsm(order, side, uplo, transa, diag, m, n, alpha, a, lda, b, ldb) }
+    } else {
+        unsafe { vendor_cblas_dtrsm(order, side, uplo, transa, diag, m, n, alpha, a, lda, b, ldb) }
+    }
+}
+#[cfg(not(rlx_cpu_blas))]
+use self::{
+    fb_cblas_dgemm as cblas_dgemm, fb_cblas_dtrsm as cblas_dtrsm, fb_cblas_sgemm as cblas_sgemm,
+    fb_cblas_sgemv as cblas_sgemv, fb_cblas_sger as cblas_sger, fb_cblas_sscal as cblas_sscal,
+    fb_lapack_dgelsd as lapack_dgelsd, fb_lapack_dgeqrf as lapack_dgeqrf,
+    fb_lapack_dgesdd as lapack_dgesdd, fb_lapack_dgesv as lapack_dgesv,
+    fb_lapack_dgesvd as lapack_dgesvd, fb_lapack_dgetrf as lapack_dgetrf,
+    fb_lapack_dorgqr as lapack_dorgqr, fb_lapack_dpotrf as lapack_dpotrf,
+    fb_lapack_dsyevd as lapack_dsyevd, fb_lapack_sgesv as lapack_sgesv,
+};
 
 /// Empty-dim-guarded wrapper over vendor `cblas_sgemm`. Vendor BLAS rejects a
 /// zero contraction (`lda=0` when `K=0`) with "Parameter 9 had an invalid
@@ -120,6 +488,14 @@ unsafe fn cblas_sgemm(
     c: *mut f32,
     ldc: i32,
 ) {
+    if crate::config::portable() {
+        unsafe {
+            fb_cblas_sgemm(
+                order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+            )
+        };
+        return;
+    }
     if m <= 0 || n <= 0 {
         return;
     }
@@ -232,10 +608,9 @@ pub fn with_blas_threads<R>(n: i32, f: impl FnOnce() -> R) -> R {
     out
 }
 
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 #[inline]
-unsafe fn cblas_sgemm(
+unsafe fn fb_cblas_sgemm(
     _order: i32,
     transa: i32,
     transb: i32,
@@ -267,7 +642,8 @@ unsafe fn cblas_sgemm(
     // operands are first copied into the contiguous row-major layout the
     // kernel packs from (O(mk + kn) next to the O(mnk) product).
     #[cfg(rlx_cpu_amx_sme)]
-    if crate::intrinsics::apple_amx::sme::dispatch_enabled()
+    if !crate::config::portable()
+        && crate::intrinsics::apple_amx::sme::dispatch_enabled()
         && crate::intrinsics::apple_amx::sme::worth_sme(m, k, n)
     {
         unsafe {
@@ -279,7 +655,7 @@ unsafe fn cblas_sgemm(
     }
 
     #[cfg(feature = "portable-gemm")]
-    if m >= PORTABLE_GEMM_MIN_M && n > 0 && k > 0 {
+    if !crate::config::portable() && m >= PORTABLE_GEMM_MIN_M && n > 0 && k > 0 {
         unsafe {
             portable_gemm(
                 m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
@@ -290,8 +666,9 @@ unsafe fn cblas_sgemm(
 
     // `portable` natively: what the relaxed-SIMD wasm kernel computes, the
     // in-order fused-multiply-add chain per element.
-    #[cfg(all(rlx_cpu_portable, not(target_arch = "wasm32")))]
-    {
+    // (also a wasm build without SIMD, e.g. Memory64: `wasm_gemm` needs simd128)
+    #[cfg(not(all(target_family = "wasm", target_feature = "simd128")))]
+    if crate::config::portable() {
         unsafe {
             sgemm_fused(
                 m, n, k, alpha, a, lda, trans_a, b, ldb, trans_b, beta, c, ldc,
@@ -302,7 +679,7 @@ unsafe fn cblas_sgemm(
 
     // wasm with simd128: the register-tiled kernel, bit-identical to the
     // loops in `sgemm_loops`.
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[cfg(all(target_family = "wasm", target_feature = "simd128"))]
     {
         unsafe {
             crate::wasm_gemm::sgemm(
@@ -330,7 +707,7 @@ unsafe fn cblas_sgemm(
 ///
 /// # Safety
 /// Same contract as `cblas_sgemm`: the pointers cover the strided extents.
-#[cfg(all(rlx_cpu_portable, not(target_arch = "wasm32")))]
+#[cfg(not(all(target_family = "wasm", target_feature = "simd128")))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sgemm_fused(
     m: usize,
@@ -364,7 +741,7 @@ pub(crate) unsafe fn sgemm_fused(
     };
 }
 
-#[cfg(all(rlx_cpu_portable, target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn sgemm_fused_x86(
@@ -389,7 +766,7 @@ unsafe fn sgemm_fused_x86(
     };
 }
 
-#[cfg(all(rlx_cpu_portable, not(target_arch = "wasm32")))]
+#[cfg(not(all(target_family = "wasm", target_feature = "simd128")))]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn sgemm_fused_body(
@@ -476,7 +853,6 @@ unsafe fn sgemm_fused_body(
 ///
 /// # Safety
 /// Same contract as `cblas_sgemm`: the pointers cover the strided extents.
-#[cfg(not(rlx_cpu_blas))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sgemm_loops(
     m: usize,
@@ -611,7 +987,7 @@ pub(crate) unsafe fn sgemm_loops(
 ///
 /// # Safety
 /// Same contract as `cblas_sgemm`: the pointers cover the strided extents.
-#[cfg(all(not(rlx_cpu_blas), rlx_cpu_amx_sme))]
+#[cfg(rlx_cpu_amx_sme)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn sme_strided(
     m: usize,
@@ -662,7 +1038,7 @@ unsafe fn sme_strided(
 /// kernel: a decode-shaped `m=1` product is a stream over B, and the `gemm`
 /// crate's packing costs more than it saves (33 vs 21 GF/s at m=1, k=1024,
 /// n=3072 on three AVX2 cores).
-#[cfg(all(not(rlx_cpu_blas), feature = "portable-gemm"))]
+#[cfg(feature = "portable-gemm")]
 const PORTABLE_GEMM_MIN_M: usize = 8;
 
 /// Row-major `C = alpha·op(A)·op(B) + beta·C` on the `gemm` crate, with the
@@ -674,7 +1050,7 @@ const PORTABLE_GEMM_MIN_M: usize = 8;
 ///
 /// # Safety
 /// Same contract as `cblas_sgemm`: the pointers cover the strided extents.
-#[cfg(all(not(rlx_cpu_blas), feature = "portable-gemm"))]
+#[cfg(feature = "portable-gemm")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn portable_gemm(
     m: usize,
@@ -732,10 +1108,9 @@ unsafe fn portable_gemm(
     };
 }
 
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 #[inline]
-unsafe fn cblas_sgemv(
+unsafe fn fb_cblas_sgemv(
     _order: i32,
     trans: i32,
     m: i32,
@@ -775,10 +1150,9 @@ unsafe fn cblas_sgemv(
     }
 }
 
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 #[inline]
-unsafe fn cblas_sger(
+unsafe fn fb_cblas_sger(
     _order: i32,
     m: i32,
     n: i32,
@@ -805,9 +1179,8 @@ unsafe fn cblas_sger(
     }
 }
 
-#[cfg(not(rlx_cpu_blas))]
 #[inline]
-unsafe fn cblas_sscal(n: i32, alpha: f32, x: *mut f32, _incx: i32) {
+unsafe fn fb_cblas_sscal(n: i32, alpha: f32, x: *mut f32, _incx: i32) {
     for i in 0..n as usize {
         let xp = unsafe { x.add(i) };
         unsafe {
@@ -830,7 +1203,8 @@ unsafe fn cblas_sscal(n: i32, alpha: f32, x: *mut f32, _incx: i32) {
 
 #[cfg(rlx_cpu_blas)]
 unsafe extern "C" {
-    fn cblas_dgemm(
+    #[link_name = "cblas_dgemm"]
+    fn vendor_cblas_dgemm(
         order: i32,
         transa: i32,
         transb: i32,
@@ -852,7 +1226,7 @@ unsafe extern "C" {
     /// Overwrites A with its LU factors and B with the solution X.
     /// `info_out`: 0 = success, k>0 = U[k-1,k-1] is exactly zero.
     #[link_name = "dgesv_"]
-    fn lapack_dgesv(
+    fn vendor_lapack_dgesv(
         n: *const i32,
         nrhs: *const i32,
         a: *mut f64,
@@ -865,7 +1239,7 @@ unsafe extern "C" {
 
     /// Single-precision twin of dgesv. Same shape contract.
     #[link_name = "sgesv_"]
-    fn lapack_sgesv(
+    fn vendor_lapack_sgesv(
         n: *const i32,
         nrhs: *const i32,
         a: *mut f32,
@@ -879,7 +1253,7 @@ unsafe extern "C" {
     /// dpotrf — Cholesky factorization of an SPD matrix.
     /// `uplo` is a single byte: b'U' or b'L' (passed as i8).
     #[link_name = "dpotrf_"]
-    fn lapack_dpotrf(
+    fn vendor_lapack_dpotrf(
         uplo: *const i8,
         n: *const i32,
         a: *mut f64,
@@ -889,7 +1263,7 @@ unsafe extern "C" {
 
     /// dgetrf — LU factorization with partial pivoting (det / logdet).
     #[link_name = "dgetrf_"]
-    fn lapack_dgetrf(
+    fn vendor_lapack_dgetrf(
         m: *const i32,
         n: *const i32,
         a: *mut f64,
@@ -901,7 +1275,7 @@ unsafe extern "C" {
     /// dsyevd — symmetric eigendecomp via divide-and-conquer.
     /// `jobz`: b'N' (eigenvalues only) or b'V' (also eigenvectors).
     #[link_name = "dsyevd_"]
-    fn lapack_dsyevd(
+    fn vendor_lapack_dsyevd(
         jobz: *const i8,
         uplo: *const i8,
         n: *const i32,
@@ -934,7 +1308,7 @@ unsafe extern "C" {
     /// dgeqrf — QR factorization. On output, A's upper triangle holds R;
     /// elementary reflectors stored below the diagonal + scalar factors `tau`.
     #[link_name = "dgeqrf_"]
-    fn lapack_dgeqrf(
+    fn vendor_lapack_dgeqrf(
         m: *const i32,
         n: *const i32,
         a: *mut f64,
@@ -947,7 +1321,7 @@ unsafe extern "C" {
 
     /// dorgqr — generate Q from the elementary reflectors produced by dgeqrf.
     #[link_name = "dorgqr_"]
-    fn lapack_dorgqr(
+    fn vendor_lapack_dorgqr(
         m: *const i32,
         n: *const i32,
         k: *const i32,
@@ -962,7 +1336,7 @@ unsafe extern "C" {
     /// dgesvd — singular value decomposition. `jobu`/`jobvt`: b'A' (all),
     /// b'S' (singular vectors only), b'O' (overwrite A), b'N' (none).
     #[link_name = "dgesvd_"]
-    fn lapack_dgesvd(
+    fn vendor_lapack_dgesvd(
         jobu: *const i8,
         jobvt: *const i8,
         m: *const i32,
@@ -983,7 +1357,7 @@ unsafe extern "C" {
     /// / `linalg.svd` use). Differs from `dgesvd` on ill-conditioned/degenerate
     /// inputs, so matching NumPy bit-for-bit requires *this* routine.
     #[link_name = "dgesdd_"]
-    fn lapack_dgesdd(
+    fn vendor_lapack_dgesdd(
         jobz: *const i8,
         m: *const i32,
         n: *const i32,
@@ -1003,7 +1377,7 @@ unsafe extern "C" {
     /// dgelsd — minimum-norm least-squares via SVD (the driver SciPy's
     /// `linalg.lstsq` uses by default). Solves `min‖A·X − B‖`.
     #[link_name = "dgelsd_"]
-    fn lapack_dgelsd(
+    fn vendor_lapack_dgelsd(
         m: *const i32,
         n: *const i32,
         nrhs: *const i32,
@@ -1023,7 +1397,8 @@ unsafe extern "C" {
     /// cblas_dtrsm — BLAS-3 row-major-friendly triangular solve.
     /// `op(A) · X = α·B`  (or  `X · op(A) = α·B` for `side=Right`).
     /// A is triangular, B overwritten with X.
-    fn cblas_dtrsm(
+    #[link_name = "cblas_dtrsm"]
+    fn vendor_cblas_dtrsm(
         order: i32,
         side: i32,
         uplo: i32,
@@ -1039,10 +1414,9 @@ unsafe extern "C" {
     );
 }
 
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 #[inline]
-unsafe fn cblas_dgemm(
+unsafe fn fb_cblas_dgemm(
     _order: i32,
     transa: i32,
     transb: i32,
@@ -1099,9 +1473,8 @@ unsafe fn cblas_dgemm(
 /// Pure-Rust LU + solve fallback for builds without BLAS/LAPACK.
 /// Partial pivoting; column-major in/out to match LAPACK's ABI.
 /// Returns 0 on success, k+1 if U[k,k] is zero (singular).
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
-unsafe fn lapack_dgesv(
+unsafe fn fb_lapack_dgesv(
     n: *const i32,
     nrhs: *const i32,
     a: *mut f64,
@@ -1194,9 +1567,8 @@ unsafe fn lapack_dgesv(
 
 /// f32 twin of `lapack_dgesv` for no-blas builds. Same algorithm,
 /// f32 instead of f64.
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
-unsafe fn lapack_sgesv(
+unsafe fn fb_lapack_sgesv(
     n: *const i32,
     nrhs: *const i32,
     a: *mut f32,
@@ -1473,7 +1845,6 @@ const CBLAS_UNIT: i32 = 132;
 /// `upper` ⇒ factor `Uᵀ·U` into the upper triangle, else `L·Lᵀ` into the
 /// lower. Returns 0, or `k>0` if the leading minor of order `k` is not
 /// positive-definite. Mirrors LAPACK `dpotrf`.
-#[cfg(not(rlx_cpu_blas))]
 fn cholesky_colmajor(a: &mut [f64], n: usize, upper: bool) -> i32 {
     let at = |i: usize, j: usize| i + j * n; // column-major, lda = n
     if upper {
@@ -1520,7 +1891,6 @@ fn cholesky_colmajor(a: &mut [f64], n: usize, upper: bool) -> i32 {
 /// (`lda = m`): unit-lower `L` below the diagonal, `U` on and above,
 /// 1-based row pivots in `ipiv`. Returns 0, or the 1-based index of the
 /// first zero pivot. Mirrors LAPACK `dgetrf`.
-#[cfg(not(rlx_cpu_blas))]
 fn lu_colmajor(a: &mut [f64], m: usize, n: usize, ipiv: &mut [i32]) -> i32 {
     let at = |i: usize, j: usize| i + j * m;
     let mut info = 0;
@@ -1563,7 +1933,6 @@ fn lu_colmajor(a: &mut [f64], m: usize, n: usize, ipiv: &mut [i32]) -> i32 {
 /// Thin SVD `A = U·diag(s)·Vᵀ` of a row-major `m×n` matrix via one-sided
 /// Jacobi. Returns `(U row-major m×k, s descending, Vᵀ row-major k×n)`,
 /// `k = min(m,n)`; singular values ≥ 0, `U`/`V` orthonormal.
-#[cfg(not(rlx_cpu_blas))]
 fn svd_thin_rowmajor(am: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let k = m.min(n);
     // One-sided Jacobi orthogonalizes columns, so work on the tall side.
@@ -1689,7 +2058,6 @@ fn svd_thin_rowmajor(am: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec
 /// Householder QR of a packed column-major `m×n` matrix (`lda = m`),
 /// LAPACK `dgeqrf` layout: `R` in the upper triangle, reflector `v_j`
 /// below the diagonal of column `j`, `tau[j]` its scalar.
-#[cfg(not(rlx_cpu_blas))]
 fn qr_householder_colmajor(a: &mut [f64], m: usize, n: usize, tau: &mut [f64]) {
     let at = |i: usize, j: usize| i + j * m;
     for j in 0..m.min(n) {
@@ -1728,7 +2096,6 @@ fn qr_householder_colmajor(a: &mut [f64], m: usize, n: usize, tau: &mut [f64]) {
 /// Form the `m×n` matrix `Q` (first `n` columns of `H_0···H_{k-1}`) in
 /// place from the reflectors + `tau` left by [`qr_householder_colmajor`].
 /// LAPACK `dorgqr` / `dorg2r`, column-major.
-#[cfg(not(rlx_cpu_blas))]
 fn form_q_colmajor(a: &mut [f64], m: usize, n: usize, k: usize, tau: &[f64]) {
     let at = |i: usize, j: usize| i + j * m;
     for j in k..n {
@@ -1765,9 +2132,8 @@ fn form_q_colmajor(a: &mut [f64], m: usize, n: usize, k: usize, tau: &[f64]) {
     }
 }
 
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
-unsafe fn lapack_dpotrf(
+unsafe fn fb_lapack_dpotrf(
     uplo: *const i8,
     n: *const i32,
     a: *mut f64,
@@ -1795,9 +2161,8 @@ unsafe fn lapack_dpotrf(
         }
     }
 }
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
-unsafe fn lapack_dgetrf(
+unsafe fn fb_lapack_dgetrf(
     m: *const i32,
     n: *const i32,
     a: *mut f64,
@@ -1828,9 +2193,8 @@ unsafe fn lapack_dgetrf(
         *info = rc;
     }
 }
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
-unsafe fn lapack_dsyevd(
+unsafe fn fb_lapack_dsyevd(
     jobz: *const i8,
     uplo: *const i8,
     n: *const i32,
@@ -1894,9 +2258,8 @@ unsafe fn lapack_dsyevd(
         Err(e) => unsafe { *info = e as i32 },
     }
 }
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
-unsafe fn lapack_dgeqrf(
+unsafe fn fb_lapack_dgeqrf(
     m: *const i32,
     n: *const i32,
     a: *mut f64,
@@ -1937,9 +2300,8 @@ unsafe fn lapack_dgeqrf(
         *info = 0;
     }
 }
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
-unsafe fn lapack_dorgqr(
+unsafe fn fb_lapack_dorgqr(
     m: *const i32,
     n: *const i32,
     k: *const i32,
@@ -1981,9 +2343,8 @@ unsafe fn lapack_dorgqr(
         *info = 0;
     }
 }
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
-unsafe fn lapack_dgesvd(
+unsafe fn fb_lapack_dgesvd(
     _jobu: *const i8,
     _jobvt: *const i8,
     m: *const i32,
@@ -2045,9 +2406,8 @@ unsafe fn lapack_dgesvd(
         *info = 0;
     }
 }
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
-unsafe fn lapack_dgesdd(
+unsafe fn fb_lapack_dgesdd(
     _jobz: *const i8,
     m: *const i32,
     n: *const i32,
@@ -2109,9 +2469,8 @@ unsafe fn lapack_dgesdd(
         *info = 0;
     }
 }
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
-unsafe fn lapack_dgelsd(
+unsafe fn fb_lapack_dgelsd(
     m: *const i32,
     n: *const i32,
     nrhs: *const i32,
@@ -2200,9 +2559,8 @@ unsafe fn lapack_dgelsd(
         *info = 0;
     }
 }
-#[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
-unsafe fn cblas_dtrsm(
+unsafe fn fb_cblas_dtrsm(
     order: i32,
     side: i32,
     uplo: i32,
@@ -2440,7 +2798,7 @@ pub fn ssyevd(a: &mut [f32], w: &mut [f32], n: usize, lower: bool) -> i32 {
     assert_eq!(a.len(), n * n);
     assert_eq!(w.len(), n);
     #[cfg(rlx_cpu_blas)]
-    {
+    if !crate::config::portable() {
         let jobz: i8 = b'V' as i8;
         let uplo: i8 = if lower { b'L' } else { b'U' } as i8;
         let nn = n as i32;
@@ -2464,9 +2822,8 @@ pub fn ssyevd(a: &mut [f32], w: &mut [f32], n: usize, lower: bool) -> i32 {
                 &mut info,
             );
         }
-        info
+        return info;
     }
-    #[cfg(not(rlx_cpu_blas))]
     {
         let mut a64: Vec<f64> = a.iter().map(|&v| v as f64).collect();
         let mut w64 = vec![0f64; n];
@@ -2826,9 +3183,9 @@ pub fn dgelsd_solve(
     }
     // Off Apple: reference LAPACK as the Linux SciPy/NumPy wheels run it (OpenBLAS
     // 0.3.30, Haswell kernels) — `numpy_lapack`, where its ported branches reach.
-    #[cfg(not(rlx_cpu_blas_accelerate))]
-    if let Some(r) =
-        crate::numpy_lapack::dgelsd(m, n, nrhs, &mut a_col.clone(), &mut b_col, ldb, rcond)
+    if (!cfg!(rlx_cpu_blas_accelerate) || crate::config::portable())
+        && let Some(r) =
+            crate::numpy_lapack::dgelsd(m, n, nrhs, &mut a_col.clone(), &mut b_col, ldb, rcond)
     {
         if r.info != 0 {
             return r.info as i32;
@@ -2949,7 +3306,7 @@ pub fn dgelsd_solve_numpy(
     x: &mut [f64],
 ) -> i32 {
     #[cfg(rlx_cpu_blas_accelerate)]
-    {
+    if !crate::config::portable() {
         assert_eq!(a.len(), m * n);
         assert_eq!(b.len(), m * nrhs);
         assert_eq!(x.len(), n * nrhs);
@@ -3020,12 +3377,9 @@ pub fn dgelsd_solve_numpy(
                 x[i * nrhs + j] = b_col[i + j * ldb];
             }
         }
-        0
+        return 0;
     }
-    #[cfg(not(rlx_cpu_blas_accelerate))]
-    {
-        dgelsd_solve(a, b, m, n, nrhs, rcond, x)
-    }
+    dgelsd_solve(a, b, m, n, nrhs, rcond, x)
 }
 
 /// Solve `op(A) · X = B` (or `X · op(A) = B` for `right`) where A is
@@ -3609,11 +3963,13 @@ pub fn sgemm_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: us
     }
 }
 
-/// Enough FLOPs + a wide enough split axis to pay for Rayon hand-off.
+/// Enough FLOPs + a wide enough split axis to pay for Rayon hand-off. Never
+/// under [`rlx_ir::reproducible`]: the split follows the core count, and each
+/// piece is a BLAS call of a different shape.
 #[inline]
 fn prefer_par_sgemm(m: usize, k: usize, n: usize) -> bool {
     let workers = crate::pool::num_threads();
-    if workers <= 1 {
+    if workers <= 1 || rlx_ir::reproducible::reproducible() {
         return false;
     }
     let flops = (m as u64).saturating_mul(k as u64).saturating_mul(n as u64);
@@ -4811,7 +5167,7 @@ pub fn round_half_into(src: &[f32], dst: &mut [u16], bf16: bool) {
 #[cfg(all(
     test,
     not(rlx_cpu_blas),
-    not(all(rlx_cpu_portable, not(target_arch = "wasm32")))
+    not(all(rlx_cpu_portable, not(target_family = "wasm")))
 ))]
 mod fallback_gemm_tests {
     use super::*;
@@ -5019,7 +5375,7 @@ mod fallback_gemm_tests {
     }
 }
 
-#[cfg(all(test, rlx_cpu_portable, not(target_arch = "wasm32")))]
+#[cfg(all(test, rlx_cpu_portable, not(target_family = "wasm")))]
 mod portable_sgemm_tests {
     /// `portable`'s native GEMM is the relaxed-SIMD wasm kernel's chain:
     /// the same scalar reference as `wasm_gemm`'s

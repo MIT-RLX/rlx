@@ -109,6 +109,10 @@ pub fn get_or_build_pipeline(device: &wgpu::Device, k: &dyn WgpuGpuKernel) -> Ar
 /// binding so params carry a tight `array<u32>` with no 16-byte stride padding.
 fn build_custom_kernel(device: &wgpu::Device, wgsl: &str, entry_point: &str) -> Kernel {
     let label = "rlx-wgpu custom gpu";
+    // A downstream kernel may call rlxsl's helpers (`rlx_div_rn`, `rlx_exp`, …)
+    // as the crate's own do; they are appended once.
+    let wgsl = crate::kernels::with_numeric_helpers(wgsl);
+    let wgsl = wgsl.as_ref();
     crate::kernels::dump_wgsl(label, wgsl);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),

@@ -99,11 +99,11 @@ pub fn decode_zstd_blocks_parallel(comp: &[u8]) -> Result<Vec<u8>> {
 // The codec: pure-Rust `zstd-rs` by default (any target, wasm32 included);
 // libzstd with `zstd-native` on native targets. Both read and write standard
 // zstd frames, so a package written by either is read by either.
-#[cfg(all(feature = "zstd-native", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "zstd-native", not(target_family = "wasm")))]
 fn z_encode_all(data: &[u8], level: i32) -> Result<Vec<u8>> {
     zstd::encode_all(data, level).context("zstd compress")
 }
-#[cfg(not(all(feature = "zstd-native", not(target_arch = "wasm32"))))]
+#[cfg(not(all(feature = "zstd-native", not(target_family = "wasm"))))]
 fn z_encode_all(data: &[u8], level: i32) -> Result<Vec<u8>> {
     let cfg = zstd_rs::CompressionConfig {
         level,
@@ -119,7 +119,7 @@ fn z_encode_all(data: &[u8], level: i32) -> Result<Vec<u8>> {
 /// Decode `data` (every frame in it), failing rather than producing more than
 /// `cap` bytes: a decompression bomb is stopped at the cap, so peak memory is
 /// tied to what the caller expects, not to the attacker's frame header.
-#[cfg(all(feature = "zstd-native", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "zstd-native", not(target_family = "wasm")))]
 fn z_decode_capped(data: &[u8], cap: usize) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut out = Vec::new();
@@ -133,7 +133,7 @@ fn z_decode_capped(data: &[u8], cap: usize) -> Result<Vec<u8>> {
     }
     Ok(out)
 }
-#[cfg(not(all(feature = "zstd-native", not(target_arch = "wasm32"))))]
+#[cfg(not(all(feature = "zstd-native", not(target_family = "wasm"))))]
 fn z_decode_capped(data: &[u8], cap: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     zstd_rs::Decompressor::new()

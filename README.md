@@ -1,6 +1,6 @@
 # RLX
 
-![status](https://img.shields.io/badge/status-0.2.19-blue)
+![status](https://img.shields.io/badge/status-0.2.20-blue)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)
 ![rust](https://img.shields.io/badge/rust-edition%202024-orange)
 [![repo](https://img.shields.io/badge/github-MIT--RLX%2Frlx-black)](https://github.com/MIT-RLX/rlx)

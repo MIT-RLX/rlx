@@ -182,25 +182,26 @@ pub fn dgemm(
         )
     });
     #[cfg(rlx_cpu_blas_accelerate)]
-    unsafe {
-        np_cblas_dgemm(
-            order,
-            transa,
-            transb,
-            m as i64,
-            n as i64,
-            k as i64,
-            1.0,
-            a.as_ptr(),
-            lda as i64,
-            b.as_ptr(),
-            ldb as i64,
-            0.0,
-            c.as_mut_ptr(),
-            ldc as i64,
-        );
+    if !crate::config::portable() {
+        return unsafe {
+            np_cblas_dgemm(
+                order,
+                transa,
+                transb,
+                m as i64,
+                n as i64,
+                k as i64,
+                1.0,
+                a.as_ptr(),
+                lda as i64,
+                b.as_ptr(),
+                ldb as i64,
+                0.0,
+                c.as_mut_ptr(),
+                ldc as i64,
+            );
+        };
     }
-    #[cfg(not(rlx_cpu_blas_accelerate))]
     crate::numpy_openblas::dgemm(order, transa, transb, m, n, k, a, lda, b, ldb, c, ldc);
 }
 
@@ -220,23 +221,24 @@ pub fn dgemv(
 ) {
     trace(|| format!("dgemv order={order} t={trans} m={m} n={n} lda={lda} incx={incx}"));
     #[cfg(rlx_cpu_blas_accelerate)]
-    unsafe {
-        np_cblas_dgemv(
-            order,
-            trans,
-            m as i64,
-            n as i64,
-            1.0,
-            a.as_ptr(),
-            lda as i64,
-            x.as_ptr(),
-            incx as i64,
-            0.0,
-            y.as_mut_ptr(),
-            incy as i64,
-        );
+    if !crate::config::portable() {
+        return unsafe {
+            np_cblas_dgemv(
+                order,
+                trans,
+                m as i64,
+                n as i64,
+                1.0,
+                a.as_ptr(),
+                lda as i64,
+                x.as_ptr(),
+                incx as i64,
+                0.0,
+                y.as_mut_ptr(),
+                incy as i64,
+            );
+        };
     }
-    #[cfg(not(rlx_cpu_blas_accelerate))]
     if !crate::numpy_openblas::dgemv(order, trans, m, n, a, lda, x, incx, y, incy) {
         // above OpenBLAS's threading threshold — NOT at parity
         let (rows, cols) = if trans == NO_TRANS { (m, n) } else { (n, m) };
@@ -265,22 +267,23 @@ pub fn dsyrk_upper(
 ) {
     trace(|| format!("dsyrk order={order} t={trans} n={n} k={k} lda={lda}"));
     #[cfg(rlx_cpu_blas_accelerate)]
-    unsafe {
-        np_cblas_dsyrk(
-            order,
-            UPPER,
-            trans,
-            n as i64,
-            k as i64,
-            1.0,
-            a.as_ptr(),
-            lda as i64,
-            0.0,
-            c.as_mut_ptr(),
-            ldc as i64,
-        );
+    if !crate::config::portable() {
+        return unsafe {
+            np_cblas_dsyrk(
+                order,
+                UPPER,
+                trans,
+                n as i64,
+                k as i64,
+                1.0,
+                a.as_ptr(),
+                lda as i64,
+                0.0,
+                c.as_mut_ptr(),
+                ldc as i64,
+            );
+        };
     }
-    #[cfg(not(rlx_cpu_blas_accelerate))]
     crate::numpy_openblas::dsyrk_upper(order, trans, n, k, a, lda, c, ldc);
 }
 
@@ -288,10 +291,11 @@ pub fn dsyrk_upper(
 pub fn ddot(n: usize, x: &[f64], incx: usize, y: &[f64], incy: usize) -> f64 {
     trace(|| format!("ddot n={n} incx={incx} incy={incy}"));
     #[cfg(rlx_cpu_blas_accelerate)]
-    unsafe {
-        np_cblas_ddot(n as i64, x.as_ptr(), incx as i64, y.as_ptr(), incy as i64)
+    if !crate::config::portable() {
+        return unsafe {
+            np_cblas_ddot(n as i64, x.as_ptr(), incx as i64, y.as_ptr(), incy as i64)
+        };
     }
-    #[cfg(not(rlx_cpu_blas_accelerate))]
     crate::numpy_openblas::ddot(n, x, incx, y, incy)
 }
 
@@ -311,7 +315,7 @@ pub fn dgelsd_scipy(
 ) -> i32 {
     trace(|| format!("dgelsd m={m} n={n} nrhs={nrhs}"));
     #[cfg(rlx_cpu_blas_accelerate)]
-    {
+    if !crate::config::portable() {
         let ldb = m.max(n).max(1);
         let lda = m.max(1);
         let mut a_col = vec![0.0f64; lda * n];
@@ -383,12 +387,9 @@ pub fn dgelsd_scipy(
                 x[i * nrhs + j] = b_col[i + j * ldb];
             }
         }
-        0
+        return 0;
     }
-    #[cfg(not(rlx_cpu_blas_accelerate))]
-    {
-        crate::blas::dgelsd_solve(a, b, m, n, nrhs, cond, x)
-    }
+    crate::blas::dgelsd_solve(a, b, m, n, nrhs, cond, x)
 }
 
 /// `np.linalg.solve(a, b)` for one right-hand side as NumPy calls it: `a` (n×n,
@@ -404,7 +405,7 @@ pub fn dgesv_numpy(a: &[f64], b: &[f64], n: usize) -> Result<Vec<f64>, i64> {
     }
     let mut x = b[..n].to_vec();
     #[cfg(rlx_cpu_blas_accelerate)]
-    {
+    if !crate::config::portable() {
         let (nn, one, ld) = (n as i64, 1i64, n.max(1) as i64);
         let mut ipiv = vec![0i64; n.max(1)];
         let mut info = 0i64;
@@ -423,14 +424,12 @@ pub fn dgesv_numpy(a: &[f64], b: &[f64], n: usize) -> Result<Vec<f64>, i64> {
         if info != 0 {
             return Err(info);
         }
-        Ok(x)
+        return Ok(x);
     }
-    #[cfg(not(rlx_cpu_blas_accelerate))]
     if let Some(info) = crate::numpy_openblas::dgesv(n, &mut a_col, &mut x) {
         // OpenBLAS 0.3.30 Haswell, the Linux reference (n ≤ 33)
         return if info != 0 { Err(info as i64) } else { Ok(x) };
     }
-    #[cfg(not(rlx_cpu_blas_accelerate))]
     {
         // n > 33: partial-pivoting LU, the algorithm (not the rounding) of OpenBLAS's
         // blocked getrf — NOT at parity
@@ -480,6 +479,9 @@ pub fn dgesv_numpy(a: &[f64], b: &[f64], n: usize) -> Result<Vec<f64>, i64> {
 /// LAPACK's `info`. Accelerate builds only.
 #[cfg(rlx_cpu_blas_accelerate)]
 pub fn dgesdd_scipy(a: &[f64], m: usize, n: usize) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), i32> {
+    if crate::config::portable() {
+        return linux_dgesdd_scipy(a, m, n);
+    }
     trace(|| format!("dgesdd m={m} n={n}"));
     let k = m.min(n);
     let lda = m.max(1);
@@ -556,6 +558,9 @@ pub fn dgesdd_scipy(a: &[f64], m: usize, n: usize) -> Result<(Vec<f64>, Vec<f64>
 /// or LAPACK's `info`. Accelerate builds only.
 #[cfg(rlx_cpu_blas_accelerate)]
 pub fn dsyevr_scipy(a: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>), i32> {
+    if crate::config::portable() {
+        return linux_dsyevr_scipy(a, n);
+    }
     trace(|| format!("dsyevr n={n}"));
     let ld = n.max(1);
     let mut a_col = vec![0.0f64; ld * n];
@@ -643,8 +648,11 @@ pub fn dsyevr_scipy(a: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>), i32> {
 /// one is linked, else rlx's pure-Rust SVD. **Not** bit-identical to SciPy on
 /// macOS (a different `dgesdd`, or a different algorithm); signs of singular
 /// vector pairs may differ too.
-#[cfg(not(rlx_cpu_blas_accelerate))]
-pub fn dgesdd_scipy(a: &[f64], m: usize, n: usize) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), i32> {
+pub fn linux_dgesdd_scipy(
+    a: &[f64],
+    m: usize,
+    n: usize,
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), i32> {
     trace(|| format!("dgesdd m={m} n={n}"));
     // the Linux reference's own dgesdd, bit for bit, where modelled
     let mut a_col = vec![0.0f64; m * n];
@@ -684,8 +692,7 @@ pub fn dgesdd_scipy(a: &[f64], m: usize, n: usize) -> Result<(Vec<f64>, Vec<f64>
 /// `lwork = 33n` — bit for bit ([`rlx_linux_ref::dsyevr_lower`]) up to
 /// [`rlx_linux_ref::DSYEVR_MAX_N`]; larger matrices fall back to
 /// [`crate::blas::dsyevd_uplo`] (not bit-identical; eigenvector signs may differ).
-#[cfg(not(rlx_cpu_blas_accelerate))]
-pub fn dsyevr_scipy(a: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>), i32> {
+pub fn linux_dsyevr_scipy(a: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>), i32> {
     trace(|| format!("dsyevr n={n}"));
     if n <= rlx_linux_ref::DSYEVR_MAX_N {
         // the Fortran copy SciPy hands LAPACK (lower triangle read)
@@ -706,7 +713,6 @@ pub fn dsyevr_scipy(a: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>), i32> {
     Ok((w, z))
 }
 
-#[cfg(not(rlx_cpu_blas_accelerate))]
 fn idx2(order: i32, trans: i32, a: &[f64], ld: usize, i: usize, j: usize) -> f64 {
     // element (i, j) of op(A)
     let (r, c) = if trans == NO_TRANS { (i, j) } else { (j, i) };
@@ -716,3 +722,6 @@ fn idx2(order: i32, trans: i32, a: &[f64], ld: usize, i: usize, j: usize) -> f64
         a[r + c * ld]
     }
 }
+
+#[cfg(not(rlx_cpu_blas_accelerate))]
+pub use self::{linux_dgesdd_scipy as dgesdd_scipy, linux_dsyevr_scipy as dsyevr_scipy};

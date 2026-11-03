@@ -277,7 +277,7 @@ impl ExecutableGraph for WgpuExecutableWrapper {
         })
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     fn wgpu_requires_host(&self) -> bool {
         self.inner.requires_host_execution()
     }
@@ -286,7 +286,7 @@ impl ExecutableGraph for WgpuExecutableWrapper {
         self.inner.host_summary()
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     fn wgpu_run_async<'a>(
         &'a mut self,
         inputs: &'a [(&'a str, &'a [f32])],

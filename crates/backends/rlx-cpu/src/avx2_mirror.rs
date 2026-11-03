@@ -20,7 +20,7 @@
 //!
 //! Compiled everywhere so that x86-64 can test each mirror against its kernel.
 
-#![cfg_attr(any(rlx_cpu_neon, rlx_cpu_x86), allow(dead_code))]
+#![cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 
 use crate::kernels::scalar_gelu;
 
@@ -138,9 +138,9 @@ impl Lanes for f32 {
     }
     #[inline(always)]
     fn fmadd(self, b: Self, c: Self) -> Self {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         return fmaf(self, b, c);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         self.mul_add(b, c)
     }
     #[inline(always)]
@@ -173,7 +173,7 @@ impl Lanes for f32 {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(target_family = "wasm", target_feature = "simd128"))]
 pub(crate) mod simd {
     use core::arch::wasm32::*;
 
@@ -253,7 +253,7 @@ pub(crate) mod simd {
     /// bits, another grid). Both are rare; such a vector goes lane by lane
     /// through [`super::fmaf`], which settles them with the sum's error.
     #[inline(always)]
-    pub(super) fn fma_f32x4(a: v128, b: v128, c: v128) -> v128 {
+    pub(crate) fn fma_f32x4(a: v128, b: v128, c: v128) -> v128 {
         let (sl, sh) = sums(a, b, c);
         if v128_any_true(v128_or(odd(sl), odd(sh))) {
             return fma_slow(a, b, c);
@@ -458,21 +458,21 @@ pub(crate) mod simd {
 }
 
 /// The widest [`Lanes`] on this target.
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(target_family = "wasm", target_feature = "simd128"))]
 type Wide = simd::X2<false>;
 
 /// `$f::<lanes>(args)` with the hardware fused multiply-add when this build
 /// has relaxed-simd and the engine fuses it, else with [`Wide`].
 macro_rules! wide {
     ($f:ident($($a:expr),* $(,)?)) => {{
-        #[cfg(all(target_arch = "wasm32", target_feature = "relaxed-simd"))]
+        #[cfg(all(target_family = "wasm", target_feature = "relaxed-simd"))]
         if simd::fused() {
             return $f::<simd::X2<true>>($($a),*);
         }
         $f::<Wide>($($a),*)
     }};
 }
-#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+#[cfg(not(all(target_family = "wasm", target_feature = "simd128")))]
 type Wide = f32;
 
 /// The kernels' horizontal sum of eight lanes: `lo + hi`, then
@@ -916,7 +916,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(test, target_family = "wasm", target_feature = "simd128"))]
 mod simd_tests {
     //! The `v128` instantiation against the `f32` one, bit for bit, and its
     //! fused multiply-add against [`super::fmaf`] (which `native_fma_tests`

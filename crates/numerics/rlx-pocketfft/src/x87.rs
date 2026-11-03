@@ -27,7 +27,13 @@ pub(crate) fn x87() -> bool {
 
 /// `Thigh(0.25L*pi/n)`.
 pub(crate) fn quarter_pi_over(n: usize) -> f64 {
-    if x87() {
+    quarter_pi_over_as(n, x87())
+}
+
+/// [`quarter_pi_over`] with the `long double` chosen by the caller (`true`:
+/// x87, as the Linux x86-64 reference, on any host).
+pub(crate) fn quarter_pi_over_as(n: usize, x87: bool) -> f64 {
+    if x87 {
         quarter_pi().div(F80::from_u64(n as u64)).to_f64()
     } else {
         0.25 * std::f64::consts::PI / n as f64
@@ -36,7 +42,12 @@ pub(crate) fn quarter_pi_over(n: usize) -> f64 {
 
 /// `T(1/ldbl_t(n))`.
 pub(crate) fn recip(n: usize) -> f64 {
-    if x87() {
+    recip_as(n, x87())
+}
+
+/// [`recip`] with the `long double` chosen by the caller.
+pub(crate) fn recip_as(n: usize, x87: bool) -> f64 {
+    if x87 {
         F80::from_u64(1).div(F80::from_u64(n as u64)).to_f64()
     } else {
         1.0 / n as f64
@@ -45,7 +56,12 @@ pub(crate) fn recip(n: usize) -> f64 {
 
 /// `T(1/sqrt(ldbl_t(n)))`.
 pub(crate) fn recip_sqrt(n: usize) -> f64 {
-    if x87() {
+    recip_sqrt_as(n, x87())
+}
+
+/// [`recip_sqrt`] with the `long double` chosen by the caller.
+pub(crate) fn recip_sqrt_as(n: usize, x87: bool) -> f64 {
+    if x87 {
         F80::from_u64(1)
             .div(F80::from_u64(n as u64).sqrt())
             .to_f64()

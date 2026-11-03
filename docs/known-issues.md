@@ -240,3 +240,6 @@ Generated from [`known_issues.rs`](../crates/core/rlx-runtime/src/doctor/known_i
 - **Symptom:** `undefined reference to `__isoc23_strtol` (ort-sys)`
 - **Cause:** The prebuilt libonnxruntime.a that ort-sys downloads targets glibc 2.38.
 - **Fix:** Build on a distro with glibc >= 2.38 (Ubuntu 24.04+, Debian trixie), or disable the onnx feature.
+## License
+
+MIT OR Apache-2.0.

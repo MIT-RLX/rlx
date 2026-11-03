@@ -1,5 +1,5 @@
 (lang dune 3.0)
 (name rlx)
-(version 0.2.19)
+(version 0.2.20)
 (license "MIT OR Apache-2.0")
 (authors "Eugene Hauptmann" "Nataliya Kosmyna")

@@ -1,0 +1,20 @@
+# Validation tool, not part of the workspace or of rlx: every one-argument
+# f32 port against glibc itself on all 2^32 inputs (Linux, glibc 2.43), and
+# the per-function hashes of glibc's outputs that `tests/f32_exhaustive.rs`
+# re-checks on any OS:
+#   cargo run --release --manifest-path tools/glibc-exhaustive/Cargo.toml -- \
+#       tests/vectors/glibc_$(uname -m)_2_43_f32_exhaustive.txt
+# `-- --f64 [N]`: every f64 port against glibc on N samples each.
+[package]
+name = "glibc-exhaustive"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rlx-libm = { path = "../.." }
+
+[profile.release]
+opt-level = 3
+
+[workspace]

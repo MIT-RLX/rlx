@@ -122,9 +122,9 @@ impl Backend for CpuBackend {
 
     fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
         // `Instant` is unimplemented on wasm32 — never touch it there.
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let prof = rlx_ir::env::var_os("RLX_PROFILE_COMPILE").is_some();
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let tt = if prof {
             Some(std::time::Instant::now())
         } else {
@@ -150,9 +150,9 @@ impl Backend for CpuBackend {
         } else {
             graph
         };
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let t_prep = tt.map(|t| t.elapsed());
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let t1 = if prof {
             Some(std::time::Instant::now())
         } else {
@@ -164,9 +164,9 @@ impl Backend for CpuBackend {
         // indexing, and no deferred-host dequant pin) for full liveness slot
         // reuse; see the note at the other plan site above.
         let plan = memory::plan_memory_native_in_order(&exec_graph, alignment);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let t_plan = t1.map(|t| t.elapsed());
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         if prof {
             eprintln!(
                 "[compile_lir] {} nodes: into_graph+passes={:?} plan_memory={:?}",
@@ -184,14 +184,14 @@ impl Backend for CpuBackend {
                 alignment,
             );
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let t2 = if prof {
             Some(std::time::Instant::now())
         } else {
             None
         };
         let exe = build_cpu_executable(exec_graph, plan, io_manifest, options.rng, alignment);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         if let Some(t2) = t2 {
             eprintln!("[compile_lir] build_thunks={:?}", t2.elapsed());
         }

@@ -37,11 +37,11 @@ fn softmax_cross_entropy(@builtin(global_invocation_id) gid: vec3<u32>, @builtin
     var dot: f32 = 0.0;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
         let v = arena[lbase + i];
-        s = s + epi_exp(v - m);
+        s = s + rlx_exp(v - m);
         dot = dot + arena[tbase + i] * v;
     }
 
-    arena[params.out_off + row] = (m + log(s)) - dot;
+    arena[params.out_off + row] = (m + rlx_log(s)) - dot;
 }
 
 @compute @workgroup_size(64)
@@ -57,28 +57,13 @@ fn softmax_cross_entropy_with_logits(@builtin(global_invocation_id) gid: vec3<u3
 
     var s: f32 = 0.0;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-        s = s + epi_exp(arena[lbase + i] - m);
+        s = s + rlx_exp(arena[lbase + i] - m);
     }
 
     let label = u32(arena[params.targets_off + row]);
     let label_c = min(label, params.inner - 1u);
-    arena[params.out_off + row] = (m + log(s)) - arena[lbase + label_c];
+    arena[params.out_off + row] = (m + rlx_log(s)) - arena[lbase + label_c];
 }
 
-// `rlxsl::exact`'s correctly-rounded helpers, verbatim (`rlx_*` → `epi_*`): the
-// builtin `/`, `inverseSqrt` and `exp` round by the compiler's math mode, so
-// native wgpu (Apple fast math) and a browser (safe math) disagreed.
-fn epi_exp(x: f32) -> f32 {
-    let bx = bitcast<u32>(x);
-    if ((bx & 0x7fffffffu) > 0x7f800000u) { return x; }
-    let xc = clamp(x, -110.0, 89.0);
-    let n = round(xc * 1.44269504);
-    let r = fma(n, -1.428606765330187e-6, fma(n, -0.693145751953125, xc));
-    var p = 1.9875691500e-4;
-    p = fma(p, r, 1.3981999507e-3);
-    p = fma(p, r, 8.3334519073e-3);
-    p = fma(p, r, 4.1665795894e-2);
-    p = fma(p, r, 1.6666665459e-1);
-    p = fma(p, r, 5.0000001201e-1);
-    return ldexp(1.0 + fma(p, r * r, r), i32(n));
-}
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).

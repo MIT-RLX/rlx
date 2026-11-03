@@ -420,7 +420,7 @@ const STORAGE_ALIGN: u64 = 256;
 /// `Send` on the browser WebGPU backend where `wgpu::Buffer` is `!Send`; wasm is
 /// single-threaded, so the process-global pool is never sent cross-thread.
 struct OutPool(wgpu::Buffer, u64);
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 unsafe impl Send for OutPool {}
 
 fn with_pooled_out_buf<R>(

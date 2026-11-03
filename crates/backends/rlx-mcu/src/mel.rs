@@ -53,8 +53,8 @@ impl Frontend {
         };
         for k in 0..n_fft / 2 {
             let a = -2.0 * core::f64::consts::PI * k as f64 / n_fft as f64;
-            f.cos[k] = libm::cos(a) as f32;
-            f.sin[k] = libm::sin(a) as f32;
+            f.cos[k] = rlx_libm::cos(a) as f32;
+            f.sin[k] = rlx_libm::sin(a) as f32;
         }
         let bits = n_fft.trailing_zeros();
         for i in 0..n_fft {
@@ -152,7 +152,7 @@ impl Frontend {
                 for (k, &wk) in w.iter().enumerate() {
                     acc += wk * re[start + k];
                 }
-                *v = libm::logf(acc + LOG_GUARD);
+                *v = rlx_libm::logf(acc + LOG_GUARD);
             }
         }
 
@@ -173,7 +173,7 @@ impl Frontend {
                 }
                 var /= valid as f32 - 1.0;
             }
-            let denom = libm::sqrtf(var) + NORM_EPS;
+            let denom = rlx_libm::sqrtf(var) + NORM_EPS;
             for f in 0..frames {
                 let v = &mut out[f * n_mels + m];
                 *v = if f < valid { (*v - mean) / denom } else { 0.0 };

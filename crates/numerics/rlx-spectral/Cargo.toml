@@ -11,8 +11,8 @@ repository.workspace   = true
 [dependencies]
 # f32 log / exp for the log-mel stage
 rlx-fastmath = { workspace = true }
-# f64 sin / cos / ln for twiddles, windows and mel scales (pure Rust, < 1 ulp)
-libm = "0.2"
+# f64 sin / cos / ln for twiddles, windows and mel scales (glibc 2.43, pure Rust)
+rlx-libm = { workspace = true }
 
 [lints]
 workspace = true

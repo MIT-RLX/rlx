@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Move the vendored MLX submodule (vendor/mlx) to a new upstream ref and
 # re-apply the tracked patches in ../patches.
 #

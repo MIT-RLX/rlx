@@ -126,7 +126,7 @@ sub-ms timing in the user-facing layer.
 
 ```toml
 [dependencies]
-rlx-runtime = { version = "0.2.19", features = ["cpu"] }
+rlx-runtime = { version = "0.2.20", features = ["cpu"] }
 ```
 
 > **Heads-up.** The `mlx` and `rocm` features pull in `rlx-mlx` and

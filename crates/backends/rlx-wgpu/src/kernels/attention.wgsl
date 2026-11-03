@@ -2,12 +2,15 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 // Single-pass online-softmax SDPA (FlashAttention v1 inner-row form).
 // One thread per (batch, head, q_row); each thread walks the K dimension
 // exactly once, maintaining a running (m, l, O[D]) tuple:
 //
 //   m_new = max(m, s)
-//   e_old = epi_exp(m - m_new); e_cur = epi_exp(s - m_new)
+//   e_old = rlx_exp(m - m_new); e_cur = rlx_exp(s - m_new)
 //   l     = e_old · l + e_cur
 //   O[d]  = e_old · O[d] + e_cur · V[s][d]
 //   m     = m_new
@@ -167,8 +170,8 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
 
         // Online softmax update.
         let m_new = max(m, score);
-        let e_old = epi_exp(m - m_new);
-        let e_cur = epi_exp(score - m_new);
+        let e_old = rlx_exp(m - m_new);
+        let e_cur = rlx_exp(score - m_new);
         l = e_old * l + e_cur;
         // V rows are `hd_v` wide (v_seq_stride already reflects that width).
         let v_base = v_bh + s * params.v_seq_stride;
@@ -180,7 +183,7 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
 
     // Normalize and emit `hd_v`-wide output rows. l is guaranteed > 0
     // (at least one finite score).
-    let inv_l = epi_div_rn(1.0, l);
+    let inv_l = rlx_div_rn(1.0, l);
     for (var d: u32 = 0u; d < hd_v; d = d + 1u) {
         arena[o_base + d] = o[d] * inv_l;
     }
@@ -284,7 +287,7 @@ fn attention_coop(
         workgroupBarrier();
 
         // Tile weights (keys past seq_k weigh nothing) and their sum.
-        let p = select(0.0, epi_exp(score - m_new), valid);
+        let p = select(0.0, rlx_exp(score - m_new), valid);
         p_sh[t] = p;
         red_sh[t] = p;
         workgroupBarrier();
@@ -292,7 +295,7 @@ fn attention_coop(
             if (t < w) { red_sh[t] = red_sh[t] + red_sh[t + w]; }
             workgroupBarrier();
         }
-        let e_old = epi_exp(m - m_new);
+        let e_old = rlx_exp(m - m_new);
         l = e_old * l + red_sh[0];
         m = m_new;
 
@@ -311,7 +314,7 @@ fn attention_coop(
         workgroupBarrier();
     }
 
-    let inv_l = epi_div_rn(1.0, l);
+    let inv_l = rlx_div_rn(1.0, l);
     var i: u32 = 0u;
     for (var d: u32 = t; d < hd_v; d = d + 64u) {
         arena[o_base + d] = o[i] * inv_l;
@@ -319,47 +322,3 @@ fn attention_coop(
     }
 }
 
-// `rlxsl::exact`'s correctly-rounded helpers, verbatim (`rlx_*` → `epi_*`): the
-// builtin `/`, `inverseSqrt` and `exp` round by the compiler's math mode, so
-// native wgpu (Apple fast math) and a browser (safe math) disagreed.
-fn epi_div_rn(a: f32, b: f32) -> f32 {
-    let k = abs(a / b) < 0x1p-100f;
-    let a2 = select(a, a * 0x1p64f, k);
-    let q = a2 / b;
-    let ok = q != 0.0 && abs(q) <= 0x1.fffffep+127f;
-    var c = select(q, q + fma(-b, q, a2) / b, ok);
-    // The step rounds its correction before adding it, so near a midpoint
-    // `c` depends on the first quotient. Move to the neighbour on the
-    // quotient's side when the quotient lies past their midpoint (ties to
-    // even): `r = a - b·c` is exact, and `r - b·u/2` has the sign of
-    // `a - b·(c + n)/2`.
-    if (ok && c != 0.0 && abs(c) < 0x1.fffffep+127f) {
-        let r = fma(-b, c, a2);
-        if (r != 0.0) {
-            let up = (r > 0.0) == (b > 0.0);
-            let cb = bitcast<u32>(c);
-            let nb = select(cb - 1u, cb + 1u, up == (c > 0.0));
-            let n = bitcast<f32>(nb);
-            let t = fma(-b, (n - c) * 0.5, r);
-            if ((t != 0.0 && ((t > 0.0) == (b > 0.0)) == up) || (t == 0.0 && (nb & 1u) == 0u)) {
-                c = n;
-            }
-        }
-    }
-    return select(c, c * 0x1p-64f, k);
-}
-
-fn epi_exp(x: f32) -> f32 {
-    let bx = bitcast<u32>(x);
-    if ((bx & 0x7fffffffu) > 0x7f800000u) { return x; }
-    let xc = clamp(x, -110.0, 89.0);
-    let n = round(xc * 1.44269504);
-    let r = fma(n, -1.428606765330187e-6, fma(n, -0.693145751953125, xc));
-    var p = 1.9875691500e-4;
-    p = fma(p, r, 1.3981999507e-3);
-    p = fma(p, r, 8.3334519073e-3);
-    p = fma(p, r, 4.1665795894e-2);
-    p = fma(p, r, 1.6666665459e-1);
-    p = fma(p, r, 5.0000001201e-1);
-    return ldexp(1.0 + fma(p, r * r, r), i32(n));
-}

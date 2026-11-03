@@ -10,6 +10,20 @@
 //! - Persistent Rayon thread pool for parallelism
 //! - Arena allocator for zero per-call allocation
 
+/// `neon_or!({ native }, { portable })`: the NEON block on aarch64 unless
+/// `config::portable()`, the portable block otherwise (and on every other
+/// target, where the NEON block is not compiled at all).
+macro_rules! neon_or {
+    ($native:block, $portable:block) => {{
+        #[cfg(rlx_cpu_neon)]
+        {
+            if !$crate::config::portable() $native else $portable
+        }
+        #[cfg(not(rlx_cpu_neon))]
+        $portable
+    }};
+}
+
 pub mod arena;
 pub mod asm_check;
 pub mod attention_bwd;
@@ -73,5 +87,5 @@ pub mod tile;
 pub mod training_bwd;
 pub mod umap_knn;
 pub mod vmath;
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(target_family = "wasm", target_feature = "simd128"))]
 mod wasm_gemm;

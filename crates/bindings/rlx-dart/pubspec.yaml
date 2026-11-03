@@ -1,6 +1,6 @@
 name: rlx
 description: Dart bindings for rlx over its C ABI — graphs, sessions, device selection, autodiff, training, weights, text and distributed nodes.
-version: 0.2.19
+version: 0.2.20
 repository: https://github.com/MIT-RLX/rlx
 environment:
   sdk: ^3.3.0

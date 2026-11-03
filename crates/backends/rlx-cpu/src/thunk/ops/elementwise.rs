@@ -3656,12 +3656,12 @@ pub(crate) fn activation_backward_kernel_f64(
     }
 }
 
-/// f64 erf, correctly rounded to within an ulp (libm). The f32 kernels use
+/// f64 erf, within an ulp (rlx-libm's glibc port). The f32 kernels use
 /// the A&S polynomial in [`erf_f32`]; at f64 its 1.5e-7 error would be the
 /// largest one in the graph.
 #[inline(always)]
 pub(crate) fn erf_f64(x: f64) -> f64 {
-    libm::erf(x)
+    rlx_libm::erf(x)
 }
 
 /// Cheap erf approximation (Abramowitz & Stegun 7.1.26, max error ~1.5e-7

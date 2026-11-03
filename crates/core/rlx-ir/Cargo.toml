@@ -17,10 +17,9 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 bincode = { version = "1", optional = true }
 aes = "0.9.1"
-# Float math `core` lacks (sqrt/sin/floor/…) for the `no_std` subset only;
-# under `std` the inherent methods are used.
-libm = "0.2"
-rlx-libm = { workspace = true, optional = true }
+# Float math `core` lacks (sqrt/sin/floor/…) for the `no_std` subset, in
+# Rust; under `std` the inherent methods are used. (`std` comes with `parity`.)
+rlx-libm = { path = "../../numerics/rlx-libm", version = "0.2.20", default-features = false }
 
 [features]
 default = ["std"]
@@ -37,7 +36,7 @@ test-support = ["std"]
 # Host-built constants (spectral windows, the exact-rDFT matrices) take their
 # cos / sin from rlx-libm's reference libm instead of std's, so a wasm build
 # (std = musl there) bakes the same bits as a native one. Off: std.
-parity = ["std", "dep:rlx-libm"]
+parity = ["std", "rlx-libm/std"]
 # No Apple frameworks: the BNNS samplers / fully-connected layer (Accelerate)
 # compile to their non-macOS stubs. Additive, so it wins under unification.
 pure-rust = []

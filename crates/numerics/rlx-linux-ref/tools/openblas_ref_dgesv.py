@@ -1,3 +1,7 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Reference for tests/fixtures/openblas_haswell_dgesv.txt: run on the Linux reference
 # (msi: numpy 2.3.5, OpenBLAS 0.3.30 Haswell): python -I tools/openblas_ref_dgesv.py out.txt
 # np.linalg.solve(A, b) (b 1-D → dgesv, nrhs = 1). One line per case:

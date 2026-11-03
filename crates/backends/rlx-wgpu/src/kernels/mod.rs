@@ -418,7 +418,8 @@ pub struct MaxPool3dBwdParams {
     pub x_off: u32,
     pub dy_off: u32,
     pub dx_off: u32,
-    pub _pad0: u32,
+    /// Nonzero: the store is `max(dx, x)` (`unfuse::UNPOOL_MAX`).
+    pub with_max: u32,
     pub _pad1: u32,
     pub _pad2: u32,
     pub _pad3: u32,
@@ -2281,8 +2282,8 @@ impl Kernel {
 /// so the exact sources can be put through another compiler (the browser's
 /// Tint rejects some WGSL that naga accepts; see `fft_gpu.wgsl`'s `fft_inner`).
 pub(crate) fn dump_wgsl(label: &str, wgsl: &str) {
-    #[cfg(not(target_arch = "wasm32"))]
-    if let Some(dir) = std::env::var_os("RLX_WGPU_DUMP_WGSL") {
+    #[cfg(not(target_family = "wasm"))]
+    if let Some(dir) = rlx_ir::env::var_os("RLX_WGPU_DUMP_WGSL") {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         wgsl.hash(&mut h);
@@ -2292,23 +2293,46 @@ pub(crate) fn dump_wgsl(label: &str, wgsl: &str) {
             let _ = std::fs::write(&path, format!("// {label}\n{wgsl}"));
         }
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     let _ = (label, wgsl);
 }
 
-pub(crate) fn kernel_module(device: &wgpu::Device, label: &str, wgsl: &str) -> wgpu::ShaderModule {
-    // Fast math swaps the prepended exact helpers for native operators; a
-    // shader without them is unchanged.
-    let fast;
-    let wgsl = if crate::device::fast_math() {
-        fast = wgsl.replace(
-            rlxsl::exact::wgsl_numeric_helpers(),
-            rlxsl::exact::wgsl_fast_numeric_helpers(),
-        );
-        fast.as_str()
+/// `wgsl` with rlxsl's numeric helpers (`rlx_div_rn`, `rlx_sqrt_rn`,
+/// `rlx_rsqrt_rn`, `rlx_exp`, `rlx_log`) defined once: appended when it calls
+/// them without defining them — module-scope declarations are order-free in
+/// WGSL, and the end is past any `enable` directive — or, for the shaders
+/// build.rs assembles with the exact block already in, kept. Fast math
+/// ([`crate::device::set_fast_math`]) takes the native-operator block instead,
+/// either way, so it reaches every kernel.
+pub(crate) fn with_numeric_helpers(wgsl: &str) -> std::borrow::Cow<'_, str> {
+    with_numeric_helpers_as(wgsl, crate::device::fast_math())
+}
+
+fn with_numeric_helpers_as(wgsl: &str, fast_math: bool) -> std::borrow::Cow<'_, str> {
+    let (exact, fast) = (
+        rlxsl::exact::wgsl_numeric_helpers(),
+        rlxsl::exact::wgsl_fast_numeric_helpers(),
+    );
+    if wgsl.contains("fn rlx_div_rn(") {
+        return if fast_math {
+            wgsl.replace(exact, fast).into()
+        } else {
+            wgsl.into()
+        };
+    }
+    let calls = rlxsl::exact::WGSL_HELPER_NAMES
+        .iter()
+        .any(|h| wgsl.contains(&format!("{h}(")));
+    if calls {
+        format!("{wgsl}\n{}", if fast_math { fast } else { exact }).into()
     } else {
-        wgsl
-    };
+        wgsl.into()
+    }
+}
+
+pub(crate) fn kernel_module(device: &wgpu::Device, label: &str, wgsl: &str) -> wgpu::ShaderModule {
+    let wgsl = with_numeric_helpers(wgsl);
+    let wgsl = wgsl.as_ref();
     dump_wgsl(label, wgsl);
     let checks = wgpu::ShaderRuntimeChecks {
         force_loop_bounding: false,
@@ -5023,10 +5047,51 @@ mod fast_math_tests {
                 1,
                 "{name} must embed the exact helpers once"
             );
-            let fast = src.replace(exact, rlxsl::exact::wgsl_fast_numeric_helpers());
+            let fast = with_numeric_helpers_as(src, true);
             assert!(!fast.contains("rlxsl::exact — correctly-rounded"), "{name}");
             assert_eq!(fast.matches("fn rlx_div_rn").count(), 1, "{name}");
         }
+    }
+
+    /// The hand-written kernels call the helpers without defining them;
+    /// `kernel_module` appends one block — exact, or the fast one under
+    /// `set_fast_math` — and leaves a shader that calls none alone.
+    #[test]
+    fn hand_written_kernels_get_the_helpers_appended_once() {
+        let exact = rlxsl::exact::wgsl_numeric_helpers();
+        let fast = rlxsl::exact::wgsl_fast_numeric_helpers();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels");
+        let mut calling = 0;
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().is_none_or(|x| x != "wgsl") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).unwrap();
+            let name = p.file_name().unwrap().to_string_lossy();
+            for h in rlxsl::exact::WGSL_HELPER_NAMES {
+                assert!(
+                    !src.contains(&format!("fn {h}(")),
+                    "{name} defines its own {h}"
+                );
+            }
+            let calls = rlxsl::exact::WGSL_HELPER_NAMES
+                .iter()
+                .any(|h| src.contains(&format!("{h}(")));
+            let (e, f) = (
+                with_numeric_helpers_as(&src, false),
+                with_numeric_helpers_as(&src, true),
+            );
+            if calls {
+                calling += 1;
+                assert_eq!(e.matches(exact).count(), 1, "{name}");
+                assert_eq!(f.matches(fast).count(), 1, "{name}");
+            } else {
+                assert_eq!(e, src.as_str(), "{name}");
+                assert_eq!(f, src.as_str(), "{name}");
+            }
+        }
+        assert!(calling >= 32, "only {calling} kernels call the helpers");
     }
 }
 

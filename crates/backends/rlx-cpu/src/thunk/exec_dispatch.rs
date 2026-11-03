@@ -420,7 +420,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     // spin instead, and this thread's share of the work is done by the worker
     // it runs on. Thread-local kernel state (MoE residency masks, counters)
     // then lives on that worker.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     if exec_in_pool()
         && rayon::current_thread_index().is_none()
         && crate::pool::num_threads() > 1
@@ -433,7 +433,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
 
 /// A schedule with a kernel that blocks on other ranks stays on the caller's
 /// thread (see [`crate::op_registry::CpuKernel::waits_on_peers`]).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn waits_on_peers(schedule: &ThunkSchedule) -> bool {
     schedule
         .thunks
@@ -441,7 +441,7 @@ fn waits_on_peers(schedule: &ThunkSchedule) -> bool {
         .any(|t| matches!(t, Thunk::CustomOp { kernel, .. } if kernel.waits_on_peers()))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn exec_in_pool() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // On by default: measured on GraphCSPNet training (many small kernels per
@@ -2482,7 +2482,8 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     // only without a BLAS, at a 512-row bucket ~11 ms of a
                     // ~30 ms step on three cores.
                     #[cfg(rlx_cpu_x86)]
-                    if b == 1
+                    if !crate::config::portable()
+                        && b == 1
                         && q_s == 1
                         && nh > 1
                         && (k_s <= cfg.sdpa_seq_threshold || cfg!(not(rlx_cpu_blas)))
@@ -2570,30 +2571,31 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     let q_off = bi * q_s * qrs + qi * qrs + hi * dh;
                                     for ki in 0..k_s {
                                         let k_off = bi * k_s * krs + ki * krs + kv_hi * dh;
-                                        #[cfg(rlx_cpu_neon)]
-                                        let mut dot;
-                                        #[cfg(not(rlx_cpu_neon))]
                                         let mut dot = 0f32;
-                                        #[cfg(rlx_cpu_neon)]
-                                        {
-                                            use std::arch::aarch64::*;
-                                            let mut acc = vdupq_n_f32(0.0);
-                                            for c in 0..neon_chunks {
-                                                let vq =
-                                                    vld1q_f32(q_data.as_ptr().add(q_off + c * 4));
-                                                let vk =
-                                                    vld1q_f32(k_data.as_ptr().add(k_off + c * 4));
-                                                acc = vfmaq_f32(acc, vq, vk);
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let mut acc = vdupq_n_f32(0.0);
+                                                for c in 0..neon_chunks {
+                                                    let vq = vld1q_f32(
+                                                        q_data.as_ptr().add(q_off + c * 4),
+                                                    );
+                                                    let vk = vld1q_f32(
+                                                        k_data.as_ptr().add(k_off + c * 4),
+                                                    );
+                                                    acc = vfmaq_f32(acc, vq, vk);
+                                                }
+                                                dot = vaddvq_f32(acc);
+                                                for d in (neon_chunks * 4)..dh {
+                                                    dot += q_data[q_off + d] * k_data[k_off + d];
+                                                }
+                                            },
+                                            {
+                                                for d in 0..dh {
+                                                    dot += q_data[q_off + d] * k_data[k_off + d];
+                                                }
                                             }
-                                            dot = vaddvq_f32(acc);
-                                            for d in (neon_chunks * 4)..dh {
-                                                dot += q_data[q_off + d] * k_data[k_off + d];
-                                            }
-                                        }
-                                        #[cfg(not(rlx_cpu_neon))]
-                                        for d in 0..dh {
-                                            dot += q_data[q_off + d] * k_data[k_off + d];
-                                        }
+                                        );
                                         scores[qi * k_s + ki] = dot * scale;
                                         // Inner-loop Custom mask check —
                                         // Causal / SlidingWindow / None
@@ -2631,31 +2633,36 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                         let sc = scores[qi * k_s + ki];
                                         if sc > score_thr {
                                             let v_off = bi * k_s * vrs + ki * vrs + kv_hi * dh_v;
-                                            #[cfg(rlx_cpu_neon)]
-                                            {
-                                                use std::arch::aarch64::*;
-                                                let vsc = vdupq_n_f32(sc);
-                                                for c in 0..neon_chunks_v {
-                                                    let off = c * 4;
-                                                    let vo = vld1q_f32(
-                                                        out_data.as_ptr().add(o_off + off),
-                                                    );
-                                                    let vv =
-                                                        vld1q_f32(v_data.as_ptr().add(v_off + off));
-                                                    vst1q_f32(
-                                                        out_data.as_mut_ptr().add(o_off + off),
-                                                        vfmaq_f32(vo, vsc, vv),
-                                                    );
+                                            neon_or!(
+                                                {
+                                                    use std::arch::aarch64::*;
+                                                    let vsc = vdupq_n_f32(sc);
+                                                    for c in 0..neon_chunks_v {
+                                                        let off = c * 4;
+                                                        let vo = vld1q_f32(
+                                                            out_data.as_ptr().add(o_off + off),
+                                                        );
+                                                        let vv = vld1q_f32(
+                                                            v_data.as_ptr().add(v_off + off),
+                                                        );
+                                                        vst1q_f32(
+                                                            out_data.as_mut_ptr().add(o_off + off),
+                                                            vfmaq_f32(vo, vsc, vv),
+                                                        );
+                                                    }
+                                                    // scalar tail if dh_v not a multiple of 4
+                                                    for d in (neon_chunks_v * 4)..dh_v {
+                                                        out_data[o_off + d] +=
+                                                            sc * v_data[v_off + d];
+                                                    }
+                                                },
+                                                {
+                                                    for d in 0..dh_v {
+                                                        out_data[o_off + d] +=
+                                                            sc * v_data[v_off + d];
+                                                    }
                                                 }
-                                                // scalar tail if dh_v not a multiple of 4
-                                                for d in (neon_chunks_v * 4)..dh_v {
-                                                    out_data[o_off + d] += sc * v_data[v_off + d];
-                                                }
-                                            }
-                                            #[cfg(not(rlx_cpu_neon))]
-                                            for d in 0..dh_v {
-                                                out_data[o_off + d] += sc * v_data[v_off + d];
-                                            }
+                                            );
                                         }
                                     }
                                 }
@@ -3019,26 +3026,28 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                             dot += qr1 * kr1 + qr2 * kr2;
                                         }
                                     } else {
-                                        #[cfg(rlx_cpu_neon)]
-                                        {
-                                            use std::arch::aarch64::*;
-                                            let mut acc = vdupq_n_f32(0.0);
-                                            for c in 0..neon_chunks {
-                                                let vq =
-                                                    vld1q_f32(qkv.as_ptr().add(q_base + c * 4));
-                                                let vk =
-                                                    vld1q_f32(qkv.as_ptr().add(k_base + c * 4));
-                                                acc = vfmaq_f32(acc, vq, vk);
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let mut acc = vdupq_n_f32(0.0);
+                                                for c in 0..neon_chunks {
+                                                    let vq =
+                                                        vld1q_f32(qkv.as_ptr().add(q_base + c * 4));
+                                                    let vk =
+                                                        vld1q_f32(qkv.as_ptr().add(k_base + c * 4));
+                                                    acc = vfmaq_f32(acc, vq, vk);
+                                                }
+                                                dot = vaddvq_f32(acc);
+                                                for d in (neon_chunks * 4)..d_h {
+                                                    dot += qkv[q_base + d] * qkv[k_base + d];
+                                                }
+                                            },
+                                            {
+                                                for d in 0..d_h {
+                                                    dot += qkv[q_base + d] * qkv[k_base + d];
+                                                }
                                             }
-                                            dot = vaddvq_f32(acc);
-                                            for d in (neon_chunks * 4)..d_h {
-                                                dot += qkv[q_base + d] * qkv[k_base + d];
-                                            }
-                                        }
-                                        #[cfg(not(rlx_cpu_neon))]
-                                        for d in 0..d_h {
-                                            dot += qkv[q_base + d] * qkv[k_base + d];
-                                        }
+                                        );
                                     }
                                     let mut sv = dot * scale;
                                     let pos_masked = match mask_kind_c {
@@ -3066,24 +3075,27 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     let sc = scores[qi * s + ki];
                                     if sc > score_thr {
                                         let v_base = bi * s * 3 * h + ki * 3 * h + 2 * h + hi * d_h;
-                                        #[cfg(rlx_cpu_neon)]
-                                        {
-                                            use std::arch::aarch64::*;
-                                            let vsc = vdupq_n_f32(sc);
-                                            for c in 0..neon_chunks {
-                                                let o = c * 4;
-                                                let vo = vld1q_f32(out.add(o_base + o));
-                                                let vv = vld1q_f32(qkv.as_ptr().add(v_base + o));
-                                                vst1q_f32(
-                                                    out.add(o_base + o),
-                                                    vfmaq_f32(vo, vsc, vv),
-                                                );
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let vsc = vdupq_n_f32(sc);
+                                                for c in 0..neon_chunks {
+                                                    let o = c * 4;
+                                                    let vo = vld1q_f32(out.add(o_base + o));
+                                                    let vv =
+                                                        vld1q_f32(qkv.as_ptr().add(v_base + o));
+                                                    vst1q_f32(
+                                                        out.add(o_base + o),
+                                                        vfmaq_f32(vo, vsc, vv),
+                                                    );
+                                                }
+                                            },
+                                            {
+                                                for d in 0..d_h {
+                                                    *out.add(o_base + d) += sc * qkv[v_base + d];
+                                                }
                                             }
-                                        }
-                                        #[cfg(not(rlx_cpu_neon))]
-                                        for d in 0..d_h {
-                                            *out.add(o_base + d) += sc * qkv[v_base + d];
-                                        }
+                                        );
                                     }
                                 }
                             }
@@ -3169,27 +3181,26 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 for ki in 0..s {
                                     let q_base = bi * s * 3 * h + qi * 3 * h + hi * d_h;
                                     let k_base = bi * s * 3 * h + ki * 3 * h + h + hi * d_h;
-                                    #[cfg(rlx_cpu_neon)]
-                                    let dot;
-                                    #[cfg(not(rlx_cpu_neon))]
                                     let mut dot = 0f32;
-                                    #[cfg(rlx_cpu_neon)]
-                                    {
-                                        use std::arch::aarch64::*;
-                                        let mut acc = vdupq_n_f32(0.0);
-                                        for c in 0..neon_chunks {
-                                            acc = vfmaq_f32(
-                                                acc,
-                                                vld1q_f32(qkv.as_ptr().add(q_base + c * 4)),
-                                                vld1q_f32(qkv.as_ptr().add(k_base + c * 4)),
-                                            );
+                                    neon_or!(
+                                        {
+                                            use std::arch::aarch64::*;
+                                            let mut acc = vdupq_n_f32(0.0);
+                                            for c in 0..neon_chunks {
+                                                acc = vfmaq_f32(
+                                                    acc,
+                                                    vld1q_f32(qkv.as_ptr().add(q_base + c * 4)),
+                                                    vld1q_f32(qkv.as_ptr().add(k_base + c * 4)),
+                                                );
+                                            }
+                                            dot = vaddvq_f32(acc);
+                                        },
+                                        {
+                                            for d in 0..d_h {
+                                                dot += qkv[q_base + d] * qkv[k_base + d];
+                                            }
                                         }
-                                        dot = vaddvq_f32(acc);
-                                    }
-                                    #[cfg(not(rlx_cpu_neon))]
-                                    for d in 0..d_h {
-                                        dot += qkv[q_base + d] * qkv[k_base + d];
-                                    }
+                                    );
                                     sc[qi * s + ki] = dot * scale;
                                     if mk[bi * s + ki] < mask_thr {
                                         sc[qi * s + ki] = mask_neg;
@@ -3206,26 +3217,28 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     let w = sc[qi * s + ki];
                                     if w > score_thr {
                                         let v = bi * s * 3 * h + ki * 3 * h + 2 * h + hi * d_h;
-                                        #[cfg(rlx_cpu_neon)]
-                                        {
-                                            use std::arch::aarch64::*;
-                                            let vw = vdupq_n_f32(w);
-                                            for c in 0..neon_chunks {
-                                                let off = c * 4;
-                                                vst1q_f32(
-                                                    attn.as_mut_ptr().add(o + off),
-                                                    vfmaq_f32(
-                                                        vld1q_f32(attn.as_ptr().add(o + off)),
-                                                        vw,
-                                                        vld1q_f32(qkv.as_ptr().add(v + off)),
-                                                    ),
-                                                );
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let vw = vdupq_n_f32(w);
+                                                for c in 0..neon_chunks {
+                                                    let off = c * 4;
+                                                    vst1q_f32(
+                                                        attn.as_mut_ptr().add(o + off),
+                                                        vfmaq_f32(
+                                                            vld1q_f32(attn.as_ptr().add(o + off)),
+                                                            vw,
+                                                            vld1q_f32(qkv.as_ptr().add(v + off)),
+                                                        ),
+                                                    );
+                                                }
+                                            },
+                                            {
+                                                for d in 0..d_h {
+                                                    attn[o + d] += w * qkv[v + d];
+                                                }
                                             }
-                                        }
-                                        #[cfg(not(rlx_cpu_neon))]
-                                        for d in 0..d_h {
-                                            attn[o + d] += w * qkv[v + d];
-                                        }
+                                        );
                                     }
                                 }
                             }
@@ -3242,28 +3255,30 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         h,
                         h,
                     );
-                    #[cfg(rlx_cpu_neon)]
-                    {
-                        use std::arch::aarch64::*;
-                        let chunks_h = (m * h) / 4;
-                        for c in 0..chunks_h {
-                            let off = c * 4;
-                            vst1q_f32(
-                                res.as_mut_ptr().add(off),
-                                vaddq_f32(
-                                    vld1q_f32(res.as_ptr().add(off)),
-                                    vld1q_f32(inp.as_ptr().add(off)),
-                                ),
-                            );
+                    neon_or!(
+                        {
+                            use std::arch::aarch64::*;
+                            let chunks_h = (m * h) / 4;
+                            for c in 0..chunks_h {
+                                let off = c * 4;
+                                vst1q_f32(
+                                    res.as_mut_ptr().add(off),
+                                    vaddq_f32(
+                                        vld1q_f32(res.as_ptr().add(off)),
+                                        vld1q_f32(inp.as_ptr().add(off)),
+                                    ),
+                                );
+                            }
+                            for i in (chunks_h * 4)..(m * h) {
+                                res[i] += inp[i];
+                            }
+                        },
+                        {
+                            for i in 0..m * h {
+                                res[i] += inp[i];
+                            }
                         }
-                        for i in (chunks_h * 4)..(m * h) {
-                            res[i] += inp[i];
-                        }
-                    }
-                    #[cfg(not(rlx_cpu_neon))]
-                    for i in 0..m * h {
-                        res[i] += inp[i];
-                    }
+                    );
 
                     // LN1 (fused residual already done above — just normalize)
                     let g1 = sl(*ln1_g, base, h);
@@ -3292,28 +3307,30 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         id,
                         h,
                     );
-                    #[cfg(rlx_cpu_neon)]
-                    {
-                        use std::arch::aarch64::*;
-                        let chunks_h = (m * h) / 4;
-                        for c in 0..chunks_h {
-                            let off = c * 4;
-                            vst1q_f32(
-                                res.as_mut_ptr().add(off),
-                                vaddq_f32(
-                                    vld1q_f32(res.as_ptr().add(off)),
-                                    vld1q_f32(normed.as_ptr().add(off)),
-                                ),
-                            );
+                    neon_or!(
+                        {
+                            use std::arch::aarch64::*;
+                            let chunks_h = (m * h) / 4;
+                            for c in 0..chunks_h {
+                                let off = c * 4;
+                                vst1q_f32(
+                                    res.as_mut_ptr().add(off),
+                                    vaddq_f32(
+                                        vld1q_f32(res.as_ptr().add(off)),
+                                        vld1q_f32(normed.as_ptr().add(off)),
+                                    ),
+                                );
+                            }
+                            for i in (chunks_h * 4)..(m * h) {
+                                res[i] += normed[i];
+                            }
+                        },
+                        {
+                            for i in 0..m * h {
+                                res[i] += normed[i];
+                            }
                         }
-                        for i in (chunks_h * 4)..(m * h) {
-                            res[i] += normed[i];
-                        }
-                    }
-                    #[cfg(not(rlx_cpu_neon))]
-                    for i in 0..m * h {
-                        res[i] += normed[i];
-                    }
+                    );
 
                     // LN2 → output
                     let g2 = sl(*ln2_g, base, h);
@@ -3423,26 +3440,28 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     let w = sc[qi * s + ki];
                                     if w > score_thr {
                                         let v = bi * s * 3 * h + ki * 3 * h + 2 * h + hi * d_h;
-                                        #[cfg(rlx_cpu_neon)]
-                                        {
-                                            use std::arch::aarch64::*;
-                                            let vw = vdupq_n_f32(w);
-                                            for c in 0..neon_chunks {
-                                                let off = c * 4;
-                                                vst1q_f32(
-                                                    attn.as_mut_ptr().add(o + off),
-                                                    vfmaq_f32(
-                                                        vld1q_f32(attn.as_ptr().add(o + off)),
-                                                        vw,
-                                                        vld1q_f32(qkv.as_ptr().add(v + off)),
-                                                    ),
-                                                );
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let vw = vdupq_n_f32(w);
+                                                for c in 0..neon_chunks {
+                                                    let off = c * 4;
+                                                    vst1q_f32(
+                                                        attn.as_mut_ptr().add(o + off),
+                                                        vfmaq_f32(
+                                                            vld1q_f32(attn.as_ptr().add(o + off)),
+                                                            vw,
+                                                            vld1q_f32(qkv.as_ptr().add(v + off)),
+                                                        ),
+                                                    );
+                                                }
+                                            },
+                                            {
+                                                for d in 0..d_h {
+                                                    attn[o + d] += w * qkv[v + d];
+                                                }
                                             }
-                                        }
-                                        #[cfg(not(rlx_cpu_neon))]
-                                        for d in 0..d_h {
-                                            attn[o + d] += w * qkv[v + d];
-                                        }
+                                        );
                                     }
                                 }
                             }

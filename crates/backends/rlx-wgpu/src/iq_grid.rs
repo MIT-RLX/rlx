@@ -8,7 +8,7 @@
 //! Same byte layout as `rlx_metal::kernels::iq_grid_buffer` /
 //! `rlx_cuda::iq_grid::cuda_iq_grid_buffer`.
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use std::sync::{Mutex, OnceLock};
 
 fn build_bytes() -> Vec<u8> {
@@ -62,7 +62,7 @@ fn create_grid_buffer(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Buffe
 /// Native uses a `Sync` global; on wasm `wgpu::Buffer` is `!Send + !Sync`
 /// (the browser is single-threaded), so the cache is a `thread_local` —
 /// equivalent here since there is only ever one thread.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub fn wgpu_iq_grid_buffer(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Buffer {
     static CACHE: OnceLock<Mutex<Option<wgpu::Buffer>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
@@ -76,7 +76,7 @@ pub fn wgpu_iq_grid_buffer(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::
 }
 
 /// Cached IQ grid LUT (read-only storage). Built once per thread on wasm.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub fn wgpu_iq_grid_buffer(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Buffer {
     thread_local! {
         static CACHE: std::cell::RefCell<Option<wgpu::Buffer>> =

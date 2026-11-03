@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! FFT plans in the working precision.
 //!
 //! * [`FftPlan`] — complex DFT of any length: a Stockham autosort
@@ -326,10 +330,10 @@ fn radix3<T: Float>(x: &[Complex<T>], y: &mut [Complex<T>], s: usize, m: usize, 
 #[inline(always)]
 fn radix5<T: Float>(x: &[Complex<T>], y: &mut [Complex<T>], s: usize, m: usize, tw: &[Complex<T>]) {
     let pi = std::f64::consts::PI;
-    let c1 = T::from_f64(libm::cos(2.0 * pi / 5.0));
-    let c2 = T::from_f64(libm::cos(4.0 * pi / 5.0));
-    let s1 = T::from_f64(libm::sin(2.0 * pi / 5.0));
-    let s2 = T::from_f64(libm::sin(4.0 * pi / 5.0));
+    let c1 = T::from_f64(rlx_libm::cos(2.0 * pi / 5.0));
+    let c2 = T::from_f64(rlx_libm::cos(4.0 * pi / 5.0));
+    let s1 = T::from_f64(rlx_libm::sin(2.0 * pi / 5.0));
+    let s2 = T::from_f64(rlx_libm::sin(4.0 * pi / 5.0));
     for q in 0..m {
         let (w1, w2, w3, w4) = (tw[4 * q], tw[4 * q + 1], tw[4 * q + 2], tw[4 * q + 3]);
         for k in 0..s {

@@ -8548,11 +8548,12 @@ fn compile_static_with(
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
-            Op::MaxPool3dBackward {
-                kernel_size,
-                stride,
-                padding,
-            } => {
+            // (and an `UNPOOL_MAX`: the same, maxed with `x` in the store)
+            op @ (Op::MaxPool3dBackward { .. } | Op::Custom { .. })
+                if crate::unfuse::maxpool3d_backward_geometry(op).is_some() =>
+            {
+                let (kernel_size, stride, padding, with_max) =
+                    crate::unfuse::maxpool3d_backward_geometry(op).unwrap();
                 let x_id = node.inputs[0];
                 let dy_id = node.inputs[1];
                 let x_shape = &graph.node(x_id).shape;
@@ -8617,7 +8618,7 @@ fn compile_static_with(
                     x_off,
                     dy_off,
                     dx_off: arena_local_off_f32(&arena, node.id, base),
-                    _pad0: 0,
+                    with_max: with_max as u32,
                     _pad1: 0,
                     _pad2: 0,
                     _pad3: 0,

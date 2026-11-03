@@ -162,22 +162,22 @@ pub fn is_available(device: Device) -> bool {
     }
     #[cfg(feature = "gpu")]
     if device == Device::Gpu {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             return rlx_wgpu::device::wgpu_device().is_some();
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             return rlx_wgpu::is_available();
         }
     }
     #[cfg(feature = "webgpu")]
     if device == Device::WebGpu {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             return rlx_wgpu::device::wgpu_device().is_some();
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             return rlx_wgpu::is_available();
         }
@@ -335,9 +335,14 @@ pub fn devices_for(graph: &Graph) -> Vec<Device> {
 /// Probes `DEVICE_PRIORITY` in order (TPU → CUDA → ROCm → MLX → Metal → …
 /// → CPU). Use this when you want a sensible default `Session` target without
 /// building a graph first. For workload-specific selection, prefer
-/// [`crate::cost::fastest_device_for`].
+/// [`crate::cost::fastest_device_for`]. Under [`rlx_ir::reproducible`] it is
+/// the CPU: the host's GPUs do not pick.
 pub fn fastest_device() -> Device {
-    fastest_among(&available_devices())
+    let available = available_devices();
+    if rlx_ir::reproducible::reproducible() && available.contains(&Device::Cpu) {
+        return Device::Cpu;
+    }
+    fastest_among(&available)
 }
 
 /// Pick the highest-priority entry from `candidates` (see `DEVICE_PRIORITY`).

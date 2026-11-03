@@ -255,10 +255,10 @@ cargo rlx nodes                                               # who is out there
 
 ```text
 name                   address                platform devices                       mem  version
-Yellow iPad            10.0.0.13:29503        ios      cpu,metal,ane                6 GB  0.2.19
-amd                    10.0.0.204:29502       linux    cpu,rocm,xdna,vulkan        44 GB  0.2.19
-mm4                    10.0.0.185:29500       macos    cpu,metal,ane,gpu           64 GB  0.2.19
-msi                    10.0.0.172:29501       linux    cpu,cuda,vulkan             61 GB  0.2.19
+Yellow iPad            10.0.0.13:29503        ios      cpu,metal,ane                6 GB  0.2.20
+amd                    10.0.0.204:29502       linux    cpu,rocm,xdna,vulkan        44 GB  0.2.20
+mm4                    10.0.0.185:29500       macos    cpu,metal,ane,gpu           64 GB  0.2.20
+msi                    10.0.0.172:29501       linux    cpu,cuda,vulkan             61 GB  0.2.20
 ```
 
 - **Advertise from the rank binary.** `cargo-rlx` is built with the CPU

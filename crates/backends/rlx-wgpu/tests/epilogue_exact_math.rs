@@ -2,14 +2,15 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The fused matmul / conv epilogues (`apply_act`) divide through
-//! `epi_div_rn` and exponentiate through `epi_exp`, copies of rlxsl's
-//! `rlx_div_rn` / `rlx_exp`, and spell the erf polynomial with explicit `fma`. A raw WGSL `/` or `exp`, or a
-//! plain `a * b + c` chain is compiled differently by native wgpu and by a
-//! browser's WebGPU on the same Metal GPU: BCG-FM's squeeze-excite sigmoid
-//! (an `m = 1` gemv epilogue) and every fused GELU moved by ULPs between them.
-//! These shaders are not built through build.rs, so the copies are pinned here;
-//! the normalization, softmax and attention kernels carry the same copies.
+//! The fused matmul / conv epilogues (`apply_act`) divide through rlxsl's
+//! `rlx_div_rn` and exponentiate through `rlx_exp`, and spell the erf
+//! polynomial with explicit `fma`. A raw WGSL `/` or `exp`, or a plain
+//! `a * b + c` chain is compiled differently by native wgpu and by a browser's
+//! WebGPU on the same Metal GPU: BCG-FM's squeeze-excite sigmoid (an `m = 1`
+//! gemv epilogue) and every fused GELU moved by ULPs between them. The kernels
+//! call the helpers and `kernel_module` appends rlxsl's one definition (pinned
+//! in `kernels::fast_math_tests`); the normalization, softmax and attention
+//! kernels call the same ones.
 
 use std::path::Path;
 
@@ -33,17 +34,6 @@ fn body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
-/// rlxsl's helper `rlx_<name>` as the kernels copy it (`rlx_*` → `epi_*`).
-fn helper(name: &str) -> String {
-    let want = body(rlxsl::exact::wgsl_numeric_helpers(), &format!("rlx_{name}"))
-        .unwrap_or_else(|| panic!("rlxsl's rlx_{name}"));
-    ["div_rn", "sqrt_rn", "rsqrt_rn", "exp"]
-        .iter()
-        .fold(want.to_string(), |b, n| {
-            b.replace(&format!("rlx_{n}"), &format!("epi_{n}"))
-        })
-}
-
 /// Whether `src` calls the builtin `name(` (not a helper ending in it).
 fn calls_builtin(src: &str, name: &str) -> bool {
     src.match_indices(&format!("{name}("))
@@ -61,22 +51,19 @@ fn every_epilogue_divides_exactly_and_fuses_its_polynomials() {
         if !name.ends_with(".wgsl") {
             continue;
         }
-        // every copy of a helper, in any kernel, is rlxsl's
-        for h in ["div_rn", "sqrt_rn", "rsqrt_rn", "exp"] {
-            if let Some(got) = body(&src, &format!("epi_{h}")) {
-                assert_eq!(got, helper(h), "{name}: epi_{h} is not rlxsl's rlx_{h}");
-            }
-        }
+        // no kernel carries its own copy of a helper
+        assert!(
+            !src.contains("fn epi_"),
+            "{name}: a private helper copy is back"
+        );
         // elementwise_region's `apply_activation` is the generated rlxsl math
         if !src.contains("fn apply_act(") {
             continue;
         }
         seen += 1;
-        for h in ["div_rn", "exp"] {
-            assert!(
-                body(&src, &format!("epi_{h}")).is_some(),
-                "{name}: no epi_{h}"
-            );
+        let act = body(&src, "apply_act").unwrap();
+        for h in ["rlx_div_rn(", "rlx_exp("] {
+            assert!(act.contains(h), "{name}: apply_act does not call {h}…)");
         }
         for raw in [
             "1.0 / (1.0 + exp",
@@ -99,9 +86,9 @@ fn every_epilogue_divides_exactly_and_fuses_its_polynomials() {
 }
 
 /// The normalization, softmax and attention kernels (forward and backward) take
-/// `1/n`, `1/sqrt` and `exp` from the helper copies (group norm from the helpers
-/// build.rs prepends): a raw `/`, `inverseSqrt` or `exp` rounds by the
-/// math mode, and LayerNorm alone moved BIOT's first token embedding.
+/// `1/n`, `1/sqrt`, `exp` and `log` from rlxsl's helpers: a raw `/`,
+/// `inverseSqrt`, `exp` or `log` rounds by the math mode, and LayerNorm alone
+/// moved BIOT's first token embedding.
 #[test]
 fn norm_softmax_attention_kernels_use_the_exact_helpers() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels");
@@ -128,6 +115,7 @@ fn norm_softmax_attention_kernels_use_the_exact_helpers() {
             "{name}: raw inverseSqrt"
         );
         assert!(!calls_builtin(&src, "exp"), "{name}: raw exp");
+        assert!(!calls_builtin(&src, "log"), "{name}: raw log");
         assert!(!src.contains("1.0 / "), "{name}: raw `1.0 / …`");
     }
 }
@@ -146,4 +134,35 @@ fn generated_wgsl_erf_is_fused() {
         text.contains("rlx_exp("),
         "rlxsl's WGSL gelu calls the builtin exp: {text}"
     );
+}
+
+/// The GPU FFT kernels take their twiddles from rlxsl's `rlx_sin` / `rlx_cos`
+/// and their angles from `rlx_div_rn`, and spell every complex multiply with an
+/// explicit `fma`: the builtins and a plain `a*b - c*d` round by the compiler's
+/// math mode, so native wgpu (Apple fast math) and a browser (safe math) ran
+/// the same `Native` FFT to different bits.
+#[test]
+fn fft_kernels_are_math_mode_independent() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels");
+    for name in [
+        "fft_gpu.wgsl",
+        "fft_gpu_big.wgsl",
+        "fft_gpu_multirow.wgsl",
+        "fft_gpu_r4_16k.wgsl",
+    ] {
+        let src = std::fs::read_to_string(dir.join(name)).unwrap();
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for f in ["sin", "cos"] {
+            assert!(!calls_builtin(&code, f), "{name}: raw {f}");
+        }
+        assert!(!code.contains(" / f32("), "{name}: a raw float division");
+        assert!(
+            !code.contains("a.x * b.x - a.y * b.y"),
+            "{name}: a contractible complex multiply"
+        );
+    }
 }

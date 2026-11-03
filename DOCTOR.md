@@ -62,7 +62,7 @@ missing hardware.
 ## Reading the output
 
 ```text
-rlx 0.2.19 on linux-x86_64
+rlx 0.2.20 on linux-x86_64
 
 Devices
   ok  CPU         ready       check rel err 0.0e0 in 5 ms

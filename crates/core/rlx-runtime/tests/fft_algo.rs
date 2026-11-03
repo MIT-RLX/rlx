@@ -310,7 +310,101 @@ fn cases() -> Vec<(DType, bool, FftNorm, FftAlgo)> {
             FftNorm::Forward,
             FftAlgo::POCKETFFT_NO_FMA,
         ),
+        (DType::F32, false, FftNorm::Backward, FftAlgo::PORTABLE),
+        (DType::F32, true, FftNorm::Forward, FftAlgo::PORTABLE),
+        (DType::F64, true, FftNorm::Ortho, FftAlgo::PORTABLE),
     ]
+}
+
+/// `RLX_FFT` / `set_fft_policy`: a graph built with the default (`Native`) FFT
+/// runs the policy's algorithm, on every device, bit for bit as if built with
+/// it; an explicit algorithm is kept; `Native` leaves graphs alone.
+#[test]
+fn fft_policy_rewrites_default_ffts() {
+    let _gpu = common::serialize_gpu();
+    use rlx_ir::{FftPolicy, set_fft_policy};
+    let n = 360usize;
+    let rows: Vec<Vec<[f64; 2]>> = (0..2)
+        .map(|r| {
+            sig(2 * n, (r * 5 + 1) as u64)
+                .chunks(2)
+                .map(|c| [c[0], c[1]])
+                .collect()
+        })
+        .collect();
+    let x = block_bytes(&rows, DType::F32);
+    let devices: Vec<Device> = std::iter::once(Device::Cpu)
+        .chain(
+            rlx_runtime::device_ext::available_devices()
+                .into_iter()
+                .filter(|d| *d != Device::Cpu && rlx_runtime::device_ext::is_available(*d)),
+        )
+        .collect();
+    let portable = run_bytes(
+        Device::Cpu,
+        fft_graph(
+            2,
+            n,
+            DType::F32,
+            false,
+            FftNorm::Backward,
+            FftAlgo::PORTABLE,
+        ),
+        &x,
+        DType::F32,
+    );
+    let native = run_bytes(
+        Device::Cpu,
+        fft_graph(2, n, DType::F32, false, FftNorm::Backward, FftAlgo::Native),
+        &x,
+        DType::F32,
+    );
+    set_fft_policy(FftPolicy::Portable);
+    let mut bad = vec![];
+    for &d in &devices {
+        let got = run_bytes(
+            d,
+            fft_graph(2, n, DType::F32, false, FftNorm::Backward, FftAlgo::Native),
+            &x,
+            DType::F32,
+        );
+        if got != portable {
+            bad.push(format!("{d:?}"));
+        }
+    }
+    // an explicit choice survives the policy
+    let scipy = run_bytes(
+        Device::Cpu,
+        fft_graph(2, n, DType::F32, false, FftNorm::Backward, FftAlgo::SCIPY),
+        &x,
+        DType::F32,
+    );
+    set_fft_policy(FftPolicy::Native);
+    let back = run_bytes(
+        Device::Cpu,
+        fft_graph(2, n, DType::F32, false, FftNorm::Backward, FftAlgo::Native),
+        &x,
+        DType::F32,
+    );
+    assert!(
+        bad.is_empty(),
+        "portable policy differs from FftAlgo::PORTABLE on {bad:?} (devices {devices:?})"
+    );
+    assert_eq!(
+        back, native,
+        "Native policy must leave the default FFT alone"
+    );
+    let want_scipy = run_bytes(
+        Device::Cpu,
+        fft_graph(2, n, DType::F32, false, FftNorm::Backward, FftAlgo::SCIPY),
+        &x,
+        DType::F32,
+    );
+    assert_eq!(
+        scipy, want_scipy,
+        "an explicit FftAlgo must survive the policy"
+    );
+    assert_eq!(FftPolicy::parse("portable"), Some(FftPolicy::Portable));
 }
 
 /// The elementwise lowering (what GPUs run) replays the CPU kernel bit for bit.

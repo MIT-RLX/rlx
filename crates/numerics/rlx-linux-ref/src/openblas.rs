@@ -655,11 +655,11 @@ pub fn dgemm_ab(
 /// kernels inline the exact `f64`-arithmetic emulation instead.
 #[inline(always)]
 fn fmadd(a: f64, b: f64, c: f64) -> f64 {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     {
         rlx_libm::fma_emulated(a, b, c)
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     {
         a.mul_add(b, c)
     }

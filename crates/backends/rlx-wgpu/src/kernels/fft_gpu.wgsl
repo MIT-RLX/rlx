@@ -68,7 +68,7 @@ fn fft_radix2_full(
     loop {
         if (len > n) { break; }
         let h2 = len >> 1u;
-        let theta_base = sign * two_pi / f32(len);
+        let theta_base = rlx_div_rn(sign * two_pi, f32(len));
         var b: u32 = tid;
         loop {
             if (b >= n / 2u) { break; }
@@ -77,10 +77,10 @@ fn fft_radix2_full(
             let i_lo = group * len + k_in;
             let i_hi = i_lo + h2;
             let theta = theta_base * f32(k_in);
-            let wre = cos(theta);
-            let wim = sin(theta);
-            let t_re = wre * sre_full[i_hi] - wim * sim_full[i_hi];
-            let t_im = wre * sim_full[i_hi] + wim * sre_full[i_hi];
+            let wre = rlx_cos(theta);
+            let wim = rlx_sin(theta);
+            let t_re = fma(wre, sre_full[i_hi], -(wim * sim_full[i_hi]));
+            let t_im = fma(wre, sim_full[i_hi], wim * sre_full[i_hi]);
             let u_re = sre_full[i_lo];
             let u_im = sim_full[i_lo];
             sre_full[i_lo] = u_re + t_re;
@@ -142,7 +142,7 @@ fn fft_radix2_full_big(
     loop {
         if (len > n) { break; }
         let h2 = len >> 1u;
-        let theta_base = sign * two_pi / f32(len);
+        let theta_base = rlx_div_rn(sign * two_pi, f32(len));
         var b: u32 = tid;
         loop {
             if (b >= n / 2u) { break; }
@@ -151,10 +151,10 @@ fn fft_radix2_full_big(
             let i_lo = group * len + k_in;
             let i_hi = i_lo + h2;
             let theta = theta_base * f32(k_in);
-            let wre = cos(theta);
-            let wim = sin(theta);
-            let t_re = wre * sre_full_big[i_hi] - wim * sim_full_big[i_hi];
-            let t_im = wre * sim_full_big[i_hi] + wim * sre_full_big[i_hi];
+            let wre = rlx_cos(theta);
+            let wim = rlx_sin(theta);
+            let t_re = fma(wre, sre_full_big[i_hi], -(wim * sim_full_big[i_hi]));
+            let t_im = fma(wre, sim_full_big[i_hi], wim * sre_full_big[i_hi]);
             let u_re = sre_full_big[i_lo];
             let u_im = sim_full_big[i_lo];
             sre_full_big[i_lo] = u_re + t_re;
@@ -245,13 +245,13 @@ fn fft_inner(
             let k = local % hs;
             let i = (local / hs) * (hs * 2u) + k;
             let j = i + hs;
-            let angle = sign * pi * f32(k) / f32(hs);
-            let cos_a = cos(angle);
-            let sin_a = sin(angle);
+            let angle = rlx_div_rn(sign * pi * f32(k), f32(hs));
+            let cos_a = rlx_cos(angle);
+            let sin_a = rlx_sin(angle);
             let ur = sre_in[i];
             let ui = sim_in[i];
-            let vr = cos_a * sre_in[j] - sin_a * sim_in[j];
-            let vi = sin_a * sre_in[j] + cos_a * sim_in[j];
+            let vr = fma(cos_a, sre_in[j], -(sin_a * sim_in[j]));
+            let vi = fma(sin_a, sre_in[j], cos_a * sim_in[j]);
             sre_in[i] = ur + vr;
             sim_in[i] = ui + vi;
             sre_in[j] = ur - vr;
@@ -300,13 +300,13 @@ fn fft_outer_r4(
 
     let sign = select(-1.0, 1.0, params.inverse != 0u);
     let neg_sign = select(1.0, -1.0, params.inverse != 0u);
-    let angle1 = sign * 3.14159265358979323846 * f32(k) / f32(q);
-    let cos1 = cos(angle1);
-    let sin1 = sin(angle1);
-    let w1b_r = cos1 * br - sin1 * bi;
-    let w1b_i = sin1 * br + cos1 * bi;
-    let w1d_r = cos1 * dr - sin1 * di;
-    let w1d_i = sin1 * dr + cos1 * di;
+    let angle1 = rlx_div_rn(sign * 3.14159265358979323846 * f32(k), f32(q));
+    let cos1 = rlx_cos(angle1);
+    let sin1 = rlx_sin(angle1);
+    let w1b_r = fma(cos1, br, -(sin1 * bi));
+    let w1b_i = fma(sin1, br, cos1 * bi);
+    let w1d_r = fma(cos1, dr, -(sin1 * di));
+    let w1d_i = fma(sin1, dr, cos1 * di);
 
     let u0r = ar + w1b_r;
     let u0i = ai + w1b_i;
@@ -317,16 +317,16 @@ fn fft_outer_r4(
     let u3r = cr - w1d_r;
     let u3i = ci - w1d_i;
 
-    let angle2a = sign * 3.14159265358979323846 * f32(k) / f32(q * 2u);
-    let cos2a = cos(angle2a);
-    let sin2a = sin(angle2a);
+    let angle2a = rlx_div_rn(sign * 3.14159265358979323846 * f32(k), f32(q * 2u));
+    let cos2a = rlx_cos(angle2a);
+    let sin2a = rlx_sin(angle2a);
     let cos2b = neg_sign * sin2a;
     let sin2b = sign * cos2a;
 
-    let w2a_u2r = cos2a * u2r - sin2a * u2i;
-    let w2a_u2i = sin2a * u2r + cos2a * u2i;
-    let w2b_u3r = cos2b * u3r - sin2b * u3i;
-    let w2b_u3i = sin2b * u3r + cos2b * u3i;
+    let w2a_u2r = fma(cos2a, u2r, -(sin2a * u2i));
+    let w2a_u2i = fma(sin2a, u2r, cos2a * u2i);
+    let w2b_u3r = fma(cos2b, u3r, -(sin2b * u3i));
+    let w2b_u3i = fma(sin2b, u3r, cos2b * u3i);
 
     let scale = params.norm_scale;
     set_re(base, p, n, (u0r + w2a_u2r) * scale);
@@ -358,9 +358,9 @@ fn fft_outer_r2(
     let j = i + half_stride;
 
     let sign = select(-1.0, 1.0, params.inverse != 0u);
-    let angle = sign * 3.14159265358979323846 * f32(k) / f32(half_stride);
-    let cos_a = cos(angle);
-    let sin_a = sin(angle);
+    let angle = rlx_div_rn(sign * 3.14159265358979323846 * f32(k), f32(half_stride));
+    let cos_a = rlx_cos(angle);
+    let sin_a = rlx_sin(angle);
 
     let ur = re_at(base, i, n);
     let ui = im_at(base, i, n);

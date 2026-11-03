@@ -1602,12 +1602,23 @@ pub unsafe fn execute_fft1d_pocketfft(
             rlx_ir::FftTwiddles::Platform => Twiddles::Platform,
             rlx_ir::FftTwiddles::AppleSinCos => Twiddles::AppleSinCos,
             rlx_ir::FftTwiddles::Separate => Twiddles::Separate,
+            rlx_ir::FftTwiddles::Linux => Twiddles::Linux,
         },
     };
     // `FftNorm::output_scale`, spelled as pocketfft's `norm_fct` (`ldbl_t`)
+    // `Linux` twiddles pair with the x87 `long double` on every host
+    let x87 = if opt.twiddles == Twiddles::Linux {
+        Some(true)
+    } else {
+        None
+    };
+    let fct = |i: u8, n: usize| match x87 {
+        Some(x) => rlx_pocketfft::norm_fct_as(i, n, x),
+        None => rlx_pocketfft::norm_fct(i, n),
+    };
     let scale = match (rlx_ir::fft::FftNorm::from_tag(norm_tag), inverse) {
-        (rlx_ir::fft::FftNorm::Ortho, _) => rlx_pocketfft::norm_fct(1, n_complex),
-        (rlx_ir::fft::FftNorm::Forward, true) => rlx_pocketfft::norm_fct(2, n_complex),
+        (rlx_ir::fft::FftNorm::Ortho, _) => fct(1, n_complex),
+        (rlx_ir::fft::FftNorm::Forward, true) => fct(2, n_complex),
         _ => 1.0,
     };
     let n = n_complex;
@@ -1700,25 +1711,25 @@ pub unsafe fn execute_fft1d_pocketfft(
 }
 
 // FFT twiddles: rlx-libm's reference ports for parity (feature `parity`),
-// the pure-Rust `libm` crate (musl, < 1 ulp) otherwise. Setup cost only.
+// its pure-Rust glibc ports otherwise. Setup cost only.
 #[inline(always)]
 fn ref_cos(x: f64) -> f64 {
     #[cfg(feature = "parity")]
     return rlx_libm::reference::cos(x);
     #[cfg(not(feature = "parity"))]
-    libm::cos(x)
+    rlx_libm::cos(x)
 }
 #[inline(always)]
 fn ref_sin(x: f64) -> f64 {
     #[cfg(feature = "parity")]
     return rlx_libm::reference::sin(x);
     #[cfg(not(feature = "parity"))]
-    libm::sin(x)
+    rlx_libm::sin(x)
 }
 #[inline(always)]
 fn ref_sincosf(x: f32) -> (f32, f32) {
     #[cfg(feature = "parity")]
     return rlx_libm::reference::sincosf(x);
     #[cfg(not(feature = "parity"))]
-    libm::sincosf(x)
+    rlx_libm::sincosf(x)
 }

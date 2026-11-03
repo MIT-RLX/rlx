@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Throughput of the f32 exp / log / tanh variants over 1M elements (best of
 //! N, single thread): rlx-cpu `fastmath` (accurate NEON), the `_fast`
 //! polynomials, `vmath::vv*` (Accelerate in non-`pure-rust` Apple builds),

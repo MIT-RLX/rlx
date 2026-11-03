@@ -11,9 +11,10 @@ no FFI, no submodules.
   matmul (32×32 tile, `simdgroup_matrix` / `KHR_cooperative_matrix`),
   f16-storage matmul.
 - **`device.rs`** — wgpu instance/adapter/device singleton. Platform
-  defaults: DX12 (+ Vulkan fallback) on Windows, Vulkan on Linux/WSL,
-  Metal (+ MoltenVK) on macOS. Override with `WGPU_BACKEND`. Sync wrapper
-  via `pollster::block_on` so the rest of the backend matches the
+  defaults: DX12 only on Windows (no Vulkan fallback), Vulkan on Linux/WSL,
+  Metal (+ MoltenVK) on macOS. Override with `WGPU_BACKEND`. Software
+  adapters (WARP, llvmpipe) are skipped unless `RLX_WGPU_ALLOW_SOFTWARE=1`.
+  Sync wrapper via `pollster::block_on` so the rest of the backend matches the
   rlx-cpu / rlx-metal / rlx-mlx synchronous shape.
 - **`buffer.rs` / `Arena`** — logical activation arena with per-node offsets
   from `rlx-opt::memory::plan_memory_aligned`. When the plan exceeds wgpu
@@ -129,7 +130,8 @@ Vulkan/DX12 visibility correct.
 
 | Variable | Effect |
 |----------|--------|
-| `WGPU_BACKEND` | `vulkan` (default Linux/Windows), `dx12` (Windows), `metal` (macOS) |
+| `WGPU_BACKEND` | `vulkan` (default Linux; opt-in on Windows), `dx12` (default Windows), `metal` (macOS) |
+| `RLX_WGPU_ALLOW_SOFTWARE=1` | Use a software adapter (WARP, llvmpipe/lavapipe). By default rlx-wgpu reports no device on one, so callers fall back to the CPU backend |
 | `RLX_WGPU_NO_COOP_F16_VK=1` | Force `matmul_wide_nv` instead of CoopF16Vk |
 | `RLX_WGPU_COOP_F16_VK_OSC_THRESH` | Oscillation score threshold for auto wide fallback (default `0.35`) |
 | `RLX_WGPU_COOP_F16_VK_NO_AUTO_WIDE=1` | Disable oscillation-based wide fallback |
