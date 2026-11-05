@@ -632,6 +632,17 @@ fn group_norm_chunks(span: u32, in_byte: usize, out_byte: usize, out_bytes: usiz
     span.div_ceil(16 << 10).clamp(1, 256)
 }
 
+/// `(n, c, 1, prod(rest))` for a GroupNorm input `[N, C, ...]` of rank >= 2.
+fn group_norm_nchw_dims(shape: &rlx_ir::Shape) -> (u32, u32, u32, u32) {
+    let dims: Vec<usize> = shape.dims().iter().map(|d| d.unwrap_static()).collect();
+    assert!(
+        dims.len() >= 2,
+        "GroupNorm input needs rank >= 2, got {dims:?}"
+    );
+    let rest: usize = dims[2..].iter().product();
+    (dims[0] as u32, dims[1] as u32, 1, rest as u32)
+}
+
 /// Whether `Op::GroupNorm` must fall back to the whole-arena host step.
 ///
 /// Mirrors the LayerNorm/RmsNorm policy in [`wgpu_prefer_host_fallback`]:
@@ -8020,11 +8031,11 @@ fn compile_static_with(
                 let in_id = node.inputs[0];
                 let gamma_id = node.inputs[1];
                 let beta_id = node.inputs[2];
-                let dims = graph.node(in_id).shape.dims();
-                let n = dims[0].unwrap_static() as u32;
-                let c = dims[1].unwrap_static() as u32;
-                let h = dims[2].unwrap_static() as u32;
-                let w = dims[3].unwrap_static() as u32;
+                // `[N, C, ...]` of any rank: the kernel only uses `h * w`, so
+                // everything after the channel folds into `w`. Reading just
+                // dims 2 and 3 normalized a rank-5 volume over its first two
+                // spatial axes — wrong values, no error.
+                let (n, c, h, w) = group_norm_nchw_dims(&graph.node(in_id).shape);
                 let g = (*num_groups).max(1) as u32;
 
                 let gamma_is_param = tensor_is_graph_param(&graph, &param_offsets, gamma_id);
@@ -8163,17 +8174,17 @@ fn compile_static_with(
                 let (num_groups, eps, act) = crate::unfuse::group_norm_act(op).unwrap();
                 let (num_groups, eps) = (&num_groups, &eps);
                 note_host_reads(&graph, node);
-                // NCHW: x [n,c,h,w], gamma/beta [c]. Host step (schedule-only).
-                let in_shape = &graph.node(node.inputs[0]).shape;
+                // `[N, C, ...]`, gamma/beta [c]. Host step (schedule-only).
+                let (n, c, h, w) = group_norm_nchw_dims(&graph.node(node.inputs[0]).shape);
                 schedule.push(Step::GroupNormHost {
                     src_byte_off: arena.offset(node.inputs[0]) as u32,
                     gamma_byte_off: arena.offset(node.inputs[1]) as u32,
                     beta_byte_off: arena.offset(node.inputs[2]) as u32,
                     dst_byte_off: arena.offset(node.id) as u32,
-                    n: in_shape.dim(0).unwrap_static() as u32,
-                    c: in_shape.dim(1).unwrap_static() as u32,
-                    h: in_shape.dim(2).unwrap_static() as u32,
-                    w: in_shape.dim(3).unwrap_static() as u32,
+                    n,
+                    c,
+                    h,
+                    w,
                     num_groups: *num_groups as u32,
                     eps: *eps,
                 });

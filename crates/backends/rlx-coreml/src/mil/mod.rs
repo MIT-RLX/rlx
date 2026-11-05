@@ -817,6 +817,9 @@ impl<'a> LowerCtx<'a> {
                 )?;
                 self.push_named(id, out_name, op);
             }
+            Op::Concat { axis } if self.concat_is_miscompiled(node) => {
+                self.lower_concat_at_rank2(id, *axis, &out_name)?;
+            }
             Op::Concat { axis } => {
                 let names: Vec<String> = node.inputs.iter().map(|&i| self.val(i)).collect();
                 let op = self.simple_op(
@@ -1759,6 +1762,105 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Emit a single-output op and push it (without registering a node).
+    /// True when CoreML would get this concat wrong: rank ≥ 3 with every
+    /// operand known at compile time. Its folding of such a concat keeps the
+    /// first rows and leaves zeros after them on every compute unit, for about
+    /// one random shape in six (`[1, 12, 8]` on the last axis does it; ranks 1
+    /// and 2, and any concat with a runtime operand, come out right). The
+    /// folded value is what later ops read, so nothing downstream shows it.
+    /// Not integers: their constants are retyped in lowering, so the shape's
+    /// dtype would not describe them (the backend makes them f32 first).
+    fn concat_is_miscompiled(&self, node: &rlx_ir::Node) -> bool {
+        node.shape.rank() > 2
+            && matches!(node.shape.dtype(), DType::F32 | DType::F16 | DType::Bool)
+            && node.inputs.iter().all(|&i| {
+                self.graph
+                    .shape(i)
+                    .dims()
+                    .iter()
+                    .all(|d| matches!(d, rlx_ir::Dim::Static(_)))
+            })
+            && self.known_at_compile_time(&node.inputs)
+    }
+
+    /// True when `roots` depend on nothing but constants.
+    fn known_at_compile_time(&self, roots: &[NodeId]) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut todo = roots.to_vec();
+        while let Some(id) = todo.pop() {
+            if !seen.insert(id.0) {
+                continue;
+            }
+            let n = self.graph.node(id);
+            match n.op {
+                Op::Constant { .. } => {}
+                _ if n.inputs.is_empty() => return false,
+                _ => todo.extend(&n.inputs),
+            }
+        }
+        true
+    }
+
+    /// `Concat` as reshape to `[outer, inner]`, concat on axis 1 and reshape
+    /// back: the same bytes in the same order, at a rank CoreML folds right.
+    fn lower_concat_at_rank2(&mut self, id: NodeId, axis: usize, out_name: &str) -> Result<()> {
+        let graph = self.graph;
+        let node = graph.node(id);
+        let dtype = node.shape.dtype();
+        let dims = |i: NodeId| -> Vec<usize> {
+            graph
+                .shape(i)
+                .dims()
+                .iter()
+                .map(|d| {
+                    if let rlx_ir::Dim::Static(n) = d {
+                        *n
+                    } else {
+                        0
+                    }
+                })
+                .collect()
+        };
+        let outer: usize = dims(node.inputs[0])[..axis].iter().product();
+        let (mut flat, mut total) = (Vec::with_capacity(node.inputs.len()), 0);
+        for (k, &i) in node.inputs.iter().enumerate() {
+            let inner: usize = dims(i)[axis..].iter().product();
+            let name = format!("{out_name}_flat{k}");
+            let x = self.val(i);
+            self.emit(
+                "reshape",
+                &name,
+                &Shape::new(&[outer, inner], dtype),
+                vec![
+                    ("x", bind_name(&x)),
+                    ("shape", bind_value(vec_i32(&[outer as i32, inner as i32]))),
+                ],
+            )?;
+            flat.push(name);
+            total += inner;
+        }
+        let cat = format!("{out_name}_rank2");
+        self.emit(
+            "concat",
+            &cat,
+            &Shape::new(&[outer, total], dtype),
+            vec![
+                ("values", bind_names(&flat)),
+                ("axis", bind_value(scalar_i32(1))),
+                ("interleave", bind_value(scalar_bool(false))),
+            ],
+        )?;
+        let shp: Vec<i32> = dims(id).iter().map(|&d| d as i32).collect();
+        let op = self.simple_op(
+            "reshape",
+            out_name,
+            &node.shape,
+            vec![("x", bind_name(&cat)), ("shape", bind_value(vec_i32(&shp)))],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
+        Ok(())
+    }
+
     pub(crate) fn emit(
         &mut self,
         ty: &str,

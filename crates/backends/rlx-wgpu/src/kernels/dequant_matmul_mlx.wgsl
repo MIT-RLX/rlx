@@ -164,14 +164,17 @@ const TM: u32 = 8u;
 var<workgroup> xs: array<f32, 8 * 256>;
 var<workgroup> smem: array<f32, 8 * 256>;
 
+// The (col, row_tile) groups are dispatched as a 2-D grid of at most 65535
+// along x (WebGPU's per-dimension limit); `tg` is the linear group index.
 @compute @workgroup_size(256, 1, 1)
 fn dequant_matmul_mlx(
     @builtin(local_invocation_index) tid: u32,
     @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let tpg = 256u;
     let n_row_tiles = (params.m + TM - 1u) / TM;
-    let tg = wid.x;
+    let tg = wid.x + wid.y * nwg.x;
     let col = tg / n_row_tiles;
     let row0 = (tg - col * n_row_tiles) * TM;
     if (col >= params.n) { return; }

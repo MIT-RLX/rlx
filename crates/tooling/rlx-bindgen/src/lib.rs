@@ -28,6 +28,7 @@ pub mod dart;
 pub mod dlang;
 pub mod docs;
 pub mod elixir;
+pub mod foreign;
 pub mod golang;
 pub mod haskell;
 pub mod header;

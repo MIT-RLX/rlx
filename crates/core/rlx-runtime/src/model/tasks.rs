@@ -715,6 +715,15 @@ impl Model for Stamped {
         self.inner.generate_text(prompt, options)
     }
 
+    fn generate_text_until(
+        &mut self,
+        prompt: &str,
+        options: &Value,
+        done: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String> {
+        self.inner.generate_text_until(prompt, options, done)
+    }
+
     fn generate_batch(&mut self, prompts: &[&str], options: &Value) -> Result<Vec<String>> {
         self.inner.generate_batch(prompts, options)
     }

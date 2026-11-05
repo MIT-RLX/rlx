@@ -320,12 +320,40 @@ static WASM_DEVICE: OnceLock<Option<WgpuDevice>> = OnceLock::new();
 #[cfg(target_family = "wasm")]
 pub async fn init_wgpu_device() -> bool {
     if let Some(slot) = WASM_DEVICE.get() {
-        return slot.is_some();
+        return slot.is_some() && on_gpu_thread();
     }
     let dev = WgpuDevice::new_with_backends_async(wgpu::Backends::BROWSER_WEBGPU).await;
     let available = dev.is_some();
-    let _ = WASM_DEVICE.set(dev);
-    available
+    if WASM_DEVICE.set(dev).is_ok() {
+        claim_gpu_thread();
+        available
+    } else {
+        // another thread initialised it first: the device is that thread's
+        WASM_DEVICE.get().is_some_and(|d| d.is_some()) && on_gpu_thread()
+    }
+}
+
+// In a shared-memory (atomics) build the device's JS objects live in the
+// worker that created them; every other thread (the rayon pool's workers)
+// sees no device and stays on the CPU. Without atomics there is one thread.
+#[cfg(all(target_family = "wasm", target_feature = "atomics"))]
+thread_local! {
+    static GPU_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(target_family = "wasm")]
+fn claim_gpu_thread() {
+    #[cfg(target_feature = "atomics")]
+    GPU_THREAD.with(|t| t.set(true));
+}
+
+/// Whether this thread may use the WebGPU device: the one that initialised it.
+#[cfg(target_family = "wasm")]
+pub fn on_gpu_thread() -> bool {
+    #[cfg(target_feature = "atomics")]
+    return GPU_THREAD.with(|t| t.get());
+    #[cfg(not(target_feature = "atomics"))]
+    true
 }
 
 #[cfg(target_family = "wasm")]
@@ -364,6 +392,9 @@ pub fn device_lost() -> bool {
 /// [`init_wgpu_device`] has been awaited.
 #[cfg(target_family = "wasm")]
 pub fn wgpu_device() -> Option<&'static WgpuDevice> {
+    if !on_gpu_thread() {
+        return None;
+    }
     WASM_DEVICE.get().and_then(|d| d.as_ref())
 }
 

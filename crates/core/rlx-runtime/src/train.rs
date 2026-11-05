@@ -99,6 +99,8 @@ pub enum FuseError {
     UnknownParam(String),
     /// No initial value was supplied for a trainable parameter.
     MissingInitialValue(String),
+    /// [`ResidentTrainer::with_rules`] got a different number of rules than params.
+    RulesPerParam { rules: usize, params: usize },
 }
 
 impl std::fmt::Display for FuseError {
@@ -110,6 +112,12 @@ impl std::fmt::Display for FuseError {
             ),
             Self::NoTrainableParams => write!(f, "no trainable parameters were given"),
             Self::UnknownParam(name) => write!(f, "'{name}' is not a Param in the forward graph"),
+            Self::RulesPerParam { rules, params } => {
+                write!(
+                    f,
+                    "{rules} rules for {params} trainable params; give one each"
+                )
+            }
             Self::MissingInitialValue(name) => {
                 write!(f, "no initial value for trainable parameter '{name}'")
             }
@@ -119,7 +127,8 @@ impl std::fmt::Display for FuseError {
 
 impl std::error::Error for FuseError {}
 
-/// Where one fused parameter's updated `p' / m' / v'` land in the outputs.
+/// Where one fused parameter's updated `p' / m' / v'` and its gradient's
+/// squared norm land in the outputs.
 #[derive(Clone, Debug)]
 struct FusedParam {
     name: String,
@@ -129,6 +138,7 @@ struct FusedParam {
     p_out: usize,
     m_out: usize,
     v_out: usize,
+    grad_sq_out: usize,
 }
 
 /// The fused forward+backward+update graph and its output layout.
@@ -353,10 +363,19 @@ fn muon_update(
 /// train, 0 to freeze); shared scalars `__lr` and, when an Adam part runs,
 /// `__bc1`, `__bc2` carry the learning rate and the bias corrections, so a
 /// schedule needs no recompile.
+/// The rules of a fused step: one for every param, with one rate (`__lr`)
+/// and Adam corrections (`__bc1`, `__bc2`), or each param its own, with its
+/// own (`<name>__lr`, `<name>__bc1`, `<name>__bc2`).
+#[derive(Clone, Copy)]
+enum Rules<'a> {
+    Shared(&'a FusedRule),
+    Each(&'a [FusedRule]),
+}
+
 fn fused_graph(
     forward: &Graph,
     wrt: &[TrainableParam],
-    rule: &FusedRule,
+    rules: Rules<'_>,
 ) -> Result<FusedStep, FuseError> {
     if forward.outputs.is_empty() {
         return Err(FuseError::NoLoss);
@@ -378,13 +397,24 @@ fn fused_graph(
     let mut outputs: Vec<NodeId> = g.outputs[..grad_start].to_vec();
     let grads: Vec<NodeId> = g.outputs[grad_start..].to_vec();
 
-    let lr = g.input("__lr", Shape::scalar(f));
-    let bc = rule.adam().map(|_| {
-        (
-            g.input("__bc1", Shape::scalar(f)),
-            g.input("__bc2", Shape::scalar(f)),
-        )
-    });
+    let shared = match rules {
+        Rules::Shared(rule) => Some((
+            g.input("__lr", Shape::scalar(f)),
+            rule.adam().map(|_| {
+                (
+                    g.input("__bc1", Shape::scalar(f)),
+                    g.input("__bc2", Shape::scalar(f)),
+                )
+            }),
+        )),
+        Rules::Each(rs) if rs.len() != wrt.len() => {
+            return Err(FuseError::RulesPerParam {
+                rules: rs.len(),
+                params: wrt.len(),
+            });
+        }
+        Rules::Each(_) => None,
+    };
 
     let mut params = Vec::with_capacity(wrt.len());
     let mut param_ids = Vec::with_capacity(wrt.len());
@@ -392,6 +422,22 @@ fn fused_graph(
         let p = g
             .param_id(&slot.name)
             .ok_or_else(|| FuseError::UnknownParam(slot.name.clone()))?;
+        let rule = match rules {
+            Rules::Shared(r) => r,
+            Rules::Each(rs) => &rs[i],
+        };
+        let (lr, bc) = match shared {
+            Some(s) => s,
+            None => (
+                g.input(format!("{}__lr", slot.name), Shape::scalar(f)),
+                rule.adam().map(|_| {
+                    (
+                        g.input(format!("{}__bc1", slot.name), Shape::scalar(f)),
+                        g.input(format!("{}__bc2", slot.name), Shape::scalar(f)),
+                    )
+                }),
+            ),
+        };
         param_ids.push(p);
         let shape = g.shape(p).clone();
         let grad = grads[i];
@@ -445,6 +491,16 @@ fn fused_graph(
         outputs.push(m_kept);
         let v_out = outputs.len();
         outputs.push(v_kept);
+        // ‖g‖², a scalar read back only when asked for (reports, monitoring).
+        let rank = dims.len();
+        let grad_sq = g.mul(grad, grad);
+        let grad_sq = if rank == 0 {
+            grad_sq
+        } else {
+            g.sum(grad_sq, (0..rank).collect(), false)
+        };
+        let grad_sq_out = outputs.len();
+        outputs.push(grad_sq);
         params.push(FusedParam {
             name: slot.name.clone(),
             m_name,
@@ -453,6 +509,7 @@ fn fused_graph(
             p_out,
             m_out,
             v_out,
+            grad_sq_out,
         });
     }
     g.set_outputs(outputs);
@@ -488,6 +545,15 @@ pub struct ResidentTrainer {
     /// Per-parameter update gate, 1.0 or 0.0.
     gates: HashMap<String, f32>,
     resident: bool,
+    /// [`Self::with_rules`]: each param's own rule, rate and step count.
+    each: Option<Each>,
+}
+
+/// Per-param rules ([`ResidentTrainer::with_rules`]), in `params` order.
+struct Each {
+    rules: Vec<FusedRule>,
+    lrs: Vec<f32>,
+    steps: Vec<i32>,
 }
 
 impl ResidentTrainer {
@@ -536,8 +602,45 @@ impl ResidentTrainer {
         device: Device,
         options: &CompileOptions,
     ) -> Result<Self, FuseError> {
+        Self::build(forward, wrt, initial, Rules::Shared(rule), device, options)
+    }
+
+    /// [`Self::with_rule`] with each param's own rule (`rules[i]` for
+    /// `wrt[i]`) and its own rate ([`Self::set_param_lr`], from its rule's
+    /// `lr`) and step count: the groups of an optimizer program, on the device.
+    pub fn with_rules(
+        forward: &Graph,
+        wrt: &[TrainableParam],
+        initial: &HashMap<String, Vec<f32>>,
+        rules: &[FusedRule],
+        device: Device,
+        options: &CompileOptions,
+    ) -> Result<Self, FuseError> {
+        Self::build(forward, wrt, initial, Rules::Each(rules), device, options)
+    }
+
+    fn build(
+        forward: &Graph,
+        wrt: &[TrainableParam],
+        initial: &HashMap<String, Vec<f32>>,
+        rules: Rules<'_>,
+        device: Device,
+        options: &CompileOptions,
+    ) -> Result<Self, FuseError> {
         let leading_outputs = forward.outputs.len();
-        let step = fused_graph(forward, wrt, rule)?;
+        let step = fused_graph(forward, wrt, rules)?;
+        let rule = match rules {
+            Rules::Shared(r) => r,
+            Rules::Each(rs) => &rs[0],
+        };
+        let each = match rules {
+            Rules::Shared(_) => None,
+            Rules::Each(rs) => Some(Each {
+                rules: rs.to_vec(),
+                lrs: rs.iter().map(FusedRule::lr).collect(),
+                steps: vec![0; rs.len()],
+            }),
+        };
         let spec = AdamSpec {
             lr: rule.lr(),
             ..rule.adam().unwrap_or_default()
@@ -585,7 +688,66 @@ impl ResidentTrainer {
             v_vals,
             gates,
             resident,
+            each,
         })
+    }
+
+    /// With [`Self::with_rules`]: set param `name`'s rate (no recompile).
+    /// False when the name is not trainable or the rules are shared.
+    pub fn set_param_lr(&mut self, name: &str, lr: f32) -> bool {
+        let Some(i) = self.params.iter().position(|p| p.name == name) else {
+            return false;
+        };
+        match self.each.as_mut() {
+            Some(e) => {
+                e.lrs[i] = lr;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// With [`Self::with_rules`]: param `name`'s step count (its Adam bias
+    /// corrections), as a carried-over optimizer state has it.
+    pub fn set_param_steps(&mut self, name: &str, steps: u64) -> bool {
+        let Some(i) = self.params.iter().position(|p| p.name == name) else {
+            return false;
+        };
+        match self.each.as_mut() {
+            Some(e) => {
+                e.steps[i] = steps as i32;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// With [`Self::with_rules`]: each param's step count, in `trainable` order.
+    pub fn param_steps(&self) -> Option<Vec<u64>> {
+        self.each
+            .as_ref()
+            .map(|e| e.steps.iter().map(|&s| s as u64).collect())
+    }
+
+    /// The per-param scalars of a [`Self::with_rules`] step: `(input, value)`.
+    /// `advance`: this is a training step, so each counter moves on first.
+    fn each_scalars(&mut self, advance: bool) -> Vec<(String, [f32; 1])> {
+        let Some(e) = self.each.as_mut() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (i, fp) in self.params.iter().enumerate() {
+            if advance {
+                e.steps[i] += 1;
+            }
+            out.push((format!("{}__lr", fp.name), [e.lrs[i]]));
+            if let Some(a) = e.rules[i].adam() {
+                let t = e.steps[i].max(1);
+                out.push((format!("{}__bc1", fp.name), [1.0 - a.beta1.powi(t)]));
+                out.push((format!("{}__bc2", fp.name), [1.0 - a.beta2.powi(t)]));
+            }
+        }
+        out
     }
 
     /// Whether parameters and moments live in device buffers.
@@ -638,6 +800,22 @@ impl ResidentTrainer {
     /// On the resident path only these are read back; `p' / m' / v'` never leave
     /// the device.
     pub fn step(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        self.step_reading(inputs, false).0
+    }
+
+    /// [`Self::step`], also reading back each trainable param's gradient
+    /// norm for this step (in [`Self::trainable`]'s order): one scalar per
+    /// param, so monitoring costs no gradient download.
+    pub fn step_with_grad_norms(&mut self, inputs: &[(&str, &[f32])]) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let (outs, norms) = self.step_reading(inputs, true);
+        (outs, norms.unwrap_or_default())
+    }
+
+    fn step_reading(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        grad_norms: bool,
+    ) -> (Vec<Vec<f32>>, Option<Vec<f32>>) {
         self.step_count += 1;
         let seed = [1.0f32];
         let lr = [self.spec.lr];
@@ -650,20 +828,37 @@ impl ResidentTrainer {
             .map(|fp| (fp.scale_name.clone(), [self.gates[&fp.name]]))
             .collect();
 
+        let each = self.each_scalars(true);
         let mut run_inputs: Vec<(&str, &[f32])> = inputs.to_vec();
         run_inputs.push(("d_output", &seed));
-        run_inputs.push(("__lr", &lr));
-        if self.rule.adam().is_some() {
-            run_inputs.push(("__bc1", &bc1));
-            run_inputs.push(("__bc2", &bc2));
+        if self.each.is_some() {
+            for (name, value) in &each {
+                run_inputs.push((name.as_str(), value));
+            }
+        } else {
+            run_inputs.push(("__lr", &lr));
+            if self.rule.adam().is_some() {
+                run_inputs.push(("__bc1", &bc1));
+                run_inputs.push(("__bc2", &bc2));
+            }
         }
         for (name, value) in &gate_values {
             run_inputs.push((name.as_str(), value));
         }
 
-        let wanted: Vec<usize> = (0..self.leading_outputs).collect();
+        let mut wanted: Vec<usize> = (0..self.leading_outputs).collect();
+        if grad_norms {
+            wanted.extend(self.params.iter().map(|fp| fp.grad_sq_out));
+        }
+        let norms = |sq: &[Vec<f32>]| -> Vec<f32> {
+            sq.iter()
+                .map(|v| v.first().copied().unwrap_or(f32::NAN).max(0.0).sqrt())
+                .collect()
+        };
         if self.resident {
-            self.compiled.run_read_outputs(&run_inputs, Some(&wanted))
+            let mut outs = self.compiled.run_read_outputs(&run_inputs, Some(&wanted));
+            let sq = outs.split_off(self.leading_outputs.min(outs.len()));
+            (outs, grad_norms.then(|| norms(&sq)))
         } else {
             for fp in &self.params {
                 run_inputs.push((fp.name.as_str(), &self.param_vals[&fp.name]));
@@ -676,7 +871,15 @@ impl ResidentTrainer {
                 copy_out(&mut self.m_vals, &fp.name, outs.get(fp.m_out));
                 copy_out(&mut self.v_vals, &fp.name, outs.get(fp.v_out));
             }
-            outs.into_iter().take(self.leading_outputs).collect()
+            let sq = grad_norms.then(|| {
+                let sq: Vec<Vec<f32>> = self
+                    .params
+                    .iter()
+                    .map(|fp| outs.get(fp.grad_sq_out).cloned().unwrap_or_default())
+                    .collect();
+                norms(&sq)
+            });
+            (outs.into_iter().take(self.leading_outputs).collect(), sq)
         }
     }
 
@@ -700,12 +903,19 @@ impl ResidentTrainer {
             .map(|fp| (fp.scale_name.clone(), [0.0f32]))
             .collect();
 
+        let each = self.each_scalars(false);
         let mut run_inputs: Vec<(&str, &[f32])> = inputs.to_vec();
         run_inputs.push(("d_output", &seed));
-        run_inputs.push(("__lr", &lr));
-        if self.rule.adam().is_some() {
-            run_inputs.push(("__bc1", &bc1));
-            run_inputs.push(("__bc2", &bc2));
+        if self.each.is_some() {
+            for (name, value) in &each {
+                run_inputs.push((name.as_str(), value));
+            }
+        } else {
+            run_inputs.push(("__lr", &lr));
+            if self.rule.adam().is_some() {
+                run_inputs.push(("__bc1", &bc1));
+                run_inputs.push(("__bc2", &bc2));
+            }
         }
         for (name, value) in &held {
             run_inputs.push((name.as_str(), value));
@@ -726,7 +936,8 @@ impl ResidentTrainer {
 
     /// Current trainable weights, reading back from the device when resident.
     pub fn params(&mut self) -> HashMap<String, Vec<f32>> {
-        if self.resident {
+        // Before the first step the device holds what the mirrors hold.
+        if self.resident && self.step_count > 0 {
             for fp in &self.params {
                 if let Some(v) = self.compiled.read_gpu_handle(&fp.name) {
                     self.param_vals.insert(fp.name.clone(), v);
@@ -760,7 +971,7 @@ impl ResidentTrainer {
 
     /// Optimizer moments, for checkpointing. `(name, m, v)` per parameter.
     pub fn moments(&mut self) -> Vec<(String, Vec<f32>, Vec<f32>)> {
-        if self.resident {
+        if self.resident && self.step_count > 0 {
             for fp in &self.params {
                 if let Some(m) = self.compiled.read_gpu_handle(&fp.m_name) {
                     self.m_vals.insert(fp.name.clone(), m);
@@ -989,6 +1200,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_fused_step_reads_back_the_gradient_norms() {
+        const DIM: usize = 4;
+        let x: Vec<f32> = vec![1.0, 0.5, -0.5, 2.0, 0.25, -1.0, 1.5, 0.0];
+        let t: Vec<f32> = vec![1.0, -1.0, 0.5, 0.0, 0.0, 2.0, -1.0, 1.0];
+        let (forward, wrt) = regression(2, DIM);
+        let mut fused = ResidentTrainer::new(
+            &forward,
+            &wrt,
+            &initial(DIM),
+            &AdamSpec::new(0.01),
+            Device::Cpu,
+        )
+        .expect("fuses");
+        let (outs, norms) = fused.step_with_grad_norms(&[("x", &x), ("t", &t)]);
+
+        // The host gradients at the same (starting) params.
+        let (forward2, _) = regression(2, DIM);
+        let ids = [
+            forward2.param_id("w").unwrap(),
+            forward2.param_id("b").unwrap(),
+        ];
+        let mut host =
+            Session::new(Device::Cpu).compile(rlx_opt::autodiff::grad_with_loss(&forward2, &ids));
+        let start = initial(DIM);
+        host.set_param("w", &start["w"]);
+        host.set_param("b", &start["b"]);
+        let h = host.run(&[("x", &x), ("t", &t), ("d_output", &[1.0])]);
+        assert_eq!(outs.len(), 1, "only the loss besides the norms");
+        assert!((outs[0][0] - h[0][0]).abs() < 1e-6);
+        let norm = |v: &[f32]| v.iter().map(|g| g * g).sum::<f32>().sqrt();
+        assert_eq!(norms.len(), 2);
+        for (got, want) in norms.iter().zip([norm(&h[1]), norm(&h[2])]) {
+            assert!(
+                (got - want).abs() <= 1e-5 * want.max(1.0),
+                "{got} vs {want}"
+            );
+        }
+        // The plain step reads none.
+        assert_eq!(fused.step(&[("x", &x), ("t", &t)]).len(), 1);
+    }
+
     /// The fused `rule` and the host `opt` from the same start, 12 steps each →
     /// (fused losses, host losses, fused params, host params).
     #[allow(clippy::type_complexity)]
@@ -1119,6 +1372,121 @@ mod tests {
         };
         let (f, h, fp, hp) = fused_and_host(FusedRule::Muon(spec), Box::new(host));
         assert_close(&f, &h, &fp, &hp);
+    }
+
+    /// Twelve steps of `t` on the regression → (losses, params).
+    fn run_steps(t: &mut ResidentTrainer) -> (Vec<f32>, HashMap<String, Vec<f32>>) {
+        let x: Vec<f32> = vec![1.0, 0.5, -0.5, 2.0, 0.25, -1.0, 1.5, 0.0];
+        let y: Vec<f32> = vec![1.0, -1.0, 0.5, 0.0, 0.0, 2.0, -1.0, 1.0];
+        let losses = (0..12)
+            .map(|_| t.step(&[("x", &x), ("t", &y)])[0][0])
+            .collect();
+        (losses, t.params())
+    }
+
+    #[test]
+    fn rules_per_param_make_the_shared_rules_steps() {
+        const DIM: usize = 4;
+        let (forward, wrt) = regression(2, DIM);
+        let opts = CompileOptions::new();
+        let adam = AdamSpec {
+            weight_decay: 0.01,
+            ..AdamSpec::new(0.05)
+        };
+        // One rule for both, given once or once each: the same step, bit for bit.
+        let mut shared = ResidentTrainer::with_rule(
+            &forward,
+            &wrt,
+            &initial(DIM),
+            &FusedRule::Adam(adam),
+            Device::Cpu,
+            &opts,
+        )
+        .expect("fuses");
+        let mut each = ResidentTrainer::with_rules(
+            &forward,
+            &wrt,
+            &initial(DIM),
+            &[FusedRule::Adam(adam); 2],
+            Device::Cpu,
+            &opts,
+        )
+        .expect("fuses");
+        assert_eq!(run_steps(&mut shared), run_steps(&mut each));
+        assert_eq!(each.param_steps(), Some(vec![12, 12]));
+
+        // MuonAdamW is Muon on the matrix and AdamW on the rest: as two rules.
+        let ms = 0.2;
+        let muon_adamw = FusedRule::Muon(MuonSpec {
+            lr: 0.05 * ms,
+            adamw: Some(adam),
+            muon_scale: ms,
+            ..MuonSpec::new(0.05)
+        });
+        let muon_w = FusedRule::Muon(MuonSpec {
+            lr: 0.05 * ms,
+            weight_decay: 0.01 / ms,
+            ..MuonSpec::new(0.05 * ms)
+        });
+        let rules: Vec<FusedRule> = wrt
+            .iter()
+            .map(|p| {
+                if p.name == "w" {
+                    muon_w
+                } else {
+                    FusedRule::Adam(adam)
+                }
+            })
+            .collect();
+        let mut one = ResidentTrainer::with_rule(
+            &forward,
+            &wrt,
+            &initial(DIM),
+            &muon_adamw,
+            Device::Cpu,
+            &opts,
+        )
+        .expect("fuses");
+        let mut two =
+            ResidentTrainer::with_rules(&forward, &wrt, &initial(DIM), &rules, Device::Cpu, &opts)
+                .expect("fuses");
+        let ((la, pa), (lb, pb)) = (run_steps(&mut one), run_steps(&mut two));
+        for (a, b) in la.iter().zip(&lb) {
+            assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0), "{la:?} vs {lb:?}");
+        }
+        for (name, a) in &pa {
+            for (x, y) in a.iter().zip(&pb[name]) {
+                assert!((x - y).abs() <= 1e-6 * x.abs().max(1.0), "{name}");
+            }
+        }
+
+        // A rate of its own: b's 0 holds it while w trains.
+        let mut held = ResidentTrainer::with_rules(
+            &forward,
+            &wrt,
+            &initial(DIM),
+            &[FusedRule::Adam(adam); 2],
+            Device::Cpu,
+            &opts,
+        )
+        .expect("fuses");
+        assert!(held.set_param_lr("b", 0.0));
+        assert!(!held.set_param_lr("nope", 0.0));
+        let (_, p) = run_steps(&mut held);
+        assert_eq!(p["b"], initial(DIM)["b"]);
+        assert_ne!(p["w"], initial(DIM)["w"]);
+        assert!(!shared.set_param_lr("w", 0.0), "shared rules have one rate");
+        assert!(
+            ResidentTrainer::with_rules(
+                &forward,
+                &wrt,
+                &initial(DIM),
+                &[FusedRule::Adam(adam)],
+                Device::Cpu,
+                &opts
+            )
+            .is_err()
+        );
     }
 
     #[test]

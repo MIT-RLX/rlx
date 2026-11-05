@@ -716,6 +716,14 @@ impl PackageTrainer {
         self.saves.sae_package(&trained, out, name)
     }
 
+    /// The LoRA factors trained, as updates `W + scale · B·A` of the stored
+    /// tensors they adapt (each in its stored layout) — to apply them to
+    /// another package holding the same tensors.
+    pub fn lora_updates(&mut self) -> Result<Vec<LoraUpdate>> {
+        let trained = self.trainer.params();
+        self.saves.lora_updates(&trained)
+    }
+
     /// Write the LoRA factors as an adapter package (see [`Prepared::save`]).
     pub fn save_adapter(&mut self, out: &Path, name: &str) -> Result<()> {
         let trained = self.trainer.params();
@@ -731,6 +739,21 @@ impl Saver {
     /// See [`Prepared::save`].
     pub fn save(&self, trained: &HashMap<String, Vec<f32>>, out: &Path, name: &str) -> Result<()> {
         self.0.save(trained, out, name)
+    }
+
+    /// The LoRA sites: `(param adapted, down factor, up factor)` names.
+    pub fn lora_sites(&self) -> Vec<(String, String, String)> {
+        self.0
+            .lora
+            .iter()
+            .map(|l| (l.param.clone(), l.down.clone(), l.up.clone()))
+            .collect()
+    }
+
+    /// `trained`'s LoRA factors as updates of the stored tensors (see
+    /// [`PackageTrainer::lora_updates`]).
+    pub fn lora_updates(&self, trained: &HashMap<String, Vec<f32>>) -> Result<Vec<LoraUpdate>> {
+        self.0.lora_updates(trained)
     }
 }
 
@@ -877,6 +900,16 @@ impl Saves {
     /// Write the LoRA factors as an adapter package at `out` over the
     /// package trained (opened, it is that package with them merged).
     fn adapter(&self, values: &HashMap<String, Vec<f32>>, out: &Path, name: &str) -> Result<()> {
+        let updates = self.lora_updates(values)?;
+        let base = std::fs::canonicalize(&self.base)
+            .unwrap_or_else(|_| self.base.clone())
+            .display()
+            .to_string();
+        save_adapter(out, name, &base, &updates)
+    }
+
+    /// The LoRA factors as updates of the stored tensors (their layout).
+    fn lora_updates(&self, values: &HashMap<String, Vec<f32>>) -> Result<Vec<LoraUpdate>> {
         if self.lora.is_empty() {
             bail!("only a LoRA trainer saves an adapter");
         }
@@ -908,10 +941,6 @@ impl Saves {
                 scale: self.scale,
             });
         }
-        let base = std::fs::canonicalize(&self.base)
-            .unwrap_or_else(|_| self.base.clone())
-            .display()
-            .to_string();
-        save_adapter(out, name, &base, &updates)
+        Ok(updates)
     }
 }

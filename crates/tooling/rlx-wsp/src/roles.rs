@@ -15,8 +15,7 @@
 
 use crate::env::{BOUNCE_H, BOUNCE_W, Bounce, Env, EnvKind};
 use crate::orchard::Orchard;
-use crate::space::WeightSpace;
-use crate::train::Trainer;
+use crate::space::{BATCH, WeightSpace};
 use rlx_ir::Philox4x32;
 use serde_json::{Value, json};
 
@@ -74,29 +73,46 @@ fn features_orchard(e: &Orchard) -> [f32; 5] {
     ]
 }
 
-/// `(unit, best feature, r)` for every hidden unit, from `episodes` greedy
-/// episodes of the network itself.
+/// `(unit, best feature, r)` for every channel of every activation node,
+/// from greedy episodes of the network itself (any graph with an `obs`
+/// input; activations come from the compiled graph).
 pub fn measure(
-    ws: &WeightSpace,
+    ws: &mut WeightSpace,
     episodes: usize,
 ) -> Result<Vec<(String, &'static str, f32)>, String> {
     let env = ws.state.env;
-    let net = Trainer::from_params(&ws.state.mlp.widths, ws.state.mlp.act, &ws.state.params);
+    let nodes = crate::graphops::unit_nodes(&ws.base_graph()?);
+    let d = ws.spec().obs_dim;
+    let na = ws.spec().actions.len();
+    let batches = episodes.max(1).div_ceil(BATCH);
+    // Per sample: activations of every node, and the features.
     let mut rows: Vec<(Vec<Vec<f32>>, [f32; 5])> = Vec::new();
     let mut rng = Philox4x32::new(0x501E_5EED);
-    let mut obs = vec![0f32; ws.spec().obs_dim];
+    let mut obs = vec![0f32; BATCH * d];
     macro_rules! play {
         ($make:expr, $feat:expr) => {{
-            for _ in 0..episodes {
-                let mut e = $make;
-                e.reset(&mut rng);
-                for _ in 0..e.spec().horizon {
-                    e.observe(&mut obs);
-                    let acts = net.forward(&obs);
-                    let f = $feat(&e);
-                    rows.push((acts[1..acts.len() - 1].to_vec(), f));
-                    let a = crate::space::argmax(acts.last().expect("logits"));
-                    e.step(a, &mut rng);
+            for _ in 0..batches {
+                let mut envs: Vec<_> = (0..BATCH).map(|_| $make).collect();
+                for e in &mut envs {
+                    e.reset(&mut rng);
+                }
+                for _ in 0..envs[0].spec().horizon {
+                    for (i, e) in envs.iter().enumerate() {
+                        e.observe(&mut obs[i * d..(i + 1) * d]);
+                    }
+                    let out = ws.activations(&obs, &nodes)?;
+                    for (i, e) in envs.iter_mut().enumerate() {
+                        let per: Vec<Vec<f32>> = out[1..]
+                            .iter()
+                            .map(|v| {
+                                let w = v.len() / BATCH;
+                                v[i * w..(i + 1) * w].to_vec()
+                            })
+                            .collect();
+                        rows.push((per, $feat(&*e)));
+                        let a = crate::space::argmax(&out[0][i * na..(i + 1) * na]);
+                        e.step(a, &mut rng);
+                    }
                 }
             }
         }};
@@ -111,9 +127,10 @@ pub fn measure(
         _ => return Err("unit roles are measured on control tasks".into()),
     }
     let mut out = Vec::new();
-    let layers = ws.state.mlp.n_layers() - 1;
-    for k in 0..layers {
-        for i in 0..ws.state.mlp.widths[k + 1] {
+    for (k, node) in nodes.iter().enumerate() {
+        let labels = ws.unit_channel_labels(node)?;
+        let width = rows.first().map_or(0, |(h, _)| h[k].len());
+        for i in 0..width {
             let a: Vec<f32> = rows.iter().map(|(h, _)| h[k][i]).collect();
             let mut best = ("none", 0f32);
             for (f, (name, _)) in FEATURES.iter().enumerate() {
@@ -123,7 +140,11 @@ pub fn measure(
                     best = (name, r);
                 }
             }
-            out.push((format!("l{k}.h{i}"), best.0, best.1));
+            let unit = labels
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("{node}[{i}]"));
+            out.push((unit, best.0, best.1));
         }
     }
     Ok(out)
@@ -148,24 +169,17 @@ fn pearson(a: &[f32], b: &[f32]) -> f32 {
 /// For each unit in `important`, the measured role and whether the text
 /// next to its label names it.
 pub fn grade(text: &str, roles: &[(String, &'static str, f32)], important: &[String]) -> Value {
-    // Text segments (sentences / lines) with the units they mention.
-    let segments: Vec<(&str, std::collections::BTreeSet<(Option<usize>, usize)>)> = text
-        .split(['\n', '.', ';'])
-        .map(|s| (s, crate::verify::mentioned_units(s)))
-        .filter(|(_, m)| !m.is_empty())
-        .collect();
+    let segments: Vec<&str> = text.split(['\n', '.', ';']).collect();
     let mut rows = Vec::new();
     let (mut described, mut matched) = (0, 0);
     for unit in important {
         let Some((_, feature, r)) = roles.iter().find(|(u, _, _)| u == unit) else {
             continue;
         };
-        let (k, i) = unit[1..].split_once(".h").expect("unit name");
-        let (k, i): (usize, usize) = (k.parse().expect("layer"), i.parse().expect("index"));
         let about: Vec<&str> = segments
             .iter()
-            .filter(|(_, m)| m.contains(&(Some(k), i)) || m.contains(&(None, i)))
-            .map(|(s, _)| *s)
+            .filter(|s| crate::verify::names_unit(s, unit))
+            .copied()
             .collect();
         let words = FEATURES
             .iter()

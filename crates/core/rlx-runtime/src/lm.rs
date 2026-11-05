@@ -136,6 +136,25 @@ pub trait LmRunner: Send {
         )
     }
 
+    /// Log-probability of each token of `continuation` after `prompt`
+    /// (teacher forcing): one value per continuation token. The default
+    /// steps [`Self::predict_logits`] over the growing context, which a
+    /// runner with a cache continues from it (one decode step a token).
+    fn score_continuation(
+        &mut self,
+        prompt: &[u32],
+        continuation: &[u32],
+    ) -> anyhow::Result<Vec<f32>> {
+        let mut context = prompt.to_vec();
+        let mut out = Vec::with_capacity(continuation.len());
+        for &t in continuation {
+            let logits = self.predict_logits(&context)?;
+            out.push(log_softmax_at(&logits, t as usize)?);
+            context.push(t);
+        }
+        Ok(out)
+    }
+
     /// Continuous batching: room for `slots` sequences decoded together,
     /// which requests join ([`Self::serve_add`]) and leave
     /// ([`Self::serve_remove`]) between steps. Default: unsupported.
@@ -324,6 +343,14 @@ impl LmRunner for Box<dyn LmRunner> {
 
     fn predict_logits(&mut self, prompt_ids: &[u32]) -> anyhow::Result<Vec<f32>> {
         (**self).predict_logits(prompt_ids)
+    }
+
+    fn score_continuation(
+        &mut self,
+        prompt: &[u32],
+        continuation: &[u32],
+    ) -> anyhow::Result<Vec<f32>> {
+        (**self).score_continuation(prompt, continuation)
     }
 
     fn generate_batch(
@@ -525,6 +552,14 @@ impl<R: LmRunner> LmRunner for HostDriven<R> {
         self.inner.predict_logits(prompt_ids)
     }
 
+    fn score_continuation(
+        &mut self,
+        prompt: &[u32],
+        continuation: &[u32],
+    ) -> anyhow::Result<Vec<f32>> {
+        self.inner.score_continuation(prompt, continuation)
+    }
+
     fn generate_batch(
         &mut self,
         prompts: &[Vec<u32>],
@@ -663,6 +698,16 @@ impl<R: LmRunner> LmRunner for HostDriven<R> {
         self.inner
             .generate_multimodal(prompt, rgb, img_w, img_h, tokenizer, n_new, on_token)
     }
+}
+
+/// `log softmax(logits)[index]`, accumulated in f64.
+pub fn log_softmax_at(logits: &[f32], index: usize) -> anyhow::Result<f32> {
+    let x = *logits
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("token {index} outside the {} logits", logits.len()))?;
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let sum: f64 = logits.iter().map(|&l| (l as f64 - max).exp()).sum();
+    Ok((x as f64 - max - sum.ln()) as f32)
 }
 
 pub(crate) fn argmax_u32(logits: &[f32]) -> u32 {

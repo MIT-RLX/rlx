@@ -4597,6 +4597,40 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 } else {
                                     tile(0, d0);
                                 }
+                            } else if rank == 2
+                                && (in_strides[0] == 0 || in_strides[1] == 0)
+                                && ((out_dims[0] as usize - 1) * (in_strides[0] as usize)
+                                    + (out_dims[1] as usize - 1) * (in_strides[1] as usize))
+                                    < in_total
+                            {
+                                // Rank-2 broadcast: `[N,1]` or `[1,S]` expanded to
+                                // `[N,S]`, every operand of an outer-product shaped
+                                // program. Rows filled or copied; the index walk
+                                // below made this 60 % of such a program's time.
+                                let d1 = out_dims[1] as usize;
+                                let (s0, s1) = (in_strides[0] as usize, in_strides[1] as usize);
+                                let row = |i: usize, o: &mut [f32]| {
+                                    if s1 == 0 {
+                                        o.fill(inp[i * s0]);
+                                    } else if s1 == 1 {
+                                        o.copy_from_slice(&inp[i * s0..i * s0 + d1]);
+                                    } else {
+                                        for (j, v) in o.iter_mut().enumerate() {
+                                            *v = inp[i * s0 + j * s1];
+                                        }
+                                    }
+                                };
+                                if crate::pool::should_parallelize(total) {
+                                    use rayon::prelude::*;
+                                    out.par_chunks_mut(d1)
+                                        .with_min_len((crate::pool::chunk_floor(total) / d1).max(1))
+                                        .enumerate()
+                                        .for_each(|(i, o)| row(i, o));
+                                } else {
+                                    for (i, o) in out.chunks_mut(d1).enumerate() {
+                                        row(i, o);
+                                    }
+                                }
                             } else if rank >= 3
                                 && in_strides[rank - 2] == 1
                                 && in_strides[rank - 1] as usize == out_dims[rank - 2] as usize

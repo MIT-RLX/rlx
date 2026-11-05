@@ -53,6 +53,10 @@ impl Run {
     }
 
     pub fn open(dir: PathBuf) -> ApiResult<Self> {
+        // Absolute: the agent CLI runs in the workspace, and the paths the
+        // run hands it (its MCP config) must not resolve from there.
+        let dir = std::path::absolute(&dir)
+            .map_err(|e| ApiError::runtime(format!("agent: run folder {}: {e}", dir.display())))?;
         for sub in [
             "workspace/inbox",
             "workspace/reference",

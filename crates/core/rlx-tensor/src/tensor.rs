@@ -13,7 +13,7 @@
 
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp, ScaleMode, SteKind};
 use rlx_ir::{DType, Dim, GraphExt, NodeId, Op, ScaleLayout, ScaledFormat, Shape};
 
 use crate::handle::GraphHandle;
@@ -998,6 +998,25 @@ impl Tensor {
         self.map_binary_op(rhs.into(), BinaryOp::Mod)
     }
 
+    /// Quantize-dequantize onto a symmetric `bits`-wide integer grid, for
+    /// quantization-aware training: `clamp(round(x/s), ±q_max)·s` with
+    /// `s = max|x| / q_max` (`q_max` 127 / 7 / 1 for 8 / 4 / 2 bits),
+    /// recomputed every call — one scale per index along `axis`, or one for
+    /// the whole tensor with `None`. The backward is the straight-through
+    /// estimator `ste`. Grouped scales: reshape so each group is a row first.
+    pub fn fake_quantize(&self, bits: u8, axis: Option<usize>, ste: SteKind) -> Self {
+        self.map_unary(|g, x| {
+            let shape = g.shape(x).clone();
+            let op = Op::FakeQuantize {
+                bits,
+                axis,
+                ste,
+                scale_mode: ScaleMode::PerBatch,
+            };
+            g.add_node(op, vec![x], shape)
+        })
+    }
+
     /// Clamp values to `[min, max]`.
     pub fn clamp(&self, min: f64, max: f64) -> Self {
         self.clamp_min(min).clamp_max(max)
@@ -1218,6 +1237,18 @@ impl Tensor {
         v[0]
     }
 
+    /// [`item`](Self::item) for an `F64` tensor, without narrowing to `f32`.
+    pub fn item_f64(&self) -> f64 {
+        let v = self.to_vec_f64();
+        assert_eq!(
+            v.len(),
+            1,
+            "item_f64(): tensor has {} elements, not 1",
+            v.len()
+        );
+        v[0]
+    }
+
     pod_readers! {
         /// Realize and read back as `f64` (tensor dtype must be `F64`).
         to_vec_f64 => (f64, F64, 8),
@@ -1245,11 +1276,16 @@ impl Tensor {
     /// Compile + run, returning the output's raw little-endian bytes + dtype.
     /// Device is auto-selected; backs the typed `to_vec_*` readers.
     fn eval_typed(&self) -> (Vec<u8>, DType) {
+        self.eval_typed_on(self.auto_device())
+    }
+
+    /// [`eval_typed`](Self::eval_typed) on an explicit device.
+    fn eval_typed_on(&self, device: rlx_runtime::Device) -> (Vec<u8>, DType) {
         // Raw constant → its bytes are the result (see `to_vec_on`).
         if let Some(ct) = self.constant_payload() {
             return ct;
         }
-        let compiled = self.compiled_on(self.auto_device());
+        let compiled = self.compiled_on(device);
         let mut outputs = compiled.borrow_mut().run_typed(&[]);
         outputs.pop().expect("eval produced no output")
     }
@@ -1287,6 +1323,19 @@ impl Materialize<'_> {
     /// Compile + run on the selected device and copy the output to host.
     pub fn to_vec(self) -> Vec<f32> {
         self.tensor.to_vec_on(self.device)
+    }
+
+    /// Compile + run on the selected device and read an `F64` result back
+    /// as `f64` (`to_vec` narrows it to `f32`).
+    pub fn to_vec_f64(self) -> Vec<f64> {
+        let (bytes, dt) = self.tensor.eval_typed_on(self.device);
+        assert_eq!(dt, DType::F64, "to_vec_f64: tensor dtype is {dt:?}");
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
+            .collect()
     }
 }
 
@@ -1338,8 +1387,14 @@ pub(crate) fn bake_unit_seed(bwd: &mut rlx_ir::Graph) {
         _ => None,
     });
     if let Some(id) = seed {
-        let n = bwd.node(id).shape.num_elements().unwrap_or(1);
-        let data: Vec<u8> = (0..n).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+        let shape = &bwd.node(id).shape;
+        let n = shape.num_elements().unwrap_or(1);
+        // ones in the seed's own dtype: f32 bytes in an f64 seed read as
+        // 5.26e-315 and scaled every gradient by it
+        let data: Vec<u8> = match shape.dtype() {
+            DType::F64 => (0..n).flat_map(|_| 1.0f64.to_le_bytes()).collect(),
+            _ => (0..n).flat_map(|_| 1.0f32.to_le_bytes()).collect(),
+        };
         let node = bwd.node_mut(id);
         node.op = Op::Constant { data };
         node.inputs = Vec::new();

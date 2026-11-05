@@ -678,6 +678,12 @@ pub fn try_lower_with_constants(
                 let x = node_to_tensor.get(&node.inputs[0])?;
                 mg.exp(x)
             }
+            // the one op that kept complex-arithmetic programs off MPSGraph; the
+            // bridge's scalar constant is f32
+            Op::Activation(Activation::Recip) if node.shape.dtype() == DType::F32 => {
+                let x = node_to_tensor.get(&node.inputs[0])?;
+                mg.div(&mg.constant_scalar(1.0), x)
+            }
             Op::Activation(Activation::Log) => {
                 let x = node_to_tensor.get(&node.inputs[0])?;
                 mg.log(x)

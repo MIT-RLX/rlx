@@ -2533,11 +2533,11 @@ fn run_model(group: &Arc<ProcessGroup>, label: &str, device: Device) -> bool {
                 (None, None) => anyhow::bail!("PROMPT is text and {pkg} has no tokenizer"),
             };
             let new: usize = env("NEW", "16").parse().unwrap_or(16);
-            // A pass reaches two rows past the last token.
-            if let Ok(entry) = md::decode_entry(&pkg, prompt.len() + new + 2)
+            // A pass reaches its rows past the last token (up to 16).
+            if let Ok(entry) = md::decode_entry(&pkg, prompt.len() + new + 16)
                 && env("SPECULATE", "0") != "0"
             {
-                let Some((verify, _)) = entry.verify.clone() else {
+                let Some((verify, width)) = entry.verify.clone() else {
                     anyhow::bail!(
                         "SPECULATE=1: {pkg} has no verify step (export it with --variant mtp)"
                     );
@@ -2586,7 +2586,7 @@ fn run_model(group: &Arc<ProcessGroup>, label: &str, device: Device) -> bool {
                     // for its weights' transfer over this job.
                     let (measured, relaid) = job.calibrate_for(
                         group,
-                        &entry.feeds_n(0, &[prompt[0], prompt[0]]),
+                        &entry.feeds_padded(0, &vec![prompt[0]; width], width),
                         6,
                         0.1,
                         Some(prompt.len() + new),
@@ -2614,10 +2614,7 @@ fn run_model(group: &Arc<ProcessGroup>, label: &str, device: Device) -> bool {
                     job.kept
                 );
                 let t = Instant::now();
-                let (toks, st) =
-                    job.decode_verify(group, &prompt, new, entry.vocab, &entry.stop, |p, tok| {
-                        entry.feeds_n(p, tok)
-                    })?;
+                let (toks, st) = job.decode_verify(group, &entry, &prompt, new)?;
                 let dt = t.elapsed().as_secs_f64();
                 let (own, rest, n) = job.timing;
                 eprintln!(

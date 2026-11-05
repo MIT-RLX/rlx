@@ -203,6 +203,12 @@ impl MetalExecutable {
         // `Thunk::SpdHost` carries the real F64 shapes; `spd::eval` does the
         // f32↔f64 conversion. No-op when the graph has no SPD op.
         let fused = widen_spd_f64_to_f32(fused);
+        // A pure elementwise program: its regions as generated kernels, before
+        // planning so that the planner sees each as the one node it runs as.
+        let fused = {
+            use rlx_opt::pass::Pass;
+            rlx_opt::rlx_compile::dce::DeadCodeElimination.run(crate::fused_ew::fuse(fused))
+        };
         // Per-node (qkv, attn) BYTE offsets for the surviving native FAB nodes,
         // relative to the FAB scratch base (resolved against the arena below).
         let (fab_scratch_bytes, fab_scratch_rel) = fab_scratch_layout(&fused);

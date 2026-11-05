@@ -141,6 +141,9 @@ pub struct AgentRun {
     pub timeout: Option<Duration>,
 }
 
+/// How many of the CLI's last stderr lines [`Outcome::stderr`] keeps.
+const STDERR_LINES: usize = 20;
+
 /// What a run produced.
 #[derive(Debug, Clone)]
 pub struct Outcome {
@@ -149,12 +152,18 @@ pub struct Outcome {
     pub summary: Summary,
     /// The CLI ran past [`AgentRun::timeout`] and was stopped.
     pub timed_out: bool,
+    /// The last lines the CLI wrote to stderr (it is passed on as it comes,
+    /// and saved whole beside the transcript as `stderr.txt`).
+    pub stderr: String,
 }
 
 impl AgentRun {
     /// A run in `run_dir` with its workspace at `run_dir/workspace`.
     pub fn new(cli: AgentCli, run_dir: impl Into<PathBuf>, servers: Vec<McpServer>) -> Self {
         let run_dir = run_dir.into();
+        // Absolute: the CLI runs in the workspace, and the paths it is given
+        // (its MCP config) must not resolve from there.
+        let run_dir = std::path::absolute(&run_dir).unwrap_or(run_dir);
         Self {
             cli,
             workspace: run_dir.join("workspace"),
@@ -326,7 +335,7 @@ impl AgentRun {
             .current_dir(&self.workspace)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
         // Its own process group, so a timeout stops what it started too (its
         // MCP servers), not just the CLI.
         #[cfg(unix)]
@@ -340,6 +349,27 @@ impl AgentRun {
         let names: Vec<&str> = self.servers.iter().map(|s| s.name.as_str()).collect();
         let mut summary = Summary::default();
         let stdout = child.stdout.take().ok_or("no stdout")?;
+        // stderr passed on as it comes, saved, and its last lines kept.
+        let stderr = child.stderr.take().ok_or("no stderr")?;
+        let err_path = path.with_file_name("stderr.txt");
+        let err_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let err_reader = {
+            let err_tail = err_tail.clone();
+            let mut saved = std::fs::File::create(&err_path).ok();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    eprintln!("{line}");
+                    if let Some(f) = saved.as_mut() {
+                        let _ = writeln!(f, "{line}");
+                    }
+                    let mut t = err_tail.lock().unwrap_or_else(|e| e.into_inner());
+                    t.push(line);
+                    if t.len() > STDERR_LINES {
+                        t.remove(0);
+                    }
+                }
+            })
+        };
         // Lines arrive through a channel so a silent CLI can still be timed out.
         let (tx, rx) = mpsc::channel::<std::io::Result<String>>();
         let reader = std::thread::spawn(move || {
@@ -384,12 +414,18 @@ impl AgentRun {
         // finishes on its own when it lets go.
         if !timed_out {
             let _ = reader.join();
+            let _ = err_reader.join();
         }
+        let stderr = err_tail
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .join("\n");
         Ok(Outcome {
             exit_code: status.code(),
             transcript: path,
             summary,
             timed_out,
+            stderr,
         })
     }
 }

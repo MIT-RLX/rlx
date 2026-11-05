@@ -50,6 +50,8 @@ pub enum EnvKind {
     AuditPair,
     MnistSteer,
     FixPolicy,
+    /// Question answering over a language-model package (`lm::QaSpec`).
+    Qa,
     /// Any rlx graph loaded with [`crate::WeightSpace::from_graph`].
     Graph,
 }
@@ -68,7 +70,7 @@ impl EnvKind {
             | EnvKind::MnistSteer => Box::new(MnistTask),
             EnvKind::ReadRules => Box::new(crate::orchard::Orchard::new()),
             EnvKind::FixPolicy => Box::new(Bounce::new(BOUNCE_W, BOUNCE_H)),
-            EnvKind::Graph => Box::new(GraphTask),
+            EnvKind::Graph | EnvKind::Qa => Box::new(GraphTask),
         }
     }
 

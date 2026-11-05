@@ -45,6 +45,11 @@ const TAG_TYPED: u32 = 93;
 /// them, or 0 to drop it) — how a speculative step is taken back.
 pub const KEEP: &str = "__keep";
 
+/// A step input no graph reads: how many of the step's new rows are real,
+/// the rest padding. A stage keeps only those, and a recurrent state (which
+/// a padded step leaves at its last real row) with them.
+pub const ROWS: &str = "__rows";
+
 /// Each stage adds its compute seconds to the values it passes on, under
 /// this prefix and its index, so rank 0 sees every stage's time each step.
 pub const TIME: &str = "__time.";
@@ -1129,6 +1134,7 @@ impl Stage {
         if let Some(k) = &keep {
             self.settle(k.first().copied().unwrap_or(0.0) as usize)?;
         }
+        let real = values.get(ROWS).cloned();
         // Stage-local state in, padded to its input.
         for (slot, cache) in self.plan.state.iter().zip(&self.caches) {
             let mut v = cache.clone();
@@ -1197,6 +1203,10 @@ impl Stage {
             rows_new = n;
             updates.push(out[(rows - n) * w..rows * w].to_vec());
         }
+        // A padded step's new rows are its real ones.
+        if let Some(r) = real.as_ref().and_then(|r| r.first()) {
+            rows_new = rows_new.min(*r as usize);
+        }
         if keep.is_some() {
             self.pending = Some((updates, rows_new));
         } else {
@@ -1228,6 +1238,9 @@ impl Stage {
         // The next stage settles its own update the same way.
         if let Some(k) = keep {
             values.insert(KEEP.into(), k);
+        }
+        if let Some(r) = real {
+            values.insert(ROWS.into(), r);
         }
         Ok(values)
     }
@@ -1291,8 +1304,14 @@ pub struct DecodeEntry {
     /// next (Qwen3.5's MTP), when the step has one.
     pub draft: Option<usize>,
     /// A speculative step (`generate.verify`): its function, and how many
-    /// tokens it takes (the last one, then the draft).
+    /// tokens it takes (the last one, then the drafts).
     pub verify: Option<(String, usize)>,
+    /// Drafts the verify step gives for the next pass.
+    pub verify_drafts: usize,
+    /// The verify step's inputs that say which of its rows are real, and
+    /// how (`pad_rows`, `pad_shift`, `last_row`): with them a pass can take
+    /// fewer tokens than the step's rows. Empty: every pass fills them.
+    pub verify_rows: Vec<(String, String)>,
     token: String,
     mask: Option<String>,
     /// `(input, table, row width)`.
@@ -1401,6 +1420,21 @@ pub fn decode_entry(path: &str, needed: usize) -> Result<DecodeEntry> {
                 v.get("tokens")?.as_u64()? as usize,
             ))
         }),
+        verify_drafts: entry
+            .get("verify")
+            .and_then(|v| v.get("drafts"))
+            .and_then(Value::as_u64)
+            .unwrap_or(1) as usize,
+        verify_rows: entry
+            .get("verify")
+            .and_then(|v| v.get("rows"))
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
         token: token.context("the generate entry has no token input")?,
         mask,
         tables,
@@ -1417,15 +1451,28 @@ impl DecodeEntry {
     /// cache length `past`: the keys mask over the padded cache and the new
     /// rows after it, and a table row per token.
     pub fn feeds_n(&self, past: usize, tokens: &[u32]) -> Vec<(String, Vec<f32>)> {
-        let n = tokens.len();
-        let mut f = vec![(
-            self.token.clone(),
-            tokens.iter().map(|&t| t as f32).collect(),
-        )];
+        self.feeds_padded(past, tokens, tokens.len())
+    }
+
+    /// [`DecodeEntry::feeds_n`] for a step of `rows` rows of which `tokens`
+    /// are the first, the rest padding: no key reaches a padding row, a
+    /// padding row takes the last real one's table row (so a row one past
+    /// the last, as a draft reads, is the next position), and the
+    /// [`DecodeEntry::verify_rows`] inputs say which rows are real.
+    pub fn feeds_padded(
+        &self,
+        past: usize,
+        tokens: &[u32],
+        rows: usize,
+    ) -> Vec<(String, Vec<f32>)> {
+        let real = tokens.len();
+        let mut ids: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
+        ids.resize(rows.max(real), 0.0);
+        let mut f = vec![(self.token.clone(), ids)];
         if let Some(m) = &self.mask {
-            let keys: Vec<f32> = (0..self.upper + n)
+            let keys: Vec<f32> = (0..self.upper + rows)
                 .map(|i| {
-                    if i < past || i >= self.upper {
+                    if i < past || (i >= self.upper && i < self.upper + real) {
                         1.0
                     } else {
                         0.0
@@ -1435,16 +1482,27 @@ impl DecodeEntry {
             f.push((m.clone(), keys));
         }
         for (name, table, w) in &self.tables {
-            let rows = (0..n)
+            let data = (0..rows)
                 .flat_map(|r| {
-                    let at = (past + r) * w;
+                    let at = (past + r.min(real.saturating_sub(1))) * w;
                     table
                         .get(at..at + w)
                         .map(<[f32]>::to_vec)
                         .unwrap_or_else(|| vec![0.0; *w])
                 })
                 .collect();
-            f.push((name.clone(), rows));
+            f.push((name.clone(), data));
+        }
+        if rows > 1 {
+            for (name, kind) in &self.verify_rows {
+                let v = match kind.as_str() {
+                    "pad_rows" => (0..rows).map(|r| f32::from(r >= real)).collect(),
+                    "pad_shift" => vec![real as f32 - rows as f32],
+                    "last_row" => vec![real.saturating_sub(1) as f32],
+                    _ => continue,
+                };
+                f.push((name.clone(), v));
+            }
         }
         f
     }
@@ -1536,6 +1594,89 @@ fn verify_decode(
                     (pair, kind) = ([pair[0], a0], Pair::Known);
                 }
             }
+        }
+    }
+    Ok((out, stats))
+}
+
+/// Greedy speculative decoding through a verify step of `width` rows that
+/// may run fewer (its trailing rows padding): each pass runs the tokens
+/// known right after the cache, then the draft head's guesses at the ones
+/// after them, and keeps every row if all the guesses were the trunk's own
+/// picks. Otherwise it drops the pass and runs the known tokens again with
+/// the guesses that held and the trunk's pick after them, which gives the
+/// token after those (a pass whose drafts follow a wrong guess has none to
+/// use). Every token is the trunk's argmax after the kept ones, as in
+/// one-token decoding. The prompt runs `width` tokens a pass.
+///
+/// `pass(past, tokens, keep)` runs the step at cache length `past` on
+/// `tokens` (at most `width`) and returns the trunk's pick at each of them
+/// and the draft head's guesses after the last; `keep` is how many rows of
+/// the previous pass to keep.
+fn verify_decode_rows(
+    prompt: &[u32],
+    new: usize,
+    stop: &[u32],
+    width: usize,
+    mut pass: impl FnMut(usize, &[u32], usize) -> Result<(Vec<u32>, Vec<u32>)>,
+) -> Result<(Vec<u32>, DraftStats)> {
+    if prompt.is_empty() {
+        bail!("decode needs at least one prompt token");
+    }
+    if width < 2 {
+        bail!("a verify step of {width} rows has no room for a draft");
+    }
+    let mut stats = DraftStats::default();
+    let (mut out, mut past, mut keep) = (Vec::new(), 0usize, 0usize);
+    // The prompt but its last `width` tokens or fewer: nothing to read yet.
+    let mut i = 0;
+    while prompt.len() - i > width {
+        pass(past, &prompt[i..i + width], keep)?;
+        stats.passes += 1;
+        (keep, past, i) = (width, past + width, i + width);
+    }
+    let (mut known, mut guess) = (prompt[i..].to_vec(), Vec::new());
+    while out.len() < new {
+        let tokens = [known.as_slice(), guess.as_slice()].concat();
+        let (picks, drafts) = pass(past, &tokens, keep)?;
+        stats.passes += 1;
+        if picks.len() < tokens.len() {
+            bail!(
+                "a pass of {} tokens gave {} picks",
+                tokens.len(),
+                picks.len()
+            );
+        }
+        // The pick after the known tokens, then one after each guess held.
+        let base = known.len() - 1;
+        let held = guess
+            .iter()
+            .zip(&picks[base..])
+            .take_while(|(g, p)| g == p)
+            .count();
+        stats.drafts += guess.len();
+        stats.accepted += held;
+        let mut done = false;
+        for &t in &picks[base..=base + held] {
+            out.push(t);
+            if out.len() >= new || stop.contains(&t) {
+                done = true;
+                break;
+            }
+        }
+        if done {
+            break;
+        }
+        let next = picks[base + held];
+        if held == guess.len() {
+            (keep, past) = (tokens.len(), past + tokens.len());
+            known = vec![next];
+            guess = drafts.into_iter().take(width - 1).collect();
+        } else {
+            keep = 0;
+            known.extend_from_slice(&guess[..held]);
+            known.push(next);
+            guess.clear();
         }
     }
     Ok((out, stats))
@@ -1658,8 +1799,8 @@ pub fn decode_local_verify(
         .verify
         .clone()
         .context("the generate entry has no verify step")?;
-    if tokens != 2 {
-        bail!("a verify step of {tokens} tokens: only 2 (the last token and a draft) run");
+    if tokens != 2 && entry.verify_rows.is_empty() {
+        bail!("a verify step of {tokens} tokens with no padded rows: only 2 run");
     }
     let mut pkg = Opened::open_merged(std::path::Path::new(path))?;
     let graph = specialize_function(&mut pkg, &function, Some(&entry.dims))?;
@@ -1694,18 +1835,51 @@ pub fn decode_local_verify(
             .context("the generate entry has no draft output")?],
     );
     let mut stage = Stage::compile(plan, &params)?;
-    verify_decode(prompt, new, &entry.stop, |past, toks, keep| {
-        let mut values: Values = entry.feeds_n(past, toks).into_iter().collect();
-        values.insert(KEEP.into(), vec![keep as f32]);
-        let mut v = stage.step(values)?;
-        let rows = picks(&v.remove(&logits_name).context("logits")?, 2, entry.vocab);
-        let draft = picks(
-            &v.remove(&draft_name).context("draft logits")?,
-            1,
-            entry.vocab,
-        );
-        Ok(([rows[0], rows[1]], draft[0]))
+    entry.speculate(prompt, new, |inputs| {
+        let mut v = stage.step(inputs.into_iter().collect())?;
+        Ok((
+            v.remove(&logits_name).context("logits")?,
+            v.remove(&draft_name).context("draft logits")?,
+        ))
     })
+}
+
+impl DecodeEntry {
+    /// Greedy speculative decoding through the verify step, `run` taking a
+    /// pass's inputs ([`KEEP`] and [`ROWS`] among them) to its logits and
+    /// draft logits (or their ids): [`verify_decode_rows`] when the step
+    /// pads short passes, else the two-token [`verify_decode`].
+    fn speculate(
+        &self,
+        prompt: &[u32],
+        new: usize,
+        mut run: impl FnMut(Vec<(String, Vec<f32>)>) -> Result<(Vec<f32>, Vec<f32>)>,
+    ) -> Result<(Vec<u32>, DraftStats)> {
+        let (_, width) = self
+            .verify
+            .clone()
+            .context("the generate entry has no verify step")?;
+        let vocab = self.vocab;
+        if self.verify_rows.is_empty() {
+            return verify_decode(prompt, new, &self.stop, |past, toks, keep| {
+                let mut inputs = self.feeds_n(past, toks);
+                inputs.push((KEEP.into(), vec![keep as f32]));
+                let (logits, draft) = run(inputs)?;
+                let rows = picks(&logits, 2, vocab);
+                Ok(([rows[0], rows[1]], picks(&draft, 1, vocab)[0]))
+            });
+        }
+        let drafts = self.verify_drafts.max(1);
+        verify_decode_rows(prompt, new, &self.stop, width, |past, toks, keep| {
+            let mut inputs = self.feeds_padded(past, toks, width);
+            inputs.push((KEEP.into(), vec![keep as f32]));
+            inputs.push((ROWS.into(), vec![toks.len() as f32]));
+            let (logits, draft) = run(inputs)?;
+            let mut rows = picks(&logits, width, vocab);
+            rows.truncate(toks.len());
+            Ok((rows, picks(&draft, drafts, vocab)))
+        })
+    }
 }
 
 /// A function split across the group, ready to run requests (rank 0).
@@ -2548,34 +2722,32 @@ impl InferJob {
         Ok((out, rows))
     }
 
-    /// Greedy speculative decoding through a verify step (the job started on
-    /// the entry's verify function): [`verify_decode`] across the group, each
-    /// stage holding a pass's state until the next one says to keep or drop
-    /// it ([`KEEP`]). `feed(past, tokens)` gives a pass's inputs; the step's
+    /// Greedy speculative decoding through `entry`'s verify step (the job
+    /// started on it): [`verify_decode_rows`] (or, for a step that cannot
+    /// pad, [`verify_decode`]) across the group, each stage holding a pass's
+    /// state until the next one says what to keep ([`KEEP`]). The step's
     /// first output is the logits, its second the draft logits.
     pub fn decode_verify(
         &mut self,
         group: &ProcessGroup,
+        entry: &DecodeEntry,
         prompt: &[u32],
         new: usize,
-        vocab: usize,
-        stop: &[u32],
-        mut feed: impl FnMut(usize, &[u32]) -> Vec<(String, Vec<f32>)>,
     ) -> Result<(Vec<u32>, DraftStats)> {
         if self.outputs.len() < 2 {
             bail!("the verify step has no draft output");
         }
-        verify_decode(prompt, new, stop, |past, toks, keep| {
-            let mut inputs = feed(past, toks);
-            inputs.push((KEEP.into(), vec![keep as f32]));
+        entry.speculate(prompt, new, |inputs| {
             let refs: Vec<(&str, &[f32])> = inputs
                 .iter()
                 .map(|(n, v)| (n.as_str(), v.as_slice()))
                 .collect();
-            let out = self.run(group, &refs)?;
-            let rows = picks(&out[0], 2, vocab);
-            let draft = picks(&out[1], 1, vocab);
-            Ok(([rows[0], rows[1]], draft[0]))
+            let mut out = self.run(group, &refs)?;
+            if out.len() < 2 {
+                bail!("the verify step gave {} outputs", out.len());
+            }
+            let draft = out.swap_remove(1);
+            Ok((out.swap_remove(0), draft))
         })
     }
 
@@ -3184,6 +3356,83 @@ mod tests {
         }
         // Both outcomes were taken.
         assert!(accepted > 0 && accepted < drafts, "{accepted}/{drafts}");
+    }
+
+    /// The padded verify loop against greedy one-token decoding, through a
+    /// model whose next token depends on the whole context, so a pass run on
+    /// a cache that kept the wrong rows gives the wrong picks. The mock
+    /// keeps rows as a stage does: a pass's tokens wait for the next pass's
+    /// `keep`. Its draft head chains right except at every `miss`-th
+    /// position, for each step width and prompt length.
+    #[test]
+    fn padded_verify_decoding_gives_the_greedy_tokens() {
+        const V: u32 = 23;
+        let next = |ctx: &[u32]| {
+            let sum: u32 = ctx
+                .iter()
+                .enumerate()
+                .map(|(i, &t)| t * (i as u32 + 1))
+                .sum();
+            (sum * 7 + ctx.len() as u32 * 3) % V
+        };
+        for width in 2..=5 {
+            for miss in [1usize, 3, 1000] {
+                let (mut drafts, mut accepted) = (0, 0);
+                for len in 1..=9 {
+                    let prompt: Vec<u32> = (0..len as u32).map(|i| (i * 5 + 2) % V).collect();
+                    let new = 20;
+                    let mut ctx = prompt.clone();
+                    for _ in 0..new {
+                        ctx.push(next(&ctx));
+                    }
+                    let want = ctx[len..].to_vec();
+                    let (mut cache, mut pending) = (Vec::<u32>::new(), Vec::<u32>::new());
+                    let (got, st) =
+                        verify_decode_rows(&prompt, new, &[], width, |past, toks, keep| {
+                            assert!(keep == 0 || keep == pending.len(), "kept part of a pass");
+                            cache.extend_from_slice(&pending[..keep]);
+                            assert_eq!(past, cache.len(), "a pass ran at a cache length not kept");
+                            assert!(!toks.is_empty() && toks.len() <= width);
+                            pending = toks.to_vec();
+                            let mut seen = cache.clone();
+                            let mut picks = Vec::new();
+                            for &t in toks {
+                                seen.push(t);
+                                picks.push(next(&seen));
+                            }
+                            // The head's guesses after the last pick.
+                            seen.push(*picks.last().unwrap());
+                            let mut guesses = Vec::new();
+                            for _ in 0..width - 1 {
+                                let right = next(&seen);
+                                let g = if seen.len() % miss == 0 {
+                                    (right + 1) % V
+                                } else {
+                                    right
+                                };
+                                guesses.push(g);
+                                seen.push(g);
+                            }
+                            Ok((picks, guesses))
+                        })
+                        .unwrap();
+                    assert_eq!(got, want, "width {width}, miss {miss}, prompt {prompt:?}");
+                    (drafts, accepted) = (drafts + st.drafts, accepted + st.accepted);
+                    if miss == 1000 {
+                        // Every draft holds: a pass gives `width` tokens.
+                        assert!(
+                            st.passes <= len.div_ceil(width) + new.div_ceil(width) + 1,
+                            "{st:?}"
+                        );
+                    }
+                }
+                match miss {
+                    1 => assert_eq!(accepted, 0),
+                    1000 => assert_eq!(accepted, drafts),
+                    _ => assert!(accepted > 0 && accepted < drafts, "{accepted}/{drafts}"),
+                }
+            }
+        }
     }
 
     use super::*;

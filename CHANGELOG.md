@@ -23,8 +23,128 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ## [Unreleased]
 
+### Added
+
+- `RLX_WEBGL_PLAN_STATS=1`: each WebGL plan's cost at compile (the
+  legalization stages' op histograms, steps, slots, planning time, index-table
+  sizes, steps per IR op) — how the conv weight-gradient blow-up (Fixed, below) was
+  found. `Plan::index_table_stats` / `Plan::steps_by_origin`.
+
+- rlx-metal: matmuls of 2–8 rows against bf16 weights (several sequences
+  decoded together) run a split-K GEMV that reads each weight once for every
+  row, `gemv_bf16w_splitk8{,_n64}_rows`. Before, 2–4 rows ran one thread per
+  output column with no K split and 5–8 rows unpacked the weight to f32 for a
+  GEMM: batching 2 Audio8 sentences made each step ~7× slower than one
+  sentence; now 4 sentences step at ~1.8× one sentence's time. Each row sums
+  in the one-row kernel's order, so a row is bit-identical to running it
+  alone (`tests/bf16w_rows_parity.rs`). `RLX_METAL_BF16W_ROWS_DISABLE=1`
+  restores the old routes.
+- `rlx_runtime::with_strict_f32(f)`: runs `f` with strict f32 matmuls where
+  a backend defaults to a faster, coarser path (CUDA's TF32, as
+  `RLX_CUDA_NO_TF32=1` for `f`'s duration), and restores the previous setting
+  afterwards, panics included. For results that are discrete decisions on
+  near-equal scores: TF32 changed 82 of 1120 codes of the Fish/Audio8 codec's
+  nearest-codebook encoder, while the LM's greedy tokens were unaffected.
+- rlx-vulkan bounds each submission: a run of GPU dispatches is split once it
+  reaches 2^21 workgroups (`RLX_VULKAN_SEGMENT_WORKGROUPS`) or 256 dispatches
+  (`RLX_VULKAN_SEGMENT_DISPATCHES`; `0` = no limit for either), each part
+  waited on before the next. One command buffer per run made a long graph a
+  single driver job, and amdgpu resets the ring after ~2 s: on an RDNA3
+  integrated GPU (RADV) a 44.1 kHz codec decode lost its context and returned
+  garbage. Workgroups, not dispatches, are the bound because the work grows
+  with the input: the same decode is 17.4 M workgroups at 64 frames (at the
+  limit) and 34.8 M at 128, so a 256-dispatch cap that fixed one failed the
+  other. Now both match the CPU (2.6e-6), with no resets; NVIDIA's time is
+  unchanged (79.5 s for an utterance either way) and `cargo test -p
+  rlx-vulkan` passes there.
+
+- rlx-cpu's wasm SIMD kernels (`wasm_gemm`, the `avx2_mirror` lanes) also
+  build for wasm64 (Memory64) with simd128. They import through a
+  `wasm_arch` alias: `core::arch::wasm32`, or `core::arch::wasm64` on wasm64,
+  which needs nightly's `simd_wasm64`.
+
 ### Fixed
 
+- `rlx-pkg`'s `remote` range reader uses reqwest over rustls with the
+  pure-Rust RustCrypto provider instead of ureq (ring: C and assembly). HTTPS
+  ranges of a Hugging Face file match `curl -r` (`tests/remote_range.rs`,
+  `--ignored`).
+
+- `rlx-pkg`'s `zstd-native` (used by rlx-bake) no longer links libzstd (C): it
+  is zstd-pure-rs, a Rust translation of libzstd, driven the way
+  `zstd::encode_all` drove libzstd, so warm/cold blobs are byte-for-byte what
+  a libzstd bake wrote (`codec_interop.rs::zstd_native_writes_libzstds_bytes`,
+  checked against libzstd itself as a test-only reference). Decoding keeps
+  its output cap, and a truncated frame is an error.
+
+- `Op::TopK` on Metal returned all-zero indices for rows longer than 1024:
+  its kernel kept the row in a fixed 1024-entry array and wrote nothing past
+  that. It is now one threadgroup per row with no length limit, and ties go to
+  the lower index as on the CPU (`tests/metal_topk_parity.rs`, which fails on
+  the old kernel at a 4096-entry row).
+- `Op::TopK` on wgpu ran one thread per row and rescanned its earlier picks
+  for every element: ~0.5 s for k = 50 over 4096 values, now 1.2 ms (one
+  workgroup per row; `tests/topk_parity.rs`, CPU-identical at 155 776-entry
+  rows, k = 1025 and 70 000 short rows).
+
+- `rlx-autodiff`: the decomposed conv weight gradient (`Conv2dBackwardWeight`,
+  `Conv3dBackwardWeight`, used by every backend that legalizes them: WebGL,
+  and others through `rewrite_for_backend`) was wrong at batch > 1. It
+  reshaped `dy` `[N, Cout, …]` straight to `[Cout, N·…]`, which is that matrix
+  only when N = 1; the batch axis now moves behind the channels first
+  (`channel_major`). Measured against rlx-cpu's native kernel at batch 2:
+  dw[0] −23.92 vs 1.16 before, equal now. The `K×1` fast path was batch-1 only
+  as well and now applies only there. (`conv3d_backward_via_decomposition`
+  used batch 1, so it never saw this.) Test: `rlx-webgl/tests/conv2d_backward.rs`.
+- `rlx-autodiff`: that decomposition built im2col one element at a time (a
+  scalar `Gather` and its index `Constant` per patch entry): EEGNet's training
+  graph legalized to 4.8 M nodes and planned on WebGL to 7,381,103 steps,
+  30 GB RSS (killed at a 107 GB footprint). It is now one gather over the
+  input plus a trailing zero (`gather_patches`, the same f32 index form; the
+  per-entry form only past 2^24 elements): 753 steps, 540 MB, and EEGNet and
+  ShallowConvNet train on WebGL2 in Chrome (ShallowConvNet 3.2× the CPU).
+  `conv2d_backward_plan_is_not_per_element` bounds the plan (the per-entry
+  form fails it at 17,700 steps).
+- `rlx-wgpu` builds for shared-memory (atomics) wasm: the WebGPU device is
+  pinned to the thread that initialised it (`device::on_gpu_thread`;
+  `wgpu_device()` is `None` elsewhere), which makes the kernel statics sound
+  there (`Kernel: Send + Sync` on that target only). A page can run rlx-cpu
+  on a rayon pool of workers and WebGPU in the same instance.
+- `rlx-runtime`: `is_available(Device::OpenGl)` in the browser makes the
+  thread's WebGL2 context instead of answering `true` for any build with the
+  backend, so a fallback chain can skip a browser without WebGL2.
+
+- rlx-mlx: a sliding-window attention on `[B, S, H, D]` inputs built its mask
+  from the head count instead of the sequence length (`len - 2` is the
+  sequence only in `[B, H, S, D]`), so it failed to lower (`[broadcast_shapes]
+  (1,1,16,16) and (1,16,288,288)`) whenever the window was shorter than the
+  sequence. The Fish/Audio8 codec's post transformer hits it past 128 frames
+  (~6 s of audio); a 261-frame round trip now matches the CPU's sample for
+  sample. `tests/basic.rs::sliding_window_attention_in_bshd_layout` fails on
+  the old code.
+
+- rlx-rocm: the mixed-precision matmul's activation cast (`cast_f32_to_half`,
+  shared with CUDA) included `cuda_fp16.h` / `cuda_bf16.h`, which hipRTC does
+  not have, so any graph with bf16 or f16 weights panicked on ROCm at its first
+  such matmul (`hipRTC compile failed for cast_f32_to_half`). Under HIP it now
+  includes `hip/hip_fp16.h` and rounds f32 to bf16 itself (nearest even, NaN
+  kept quiet); CUDA is unchanged. Found on gfx1103 running Audio8-TTS
+  (rlx-models `rlx-fish`), which then matched its reference.
+
+- `Graph::interpolate1d(.., InterpMode::Nearest)` is now a gather along the
+  last axis. It used to be a matmul with a one-hot [L_in, L_out] constant,
+  which is quadratic in length. For U-Sleep's 61440-sample input, the top
+  decoder level's constant was 30720 × 61440 floats (7.03 GiB), so wgpu
+  panicked past its 4 GiB buffer cap after 40 s and 18 GB. In the browser the
+  embed never finished. That model now embeds in 0.2 s and 50 MB. The values
+  are the matmul's, except that a gather copies -0, ±inf and NaN as they are
+  (the one-hot product made NaN of a neighbouring inf, 0·inf), which is what
+  torch's nearest does. Linear mode keeps the matrix. Pinned by
+  `cpu_exg_kernels.rs` (bits on a rank-3 input with -0/inf/NaN; the
+  constants are O(L) at 30720 → 61440) and by `gpu_exg_parity.rs`
+  (`interpolate1d_nearest`, exact against the CPU). Both CPU tests fail with
+  the old lowering. exg's U-Sleep and U-Time torch-parity numbers are
+  identical under both lowerings.
 - `rlx_libm::reference::*` now honours `platform::use_linux_reference()`.
   Before, on Apple targets with the `libm` feature it chose Apple's libm at
   compile time, so the runtime switch never reached it. A browser/native

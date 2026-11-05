@@ -97,11 +97,64 @@ pub fn decode_zstd_blocks_parallel(comp: &[u8]) -> Result<Vec<u8>> {
 }
 
 // The codec: pure-Rust `zstd-rs` by default (any target, wasm32 included);
-// libzstd with `zstd-native` on native targets. Both read and write standard
+// libzstd's algorithm (zstd-pure-rs) with `zstd-native` on native targets. Both read and write standard
 // zstd frames, so a package written by either is read by either.
 #[cfg(all(feature = "zstd-native", not(target_family = "wasm")))]
+fn z_check(code: usize, what: &str) -> Result<usize> {
+    if zstd_pure_rs::ZSTD_isError(code) {
+        bail!("{what}: {}", zstd_pure_rs::ZSTD_getErrorName(code));
+    }
+    Ok(code)
+}
+
+/// libzstd's `zstd::encode_all`, step for step: a streaming context at
+/// `level`, no pledged size (so no content size in the frame header), input
+/// fed with `continue` and closed with `end` — the same frame bytes.
+#[cfg(all(feature = "zstd-native", not(target_family = "wasm")))]
 fn z_encode_all(data: &[u8], level: i32) -> Result<Vec<u8>> {
-    zstd::encode_all(data, level).context("zstd compress")
+    use zstd_pure_rs::compress::zstd_compress as zc;
+    let mut c = zc::ZSTD_createCCtx().context("ZSTD_createCCtx")?;
+    z_check(
+        zc::ZSTD_CCtx_setParameter(&mut c, zc::ZSTD_cParameter::ZSTD_c_compressionLevel, level),
+        "zstd level",
+    )?;
+    let mut out = vec![0u8; zc::ZSTD_compressBound(data.len()).max(64)];
+    let (mut op, mut ip) = (0usize, 0usize);
+    while ip < data.len() {
+        z_check(
+            zc::ZSTD_compressStream2(
+                &mut c,
+                &mut out,
+                &mut op,
+                data,
+                &mut ip,
+                zc::ZSTD_EndDirective::ZSTD_e_continue,
+            ),
+            "zstd compress",
+        )?;
+        if op == out.len() {
+            out.resize(out.len() * 2, 0);
+        }
+    }
+    loop {
+        let left = z_check(
+            zc::ZSTD_compressStream2(
+                &mut c,
+                &mut out,
+                &mut op,
+                &[],
+                &mut 0,
+                zc::ZSTD_EndDirective::ZSTD_e_end,
+            ),
+            "zstd compress",
+        )?;
+        if left == 0 {
+            break;
+        }
+        out.resize(out.len() + left.max(1 << 16), 0);
+    }
+    out.truncate(op);
+    Ok(out)
 }
 #[cfg(not(all(feature = "zstd-native", not(target_family = "wasm"))))]
 fn z_encode_all(data: &[u8], level: i32) -> Result<Vec<u8>> {
@@ -121,15 +174,25 @@ fn z_encode_all(data: &[u8], level: i32) -> Result<Vec<u8>> {
 /// tied to what the caller expects, not to the attacker's frame header.
 #[cfg(all(feature = "zstd-native", not(target_family = "wasm")))]
 fn z_decode_capped(data: &[u8], cap: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
+    use zstd_pure_rs::decompress::zstd_decompress as zd;
+    let mut d = zd::ZSTD_createDCtx();
     let mut out = Vec::new();
-    zstd::Decoder::new(data)
-        .context("init zstd decoder")?
-        .take((cap as u64).saturating_add(1))
-        .read_to_end(&mut out)
-        .context("zstd decompress")?;
-    if out.len() > cap {
-        bail!("zstd output exceeds {cap} bytes");
+    let mut chunk = vec![0u8; 1 << 17];
+    let mut ip = 0usize;
+    // every frame in `data`, a chunk of output at a time, stopped past `cap`
+    while ip < data.len() {
+        let mut op = 0usize;
+        let hint = z_check(
+            zd::ZSTD_decompressStream(&mut d, &mut chunk, &mut op, data, &mut ip),
+            "zstd decompress",
+        )?;
+        out.extend_from_slice(&chunk[..op]);
+        if out.len() > cap {
+            bail!("zstd output exceeds {cap} bytes");
+        }
+        if ip == data.len() && hint != 0 && op < chunk.len() {
+            bail!("zstd decompress: truncated frame");
+        }
     }
     Ok(out)
 }

@@ -91,6 +91,7 @@ fn run_metal_dequant(scheme_id: u32, block_bytes: &[u8], num_blocks: u32) -> Vec
     // schemes that don't read it — Metal requires every declared
     // argument to be bound).
     enc.set_buffer(5, Some(k.iq_grid_buffer()), 0);
+    enc.set_buffer(6, Some(&arena), 0);
     let grid = MTLSize {
         width: num_blocks as u64,
         height: 1,

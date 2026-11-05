@@ -21,7 +21,7 @@ use rlx_optim::{OptItem, Optimizer as OptimizerTrait, OptimizerState};
 use serde_json::{Value, json};
 
 use crate::runtime::opts::Opts;
-use crate::runtime::train::optimizer;
+use crate::runtime::train::{FusedRule, fused_rule, optimizer};
 use crate::{ApiError, ApiResult};
 
 /// A program's source: file name → contents.
@@ -70,6 +70,27 @@ pub trait Program {
     fn load_state_dict(&mut self, _state: &OptimizerState) -> bool {
         false
     }
+    /// Each group's learning rate at its last update, by a label of the
+    /// group, for the reports; empty when the program does not say.
+    fn learning_rates(&self) -> Vec<(String, f32)> {
+        Vec::new()
+    }
+    /// On a resident trainer: the update at `ctx.update` as each param's
+    /// fused rule and rate (in `params` order), made by the trainer's own
+    /// fused step. `Err`: why this program cannot run on the device.
+    fn device_plan(&self, _ctx: &StepCtx, _params: &[ParamInfo]) -> Result<DevicePlan, String> {
+        Err("this program runs on the host only".into())
+    }
+}
+
+/// A program's update as the fused step makes it ([`Program::device_plan`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DevicePlan {
+    pub rules: Vec<FusedRule>,
+    pub lrs: Vec<f32>,
+    /// Whether each param keeps its moments when its rule changes to one of
+    /// the same family (its group's `carry_state`).
+    pub carry: Vec<bool>,
 }
 
 /// Builds programs from the files of one language.
@@ -86,6 +107,27 @@ pub trait ProgramHost {
     ) -> ApiResult<Box<dyn Program>>;
     /// The prompt section that tells the agent how to write a program here.
     fn interface(&self) -> String;
+    /// Static findings where `files` reach past the program (files, dynamic
+    /// code, introspection, the model): `{file, line, category, snippet}`.
+    /// Recorded, never a reason to reject a program, and no sandbox. None by
+    /// default (rules run no code of the agent's).
+    fn boundary_flags(&self, _files: &Files) -> Vec<Value> {
+        Vec::new()
+    }
+    /// The agent's `check_program` tool: the command (program, arguments…)
+    /// that builds this host's programs in a process of its own, run as
+    /// `<command> <workspace>`, and what it needs to make this host again
+    /// (`{"program": <language>, …}`, written to `reference/check.json` with
+    /// the params). `None`: no such tool.
+    fn check(&self) -> Option<(Vec<String>, Value)> {
+        None
+    }
+    /// Files for the agent's `reference/`: example programs that use the
+    /// language's features with values that change nothing (no
+    /// recommendation); `aggressive` for the aggressive prompt's additions.
+    fn examples(&self, _aggressive: bool) -> Files {
+        Files::new()
+    }
 }
 
 // ── RuleHost ────────────────────────────────────────────────────
@@ -94,9 +136,28 @@ pub trait ProgramHost {
 pub struct RuleHost {
     start: Value,
     start_lr: f32,
+    /// `check_program`'s command, when not `rlx-agent-opt check-program`.
+    check_command: Option<Vec<String>>,
 }
 
 pub const UPDATER: &str = "updater.json";
+
+/// `name` next to this executable (or one folder up, where cargo puts test
+/// executables), else on `PATH`; `None` when it is in neither.
+pub fn find_tool(name: &str) -> Option<std::path::PathBuf> {
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let near = std::env::current_exe().ok().and_then(|exe| {
+        let dir = exe.parent()?.to_path_buf();
+        [dir.join(&file), dir.parent()?.join(&file)]
+            .into_iter()
+            .find(|p| p.is_file())
+    });
+    near.or_else(|| {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|d| d.join(&file))
+            .find(|p| p.is_file())
+    })
+}
 
 impl RuleHost {
     /// `optimizer` is the trainer's own optimizer config (a kind name or
@@ -112,11 +173,50 @@ impl RuleHost {
         Ok(Self {
             start,
             start_lr: spec.lr,
+            check_command: None,
         })
+    }
+
+    /// With `check_program` running `command` (program, arguments…; the
+    /// workspace last) rather than `rlx-agent-opt check-program` — a binding
+    /// whose executable is not that tool's neighbour.
+    pub fn with_check_command(mut self, command: Vec<String>) -> Self {
+        self.check_command = Some(command);
+        self
     }
 }
 
 impl ProgramHost for RuleHost {
+    fn check(&self) -> Option<(Vec<String>, Value)> {
+        let command = match &self.check_command {
+            Some(c) => c.clone(),
+            None => vec![
+                find_tool("rlx-agent-opt")?.display().to_string(),
+                "check-program".into(),
+            ],
+        };
+        Some((
+            command,
+            json!({"program": "rules", "optimizer": self.start}),
+        ))
+    }
+
+    fn examples(&self, _aggressive: bool) -> Files {
+        // Every key, at values that make it the starting program: 1-D params
+        // in a group of their own, a multiplier of 1, a flat schedule.
+        let program = json!({
+            "groups": [
+                {"names": ["*"], "ndim": 1, "optimizer": self.start, "lr_mult": 1.0, "carry_state": true},
+                {"names": ["*"], "optimizer": self.start, "lr_mult": 1.0, "carry_state": true},
+            ],
+            "schedule": [[0.0, 1.0], [0.5, 1.0], [1.0, 1.0]],
+        });
+        Files::from([(
+            "example_updater.json".to_string(),
+            serde_json::to_string_pretty(&program).unwrap() + "\n",
+        )])
+    }
+
     fn starting_files(&self) -> Files {
         let program = json!({
             "groups": [{"names": ["*"], "optimizer": self.start}],
@@ -173,7 +273,9 @@ impl ProgramHost for RuleHost {
              whose training loss (computed before the update) or total gradient norm is above the \
              bound, or not finite: the params and the optimizer state stay as they were. After 10 \
              skips in a row the update is made anyway and you are asked for a decision.\n\
-             - Gradient clipping is done by the training script before your program runs.",
+             - Gradient clipping is done by the training script before your program runs.\n\
+             - reference/example_updater.json uses every key but skip_if, at values that make it \
+             the starting program: an example of the form, not a recommendation.",
             crate::runtime::train::KINDS.join(", "),
             self.start_lr
         )
@@ -485,6 +587,63 @@ impl RuleProgram {
 }
 
 impl Program for RuleProgram {
+    fn learning_rates(&self) -> Vec<(String, f32)> {
+        self.groups
+            .iter()
+            .zip(&self.spec.groups)
+            .enumerate()
+            .filter(|(_, (g, _))| !g.members.is_empty())
+            .map(|(i, (g, spec))| {
+                let ndim = spec.ndim.map(|n| format!(", ndim {n}")).unwrap_or_default();
+                (
+                    format!("{i}: {} [{}{ndim}]", g.kind, spec.names.join(" ")),
+                    g.lr_set,
+                )
+            })
+            .collect()
+    }
+
+    fn device_plan(&self, ctx: &StepCtx, params: &[ParamInfo]) -> Result<DevicePlan, String> {
+        if self.spec.skip.any() {
+            return Err(
+                "skip_if needs the loss and the gradients before the update, and on the \
+                        device the update is made in the same step as the loss"
+                    .into(),
+            );
+        }
+        let rules: Vec<FusedRule> = self
+            .spec
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                optimizer(None, &g.optimizer)
+                    .and_then(|o| fused_rule(&o))
+                    .map_err(|e| format!("{UPDATER} group {i}: {}", e.message))
+            })
+            .collect::<Result<_, _>>()?;
+        let fraction = ctx.update as f64 / ctx.total.max(1) as f64;
+        let schedule = self.spec.multiplier(fraction);
+        let base = ctx.base_lr.unwrap_or(self.start_lr) as f64;
+        let mut plan = DevicePlan {
+            rules: Vec::new(),
+            lrs: Vec::new(),
+            carry: Vec::new(),
+        };
+        for p in params {
+            let i = *self
+                .group_of
+                .get(&p.name)
+                .ok_or_else(|| format!("param '{}' was not in the program's build", p.name))?;
+            let g = &self.groups[i];
+            plan.rules.push(rules[i]);
+            plan.lrs
+                .push((base * g.lr_ratio * g.lr_mult * schedule) as f32);
+            plan.carry.push(self.spec.groups[i].carry_state);
+        }
+        Ok(plan)
+    }
+
     fn step(&mut self, items: &mut [OptItem<'_>], ctx: &StepCtx) -> ApiResult<bool> {
         let skip = self.spec.skip.hit(items, ctx.loss);
         let fraction = ctx.update as f64 / ctx.total.max(1) as f64;

@@ -719,12 +719,13 @@ pub(crate) fn encode_activation(
         }
     };
     enc.set_compute_pipeline_state(pipeline);
-    if matches!(dt, HalfFlag::F32)
-        && matches!(
-            act,
-            Activation::Gelu | Activation::GeluApprox | Activation::Silu
-        )
-    {
+    // Only the generated GELU kernels take the arena-base ABI. `silu_inplace`
+    // is hand-written with a data pointer and `len` at buffer(1) (see
+    // `icb_encoded_kernels_keep_their_buffer0_abi`); binding it here as
+    // arena + offset made it apply SiLU to the arena's first bytes, with
+    // `len` read from the low word of the offset — whenever the length was
+    // not a multiple of 4, so the vectorised `silu_inplace4` was skipped.
+    if matches!(dt, HalfFlag::F32) && matches!(act, Activation::Gelu | Activation::GeluApprox) {
         // Task #50: arena base + byte offset for activations past 4 GB.
         enc.set_buffer(0, Some(buffer), 0);
         let off = data_off as u64;
@@ -9771,15 +9772,16 @@ pub(crate) fn encode_topk(
     enc.set_buffer(1, Some(buffer), dst as u64);
     enc.set_bytes(2, 4, &axis_dim as *const u32 as *const _);
     enc.set_bytes(3, 4, &k_val as *const u32 as *const _);
-    let tg_w = k.topk_lastax.thread_execution_width().min(outer as u64);
-    enc.dispatch_threads(
+    // One 256-thread group per row (the kernel reduces in threadgroup memory
+    // sized for 256).
+    enc.dispatch_thread_groups(
         crate::mtl::MTLSize {
             width: outer as u64,
             height: 1,
             depth: 1,
         },
         crate::mtl::MTLSize {
-            width: tg_w,
+            width: 256,
             height: 1,
             depth: 1,
         },

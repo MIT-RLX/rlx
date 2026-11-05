@@ -1630,6 +1630,71 @@ fn sliding_window_attention_matches_reference() {
 }
 
 #[test]
+fn sliding_window_attention_in_bshd_layout() {
+    // [B, S, H, D] with S != H and a window shorter than S: the mask must span
+    // S rows, not H (it used to be built [H, H] and fail to broadcast).
+    let (s, h, d, window) = (7usize, 2usize, 4usize, 2usize);
+    let shape = Shape::new(&[1, s, h, d], DType::F32);
+    let mut g = Graph::new("sw_bshd");
+    let q = g.input("q", shape.clone());
+    let k = g.input("k", shape.clone());
+    let v = g.input("v", shape.clone());
+    let o = g.add_node(
+        Op::Attention {
+            num_heads: h,
+            head_dim: d,
+            v_head_dim: None,
+            mask_kind: MaskKind::SlidingWindow(window),
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![q, k, v],
+        shape,
+    );
+    g.set_outputs(vec![o]);
+    let mut exe = MlxExecutable::compile(g);
+    let n = s * h * d;
+    let data =
+        |seed: f32| -> Vec<f32> { (0..n).map(|i| ((i as f32 + seed) * 0.37).sin()).collect() };
+    let (qd, kd, vd) = (data(0.0), data(5.0), data(11.0));
+    let got = exe
+        .run(&[("q", &qd), ("k", &kd), ("v", &vd)])
+        .into_iter()
+        .next()
+        .unwrap();
+    // Query row i sees keys j with i - window <= j <= i.
+    fn at(t: &[f32], row: usize, head: usize, h: usize, d: usize) -> &[f32] {
+        &t[(row * h + head) * d..(row * h + head + 1) * d]
+    }
+    let mut want = vec![0f32; n];
+    for head in 0..h {
+        for i in 0..s {
+            let keys: Vec<usize> = (i.saturating_sub(window)..=i).collect();
+            let scores: Vec<f32> = keys
+                .iter()
+                .map(|&j| {
+                    at(&qd, i, head, h, d)
+                        .iter()
+                        .zip(at(&kd, j, head, h, d))
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                        / (d as f32).sqrt()
+                })
+                .collect();
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let e: Vec<f32> = scores.iter().map(|x| (x - max).exp()).collect();
+            let z: f32 = e.iter().sum();
+            for (&j, w) in keys.iter().zip(&e) {
+                for (c, x) in at(&vd, j, head, h, d).iter().enumerate() {
+                    want[(i * h + head) * d + c] += w / z * x;
+                }
+            }
+        }
+    }
+    assert!(close(&got, &want, 1e-5), "got {got:?} want {want:?}");
+}
+
+#[test]
 fn sample_top_k_2_only_picks_from_top_two() {
     // Logits where 5 and 3 are the top two; everything else far below.
     // top_k=2 must clip to {idx 5, idx 3}; over many samples the

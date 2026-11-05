@@ -86,8 +86,39 @@ impl Backend for WebglBackend {
         if let Some(reason) = crate::browser_support::collective_block_reason(&graph) {
             panic!("{reason}");
         }
+        let t0 = web_time_now();
         let plan =
             build_plan(&graph).unwrap_or_else(|e| panic!("rlx-webgl compile failed: {}", e.0));
+        // `RLX_WEBGL_PLAN_STATS=1`: what planning cost (time, steps, index tables)
+        if rlx_ir::env::flag("RLX_WEBGL_PLAN_STATS") {
+            let tables: Vec<String> = plan
+                .index_table_stats()
+                .iter()
+                .map(|(k, n, m)| {
+                    format!(
+                        "{k} {:.1} MB (largest {:.1} MB)",
+                        *n as f64 * 4e-6,
+                        *m as f64 * 4e-6
+                    )
+                })
+                .collect();
+            let ops: Vec<String> = plan
+                .steps_by_origin()
+                .iter()
+                .take(6)
+                .map(|(o, n)| format!("{o} {n}"))
+                .collect();
+            eprintln!(
+                "rlx-webgl plan {:?}: {} nodes -> {} steps, {} slots, {:.0} ms; tables: {}; steps by op: {}",
+                graph.name,
+                graph.len(),
+                plan.steps.len(),
+                plan.slot_dims.len(),
+                web_time_now() - t0,
+                tables.join(", "),
+                ops.join(", ")
+            );
+        }
         // Natively `OpenGl` runs the plan on the CPU, where no texture limit
         // applies — so check the one browsers impose, or a graph that passes
         // every native test fails in the tab. `RLX_WEBGL_MAX_TEXTURE` sets it.
@@ -213,5 +244,23 @@ impl ExecutableGraph for WebglExecutable {
             #[cfg(target_family = "wasm")]
             id: shared::next_id(),
         })
+    }
+}
+
+/// Milliseconds on a monotonic clock (natively; the browser has no
+/// `Instant`, and its plan stats report 0 ms).
+fn web_time_now() -> f64 {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        use std::sync::OnceLock;
+        static T0: OnceLock<std::time::Instant> = OnceLock::new();
+        T0.get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_secs_f64()
+            * 1e3
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        0.0
     }
 }

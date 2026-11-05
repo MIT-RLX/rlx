@@ -1241,6 +1241,83 @@ kernel void copy_f32x4(
     dst[gid] = src[gid];
 }
 
+// `gemv_bf16w_splitk8` / `_n64` for 2–8 rows (sequences decoded together):
+// each weight load serves every row, and each row's sum runs in the same order
+// as the one-row kernel's, so a row's result is bit-identical to running it
+// alone. The partials go through threadgroup memory one row at a time.
+template <uint KS, uint TX>
+inline void gemv_bf16w_rows8(
+    device const float* A, device const ushort* B, device float* C,
+    uint M, uint K, uint N, uint2 tid, uint2 tgid,
+    threadgroup float4 (*partial)[TX][2]
+) {
+    uint col = tgid.x * (TX * 8u) + tid.x * 8u;
+    float4 lo[8];
+    float4 hi[8];
+    for (uint r = 0u; r < 8u; ++r) {
+        lo[r] = float4(0.0f);
+        hi[r] = float4(0.0f);
+    }
+    if (col < N) {
+        for (uint k = tid.y; k < K; k += KS) {
+            uint4 w = *(device const uint4*)(B + (ulong)k * N + col);
+            float4 wl = float4(as_type<float>(w.x << 16), as_type<float>(w.x & 0xffff0000u),
+                               as_type<float>(w.y << 16), as_type<float>(w.y & 0xffff0000u));
+            float4 wh = float4(as_type<float>(w.z << 16), as_type<float>(w.z & 0xffff0000u),
+                               as_type<float>(w.w << 16), as_type<float>(w.w & 0xffff0000u));
+            for (uint r = 0u; r < M; ++r) {
+                float a = A[r * K + k];
+                lo[r] += a * wl;
+                hi[r] += a * wh;
+            }
+        }
+    }
+    for (uint r = 0u; r < M; ++r) {
+        partial[tid.y][tid.x][0] = lo[r];
+        partial[tid.y][tid.x][1] = hi[r];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid.y == 0u && col < N) {
+            float4 s0 = float4(0.0f);
+            float4 s1 = float4(0.0f);
+            for (uint j = 0u; j < KS; ++j) {
+                s0 += partial[j][tid.x][0];
+                s1 += partial[j][tid.x][1];
+            }
+            *(device float4*)(C + r * N + col) = s0;
+            *(device float4*)(C + r * N + col + 4u) = s1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void gemv_bf16w_splitk8_rows(
+    device const float*  A [[buffer(0)]],
+    device const ushort* B [[buffer(1)]],
+    device float*        C [[buffer(2)]],
+    constant uint& M       [[buffer(3)]],
+    constant uint& K       [[buffer(4)]],
+    constant uint& N       [[buffer(5)]],
+    uint2 tid  [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    threadgroup float4 partial[16][32][2];
+    gemv_bf16w_rows8<16u, 32u>(A, B, C, M, K, N, tid, tgid, partial);
+}
+
+kernel void gemv_bf16w_splitk8_n64_rows(
+    device const float*  A [[buffer(0)]],
+    device const ushort* B [[buffer(1)]],
+    device float*        C [[buffer(2)]],
+    constant uint& M       [[buffer(3)]],
+    constant uint& K       [[buffer(4)]],
+    constant uint& N       [[buffer(5)]],
+    uint2 tid  [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    threadgroup float4 partial[64][8][2];
+    gemv_bf16w_rows8<64u, 8u>(A, B, C, M, K, N, tid, tgid, partial);
+}
+
 kernel void sgemm_bf16w_small_m(
     device const float*  A [[buffer(0)]],
     device const ushort* B [[buffer(1)]],
@@ -3651,30 +3728,44 @@ kernel void group_norm(
     uint plane = h * w;
     uint count = cpg * plane;
 
+    // Two passes: the mean, then the centred sum of squares. The single-pass
+    // E[x^2] - mean^2 cancels on data with a DC offset — over a 96^3 group at
+    // offset 50 it gave 7e-4 relative error — the same reason wgpu's
+    // group_norm.wgsl and layernorm use the stable form.
+    threadgroup float partial[256];
     float local_sum = 0.0f;
-    float local_sumsq = 0.0f;
     for (uint i = tid; i < count; i += tsize) {
         uint c_off = i / plane;
         uint s = i % plane;
-        uint ch = c0 + c_off;
-        float v = src[((n * c + ch) * plane) + s];
-        local_sum += v;
-        local_sumsq += v * v;
+        local_sum += src[((n * c + c0 + c_off) * plane) + s];
     }
-    threadgroup float partial_sum[256];
-    threadgroup float partial_sumsq[256];
-    partial_sum[tid] = local_sum;
-    partial_sumsq[tid] = local_sumsq;
+    partial[tid] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = tsize / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
-            partial_sum[tid] += partial_sum[tid + stride];
-            partial_sumsq[tid] += partial_sumsq[tid + stride];
+            partial[tid] += partial[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float mean = partial_sum[0] / float(count);
-    float var = fmax(0.0f, partial_sumsq[0] / float(count) - mean * mean);
+    float mean = partial[0] / float(count);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_sq = 0.0f;
+    for (uint i = tid; i < count; i += tsize) {
+        uint c_off = i / plane;
+        uint s = i % plane;
+        float d = src[((n * c + c0 + c_off) * plane) + s] - mean;
+        local_sq += d * d;
+    }
+    partial[tid] = local_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float var = partial[0] / float(count);
     float inv = rsqrt(var + eps);
 
     for (uint i = tid; i < count; i += tsize) {
@@ -4772,28 +4863,48 @@ kernel void topk_lastax(
     device float* dst       [[buffer(1)]],
     constant uint& axis_dim [[buffer(2)]],
     constant uint& k        [[buffer(3)]],
-    uint o [[thread_position_in_grid]]
+    uint o  [[threadgroup_position_in_grid]],
+    uint t  [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]]
 ) {
-    // Hard cap on axis_dim — guards the on-chip scratch. MoE expert
-    // counts top out around 256 in practice; raise this if a real
-    // workload needs more.
-    const uint MAX_AXIS = 1024;
-    if (axis_dim > MAX_AXIS) return;
-
-    float scratch[MAX_AXIS];
+    // One threadgroup per row, any row length. Pass `ki` picks the best
+    // element ranked after pick `ki - 1` in (value descending, index
+    // ascending) order — a strict total order, so ties go to the lower index
+    // (as torch.topk and the CPU) and no scratch copy of the row is needed.
+    // (The single-thread version this replaces kept the row in a 1024-entry
+    // array and wrote nothing for longer rows: indices read as 0.)
+    threadgroup float bv[256];
+    threadgroup uint  bi[256];
+    threadgroup float pv;
+    threadgroup uint  pi;
+    const uint NONE = 0xffffffffu;
     uint base = o * axis_dim;
-    for (uint i = 0; i < axis_dim; ++i) scratch[i] = src[base + i];
-
-    uint out_base = o * k;
     for (uint ki = 0; ki < k; ++ki) {
-        float best_v = scratch[0];
-        uint  best_i = 0;
-        for (uint i = 1; i < axis_dim; ++i) {
-            float v = scratch[i];
-            if (v > best_v) { best_v = v; best_i = i; }
+        float best = -INFINITY;
+        uint  besti = NONE;
+        for (uint i = t; i < axis_dim; i += nt) {
+            float v = src[base + i];
+            bool after = ki == 0 || v < pv || (v == pv && i > pi);
+            if (after && (besti == NONE || v > best)) { best = v; besti = i; }
         }
-        dst[out_base + ki] = (float)best_i;
-        scratch[best_i] = -INFINITY;
+        bv[t] = best;
+        bi[t] = besti;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = nt / 2; s > 0; s >>= 1) {
+            if (t < s) {
+                float ov = bv[t + s];
+                uint  oi = bi[t + s];
+                bool better = oi != NONE && (bi[t] == NONE || ov > bv[t] || (ov == bv[t] && oi < bi[t]));
+                if (better) { bv[t] = ov; bi[t] = oi; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (t == 0) {
+            dst[o * k + ki] = (float)bi[0];
+            pv = bv[0];
+            pi = bi[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -14550,6 +14661,8 @@ pub struct Kernels {
     pub gemv_bf16w_splitk8: ComputePipelineState,
     pub gemv_bf16w_splitk8_n64: ComputePipelineState,
     pub sgemm_bf16w_small_m: ComputePipelineState,
+    pub gemv_bf16w_splitk8_rows: ComputePipelineState,
+    pub gemv_bf16w_splitk8_n64_rows: ComputePipelineState,
     pub gemv_f16w_kpart: ComputePipelineState,
     pub gemv_zero_f32: ComputePipelineState,
     pub sgemm_simd_padded_bias: ComputePipelineState,
@@ -15359,6 +15472,8 @@ impl Kernels {
             gemv_bf16w_splitk8: pipeline("gemv_bf16w_splitk8"),
             gemv_bf16w_splitk8_n64: pipeline("gemv_bf16w_splitk8_n64"),
             sgemm_bf16w_small_m: pipeline("sgemm_bf16w_small_m"),
+            gemv_bf16w_splitk8_rows: pipeline("gemv_bf16w_splitk8_rows"),
+            gemv_bf16w_splitk8_n64_rows: pipeline("gemv_bf16w_splitk8_n64_rows"),
             gemv_f16w_kpart: pipeline("gemv_f16w_kpart"),
             gemv_zero_f32: pipeline("gemv_zero_f32"),
             sgemm_simd_padded_bias: pipeline("sgemm_simd_padded_bias"),

@@ -256,3 +256,13 @@ fn a_cli_past_its_timeout_is_stopped() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_relative_run_folder_is_made_absolute() {
+    // The CLI runs in the workspace; a relative MCP config path would resolve
+    // from there and not be found.
+    let run = AgentRun::new(AgentCli::Claude, "rlx_runs/1/decisions/001", vec![]);
+    assert!(run.run_dir.is_absolute(), "{}", run.run_dir.display());
+    assert!(run.workspace.is_absolute());
+    assert!(run.run_dir.ends_with("rlx_runs/1/decisions/001"));
+}

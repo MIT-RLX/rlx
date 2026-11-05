@@ -26,17 +26,30 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use super::analysis::{ANALYSIS, Analysis};
 use super::backend::{Backend, CliAgent, DecisionRequest};
+use super::program::{Files, ParamInfo, ProgramHost, RuleHost, StepCtx};
 use super::{AgentCli, estimate_decisions, mailbox, records};
+use crate::ApiResult;
+
+/// Makes the host of a program language other than rules, from its part of
+/// `reference/check.json` and the run's total updates.
+pub type HostMaker = fn(&Value, u64) -> ApiResult<Box<dyn ProgramHost>>;
 
 /// What the caller fills in for its environment.
 #[derive(Clone, Debug, Default)]
 pub struct CliDefaults {
     /// The workspace MCP server to use (the bindings serve it themselves).
     pub mcp_command: Option<Vec<String>>,
+    /// `check-program`'s host for programs not in rules (pyrlx: `python`).
+    pub host: Option<HostMaker>,
 }
 
-const USAGE: &str = "usage: rlx-agent-opt <doctor|estimate|show|watch|report|compare|say|broker> …
+/// How many param values `check-program` makes up at most; params past it
+/// are left out (and the output says so).
+const CHECK_VALUES: usize = 16 << 20;
+
+const USAGE: &str = "usage: rlx-agent-opt <doctor|estimate|show|watch|report|compare|say|broker|check-program> …
   doctor [--live] [--backend claude|cursor|copilot|codex]
   estimate --total-steps N --sec-per-step S [--sec-per-decision 40] [--max-wait-ratio 4] [--decisions K] [--cost-per-decision USD]
   show <run>
@@ -44,7 +57,8 @@ const USAGE: &str = "usage: rlx-agent-opt <doctor|estimate|show|watch|report|com
   report <run> [--out page.html]
   compare <a> <b>
   say <run> <text…>
-  broker <box> [--backend claude] [--model M] [--effort E] [--poll S] [--once]";
+  broker <box> [--backend claude] [--model M] [--effort E] [--poll S] [--once]
+  check-program <workspace> [--updates N]          build the workspace's program, run it on random params";
 
 /// The binary's `main`: arguments after the program name → exit code.
 pub fn main_with(args: &[String], defaults: &CliDefaults) -> i32 {
@@ -212,6 +226,12 @@ pub fn run(args: &[String], defaults: &CliDefaults, out: &mut dyn Write) -> Resu
             a.only(&[])?;
             compare(&a.path(0, "two runs")?, &a.path(1, "two runs")?, out)
         }
+        "check-program" => {
+            a.only(&["--updates"])?;
+            let ws = a.path(0, "the workspace folder")?;
+            let updates = a.num("--updates")?.unwrap_or(5.0).max(1.0) as u64;
+            w(out, check_program(&ws, updates, defaults)?)
+        }
         "say" => {
             a.only(&[])?;
             let run = a.path(0, "a run folder and the note")?;
@@ -325,6 +345,7 @@ fn doctor(
                 .into(),
             system: "You are checking that your tools start. Use none.".into(),
             budget_left: Some(0.5),
+            check: Vec::new(),
         };
         let t0 = Instant::now();
         let r = agent.decide(&req);
@@ -428,6 +449,7 @@ fn show(run: &Path, out: &mut dyn Write) -> Result<(), String> {
     if let Some(s) = ev.iter().find(|e| e["kind"] == "started") {
         w(format!("goal: {}", s["goal"].as_str().unwrap_or("?")))?;
     }
+    let mut version_seen = 0u64;
     for e in &ev {
         let kind = e["kind"].as_str().unwrap_or("");
         let line = match kind {
@@ -462,6 +484,18 @@ fn show(run: &Path, out: &mut dyn Write) -> Result<(), String> {
             _ => continue,
         };
         w(line)?;
+        if kind == "applied"
+            && let Some(v) = e["version"].as_u64()
+        {
+            let changes = change_summary(&program_files(run, version_seen), &program_files(run, v));
+            version_seen = v;
+            for c in changes.iter().take(6) {
+                w(format!("       {c}"))?;
+            }
+            if changes.len() > 6 {
+                w(format!("       … and {} more", changes.len() - 6))?;
+            }
+        }
     }
     Ok(())
 }
@@ -542,6 +576,7 @@ fn compare(a: &Path, b: &Path, out: &mut dyn Write) -> Result<(), String> {
         "last_validation",
         "best_validation",
         "integrity_flags",
+        "boundary_flags",
     ];
     writeln!(out, "{:<18} {:<36} {}", "", a.display(), b.display()).map_err(|e| e.to_string())?;
     for k in keys {
@@ -597,6 +632,90 @@ pub fn line_diff(a: &str, b: &str) -> Vec<(char, String)> {
         } else {
             out.push(('-', x[i].to_string()));
             i += 1;
+        }
+    }
+    out
+}
+
+/// What changed from the program files `old` to `new`, one line per change:
+/// each JSON setting that differs (`groups[0].optimizer.lr: 0.001 → 0.003`),
+/// else how many lines of a file were added and removed.
+pub fn change_summary(old: &[(String, String)], new: &[(String, String)]) -> Vec<String> {
+    fn short(v: &Value) -> String {
+        let t = v.to_string();
+        if t.chars().count() > 80 {
+            format!("{}…", t.chars().take(79).collect::<String>())
+        } else {
+            t
+        }
+    }
+    fn walk(path: &str, a: &Value, b: &Value, out: &mut Vec<String>) {
+        match (a, b) {
+            _ if a == b => {}
+            (Value::Object(x), Value::Object(y)) => {
+                let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
+                keys.sort();
+                keys.dedup();
+                for k in keys {
+                    let p = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    match (x.get(k), y.get(k)) {
+                        (Some(a), Some(b)) => walk(&p, a, b, out),
+                        (None, Some(b)) => out.push(format!("{p}: set to {}", short(b))),
+                        (Some(_), None) => out.push(format!("{p}: removed")),
+                        (None, None) => {}
+                    }
+                }
+            }
+            (Value::Array(x), Value::Array(y)) if x.len() == y.len() => {
+                for (i, (a, b)) in x.iter().zip(y).enumerate() {
+                    walk(&format!("{path}[{i}]"), a, b, out);
+                }
+            }
+            _ => out.push(format!("{path}: {} → {}", short(a), short(b))),
+        }
+    }
+    let mut out = Vec::new();
+    for (name, text) in new {
+        let before = old.iter().find(|(n, _)| n == name).map(|(_, t)| t.as_str());
+        let Some(before) = before else {
+            out.push(format!("{name}: new file"));
+            continue;
+        };
+        if before == text {
+            continue;
+        }
+        let parsed = (name.ends_with(".json"))
+            .then(|| {
+                Some((
+                    serde_json::from_str::<Value>(before).ok()?,
+                    serde_json::from_str::<Value>(text).ok()?,
+                ))
+            })
+            .flatten();
+        match parsed {
+            Some((a, b)) => {
+                let mut changes = Vec::new();
+                walk("", &a, &b, &mut changes);
+                if changes.is_empty() {
+                    out.push(format!("{name}: reformatted"));
+                }
+                out.extend(changes.into_iter().map(|c| format!("{name} {c}")));
+            }
+            None => {
+                let d = line_diff(before, text);
+                let added = d.iter().filter(|(op, _)| *op == '+').count();
+                let removed = d.iter().filter(|(op, _)| *op == '-').count();
+                out.push(format!("{name}: +{added} −{removed} lines"));
+            }
+        }
+    }
+    for (name, _) in old {
+        if !new.iter().any(|(n, _)| n == name) {
+            out.push(format!("{name}: removed"));
         }
     }
     out
@@ -682,6 +801,29 @@ pub fn report(run: &Path) -> Result<String, String> {
          <h1>RLX agent run</h1><p>{}</p>",
         esc(&goal)
     );
+    let boundary: Vec<&Value> = ev.iter().filter(|e| e["kind"] == "boundary").collect();
+    if !boundary.is_empty() {
+        let at: Vec<String> = boundary
+            .iter()
+            .take(6)
+            .map(|e| {
+                format!(
+                    "v{:03} {}:{} ({})",
+                    e["version"].as_u64().unwrap_or(0),
+                    e["file"].as_str().unwrap_or("?"),
+                    e["line"],
+                    e["category"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        let _ = write!(
+            html,
+            "<p style=\"background:#fff4e5;padding:.5em\"><b>Boundary flags:</b> {} static findings: {}. \
+             See events.jsonl and programs/; the flags do not stop a program and are no sandbox.</p>",
+            boundary.len(),
+            esc(&at.join("; "))
+        );
+    }
     if res.is_object() {
         html.push_str("<table>");
         for k in [
@@ -697,6 +839,7 @@ pub fn report(run: &Path) -> Result<String, String> {
             "final_train_loss",
             "best_validation",
             "integrity_flags",
+            "boundary_flags",
         ] {
             if !res[k].is_null() {
                 let _ = write!(
@@ -752,6 +895,39 @@ pub fn report(run: &Path) -> Result<String, String> {
              <p class=\"k\">Blue: training loss; orange: validation loss; grey lines: a new program took over; red: a revert.</p>"
         );
     }
+    // Each group's learning rate, from the reports (at most 25 rows, evenly).
+    let lr_rows: Vec<(u64, u64, Vec<(String, f64)>)> =
+        std::fs::read_to_string(run.join("reports.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let v: Value = serde_json::from_str(l).ok()?;
+                let lr = v["report"]["lr"].as_object()?;
+                Some((
+                    v["report"]["update"].as_u64()?,
+                    v["version"].as_u64().unwrap_or(0),
+                    lr.iter()
+                        .filter_map(|(k, x)| Some((k.clone(), x.as_f64()?)))
+                        .collect(),
+                ))
+            })
+            .collect();
+    if !lr_rows.is_empty() {
+        let stride = lr_rows.len().div_ceil(25).max(1);
+        html.push_str("<h2>Learning rate by group</h2><table><tr><th>update</th><th>program</th><th>groups</th></tr>");
+        for (i, (u, v, lrs)) in lr_rows.iter().enumerate() {
+            if i % stride != 0 && i + 1 != lr_rows.len() {
+                continue;
+            }
+            let groups: Vec<String> = lrs.iter().map(|(k, x)| format!("{k}: {x:.3e}")).collect();
+            let _ = write!(
+                html,
+                "<tr><td>{u}</td><td>v{v:03}</td><td>{}</td></tr>",
+                esc(&groups.join("; "))
+            );
+        }
+        html.push_str("</table>");
+    }
     html.push_str("<h2>Decisions</h2>");
     let mut version_seen = 0u64;
     for e in &ev {
@@ -772,6 +948,14 @@ pub fn report(run: &Path) -> Result<String, String> {
                     && let Some(v) = e["version"].as_u64()
                 {
                     let before = program_files(run, version_seen);
+                    let changes = change_summary(&before, &program_files(run, v));
+                    if !changes.is_empty() {
+                        html.push_str("<ul>");
+                        for c in &changes {
+                            let _ = write!(html, "<li>{}</li>", esc(c));
+                        }
+                        html.push_str("</ul>");
+                    }
                     for (name, text) in program_files(run, v) {
                         let old = before
                             .iter()
@@ -823,6 +1007,168 @@ pub fn report(run: &Path) -> Result<String, String> {
     }
     html.push_str("</body></html>\n");
     Ok(html)
+}
+
+/// `check-program`: build the program in workspace `ws` as its files are now
+/// (with `reference/check.json`'s params and host) and make `updates`
+/// updates on made-up params and gradients → what it saw; an error when the
+/// program does not build, fails, or makes a value non-finite.
+pub fn check_program(ws: &Path, updates: u64, defaults: &CliDefaults) -> Result<String, String> {
+    let spec_path = ws.join("reference/check.json");
+    let spec: Value = std::fs::read_to_string(&spec_path)
+        .map_err(|e| format!("{}: {e}", spec_path.display()))
+        .and_then(|t| {
+            serde_json::from_str(&t).map_err(|e| format!("{}: {e}", spec_path.display()))
+        })?;
+    let total = spec["total_updates"].as_u64().unwrap_or(updates).max(1);
+    let host_spec = &spec["host"];
+    let mut host: Box<dyn ProgramHost> = match host_spec["program"].as_str() {
+        Some("rules") => Box::new(RuleHost::new(&host_spec["optimizer"]).map_err(|e| e.message)?),
+        Some(other) => match defaults.host {
+            Some(make) => make(host_spec, total).map_err(|e| e.message)?,
+            None => return Err(format!("this command cannot build {other} programs")),
+        },
+        None => return Err(format!("{}: no host program", spec_path.display())),
+    };
+    let mut files = Files::new();
+    for name in spec["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let text = std::fs::read_to_string(ws.join(name)).map_err(|e| format!("{name}: {e}"))?;
+        files.insert(name.to_string(), text);
+    }
+    let mut report = Vec::new();
+    if let Some(text) = files.get(ANALYSIS) {
+        Analysis::parse(text).map_err(|e| format!("{ANALYSIS} does not parse: {}", e.message))?;
+        report.push(format!("{ANALYSIS}: parses"));
+    }
+
+    // The params, up to CHECK_VALUES values.
+    let all: Vec<ParamInfo> = spec["params"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| ParamInfo {
+            name: p["name"].as_str().unwrap_or_default().to_string(),
+            shape: p["shape"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|d| d.as_u64().map(|d| d as usize))
+                .collect(),
+        })
+        .collect();
+    let (mut params, mut n) = (Vec::new(), 0usize);
+    for p in &all {
+        let len: usize = p.shape.iter().product();
+        if n + len > CHECK_VALUES && !params.is_empty() {
+            break;
+        }
+        n += len;
+        params.push(p.clone());
+    }
+    if params.is_empty() {
+        return Err("reference/check.json lists no params".into());
+    }
+    if params.len() < all.len() {
+        report.push(format!(
+            "made up {} of the {} params ({n} values); the rest are left out of this check",
+            params.len(),
+            all.len()
+        ));
+    }
+
+    let mut program = host
+        .build(&files, &params, None)
+        .map_err(|e| format!("the program does not build: {}", e.message))?;
+    report.push(format!("builds for {} params", params.len()));
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut noise = |scale: f32| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        ((seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale
+    };
+    let mut values: Vec<Vec<f32>> = params
+        .iter()
+        .map(|p| {
+            (0..p.shape.iter().product::<usize>())
+                .map(|_| noise(0.05))
+                .collect()
+        })
+        .collect();
+    let first = spec["update"].as_u64().unwrap_or(0) + 1;
+    let base_lr = spec["base_lr"].as_f64().map(|v| v as f32);
+    let mut changes: Vec<(f64, &str)> = Vec::new();
+    for i in 0..updates {
+        let update = (first + i).min(total);
+        let grads: Vec<Vec<f32>> = values
+            .iter()
+            .map(|v| v.iter().map(|_| noise(0.01)).collect())
+            .collect();
+        let before = values.clone();
+        let ctx = StepCtx {
+            update,
+            total,
+            base_lr,
+            loss: Some(2.0),
+        };
+        let t0 = Instant::now();
+        let skipped = {
+            let mut items: Vec<rlx_optim::OptItem<'_>> = params
+                .iter()
+                .zip(values.iter_mut())
+                .zip(grads.iter())
+                .map(|((p, v), g)| rlx_optim::OptItem {
+                    name: &p.name,
+                    shape: &p.shape,
+                    param: v.as_mut_slice(),
+                    grad: g.as_slice(),
+                })
+                .collect();
+            program
+                .step(&mut items, &ctx)
+                .map_err(|e| format!("update {update} fails: {}", e.message))?
+        };
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        for (p, v) in params.iter().zip(&values) {
+            if let Some(j) = v.iter().position(|x| !x.is_finite()) {
+                return Err(format!(
+                    "update {update} makes {}[{j}] = {} (not finite)",
+                    p.name, v[j]
+                ));
+            }
+        }
+        changes.clear();
+        for ((p, v), b) in params.iter().zip(&values).zip(&before) {
+            let d: f64 = v.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum();
+            let w: f64 = b.iter().map(|y| f64::from(*y).powi(2)).sum();
+            changes.push((d.sqrt() / w.sqrt().max(1e-12), p.name.as_str()));
+        }
+        changes.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let moved = changes.iter().filter(|c| c.0 > 0.0).count();
+        report.push(format!(
+            "update {update}{}: finite, {moved} of {} params moved, the most {} by {:.3e} of its norm, \
+             the least {} by {:.3e}; {ms:.1} ms",
+            if skipped { " (asked to skip)" } else { "" },
+            params.len(),
+            changes[0].1,
+            changes[0].0,
+            changes[changes.len() - 1].1,
+            changes[changes.len() - 1].0,
+        ));
+    }
+    host.build(&files, &params, Some(program.as_ref()))
+        .map_err(|e| format!("the program builds once but not over itself (as it takes over from the running one): {}", e.message))?;
+    report.push("builds over itself, taking over its state".into());
+    report.push(format!(
+        "(random params of scale 0.05 and gradients of scale 0.01, a loss of 2.0, from update {first}: \
+         a check that the program runs, not of how it will train)"
+    ));
+    Ok(report.join("\n"))
 }
 
 #[cfg(test)]

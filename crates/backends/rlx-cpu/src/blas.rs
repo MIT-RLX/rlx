@@ -666,7 +666,7 @@ unsafe fn fb_cblas_sgemm(
 
     // `portable` natively: what the relaxed-SIMD wasm kernel computes, the
     // in-order fused-multiply-add chain per element.
-    // (also a wasm build without SIMD, e.g. Memory64: `wasm_gemm` needs simd128)
+    // (also a wasm build without SIMD: `wasm_gemm` needs simd128)
     #[cfg(not(all(target_family = "wasm", target_feature = "simd128")))]
     if crate::config::portable() {
         unsafe {

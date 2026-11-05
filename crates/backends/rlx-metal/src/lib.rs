@@ -47,6 +47,7 @@ pub mod blas;
 #[cfg(rlx_metal_host)]
 pub mod mps_blas;
 
+mod fused_ew;
 #[cfg(rlx_metal_host)]
 pub mod mps_graph;
 

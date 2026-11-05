@@ -58,3 +58,12 @@ fn index_vec_reads_back() {
     let idx = Tensor::index_vec([0_i64, 2, 4, 6]);
     assert_eq!(idx.to_vec_i64(), vec![0, 2, 4, 6]);
 }
+
+#[test]
+fn float_literal_on_f64_tensor() {
+    // a float literal against an f64 tensor is an f64 constant
+    let x = Tensor::from_f64(vec![1.0, 2.0, 3.0], [3]);
+    assert_eq!((&x * 2.0f64).to_vec_f64(), vec![2.0, 4.0, 6.0]);
+    assert_eq!((&x + 1.0f64).to_vec_f64(), vec![2.0, 3.0, 4.0]);
+    assert_eq!((&x - 0.5f64).to_vec_f64(), vec![0.5, 1.5, 2.5]);
+}

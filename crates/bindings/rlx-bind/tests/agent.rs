@@ -790,6 +790,66 @@ fn rules() -> Box<RuleHost> {
 const FASTER: &str = r#"{"groups": [{"names": ["w"], "optimizer": {"kind": "adamw", "lr": 0.1}},
                                     {"names": ["*"], "optimizer": {"kind": "adamw", "lr": 0.05}}]}"#;
 
+#[cfg(feature = "gguf-io")]
+#[test]
+fn save_with_checkpoints_the_trainer_and_the_agent_together() {
+    let x: Vec<f32> = (0..12).map(|i| ((i * 5 % 11) as f32 - 5.0) / 5.0).collect();
+    let t: Vec<f32> = (0..12).map(|i| ((i * 3 % 7) as f32 - 3.0) / 3.0).collect();
+    let inputs = [("x", x.as_slice()), ("t", t.as_slice())];
+    let opts = json!({"kind": "adamw", "lr": 0.05});
+    let root = tempfile::tempdir().unwrap();
+    let run = |agent: &mut AgentOptimizer, tr: &mut Trainer, n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|_| agent.train_step(tr, &inputs).unwrap())
+            .collect()
+    };
+
+    let (backend, _) = scripted(vec![edit("updater.json", FASTER), keep()]);
+    let mut whole_tr = trainer(&opts);
+    let mut whole = AgentOptimizer::new(config(root.path(), 30, 2), rules(), backend).unwrap();
+    let whole_losses = run(&mut whole, &mut whole_tr, 30);
+
+    let (backend, _) = scripted(vec![edit("updater.json", FASTER)]);
+    let mut first_tr = trainer(&opts);
+    let mut first = AgentOptimizer::new(config(root.path(), 30, 2), rules(), backend).unwrap();
+    let mut losses = run(&mut first, &mut first_tr, 15);
+    let ck = root.path().join("ck");
+    first.save_with(&mut first_tr, &ck).unwrap();
+    drop((first, first_tr));
+
+    // A fresh trainer, as a new process makes it.
+    let mut tr = trainer(&opts);
+    let (backend, _) = scripted(vec![keep()]);
+    let mut resumed =
+        AgentOptimizer::resume_with(config(root.path(), 30, 2), rules(), backend, &ck, &mut tr)
+            .unwrap();
+    losses.extend(run(&mut resumed, &mut tr, 15));
+    assert_eq!(losses, whole_losses, "the same run");
+    assert_eq!(tr.params(), whole_tr.params());
+    assert_eq!(resumed.version(), 1);
+
+    // A trainer checkpoint from another update is refused.
+    let mut other = trainer(&opts);
+    other
+        .save(&ck.join("trainer.gguf").display().to_string())
+        .unwrap();
+    let (backend, _) = scripted(vec![]);
+    let err = AgentOptimizer::resume_with(
+        config(root.path(), 30, 2),
+        rules(),
+        backend,
+        &ck,
+        &mut other,
+    )
+    .err()
+    .expect("mismatched checkpoints");
+    assert!(
+        err.to_string()
+            .contains("the trainer is at update 0 but the agent at 15"),
+        "{err}"
+    );
+}
+
 #[test]
 fn a_resumed_run_continues_bit_for_bit() {
     let root = tempfile::tempdir().unwrap();
@@ -922,6 +982,7 @@ fn request(dir: &Path) -> DecisionRequest {
         message: "Decision 1.".into(),
         system: "SYSTEM".into(),
         budget_left: Some(1.5),
+        check: vec![],
     }
 }
 
@@ -1314,11 +1375,15 @@ fn auto_waiting_waits_at_the_first_decision_and_then_when_answers_would_land_lat
             .filter(|e| e["kind"] == "requested")
             .map(|e| e["paused"].as_bool().unwrap())
             .collect();
-        assert_eq!(
-            paused,
-            vec![true, later_paused, later_paused],
-            "max_lag {max_lag}"
+        // Without waiting, the last decision is not asked while the one
+        // before it is still being answered, which depends on its thread.
+        let expected = [true, later_paused, later_paused];
+        let asked = if later_paused { 3 } else { paused.len() };
+        assert!(
+            (2..=3).contains(&paused.len()),
+            "max_lag {max_lag}: {paused:?}"
         );
+        assert_eq!(paused, expected[..asked], "max_lag {max_lag}");
         agent.close().unwrap();
     }
 }
@@ -1560,6 +1625,34 @@ fn an_unavailable_agent_is_given_up_on_after_its_timeout() {
     assert!(out.error.unwrap().contains("stayed unavailable"));
 }
 
+#[cfg(unix)]
+#[test]
+fn a_misconfigured_cli_is_called_once_and_its_stderr_is_the_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    // As Claude Code fails when its MCP config path does not resolve.
+    let cli = dir.path().join("misconfigured");
+    let script = format!(
+        "#!/bin/sh\nn=$(cat \"{count}\" 2>/dev/null || echo 0)\necho $((n+1)) > \"{count}\"\n\
+         echo 'Error: Invalid MCP configuration:' >&2\n\
+         echo 'MCP config file not found: rlx_runs/1/mcp.json' >&2\nexit 1\n",
+        count = dir.path().join("calls").display(),
+    );
+    std::fs::write(&cli, script).unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut agent = CliAgent::from_json(
+        AgentCli::Claude,
+        &json!({"program": cli.display().to_string(), "retries": 5,
+                "retry_pause_seconds": 0.01, "mcp_command": ["true"]}),
+    )
+    .unwrap();
+    let out = agent.decide(&request(dir.path()));
+    let err = out.error.expect("a failed decision");
+    assert!(err.contains("MCP config file not found"), "{err}");
+    let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+    assert_eq!(calls.trim(), "1", "not called again");
+}
+
 #[test]
 fn codex_runs_with_its_own_home_and_the_workspace_server_as_an_override() {
     let dir = tempfile::tempdir().unwrap();
@@ -1608,4 +1701,274 @@ fn a_cli_that_started_without_the_workspace_tools_is_a_failed_decision() {
         err.contains("started without the rlx_files workspace tools (it had: none)"),
         "{err}"
     );
+}
+
+// ── check_program ───────────────────────────────────────────────
+
+/// A workspace as a run leaves it for `check-program`, with `updater` as the program.
+fn check_workspace(dir: &Path, updater: &str) -> std::path::PathBuf {
+    let ws = dir.join("workspace");
+    std::fs::create_dir_all(ws.join("reference")).unwrap();
+    std::fs::write(ws.join("updater.json"), updater).unwrap();
+    std::fs::write(ws.join("analysis.json"), "{}").unwrap();
+    std::fs::write(
+        ws.join("reference/check.json"),
+        json!({"host": {"program": "rules", "optimizer": {"kind": "adamw", "lr": 0.01}},
+               "params": [{"name": "w", "shape": [3, 3]}, {"name": "b", "shape": [3]}],
+               "files": ["analysis.json", "updater.json"], "total_updates": 100, "update": 40,
+               "base_lr": null})
+        .to_string(),
+    )
+    .unwrap();
+    ws
+}
+
+#[test]
+fn check_program_builds_and_runs_a_candidate_on_made_up_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = check_workspace(dir.path(), FASTER);
+    let out = cli::check_program(&ws, 3, &cli::CliDefaults::default()).unwrap();
+    assert!(out.contains("analysis.json: parses"), "{out}");
+    assert!(out.contains("builds for 2 params"), "{out}");
+    assert!(
+        out.contains("update 41: finite, 2 of 2 params moved"),
+        "{out}"
+    );
+    assert!(out.contains("update 43: finite"), "{out}");
+    assert!(out.contains("builds over itself"), "{out}");
+
+    let ws = check_workspace(
+        dir.path(),
+        r#"{"groups": [{"names": ["*"], "optimizer": {"kind": "nope"}}]}"#,
+    );
+    let err = cli::check_program(&ws, 3, &cli::CliDefaults::default()).unwrap_err();
+    assert!(err.starts_with("the program does not build:"), "{err}");
+
+    let ws = check_workspace(dir.path(), FASTER);
+    std::fs::write(ws.join("analysis.json"), "{\"every\": \"often\"}").unwrap();
+    let err = cli::check_program(&ws, 3, &cli::CliDefaults::default()).unwrap_err();
+    assert!(err.starts_with("analysis.json does not parse"), "{err}");
+}
+
+#[test]
+fn a_decision_offers_check_program_when_the_host_has_a_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(None::<Result<String, String>>));
+    let got = Arc::clone(&seen);
+    let act: Act = Box::new(move |req| {
+        std::fs::write(req.workspace.join("updater.json"), FASTER).unwrap();
+        // What the agent's workspace server does with the request.
+        let ws = rlx_agent::workspace::Workspace::new(&req.workspace, req.writable.clone())
+            .with_check(req.check.clone());
+        *got.lock().unwrap() = Some(if req.check.is_empty() {
+            Err("no check command".into())
+        } else {
+            ws.call("check_program", &json!({}))
+        });
+        DecisionOutcome::default()
+    });
+    let (backend, _) = scripted(vec![act]);
+    let mut agent = AgentOptimizer::new(config(dir.path(), 20, 1), rules(), backend).unwrap();
+    Toyrun::new().steps(&mut agent, 1, 20).unwrap();
+    let out = seen.lock().unwrap().take().expect("asked once").unwrap();
+    assert!(
+        out.contains("builds for 2 params") && out.contains("finite"),
+        "{out}"
+    );
+    let spec: Value = serde_json::from_str(
+        &std::fs::read_to_string(agent.run_dir().join("workspace/reference/check.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(spec["params"][0], json!({"name": "w", "shape": [2, 2]}));
+}
+
+#[test]
+fn the_rules_example_is_the_starting_program_in_another_form() {
+    for opts in [
+        json!({"kind": "adamw", "lr": 0.05, "weight_decay": 0.01}),
+        json!({"kind": "muon_adamw", "lr": 0.05}),
+    ] {
+        let host = RuleHost::new(&opts).unwrap();
+        let example = host.examples(false);
+        let text = example["example_updater.json"].clone();
+        let dir = tempfile::tempdir().unwrap();
+        // A run whose only decision installs the example.
+        let act: Act = Box::new(move |req| {
+            std::fs::write(req.workspace.join("updater.json"), &text).unwrap();
+            DecisionOutcome::default()
+        });
+        let (backend, _) = scripted(vec![act]);
+        let mut cfg = config(dir.path(), 30, 1);
+        cfg.waiting = Waiting::Always;
+        let mut with =
+            AgentOptimizer::new(cfg, Box::new(RuleHost::new(&opts).unwrap()), backend).unwrap();
+        let mut a = Toyrun::new();
+        a.steps(&mut with, 1, 30).unwrap();
+        assert_eq!(with.version(), 1, "the example was installed");
+        assert!(
+            with.run_dir()
+                .join("workspace/reference/example_updater.json")
+                .is_file()
+        );
+
+        let mut plain = AgentOptimizer::new(
+            config(dir.path(), 30, 1),
+            Box::new(RuleHost::new(&opts).unwrap()),
+            Box::new(Keep),
+        )
+        .unwrap();
+        let mut b = Toyrun::new();
+        b.steps(&mut plain, 1, 30).unwrap();
+        assert_eq!((a.w, a.b), (b.w, b.b), "{opts}: it changes nothing");
+    }
+}
+
+#[test]
+fn reports_carry_each_groups_learning_rate_and_the_page_shows_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, _) = scripted(vec![edit("updater.json", FASTER)]);
+    let mut cfg = config(dir.path(), 30, 1);
+    cfg.waiting = Waiting::Always;
+    let mut agent = AgentOptimizer::new(cfg, rules(), backend).unwrap();
+    Toyrun::new().steps(&mut agent, 1, 30).unwrap();
+    let run = agent.run_dir().to_path_buf();
+    agent.close().unwrap();
+    let last: Value = serde_json::from_str(
+        std::fs::read_to_string(run.join("reports.jsonl"))
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(last["version"], 1);
+    assert_eq!(
+        last["report"]["lr"],
+        json!({"0: adamw [w]": 0.1f32, "1: adamw [*]": 0.05f32}),
+        "{last}"
+    );
+    let page = cli::report(&run).unwrap();
+    assert!(page.contains("Learning rate by group"), "the HTML report");
+    assert!(page.contains("0: adamw [w]: 1.000e-1"));
+}
+
+#[test]
+fn change_summaries_name_each_setting_that_changed() {
+    let f = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect()
+    };
+    let old = f(&[
+        (
+            "updater.json",
+            r#"{"groups": [{"names": ["*"], "optimizer": {"kind": "adamw", "lr": 0.001}}]}"#,
+        ),
+        ("analysis.json", "{}"),
+    ]);
+    let new = f(&[
+        (
+            "updater.json",
+            r#"{"groups": [{"names": ["*"], "optimizer": {"kind": "adamw", "lr": 0.003}}],
+                "schedule": [[0, 1], [1, 0.1]]}"#,
+        ),
+        ("analysis.json", "{}"),
+        ("notes.py", "x = 1\n"),
+    ]);
+    assert_eq!(
+        cli::change_summary(&old, &new),
+        [
+            "updater.json groups[0].optimizer.lr: 0.001 → 0.003",
+            "updater.json schedule: set to [[0,1],[1,0.1]]",
+            "notes.py: new file",
+        ]
+    );
+    let py = cli::change_summary(
+        &f(&[("updater.py", "a\nb\n")]),
+        &f(&[("updater.py", "a\nc\nd\n")]),
+    );
+    assert_eq!(py, ["updater.py: +2 −1 lines"]);
+}
+
+#[test]
+fn the_message_tells_the_next_decision_and_leaves_cost_out_of_the_built_in_prompts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, messages) = scripted(vec![keep(), keep(), keep()]);
+    let mut cfg = config(dir.path(), 30, 3);
+    cfg.waiting = Waiting::Always;
+    let mut agent = AgentOptimizer::new(cfg, rules(), backend).unwrap();
+    Toyrun::new().steps(&mut agent, 1, 30).unwrap();
+    let schedule = agent.schedule().unwrap().to_vec();
+    let msgs = messages.lock().unwrap();
+    assert!(
+        msgs[0].contains(&format!(
+            "The next scheduled decision is at update {}.",
+            schedule[1]
+        )),
+        "{}",
+        msgs[0]
+    );
+    assert!(msgs[2].contains("This is your last decision in this run."));
+    assert!(msgs.iter().all(|m| !m.contains("cost so far")));
+    drop(msgs);
+
+    let t = dir.path().join("prompt.md");
+    std::fs::write(&t, "{goal}").unwrap();
+    let (backend, messages) = scripted(vec![keep(), keep()]);
+    let mut cfg = config(dir.path(), 30, 2);
+    cfg.waiting = Waiting::Always;
+    cfg.prompt = Prompt::Template(t);
+    let mut agent = AgentOptimizer::new(cfg, rules(), backend).unwrap();
+    Toyrun::new().steps(&mut agent, 1, 30).unwrap();
+    let msgs = messages.lock().unwrap();
+    assert!(msgs[0].contains("agent cost so far: $0.00"), "{}", msgs[0]);
+    assert!(
+        !msgs[0].contains("next scheduled decision"),
+        "off with a template"
+    );
+}
+
+#[test]
+fn the_agent_is_shown_the_training_scripts_own_schedule() {
+    use rlx_bind::runtime::train::TrainingOptions;
+    let x: Vec<f32> = (0..12).map(|i| ((i * 5 % 11) as f32 - 5.0) / 5.0).collect();
+    let t: Vec<f32> = (0..12).map(|i| ((i * 3 % 7) as f32 - 3.0) / 3.0).collect();
+    let inputs = [("x", x.as_slice()), ("t", t.as_slice())];
+    let root = tempfile::tempdir().unwrap();
+    let prompt = |training: TrainingOptions| -> String {
+        let mut tr = trainer(&json!({"kind": "adamw", "lr": 0.05}));
+        if training.schedule.is_some() {
+            let w: Vec<f32> = (0..9).map(|i| 0.1 * (i % 7) as f32 - 0.2).collect();
+            tr = Trainer::new(
+                regression(),
+                TrainerConfig {
+                    wrt: vec!["w".into(), "b".into()],
+                    init: vec![("w".into(), w), ("b".into(), vec![0.0; 3])],
+                    device: "cpu".into(),
+                    optimizer: json!({"kind": "adamw", "lr": 0.05}),
+                    policy: None,
+                    clip_norm: None,
+                    resident: Resident::Off,
+                    training,
+                },
+            )
+            .unwrap();
+        }
+        let (backend, _) = scripted(vec![keep()]);
+        let mut agent = AgentOptimizer::new(config(root.path(), 20, 1), rules(), backend).unwrap();
+        agent.train_step(&mut tr, &inputs).unwrap();
+        std::fs::read_to_string(agent.run_dir().join("system_prompt.txt")).unwrap()
+    };
+    let cosine = TrainingOptions::from_json(
+        &json!({"schedule": {"kind": "cosine", "total_steps": 20, "warmup_steps": 2}}),
+    )
+    .unwrap();
+    let shown = prompt(cosine);
+    assert!(shown.contains("follows its own schedule"), "{shown}");
+    // The peak after the warm-up, and halfway down the cosine.
+    assert!(shown.contains("[0.1, 5.000e-2]"), "{shown}");
+    assert!(shown.contains("[0.5, 2.934e-2]"), "{shown}");
+    let plain = prompt(TrainingOptions::default());
+    assert!(!plain.contains("follows its own schedule"), "{plain}");
 }

@@ -1451,6 +1451,12 @@ pub struct MemoryPlanOptions {
     /// this false: only the output nodes are pinned (read-back protection), which
     /// is sufficient and keeps the arena small.
     pub pin_output_ancestors: bool,
+    /// When true (default), give every tensor derived only from params and
+    /// constants a private slot for the whole graph: GPU backends compute such
+    /// packs once and skip them on later runs. An executor that re-runs every
+    /// step sets this false. In a program built from constants that is every
+    /// node, and the pin turns off slot reuse altogether.
+    pub pin_static_packs: bool,
     /// When true (default), pin every `DequantMatMul`/`DequantGroupedMatMul`
     /// activation input (operand 0) live-to-end — guards the deferred-host dequant
     /// path (task #50: the host o_proj flush reads an activation a later GPU op
@@ -1485,6 +1491,7 @@ impl MemoryPlanOptions {
             arena_no_reuse: rlx_ir::env::var("RLX_ARENA_NO_REUSE")
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             pin_output_ancestors: true,
+            pin_static_packs: true,
             dequant_host_fallback: true,
             elide_bank_transposes: false,
             fold_conv3d_epilogue: false,
@@ -1501,6 +1508,7 @@ impl MemoryPlanOptions {
             arena_no_reuse: rlx_ir::env::var("RLX_ARENA_NO_REUSE")
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             pin_output_ancestors: true,
+            pin_static_packs: true,
             dequant_host_fallback: true,
             elide_bank_transposes: false,
             fold_conv3d_epilogue: false,
@@ -1695,6 +1703,9 @@ pub fn plan_memory_native_in_order_params(
         // scratch for 308 patches and ~24 GB for 4928. `RLX_PIN_OUTPUT_ANCESTORS=1`
         // restores the pin.
         pin_output_ancestors: rlx_ir::env::var("RLX_PIN_OUTPUT_ANCESTORS").as_deref() == Some("1"),
+        // The thunks all run on every `run()`: nothing is computed once and
+        // kept, so a pack is an ordinary tensor with ordinary liveness.
+        pin_static_packs: false,
         dequant_host_fallback: false,
         // The CPU backend folds `Transpose -> GroupedMatMul`, and this planner
         // is its own — no other backend calls it.
@@ -2044,6 +2055,46 @@ thread_local! {
 
 /// Run `f` with the planner's candidate-scan self-check enabled on this thread.
 #[cfg(test)]
+mod static_pack_tests {
+    use super::*;
+    use rlx_ir::op::BinaryOp;
+    use rlx_ir::{DType, Shape};
+
+    /// A chain of `n` adds on one constant: everything is a static pack.
+    fn chain(n: usize) -> Graph {
+        let s = Shape::new(&[1024], DType::F32);
+        let mut g = Graph::new("chain");
+        let c = g.add_node(
+            Op::Constant {
+                data: vec![0; 4096],
+            },
+            vec![],
+            s.clone(),
+        );
+        let mut t = c;
+        for _ in 0..n {
+            t = g.binary(BinaryOp::Add, t, c, s.clone());
+        }
+        g.set_outputs(vec![t]);
+        g
+    }
+
+    #[test]
+    fn the_in_order_planner_reuses_constant_derived_slots() {
+        let g = chain(20);
+        let cpu = plan_memory_native_in_order(&g, 64);
+        assert!(cpu.arena_size <= 4 * 4096, "{}", cpu.arena_size);
+    }
+
+    #[test]
+    fn other_planners_keep_packs_private() {
+        let g = chain(20);
+        assert!(plan_memory(&g).arena_size >= 21 * 4096);
+        assert!(plan_memory_f32_uniform(&g, 64).arena_size >= 21 * 4096);
+    }
+}
+
+#[cfg(test)]
 fn with_plan_verify<R>(f: impl FnOnce() -> R) -> R {
     VERIFY_PLAN.with(|v| v.set(true));
     let r = f();
@@ -2063,7 +2114,9 @@ fn plan_memory_aligned_inner(
     extend_custom_op_input_liveness(graph, &mut ranges, opts.dequant_host_fallback);
     extend_bert_hidden_liveness(graph, &mut ranges);
     extend_onnx_duration_epilogue_liveness(graph, &mut ranges);
-    extend_static_weight_pack_liveness(graph, &mut ranges);
+    if opts.pin_static_packs {
+        extend_static_weight_pack_liveness(graph, &mut ranges);
+    }
     if opts.fold_conv3d_epilogue {
         extend_conv3d_epilogue_fold_liveness(graph, &mut ranges);
     }

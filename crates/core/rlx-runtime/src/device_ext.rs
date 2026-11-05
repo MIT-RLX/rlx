@@ -184,6 +184,13 @@ pub fn is_available(device: Device) -> bool {
     }
     #[cfg(feature = "opengl")]
     if device == Device::OpenGl {
+        // In the browser, whether this thread can make a WebGL2 context (a
+        // browser, tab or worker may have none); the context made is the one
+        // every graph on the thread then shares. Natively the plan runs on the
+        // CPU, which is always there.
+        #[cfg(target_family = "wasm")]
+        return crate::backend::webgl_backend::webgl_backend().is_ok();
+        #[cfg(not(target_family = "wasm"))]
         return true;
     }
     #[cfg(feature = "vulkan")]

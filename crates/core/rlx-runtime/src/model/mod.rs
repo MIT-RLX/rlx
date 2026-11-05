@@ -218,6 +218,19 @@ pub trait Model: Send {
         )
     }
 
+    /// [`Model::generate_text`], ending once `done` holds of the text so
+    /// far: what would follow is not wanted (an answer already given). The
+    /// default generates the whole text.
+    fn generate_text_until(
+        &mut self,
+        prompt: &str,
+        options: &Value,
+        done: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String> {
+        let _ = done;
+        self.generate_text(prompt, options)
+    }
+
     /// The text after each of `prompts` (`options` as
     /// [`Model::generate_text`]). A model that can decode several sequences
     /// at once does (a package step with a `batch` symbol, greedy); the
@@ -862,10 +875,23 @@ impl LmModel {
     /// Generate up to `max_tokens` after `prompt` with `options` sampling,
     /// stopping at a stop id.
     fn generate(&mut self, prompt: &[u32], options: &Value) -> Result<Vec<u32>> {
-        let max_tokens = max_tokens(options);
         let stops = self.stop_ids(options);
+        self.generate_until(prompt, options, &stops, None)
+    }
+
+    /// [`Self::generate`] with `stops`, ending too once `done` holds of
+    /// the ids produced so far (greedy and sampled decoding; beams and JSON
+    /// run to their own end).
+    fn generate_until(
+        &mut self,
+        prompt: &[u32],
+        options: &Value,
+        stops: &[u32],
+        mut done: Option<&mut dyn FnMut(&[u32]) -> bool>,
+    ) -> Result<Vec<u32>> {
+        let max_tokens = max_tokens(options);
         if wants_json(options) {
-            return self.generate_json(prompt, max_tokens, &stops, options);
+            return self.generate_json(prompt, max_tokens, stops, options);
         }
         // `num_beams > 1`: beam search (`length_penalty`, 1 by default).
         let beams = option(options, "num_beams")
@@ -877,14 +903,14 @@ impl LmModel {
                 .unwrap_or(1.0) as f32;
             return self
                 .runner
-                .generate_beam(prompt, beams, max_tokens, &stops, penalty);
+                .generate_beam(prompt, beams, max_tokens, stops, penalty);
         }
         let opts = sample_opts(options);
         if opts.is_greedy() {
             let mut produced = Vec::new();
             self.runner.generate(prompt, max_tokens, &mut |t| {
                 produced.push(t);
-                !stops.contains(&t)
+                !stops.contains(&t) && !done.as_mut().is_some_and(|d| d(&produced))
             })?;
             if produced.last().is_some_and(|t| stops.contains(t)) {
                 produced.pop();
@@ -917,6 +943,9 @@ impl LmModel {
             }
             produced.push(next);
             context.push(next);
+            if done.as_mut().is_some_and(|d| d(&produced)) {
+                break;
+            }
         }
         Ok(produced)
     }
@@ -974,6 +1003,28 @@ impl Model for LmModel {
         let ids = codec.encode(&prompt)?;
         let out = self.generate(&ids, options)?;
         self.codec.as_ref().unwrap().decode(&out)
+    }
+
+    fn generate_text_until(
+        &mut self,
+        prompt: &str,
+        options: &Value,
+        done: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String> {
+        let options = &self.with_defaults(options);
+        if self.codec.is_none() || option(options, "messages").is_some() || wants_json(options) {
+            return self.generate_text(prompt, options);
+        }
+        let stops = self.stop_ids(options);
+        // The codec decodes the text so far while the runner steps.
+        let codec = self.codec.take().expect("checked");
+        let out = codec.encode(prompt).and_then(|ids| {
+            let mut check = |ids: &[u32]| codec.decode(ids).is_ok_and(|t| done(&t));
+            self.generate_until(&ids, options, &stops, Some(&mut check))
+        });
+        let text = out.and_then(|o| codec.decode(&o));
+        self.codec = Some(codec);
+        text
     }
 
     fn generate_with_media(

@@ -461,6 +461,7 @@ pub fn markdown() -> String {
             fix = i.fix,
         ));
     }
+    s.push_str("## License\n\nMIT OR Apache-2.0.\n");
     s
 }
 
@@ -471,7 +472,11 @@ mod tests {
     use std::path::Path;
 
     fn root(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("rlx_ki_{name}_{}", std::process::id()));
+        // `cases()` runs in two tests at once: the same name must not be one
+        // directory, or one test deletes what the other is reading
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("rlx_ki_{name}_{}_{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

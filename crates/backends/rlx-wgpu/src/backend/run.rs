@@ -3380,7 +3380,8 @@ impl WgpuExecutable {
                                     let tk = topk_kernel(&dev.device);
                                     pass.set_pipeline(&tk.pipeline);
                                     pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                    let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                    // One workgroup per row (`topk.wgsl`).
+                                    let (gx, gy, gz) = dispatch_dims(outer_s, 1);
                                     pass.dispatch_workgroups(gx, gy, gz);
                                 }
                                 Step::WelchPeaksGpu { params } => {
@@ -3563,7 +3564,8 @@ impl WgpuExecutable {
                                     // One workgroup per (col, row_tile); local size 256
                                     // splits K and stages X in workgroup memory.
                                     let n_row_tiles = m_s.div_ceil(8);
-                                    pass.dispatch_workgroups(params.n * n_row_tiles, 1, 1);
+                                    let [x, y] = fold_dispatch(params.n * n_row_tiles);
+                                    pass.dispatch_workgroups(x, y, 1);
                                 }
                                 Step::FusedResidualLn { params } => {
                                     let outer_s = scale(params.outer);
@@ -6226,5 +6228,17 @@ fn profile_label(step: &Step) -> &'static str {
             params.total, params.outer, params.inner, params.axis_in_size, params.axis_out_size
         )),
         other => step_name(other),
+    }
+}
+
+/// Split `groups` workgroups into a 2-D grid within WebGPU's 65535-per-axis
+/// limit; kernels recover the linear index as `wid.x + wid.y * nwg.x` and
+/// skip the overhang past `groups`.
+pub(crate) fn fold_dispatch(groups: u32) -> [u32; 2] {
+    const MAX: u32 = 65535;
+    if groups <= MAX {
+        [groups.max(1), 1]
+    } else {
+        [MAX, groups.div_ceil(MAX)]
     }
 }

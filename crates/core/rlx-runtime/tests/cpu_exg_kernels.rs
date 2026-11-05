@@ -77,6 +77,71 @@ fn interpolate1d_linear_exact_ramp() {
     }
 }
 
+/// Nearest is a copy of the source sample at `round(j·(L_in−1)/(L_out−1))`:
+/// bit for bit, including -0, ±inf and NaN, which a one-hot matmul turns into
+/// +0 and NaN (0·inf).
+#[test]
+fn interpolate1d_nearest_copies_bits() {
+    let row = [
+        -0.0f32,
+        f32::INFINITY,
+        1.5,
+        f32::NAN,
+        -2.25,
+        f32::NEG_INFINITY,
+        7.0,
+    ];
+    let (l_in, l_out) = (row.len(), 16);
+    let data: Vec<f32> = (0..2 * 3)
+        .flat_map(|r| {
+            row.iter()
+                .map(move |v| v * if r % 2 == 0 { 1.0 } else { -1.0 })
+        })
+        .collect();
+    let mut g = Graph::new("interp_nearest");
+    let x = const_f32(&mut g, &data, &[2, 3, l_in]);
+    let y = g.interpolate1d(x, l_out, InterpMode::Nearest);
+    g.set_outputs(vec![y]);
+    let out = &run(g)[0];
+    assert_eq!(out.len(), 2 * 3 * l_out);
+    for r in 0..2 * 3 {
+        for j in 0..l_out {
+            let pos = j as f32 * (l_in as f32 - 1.0) / (l_out as f32 - 1.0);
+            let want = data[r * l_in + ((pos + 0.5) as usize).min(l_in - 1)];
+            let got = out[r * l_out + j];
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "row {r} sample {j}: {got} vs {want}"
+            );
+        }
+    }
+}
+
+/// U-Sleep's top decoder level doubles 30720 samples to 61440. A one-hot
+/// matrix for that is 30720 × 61440 floats (7 GiB), which wgpu refused; the
+/// graph must hold only O(L) of constants.
+#[test]
+fn interpolate1d_nearest_constants_are_linear_in_length() {
+    let (l_in, l_out) = (30720, 61440);
+    let mut g = Graph::new("interp_long");
+    let x = g.input("x", Shape::new(&[1, 4, l_in], DType::F32));
+    let y = g.interpolate1d(x, l_out, InterpMode::Nearest);
+    g.set_outputs(vec![y]);
+    let consts: usize = g
+        .nodes()
+        .iter()
+        .map(|n| match &n.op {
+            Op::Constant { data } => data.len(),
+            _ => 0,
+        })
+        .sum();
+    assert!(
+        consts <= 4 * l_out,
+        "{consts} bytes of constants for {l_in} → {l_out}"
+    );
+}
+
 #[test]
 fn conv_transpose1d_overlap_add() {
     // input [1,1,2] = [1,1], kernel [1,1,2] = [1,1], stride 1.

@@ -871,8 +871,20 @@ pub fn lower_with_env_writeback(
                         )
                     }
                     MaskKind::SlidingWindow(window) => {
-                        let s_q = q_shape[q_shape.len() - 2];
-                        let s_k = k_shape[k_shape.len() - 2];
+                        // The rows of the [B, H, S, D] view `to_bhsd` hands
+                        // SDPA: axis 2 of a rank-4 input already in that
+                        // layout, axis 1 of [B, S, H, D] and [B, S, H*D].
+                        // (`len - 2` took the head count of [B, S, H, D],
+                        // a [1, 1, H, H] mask against [1, H, S, S] scores.)
+                        let rows = |sh: &[i32]| {
+                            if sh.len() == 4 && sh[1] == nh {
+                                sh[2]
+                            } else {
+                                sh[1]
+                            }
+                        };
+                        let s_q = rows(&q_shape);
+                        let s_k = rows(&k_shape);
                         let m = build_sliding_window_mask(s_q, s_k, *window as i32)?;
                         // build_sliding_window_mask returns rank-2; normalize.
                         let m4 = ops::reshape(&m, &[1, 1, s_q, s_k])?;

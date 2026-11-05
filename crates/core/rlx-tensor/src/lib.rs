@@ -98,7 +98,7 @@ mod transform;
 pub use array::{cat, stack};
 #[cfg(feature = "optim")]
 pub use parallel::{DataParallel, Replica, StepReport, Tuned, apply_gradients, split_batch, tune};
-pub use rlx_ir::op::{Activation, MaskKind};
+pub use rlx_ir::op::{Activation, MaskKind, SteKind};
 pub use rlx_ir::{DType, Dim, Graph, NodeId, ScaleLayout, ScaledFormat, Shape};
 /// Optimizers for [`Func::train_step`] (re-exported from `rlx_optim`).
 /// Available with the `optim` feature.

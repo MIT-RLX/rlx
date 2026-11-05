@@ -20,6 +20,21 @@ impl LmRunner for CountLm {
     }
 }
 
+#[test]
+fn score_continuation_is_teacher_forced_log_softmax() {
+    let mut lm = CountLm;
+    // After 2 the model expects 3 (logit 50 vs seven 0s), then 4.
+    let lp = lm.score_continuation(&[1, 2], &[3, 5]).unwrap();
+    let sure = -(1.0f64 + 7.0 * (-50f64).exp()).ln() as f32;
+    assert!((lp[0] - sure).abs() < 1e-6, "{lp:?}");
+    // 5 where 4 was expected: about -50, and the context grew by the forced 3.
+    assert!((lp[1] - (sure - 50.0)).abs() < 1e-4, "{lp:?}");
+    assert!(
+        lm.score_continuation(&[1], &[9]).is_err(),
+        "outside the vocabulary"
+    );
+}
+
 /// Held by each test that installs the global tokenizer loader, for as long
 /// as it runs: tests run in parallel, and one installing `Chars` while
 /// another decodes with `Letters` fails the other.
@@ -1163,6 +1178,54 @@ fn a_stateful_step_keeps_its_cache_across_steps_and_functions() {
                 "{device}"
             );
         }
+        // A tap reads a node of the step on every token, though the step
+        // reads back only its logits, and the generation is unchanged.
+        struct Reads(std::cell::RefCell<Vec<Vec<f32>>>);
+        impl crate::taps::GraphTap for Reads {
+            fn on_compile(&self, mut g: rlx_ir::Graph) -> (rlx_ir::Graph, usize) {
+                let Some(n) = g
+                    .nodes()
+                    .iter()
+                    .find(|n| n.name.as_deref() == Some("cache.next"))
+                    .map(|n| n.id)
+                else {
+                    return (g, 0);
+                };
+                let mut outs = g.outputs.clone();
+                outs.push(n);
+                g.set_outputs(outs);
+                (g, 1)
+            }
+            fn on_outputs(&self, extra: Vec<(Vec<u8>, DType)>) {
+                let (b, d) = &extra[0];
+                self.0.borrow_mut().push(crate::taps::to_f32(b, *d));
+            }
+        }
+        let reads = std::rc::Rc::new(Reads(Default::default()));
+        let text = crate::taps::with_tap(reads.clone(), || {
+            let mut t = open_source(path.to_str().unwrap(), json!({"device": device})).unwrap();
+            t.generate_text("c", &json!({"max_tokens": 3})).unwrap()
+        });
+        assert_eq!(text, "dge", "{device}");
+        let reads = reads.0.borrow();
+        assert!(reads.len() >= 2, "{device}: {} step reads", reads.len());
+        // The cache the last step wrote holds `c` (2) and `d` (3) first.
+        assert_eq!(
+            reads.last().unwrap()[..2],
+            [2.0, 3.0],
+            "{device}: {reads:?}"
+        );
+        // Generation ends once the text so far is done, at the token that
+        // made it so; the text up to there is what the whole run gives.
+        let mut seen = 0;
+        let until = m
+            .generate_text_until("c", &json!({"max_tokens": 6}), &mut |t| {
+                seen += 1;
+                t.contains('e')
+            })
+            .unwrap();
+        assert_eq!(until, "dge", "{device}");
+        assert_eq!(seen, 3, "{device}");
         // A second generation in the 16-row step: the rows the first left
         // past its position are masked, not summed.
         assert_eq!(

@@ -41,14 +41,28 @@ tests (`tests/cli.rs`) but have not been run live; Claude has.
 ## The workspace server
 
 `workspace::Workspace` is a stdio MCP server over one folder — the whole file
-surface of an agent whose CLI runs without built-in tools: `list_files`,
-`read_file`, `write_file`, `edit_file`. Every file in the folder can be read;
-only the names given as writable can be written. Absolute paths and `..` are
-refused.
+surface of an agent whose CLI runs without built-in tools:
+
+| tool | what it does |
+|---|---|
+| `list_files` | every file, with its size and whether it is writable |
+| `read_file` | a file's text; with `start_line` / `lines`, those lines, numbered |
+| `search` | the lines containing a text (`ignore_case`), as `file:line`, in every file or under `path` |
+| `write_file`, `edit_file` | replace or create a writable file; a `.json` one is parsed at once and a syntax error is in the reply |
+| `check_program` | with `--check`: that command run on the folder, in a process of its own, for at most 300 s |
+
+Every file in the folder can be read; only the names given as writable can be
+written. Absolute paths, `..` and links leading out of the folder are refused.
+The reading tools carry MCP's `readOnlyHint`.
 
 ```text
-rlx-agent workspace-mcp --dir runs/1/workspace --write updater.json --write NOTES.md
+rlx-agent workspace-mcp --dir runs/1/workspace --write updater.json --write NOTES.md \
+  --check rlx-agent-opt --check check-program
 ```
+
+The CLI's stderr is passed on, saved beside its transcript (`stderr.txt`) and
+its last lines kept in `Outcome::stderr`; the run folder is made absolute, as
+the CLI runs in the workspace.
 
 `Workspace::server(name, command, prefix)` builds the `McpServer` entry that
 launches it. `rlx-bind`'s agent optimizer (`runtime::agent`) uses it for every

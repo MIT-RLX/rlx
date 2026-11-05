@@ -7,19 +7,20 @@
 //! Each data-bearing tensor ([`crate::Tensor::from_vec`] & friends) starts
 //! life owning its own graph. When two tensors from *different* graphs meet
 //! in a binary op, the right-hand graph is **adopted** into the left's via
-//! [`GraphHandle::adopt`] — every node is copied with its operands remapped.
+//! [`GraphHandle::adopt`] — the operand's ancestors are copied with their
+//! operands remapped.
 //! Embedded [`rlx_ir::Op::Constant`] data travels inside the nodes, so there
 //! is no side table to merge. The result keeps NumPy-style value semantics
 //! with no ambient/global graph state.
 //!
-//! Adoption is **memoized by source identity**: a given source node is copied
-//! into a target graph at most once. This (a) collapses repeated merges of the
+//! Adoption is **memoized by first-home identity**: a given node is copied
+//! into a target graph at most once, however many graphs it came through. This (a) collapses repeated merges of the
 //! same operand into a single node, and (b) — crucially for autodiff — lets a
 //! `wrt` tensor be mapped back to the *exact* node the loss was built from, so
 //! gradients actually flow to it instead of a stale duplicate.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -33,8 +34,10 @@ static HANDLE_SEQ: AtomicU64 = AtomicU64::new(1);
 struct Inner {
     id: u64,
     graph: Graph,
-    /// `(source handle id, source node id) -> node id in this graph`.
+    /// A node's first home `(handle id, node id)` -> node id in this graph.
     adopted: HashMap<(u64, u32), NodeId>,
+    /// The inverse, for this graph's adopted nodes.
+    roots: HashMap<u32, (u64, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +50,7 @@ impl GraphHandle {
             id,
             graph,
             adopted: HashMap::new(),
+            roots: HashMap::new(),
         })))
     }
 
@@ -62,55 +66,114 @@ impl GraphHandle {
         Rc::ptr_eq(&self.0, &other.0)
     }
 
-    /// Copy `other`'s nodes into this graph (memoized), returning the id that
-    /// `other_id` maps to *here*. No-op fast path when both handles already
+    /// Copy what `other_id` depends on into this graph (memoized), returning
+    /// the id it maps to *here*. No-op fast path when both handles already
     /// share a graph.
     ///
-    /// Nodes are visited in insertion order, which is topological for an rlx
-    /// graph, so each operand is already remapped before its consumer.
+    /// Identity is the node's first home: a copy of a copy is the same value,
+    /// and a node coming back is this graph's own, so graphs trading results
+    /// grow by what each round adds. Nodes are appended in id order, which is
+    /// topological for an rlx graph, so each operand is remapped first.
     pub(crate) fn adopt(&self, other: &GraphHandle, other_id: NodeId) -> NodeId {
         if self.same(other) {
             return other_id;
         }
-        let src_id = other.0.borrow().id;
-        // Fast path: this exact source node was already adopted.
-        if let Some(&mapped) = self.0.borrow().adopted.get(&(src_id, other_id.0)) {
-            return mapped;
-        }
-        let snapshot = other.with_graph(|src| {
-            src.nodes()
-                .iter()
-                .map(|n| {
-                    (
-                        n.id,
-                        n.op.clone(),
-                        n.inputs.clone(),
-                        n.shape.clone(),
-                        n.name.clone(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        });
+        let src = other.0.borrow();
         let mut inner = self.0.borrow_mut();
-        let mut local: HashMap<NodeId, NodeId> = HashMap::with_capacity(snapshot.len());
-        let mut mapped = other_id;
-        for (old_id, op, inputs, shape, name) in snapshot {
-            // Reuse a node copied by an earlier adopt of this source.
-            if let Some(&existing) = inner.adopted.get(&(src_id, old_id.0)) {
-                local.insert(old_id, existing);
-                if old_id == other_id {
-                    mapped = existing;
-                }
+        let mut local: HashMap<NodeId, NodeId> = HashMap::new();
+        let mut copy: Vec<NodeId> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut todo = vec![other_id];
+        while let Some(id) = todo.pop() {
+            if !seen.insert(id) {
                 continue;
             }
-            let new_inputs: Vec<NodeId> = inputs.iter().map(|i| local[i]).collect();
-            let new_id = inner.graph.append_node(op, new_inputs, shape, name);
-            inner.adopted.insert((src_id, old_id.0), new_id);
-            local.insert(old_id, new_id);
-            if old_id == other_id {
-                mapped = new_id;
+            match inner.resolve(src.root(id)) {
+                Some(here) => {
+                    local.insert(id, here);
+                }
+                None => {
+                    copy.push(id);
+                    todo.extend(&src.graph.node(id).inputs);
+                }
             }
         }
-        mapped
+        copy.sort_unstable_by_key(|id| id.0);
+        for id in copy {
+            let n = src.graph.node(id);
+            let inputs: Vec<NodeId> = n.inputs.iter().map(|i| local[i]).collect();
+            let new_id =
+                inner
+                    .graph
+                    .append_node(n.op.clone(), inputs, n.shape.clone(), n.name.clone());
+            let root = src.root(id);
+            inner.adopted.insert(root, new_id);
+            inner.roots.insert(new_id.0, root);
+            local.insert(id, new_id);
+        }
+        local[&other_id]
+    }
+}
+
+impl Inner {
+    /// The first home of this graph's node `id`.
+    fn root(&self, id: NodeId) -> (u64, u32) {
+        self.roots.get(&id.0).copied().unwrap_or((self.id, id.0))
+    }
+
+    /// This graph's node for `root`, if it has one.
+    fn resolve(&self, root: (u64, u32)) -> Option<NodeId> {
+        if root.0 == self.id {
+            Some(NodeId(root.1))
+        } else {
+            self.adopted.get(&root).copied()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Tensor;
+
+    fn nodes(t: &Tensor) -> usize {
+        t.handle.with_graph(|g| g.nodes().len())
+    }
+
+    /// Two graphs trading results: what comes back is the graph's own node,
+    /// not a copy of a copy, so each round adds the same few nodes.
+    #[test]
+    fn adoption_does_not_duplicate_a_returning_node() {
+        let (mut x, mut y) = (Tensor::from_f64([1.0], [1]), Tensor::from_f64([0.5], [1]));
+        let (mut wx, mut wy) = (1.0f64, 0.5f64);
+        let mut sizes = Vec::new();
+        for _ in 0..12 {
+            let (a, b) = (&x * &y, &y * &x);
+            (x, y) = (&a + &b, &b / &a);
+            (wx, wy) = (2.0 * wx * wy, 1.0);
+            sizes.push(nodes(&x).max(nodes(&y)));
+        }
+        assert_eq!((x.to_vec_f64(), y.to_vec_f64()), (vec![wx], vec![wy]));
+        let step = sizes[11] - sizes[10];
+        assert!(
+            sizes.windows(2).skip(1).all(|w| w[1] - w[0] == step),
+            "{sizes:?}"
+        );
+    }
+
+    /// Only what the operand depends on crosses over.
+    #[test]
+    fn adoption_copies_ancestors_only() {
+        let a = Tensor::from_f64([1.0], [1]);
+        let b = Tensor::from_f64([2.0], [1]);
+        let used = &b + &b;
+        let mut unused = &b * &b;
+        for _ in 0..50 {
+            unused = &unused * &b;
+        }
+        let before = nodes(&a);
+        let c = &a + &used;
+        assert_eq!(nodes(&c), before + 3, "b, b + b, and the sum");
+        assert_eq!(c.to_vec_f64(), vec![5.0]);
+        let _ = unused;
     }
 }

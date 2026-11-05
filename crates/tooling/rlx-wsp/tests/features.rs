@@ -91,7 +91,7 @@ fn graph_space_runs_any_rlx_graph_like_the_mlp() {
 fn trace_returns_named_nodes_and_compose_is_the_product() {
     let mut ws = bounce(2);
     let nodes = ok(&mut ws, r#"{"tool":"list_nodes"}"#);
-    let names: Vec<&str> = nodes
+    let names: Vec<&str> = nodes["nodes"]
         .as_array()
         .unwrap()
         .iter()
@@ -323,22 +323,6 @@ fn export_bakes_weights_and_checks_int8() {
 }
 
 #[test]
-fn edited_units_are_the_ones_whose_weights_changed() {
-    let ws = bounce(0);
-    let before = ws.state.params.clone();
-    let mut after = before.clone();
-    after.get_mut("l0.w").unwrap().data[3 * 32 + 7] += 1.0; // into l0.h7
-    after.get_mut("l1.b").unwrap().data[2] = 0.5; // l1.h2
-    after.get_mut("l2.w").unwrap().data[5 * 3 + 1] = 0.25; // out of l1.h5
-    let touched = rlx_wsp::verify::edited_units(&ws.state.mlp.widths, &before, &after);
-    let want: std::collections::BTreeSet<String> = ["l0.h7", "l1.h2", "l1.h5"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    assert_eq!(touched, want);
-}
-
-#[test]
 fn scripts_carrying_copied_weights_are_refused() {
     // A trained-looking network: non-round weights.
     let mut ws = WeightSpace::new(EnvKind::Bounce, &[32, 32], Act::Tanh, 0);
@@ -368,4 +352,77 @@ fn scripts_carrying_copied_weights_are_refused() {
         &serde_json::json!({"tool": "script", "code": code}).to_string(),
     );
     assert_eq!(r["ok"]["value"], 210, "{r}");
+}
+
+#[test]
+fn every_tool_has_a_schema() {
+    // Variant names of `Call` (snake_case) against `tool_schemas()`: a tool
+    // without a schema is invisible to agents.
+    let src = include_str!("../src/tools.rs");
+    let body = &src[src.find("pub enum Call {").unwrap()..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    let names: Vec<String> = body
+        .lines()
+        .filter_map(|l| {
+            let v = l.strip_prefix("    ")?;
+            let first = v.chars().next()?;
+            if !first.is_ascii_uppercase() {
+                return None;
+            }
+            let ident: String = v
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            let mut snake = String::new();
+            for (i, c) in ident.chars().enumerate() {
+                if c.is_ascii_uppercase() && i > 0 {
+                    snake.push('_');
+                }
+                snake.push(c.to_ascii_lowercase());
+            }
+            Some(snake)
+        })
+        .collect();
+    assert!(names.len() > 40, "{names:?}");
+    let schemas = rlx_wsp::tool_schemas();
+    let have: Vec<&str> = schemas
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    let missing: Vec<&String> = names
+        .iter()
+        .filter(|n| !have.contains(&n.as_str()))
+        .collect();
+    assert!(missing.is_empty(), "tools without a schema: {missing:?}");
+}
+
+/// `external_score` hands the command the live weights, returns its JSON and
+/// spends one forward pass; a space without a command refuses.
+#[test]
+fn external_score_runs_the_command_on_the_live_weights() {
+    let mut ws = bounce(2);
+    ws.state.score_cmd = Some(vec![
+        "sh".into(),
+        "-c".into(),
+        r#"test -s "$0" && grep -q l0 "$0" && echo noise && echo '{"val":0.5}'"#.into(),
+    ]);
+    assert_eq!(ok(&mut ws, r#"{"tool":"external_score"}"#)["val"], 0.5);
+    assert_eq!(ws.state.used, 1);
+
+    ws.state.score_cmd = Some(vec!["false".into()]);
+    assert!(
+        handle_json(&mut ws, r#"{"tool":"external_score"}"#)
+            .get("error")
+            .is_some()
+    );
+    assert!(
+        handle_json(&mut ws, r#"{"tool":"external_score"}"#)
+            .get("error")
+            .is_some()
+    );
+
+    let r = handle_json(&mut bounce(2), r#"{"tool":"external_score"}"#);
+    assert!(r["error"].as_str().unwrap().contains("no scoring command"));
 }

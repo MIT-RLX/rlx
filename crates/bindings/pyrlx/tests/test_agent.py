@@ -311,3 +311,185 @@ def test_a_finished_run_replays_and_the_cli_reads_it(tmp_path):
     doctor = cli("doctor", "--backend", "claude")
     assert "workspace server:" in doctor.stdout and "(answers)" in doctor.stdout, doctor.stdout
     assert cli("bogus").returncode == 2
+
+
+@pytest.mark.parametrize("program", ["rules", "python"])
+def test_save_with_the_trainer_checkpoints_the_whole_run(tmp_path, program):
+    opts = options(tmp_path, 2)
+    whole_t = trainer()
+    whole = rlx.AgentOptimizer(GOAL, 30, optimizer=OPT, program=program, **opts)
+    for _ in range(30):
+        whole.train_step(whole_t, BATCH)
+
+    first_t = trainer()
+    first = rlx.AgentOptimizer(GOAL, 30, optimizer=OPT, program=program, **opts)
+    for _ in range(15):
+        first.train_step(first_t, BATCH)
+    ck = tmp_path / "ck"
+    first.save(str(ck), trainer=first_t)
+    assert (ck / "trainer.gguf").is_file()
+    del first, first_t
+
+    t = trainer()
+    resumed = rlx.AgentOptimizer.resume(str(ck), GOAL, 30, optimizer=OPT, program=program, trainer=t, **opts)
+    for _ in range(15, 30):
+        resumed.train_step(t, BATCH)
+    for n, v in whole_t.params().items():
+        np.testing.assert_array_equal(t.params()[n], v)
+
+
+SNOOPS = """\
+import sys
+import numpy as np
+
+def build(params, previous, spec):
+    return U()
+
+class U:
+    def step(self, params, grads, ctx):
+        main = sys.modules["__main__"]
+        for n in params:
+            params[n][...] = params[n] - 0.05 * grads[n]
+"""
+
+
+def test_a_python_updater_reaching_past_its_program_is_flagged_not_stopped(tmp_path):
+    agent = rlx.AgentOptimizer(GOAL, 40, optimizer=OPT, program="python", backend="claude",
+                               backend_options=stand_in_cli(tmp_path, SNOOPS), **options(tmp_path))
+    t = trainer()
+    for _ in range(40):
+        agent.train_step(t, BATCH)
+    run_dir = agent.run_dir()
+    results = agent.close()
+    assert results["applied"] == 1, "flags never stop a program"
+    flags = [e for e in events(run_dir) if e["kind"] == "boundary"]
+    assert {f["category"] for f in flags} == {"introspection"}, flags
+    assert flags[0]["version"] == 1 and flags[0]["file"] == "updater.py"
+    assert results["boundary_flags"] == len(flags)
+    import subprocess
+    out = subprocess.run([sys.executable, "-m", "pyrlx.agent", "report", run_dir], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert "Boundary flags:</b> 1 static findings" in Path(run_dir, "report.html").read_text()
+
+
+def test_the_boundary_check_names_each_kind_of_reach():
+    from pyrlx import _boundary
+
+    src = "\n".join([
+        "import os, gc, subprocess",
+        "import pickle as pk",
+        "x = gc.get_objects()",
+        "y = os.listdir('.')",
+        "z = eval('1')",
+        "f = lambda fr: fr.f_back",
+        "pk.load(open('a'))",
+        "def g(model): model.weight = 1",
+    ])
+    cats = {(f["line"], f["category"]) for f in _boundary.check({"updater.py": src, "notes.md": "import os"})}
+    assert (1, "introspection") in cats and (1, "io") in cats  # gc, subprocess
+    assert (3, "introspection") in cats
+    assert (4, "io") in cats
+    assert (5, "dynamic") in cats
+    assert (6, "introspection") in cats
+    assert (7, "io") in cats
+    assert (8, "model_mutation") in cats
+    assert _boundary.check({"updater.py": "def (:"}) == [], "a syntax error is the build's to report"
+
+
+def test_the_python_example_is_the_starting_program_and_check_program_runs_it(tmp_path):
+    opts = options(tmp_path, 1)
+    agent = rlx.AgentOptimizer(GOAL, 30, optimizer=OPT, program="python", **opts)
+    plain_t = trainer()
+    t = trainer()
+    for _ in range(30):
+        agent.train_step(t, BATCH)
+        plain_t.step(BATCH)
+    ws = Path(agent.run_dir(), "workspace")
+    example = (ws / "reference/example_updater.py").read_text()
+    assert "Nothing here is a recommendation" in example and "LR_CONTROLLER" not in example
+
+    # Installed by an agent, the example trains as the starting program did.
+    agent2 = rlx.AgentOptimizer(GOAL, 30, optimizer=OPT, program="python", backend="claude",
+                                backend_options=stand_in_cli(tmp_path, example), **opts)
+    t2 = trainer()
+    for _ in range(30):
+        agent2.train_step(t2, BATCH)
+    assert agent2.version() == 1
+    for n, v in t.params().items():
+        np.testing.assert_array_equal(t2.params()[n], v)
+
+    # check-program builds it in a process of its own.
+    ws2 = Path(agent2.run_dir(), "workspace")
+    import subprocess
+    out = subprocess.run([sys.executable, "-m", "pyrlx.agent", "check-program", str(ws2), "--updates", "2"],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr + out.stdout
+    assert "builds for 2 params" in out.stdout and "finite" in out.stdout
+
+    aggressive = rlx.AgentOptimizer(GOAL, 30, optimizer=OPT, program="python", prompt="aggressive",
+                                    **options(tmp_path / "a", 1))
+    aggressive.train_step(trainer(), BATCH)
+    text = Path(aggressive.run_dir(), "workspace/reference/example_updater.py").read_text()
+    assert "LR_CONTROLLER = False" in text
+    compile(text, "example_updater.py", "exec")
+
+
+def device_trainer():
+    init = {"w": np.array([0.3, -0.2, 0.1, 0.4], np.float32), "b": np.zeros(2, np.float32)}
+    try:
+        return rlx.Trainer(graph(), wrt=["w", "b"], init=init, optimizer=OPT, device="metal", resident=True)
+    except Exception:
+        return None
+
+
+GROUPS_JSON = json.dumps({"groups": [{"names": ["w"], "optimizer": {"kind": "muon", "lr": 0.02}},
+                                     {"names": ["*"], "optimizer": {"kind": "adamw", "lr": 0.05}}]})
+
+
+def stand_in_rules_cli(tmp_path, updater_json):
+    """`stand_in_cli`, writing updater.json."""
+    backend = stand_in_cli(tmp_path, "")
+    path = Path(backend["program"])
+    path.write_text(path.read_text().replace('"updater.py", "content": ""',
+                                             f'"updater.json", "content": {json.dumps(updater_json)}'))
+    return backend
+
+
+def test_on_a_resident_trainer_the_program_runs_on_the_device(tmp_path):
+    plain = device_trainer()
+    if plain is None:
+        pytest.skip("no metal backend in this build")
+    plain_losses = [plain.step(BATCH) for _ in range(30)]
+    t = device_trainer()
+    agent = rlx.AgentOptimizer(GOAL, 30, optimizer=OPT, **options(tmp_path, 2))
+    losses = [agent.train_step(t, BATCH) for _ in range(30)]
+    np.testing.assert_allclose(losses, plain_losses, rtol=1e-6)
+
+    t = device_trainer()
+    agent = rlx.AgentOptimizer(GOAL, 30, optimizer=OPT, backend="claude",
+                               backend_options=stand_in_rules_cli(tmp_path, GROUPS_JSON),
+                               **options(tmp_path, 1, blocking=True, trial_steps=5))
+    losses = [agent.train_step(t, BATCH) for _ in range(30)]
+    assert agent.version() == 1 and all(np.isfinite(losses))
+    kinds = [e["kind"] for e in events(agent.run_dir())]
+    assert "applied" in kinds and "trial_passed" in kinds
+
+    # A Python program cannot run there: the run says so.
+    with pytest.raises(Exception, match="device"):
+        py = rlx.AgentOptimizer(GOAL, 30, optimizer=OPT, program="python", **options(tmp_path / "py", 1))
+        py.train_step(device_trainer(), BATCH)
+
+
+def test_a_rules_run_from_python_offers_check_program(tmp_path):
+    agent = rlx.AgentOptimizer(GOAL, 30, optimizer=OPT, backend="claude",
+                               backend_options=stand_in_rules_cli(tmp_path, GROUPS_JSON), **options(tmp_path))
+    t = trainer()
+    for _ in range(30):
+        agent.train_step(t, BATCH)
+    ws = Path(agent.run_dir(), "workspace")
+    spec = json.loads((ws / "reference/check.json").read_text())
+    assert spec["host"]["program"] == "rules"
+    import subprocess
+    out = subprocess.run([sys.executable, "-m", "pyrlx.agent", "check-program", str(ws)], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr + out.stdout
+    assert "builds for 2 params" in out.stdout

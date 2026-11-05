@@ -70,6 +70,27 @@ pub fn export(
     episodes: usize,
 ) -> Result<Value, String> {
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    if let Some(store) = ws.store() {
+        // A package space ships its edits: the adapter over the base package.
+        let base = store.path.clone();
+        let path = ws.model_path()?;
+        let mut files = Vec::new();
+        if path.display().to_string() != base {
+            std::fs::copy(&path, out.join("adapter.rlxp")).map_err(|e| e.to_string())?;
+            files.push("adapter.rlxp");
+        }
+        let doc = json!({
+            "base_package": base,
+            "files": files,
+            "edited_tensors": ws.state.params.keys().collect::<Vec<_>>(),
+            "low_rank": ws.state.lowrank.iter().map(|(n, f)| (n.clone(), f.len())).collect::<BTreeMap<_, _>>(),
+            "rewrites": ws.state.rewrites,
+            "note": "open adapter.rlxp with rlx-runtime (it references the base package); rewrites \
+                     are replayed by rlx-wsp, not stored in the adapter",
+        });
+        std::fs::write(out.join("export.json"), format!("{doc:#}\n")).map_err(|e| e.to_string())?;
+        return Ok(doc);
+    }
     let g = baked_graph(ws)?;
     let text = rlx_ir::rlxmodel::to_text(&g).map_err(|e| e.to_string())?;
     std::fs::write(out.join("model.rlxmodel"), text).map_err(|e| e.to_string())?;
@@ -104,7 +125,7 @@ pub fn export(
         .map(|t| t.data.iter().filter(|v| **v != 0.0).count())
         .sum();
 
-    let scored = ws.state.graph.is_none();
+    let scored = !ws.is_loaded();
     let (f32_score, int8_score) = if scored {
         let live = ws.state.params.clone();
         let f = ws.held_out(episodes)?;

@@ -1758,23 +1758,28 @@ pub fn group_norm_nchw(
     for b in 0..batch {
         for g in 0..num_groups {
             let c0 = g * cpg;
-            let mut mean = 0.0f32;
+            // Statistics accumulate in f64: a group spans whole volumes (a
+            // 96^3 instance norm is 884k terms), and a running f32 sum over
+            // that many values drifted to 1.7e-4 relative error at zero mean
+            // and 2e-3 at a DC offset of 50.
+            let mut sum = 0.0f64;
             for c in 0..cpg {
                 let plane = &input
                     [((b * channels + c0 + c) * spatial)..((b * channels + c0 + c + 1) * spatial)];
-                mean += plane.iter().sum::<f32>();
+                sum += plane.iter().map(|&v| v as f64).sum::<f64>();
             }
-            mean /= n;
-            let mut var = 0.0f32;
+            let mean64 = sum / n as f64;
+            let mut var = 0.0f64;
             for c in 0..cpg {
                 let plane = &input
                     [((b * channels + c0 + c) * spatial)..((b * channels + c0 + c + 1) * spatial)];
                 for &v in plane {
-                    let d = v - mean;
+                    let d = v as f64 - mean64;
                     var += d * d;
                 }
             }
-            var /= n;
+            let var = (var / n as f64) as f32;
+            let mean = mean64 as f32;
             let inv = 1.0 / (var + eps).sqrt();
             for c in 0..cpg {
                 let gi = c0 + c;

@@ -1,0 +1,5041 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+#![allow(unsafe_op_in_unsafe_fn)]
+use crate::thunk::*;
+
+/// Execute a thunk schedule on a raw arena buffer.
+/// Fastest executor: call pre-compiled closures sequentially.
+/// Zero match dispatch — each closure is a direct kernel call.
+pub fn execute_compiled(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
+    let base = arena_buf.as_mut_ptr();
+    // `RLX_CPU_WATCH=<byte_offset>:<n_floats>` reports every thunk that changes
+    // the watched region. A node read by one thunk and written by a LATER one
+    // is a scheduling hazard the post-run arena dump cannot see: it shows the
+    // final value, so the reader looks like it was fed data it never got.
+    if let Some(spec) = rlx_ir::env::var("RLX_CPU_WATCH") {
+        let mut it = spec
+            .split(':')
+            .filter_map(|t| t.trim().parse::<usize>().ok());
+        if let (Some(off), Some(len)) = (it.next(), it.next()) {
+            let mut prev: Option<Vec<f32>> = None;
+            for (i, f) in schedule.compiled_fns.iter().enumerate() {
+                f(base);
+                let cur: Vec<f32> =
+                    unsafe { std::slice::from_raw_parts(base.add(off) as *const f32, len) }
+                        .to_vec();
+                if prev.as_deref() != Some(cur.as_slice()) {
+                    let tabs: f64 = cur.iter().map(|&v| v.abs() as f64).sum();
+                    eprintln!(
+                        "[rlx-cpu-watch] thunk {i} {:?} changed watch: tabs={tabs:.6}",
+                        schedule.thunks.get(i).map(std::mem::discriminant)
+                    );
+                    prev = Some(cur);
+                }
+            }
+            return;
+        }
+    }
+    for f in &schedule.compiled_fns {
+        f(base);
+    }
+}
+
+/// Active-extent execution stub. The runtime calls this when it has an
+/// active-extent hint set. CPU doesn't implement per-thunk active-extent
+/// scaling yet — return false so the caller falls back to the full
+/// `execute_thunks` path.
+pub fn execute_thunks_active(
+    schedule: &ThunkSchedule,
+    _arena_buf: &mut [u8],
+    _actual: usize,
+    _upper: usize,
+) -> bool {
+    let _ = schedule;
+    false
+}
+
+/// Match-based executor (fallback, used by tests).
+pub(crate) struct MoeResidencyGuard;
+impl Drop for MoeResidencyGuard {
+    fn drop(&mut self) {
+        if let Some(stats) = crate::moe_residency::take_stats() {
+            crate::moe_residency::stash_last_forward_stats(stats);
+        } else {
+            crate::moe_residency::clear_mask();
+        }
+    }
+}
+
+/// Contiguous AVX2 Add/Mul/Sub. Large buffers are split across Rayon so we
+/// keep SIMD *and* multi-core (serial AVX2 alone lost to 16-wide scalar rayon
+/// on F5-TTS DiT residuals).
+#[cfg(rlx_cpu_x86)]
+#[inline]
+fn binary_contig_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp) -> bool {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return false;
+    }
+    if !matches!(op, BinaryOp::Add | BinaryOp::Mul | BinaryOp::Sub) {
+        return false;
+    }
+    let len = o.len();
+    let l_ptr = l.as_ptr() as usize;
+    let r_ptr = r.as_ptr() as usize;
+    let o_ptr = o.as_mut_ptr() as usize;
+    let run = |i0: usize, i1: usize| unsafe {
+        // SAFETY: AVX2 checked above, `op` is Add/Sub/Mul, and `[i0, i1)` is
+        // within `len` — the bound every caller below is derived from.
+        binary_contig_avx2(
+            l_ptr as *const f32,
+            r_ptr as *const f32,
+            o_ptr as *mut f32,
+            i0,
+            i1,
+            op,
+        )
+    };
+    if crate::pool::should_parallelize(len) {
+        crate::pool::par_for(len, crate::pool::chunk_floor(len), &|off, cnt| {
+            run(off, off + cnt);
+        });
+    } else {
+        run(0, len);
+    }
+    true
+}
+
+/// 8-wide Add/Sub/Mul over `[i0, i1)` of three raw f32 buffers.
+///
+/// Carries `#[target_feature(enable = "avx2")]` for a reason that is invisible
+/// in the source and obvious in the disassembly: `_mm256_*` are themselves
+/// `#[target_feature]` fns, so a caller that merely *checks* AVX2 at runtime
+/// cannot inline them — each becomes a `call` plus a `vzeroupper`, four per 8
+/// lanes. Measured that way this path ran at ~7-9 GB/s against ~70-124 GB/s
+/// for the plain scalar loop it exists to beat, i.e. the "fast path" was an
+/// 8-18x pessimization. With the attribute here the intrinsics inline and it
+/// matches the hand-written-SIMD number. Same shape as every other AVX2
+/// kernel in this crate (`silu_inplace_avx2`, `softmax_rows_avx2`, …): tiny
+/// runtime-gated wrapper, `#[target_feature]` body.
+///
+/// # Safety
+/// Caller has checked `is_x86_feature_detected!("avx2")`, `op` is one of
+/// Add/Sub/Mul, and `[i0, i1)` is in bounds of all three buffers.
+#[cfg(rlx_cpu_x86)]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn binary_contig_avx2(
+    l: *const f32,
+    r: *const f32,
+    o: *mut f32,
+    i0: usize,
+    i1: usize,
+    op: BinaryOp,
+) {
+    use std::arch::x86_64::*;
+    let mut i = i0;
+    // Align to 8-wide when possible within the chunk.
+    while i + 8 <= i1 {
+        let a = _mm256_loadu_ps(l.add(i));
+        let b = _mm256_loadu_ps(r.add(i));
+        let res = match op {
+            BinaryOp::Add => _mm256_add_ps(a, b),
+            BinaryOp::Sub => _mm256_sub_ps(a, b),
+            BinaryOp::Mul => _mm256_mul_ps(a, b),
+            _ => unreachable!(),
+        };
+        _mm256_storeu_ps(o.add(i), res);
+        i += 8;
+    }
+    while i < i1 {
+        let a = *l.add(i);
+        let b = *r.add(i);
+        *o.add(i) = match op {
+            BinaryOp::Add => a + b,
+            BinaryOp::Sub => a - b,
+            BinaryOp::Mul => a * b,
+            _ => unreachable!(),
+        };
+        i += 1;
+    }
+}
+
+#[cfg(not(rlx_cpu_x86))]
+#[inline]
+#[allow(dead_code)]
+fn binary_contig_f32(_l: &[f32], _r: &[f32], _o: &mut [f32], _op: BinaryOp) -> bool {
+    false
+}
+
+/// Row-tiled rhs broadcast: `o[i] = op(l[i], r[i % rl])` with optional AVX2.
+#[inline]
+fn binary_row_bcast_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp, rl: usize) -> bool {
+    let len = o.len();
+    if rl == 0 || rl >= len || !len.is_multiple_of(rl) || l.len() < len || r.len() < rl {
+        return false;
+    }
+    let rows = len / rl;
+    let l_ptr = l.as_ptr() as usize;
+    let r_ptr = r.as_ptr() as usize;
+    let o_ptr = o.as_mut_ptr() as usize;
+
+    #[cfg(rlx_cpu_x86)]
+    let use_avx2 = rl >= 8
+        && rl.is_multiple_of(8)
+        && matches!(op, BinaryOp::Add | BinaryOp::Mul | BinaryOp::Sub)
+        && std::arch::is_x86_feature_detected!("avx2");
+
+    let run_rows = |row0: usize, row1: usize| unsafe {
+        let l = l_ptr as *const f32;
+        let r = r_ptr as *const f32;
+        let o = o_ptr as *mut f32;
+        #[cfg(rlx_cpu_x86)]
+        if use_avx2 {
+            // SAFETY: AVX2 + `rl % 8 == 0` + Add/Sub/Mul all checked in
+            // `use_avx2`; rows `[row0, row1)` are within `rows`.
+            binary_row_bcast_avx2(l, r, o, row0, row1, rl, op);
+            return;
+        }
+        for row in row0..row1 {
+            let base = row * rl;
+            for j in 0..rl {
+                let i = base + j;
+                let a = *l.add(i);
+                let b = *r.add(j);
+                *o.add(i) = match op {
+                    BinaryOp::Add => a + b,
+                    BinaryOp::Sub => a - b,
+                    BinaryOp::Mul => a * b,
+                    BinaryOp::Div => a / b,
+                    BinaryOp::Max => a.max(b),
+                    BinaryOp::Min => a.min(b),
+                    BinaryOp::Pow => a.powf(b),
+                    BinaryOp::Mod => a % b,
+                    BinaryOp::Atan2 => a.atan2(b),
+                    BinaryOp::BitAnd => ((a as i64) & (b as i64)) as f32,
+                    BinaryOp::BitOr => ((a as i64) | (b as i64)) as f32,
+                    BinaryOp::BitXor => ((a as i64) ^ (b as i64)) as f32,
+                    BinaryOp::Shl => (a as i64).wrapping_shl(b as u32) as f32,
+                    BinaryOp::Shr => (a as i64).wrapping_shr(b as u32) as f32,
+                };
+            }
+        }
+    };
+    if rows >= 4 && crate::pool::should_parallelize(len) {
+        crate::pool::par_for(rows, 1, &|off, cnt| run_rows(off, off + cnt));
+    } else {
+        run_rows(0, rows);
+    }
+    true
+}
+
+/// Row-broadcast `o[row*rl + j] = op(l[row*rl + j], r[j])`, 8 lanes at a time.
+///
+/// Split out for the same reason as [`binary_contig_avx2`] — the intrinsics
+/// only inline inside a fn that actually has AVX2 enabled.
+///
+/// # Safety
+/// Caller has checked `is_x86_feature_detected!("avx2")`, that `rl` is a
+/// non-zero multiple of 8, that `op` is one of Add/Sub/Mul, and that rows
+/// `[row0, row1)` are in bounds of all three buffers.
+#[cfg(rlx_cpu_x86)]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn binary_row_bcast_avx2(
+    l: *const f32,
+    r: *const f32,
+    o: *mut f32,
+    row0: usize,
+    row1: usize,
+    rl: usize,
+    op: BinaryOp,
+) {
+    use std::arch::x86_64::*;
+    let chunks = rl / 8;
+    for row in row0..row1 {
+        let base = row * rl;
+        for c in 0..chunks {
+            let off = base + c * 8;
+            let roff = c * 8;
+            let a = _mm256_loadu_ps(l.add(off));
+            let b = _mm256_loadu_ps(r.add(roff));
+            let res = match op {
+                BinaryOp::Add => _mm256_add_ps(a, b),
+                BinaryOp::Sub => _mm256_sub_ps(a, b),
+                BinaryOp::Mul => _mm256_mul_ps(a, b),
+                _ => unreachable!(),
+            };
+            _mm256_storeu_ps(o.add(off), res);
+        }
+    }
+}
+
+pub(crate) fn thunk_kind_name(t: &Thunk) -> &'static str {
+    // Zero-alloc variant name from the derived `IntoStaticStr` on `Thunk`
+    // (see its definition). Covers EVERY variant automatically, so a newly
+    // added thunk is labeled by name instead of silently bucketing into
+    // "Other" — which had hidden the pathologically slow AttentionBackward.
+    <&'static str>::from(t)
+}
+
+/// Per-thunk-kind wall-time accumulator, populated only when the env var
+/// `RLX_PROFILE_THUNKS` is set. Used to see which ops dominate a step so the
+/// optimizer/kernels can target the real hotspots rather than guesses.
+pub(crate) static THUNK_PROFILE: std::sync::Mutex<
+    Option<std::collections::BTreeMap<&'static str, (u128, u64)>>,
+> = std::sync::Mutex::new(None);
+
+#[inline]
+pub(crate) fn profile_record(name: &'static str, d: std::time::Duration) {
+    let mut g = THUNK_PROFILE.lock().unwrap();
+    let map = g.get_or_insert_with(std::collections::BTreeMap::new);
+    let e = map.entry(name).or_insert((0, 0));
+    e.0 += d.as_nanos();
+    e.1 += 1;
+}
+
+/// Print and clear the per-thunk-kind time profile gathered under
+/// `RLX_PROFILE_THUNKS`. Call after a run to see where the time went.
+pub fn dump_thunk_profile() {
+    let mut g = THUNK_PROFILE.lock().unwrap();
+    if let Some(map) = g.take() {
+        let mut v: Vec<_> = map.into_iter().collect();
+        v.sort_by_key(|b| std::cmp::Reverse(b.1.0));
+        let total: u128 = v.iter().map(|(_, (ns, _))| *ns).sum();
+        eprintln!(
+            "[thunk-profile] total {:.1}ms across kinds:",
+            total as f64 / 1e6
+        );
+        for (name, (ns, c)) in v.iter().take(25) {
+            eprintln!("  {name:<28} {:>8.1}ms  ({c} calls)", *ns as f64 / 1e6);
+        }
+    }
+}
+
+/// Do the arena byte ranges `[a, a + a_elems*4)` and `[c, c + c_elems*4)`
+/// overlap at all?
+///
+/// The BLAS aliasing guard has to compare *ranges*, not pointers. When a
+/// fusion folds a `Transpose` into a matmul, the surviving operand is the
+/// transpose's *source* buffer, which the planner scored as dead at the
+/// transpose — so its slot is free to be reused for the matmul's own output.
+/// That leaves an operand sitting strictly inside the destination (WavTokenizer
+/// attention: `probs @ V` reads a 256 B `probs` from the middle of its own
+/// 24 KB output slot). `ptr::eq` sees two different addresses and waves it
+/// through, after which cblas streams `probs` while overwriting it. Accelerate
+/// happens to pack its operands up front and survives; OpenBLAS does not, which
+/// is why this only ever corrupted x86_64.
+#[inline]
+fn arena_ranges_overlap(a: usize, a_elems: usize, c: usize, c_elems: usize) -> bool {
+    a < c + c_elems * 4 && c < a + a_elems * 4
+}
+
+/// `Thunk::Sgemm`, operands clamped to the arena and staged through a
+/// temporary when one sits inside the destination (see [`arena_ranges_overlap`]).
+pub(crate) fn exec_sgemm(t: &Thunk, base: *mut u8, arena_len: usize, trace: bool) {
+    let Thunk::Sgemm { a, b, c, m, k, n } = t else {
+        unreachable!()
+    };
+    let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+    if trace {
+        eprintln!("[sgemm] m={m} k={k} n={n} a={} b={} c={}", *a, *b, *c);
+    }
+    let c_len = m.saturating_mul(n);
+    let a_len = m.saturating_mul(k);
+    let b_len = k.saturating_mul(n);
+    let max_a = (arena_len.saturating_sub(*a)) / 4;
+    let max_b = (arena_len.saturating_sub(*b)) / 4;
+    let max_c = (arena_len.saturating_sub(*c)) / 4;
+    let a_len = a_len.min(max_a);
+    let b_len = b_len.min(max_b);
+    let c_len = c_len.min(max_c);
+    unsafe {
+        let a_sl = sl(*a, base, a_len);
+        let b_sl = sl(*b, base, b_len);
+        let c_sl = sl_mut(*c, base, c_len);
+        if arena_ranges_overlap(*a, a_len, *c, c_len) || arena_ranges_overlap(*b, b_len, *c, c_len)
+        {
+            let mut tmp = vec![0.0f32; c_len];
+            crate::blas::sgemm_auto(a_sl, b_sl, &mut tmp, m, k, n);
+            c_sl.copy_from_slice(&tmp);
+        } else {
+            crate::blas::sgemm_auto(a_sl, b_sl, c_sl, m, k, n);
+        }
+    }
+}
+
+/// The same range test where only the slices are in hand.
+///
+/// The batched matmul paths build their per-item slices from raw pointers, so
+/// they have no arena offsets to compare — and they were left on `ptr::eq` when
+/// the non-batched paths were fixed. A batched attention (`probs @ V` per head)
+/// is exactly where an operand ends up strictly inside its own output slot, so
+/// the weaker guard let cblas stream an operand it was simultaneously
+/// overwriting: a band of query rows corrupted, varying run to run with the
+/// order BLAS happened to pack in, and cured by `RLX_ARENA_NO_REUSE=1`.
+#[inline]
+fn slices_overlap(a: &[f32], c: &[f32]) -> bool {
+    let (a0, a1) = (a.as_ptr() as usize, a.as_ptr() as usize + a.len() * 4);
+    let (c0, c1) = (c.as_ptr() as usize, c.as_ptr() as usize + c.len() * 4);
+    a0 < c1 && c0 < a1
+}
+
+/// Coalesce a broadcast's axes without changing its element → (lhs, rhs)
+/// index map: drop size-1 axes, then fold each axis into the one outside it
+/// when `stride[outer] == stride[inner] * size[inner]` for both operands.
+fn coalesce_bcast_axes(dims: &[u32], ls: &[u32], rs: &[u32]) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let (mut d, mut l, mut r) = (
+        Vec::with_capacity(dims.len()),
+        Vec::with_capacity(dims.len()),
+        Vec::<u32>::with_capacity(dims.len()),
+    );
+    for ax in 0..dims.len() {
+        let (sz, la, ra) = (dims[ax], ls[ax], rs[ax]);
+        if sz == 1 {
+            continue;
+        }
+        if let (Some(dl), Some(pl), Some(pr)) = (d.last_mut(), l.last_mut(), r.last_mut()) {
+            let merged = u64::from(*dl) * u64::from(sz);
+            if u64::from(*pl) == u64::from(la) * u64::from(sz)
+                && u64::from(*pr) == u64::from(ra) * u64::from(sz)
+                && merged <= u64::from(u32::MAX)
+            {
+                (*dl, *pl, *pr) = (merged as u32, la, ra);
+                continue;
+            }
+        }
+        d.push(sz);
+        l.push(la);
+        r.push(ra);
+    }
+    (d, l, r)
+}
+
+pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
+    // Run the whole schedule on a pool worker (default; `RLX_CPU_EXEC_IN_POOL=0`
+    // opts out). Called
+    // from outside the pool, every parallel kernel parks this thread until the
+    // workers finish and then waits for it to be woken — per GEMV, per
+    // attention, ~225 times per decoded token. On a worker the kernels' joins
+    // spin instead, and this thread's share of the work is done by the worker
+    // it runs on. Thread-local kernel state (MoE residency masks, counters)
+    // then lives on that worker.
+    #[cfg(not(target_family = "wasm"))]
+    if exec_in_pool()
+        && rayon::current_thread_index().is_none()
+        && crate::pool::num_threads() > 1
+        && !waits_on_peers(schedule)
+    {
+        return rayon::scope(|_| execute_thunks_here(schedule, arena_buf));
+    }
+    execute_thunks_here(schedule, arena_buf)
+}
+
+/// A schedule with a kernel that blocks on other ranks stays on the caller's
+/// thread (see [`crate::op_registry::CpuKernel::waits_on_peers`]).
+#[cfg(not(target_family = "wasm"))]
+fn waits_on_peers(schedule: &ThunkSchedule) -> bool {
+    schedule
+        .thunks
+        .iter()
+        .any(|t| matches!(t, Thunk::CustomOp { kernel, .. } if kernel.waits_on_peers()))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn exec_in_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // On by default: measured on GraphCSPNet training (many small kernels per
+    // step), 124.6 s → 50.0 s wall, system time 81 s → 48 s.
+    *ON.get_or_init(|| rlx_ir::env::flag_or("RLX_CPU_EXEC_IN_POOL", true))
+}
+
+fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
+    crate::moe_residency::reset_gmm_counters();
+    if let Some(layers) = schedule.moe_resident_layers.clone() {
+        crate::moe_residency::set_per_layer_masks(Some(layers));
+    } else {
+        crate::moe_residency::set_mask(schedule.moe_resident.clone());
+    }
+    if let Some(cap) = schedule.moe_topk_capture.as_ref() {
+        cap.clear();
+    }
+    let _moe_guard = MoeResidencyGuard;
+    let base = arena_buf.as_mut_ptr();
+    let mask_thr = schedule.mask_threshold;
+    let mask_neg = schedule.mask_neg_inf;
+    let score_thr = schedule.score_skip;
+    let thunks = &schedule.thunks;
+    let len = thunks.len();
+
+    // Pre-allocate ALL reusable buffers once (zero per-call allocation)
+    let max_h = thunks
+        .iter()
+        .filter_map(|t| match t {
+            Thunk::FusedResidualLN { h, .. }
+            | Thunk::FusedResidualRmsNorm { h, .. }
+            | Thunk::LayerNorm { h, .. } => Some(*h as usize),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let zero_bias = vec![0f32; max_h];
+
+    // Pre-allocate per-(batch,head) score buffers for parallel SDPA.
+    // Q/K/V/out are accessed via strided BLAS — no deinterleave copy needed.
+    let max_sdpa = thunks
+        .iter()
+        .filter_map(|t| match t {
+            Thunk::Attention {
+                batch,
+                seq,
+                kv_seq,
+                heads,
+                head_dim,
+                ..
+            } => Some((
+                *batch as usize,
+                (*seq as usize).max(*kv_seq as usize),
+                *heads as usize,
+                *head_dim as usize,
+            )),
+            _ => None,
+        })
+        .fold((0, 0, 0, 0), |(mb, ms, mh, md), (b, s, h, d)| {
+            (mb.max(b), ms.max(s), mh.max(h), md.max(d))
+        });
+    let (max_batch, max_seq, max_heads, _max_dh) = max_sdpa;
+    let _ = (max_batch, max_seq, max_heads);
+    // Heads whose score matrix is large run row-blocked with per-worker
+    // buffers (`sdpa_row_blocked`): they need none of this up-front scratch,
+    // which for long sequences would be gigabytes zeroed on every run.
+    let sdpa_need = thunks
+        .iter()
+        .filter_map(|t| match t {
+            Thunk::Attention {
+                batch,
+                seq,
+                kv_seq,
+                heads,
+                mask_kind,
+                bhsd,
+                head_dim,
+                v_head_dim,
+                ..
+            } => {
+                let (b, q, k, h) = (
+                    *batch as usize,
+                    *seq as usize,
+                    *kv_seq as usize,
+                    *heads as usize,
+                );
+                if sdpa_row_blocked(q, k, *mask_kind, *bhsd)
+                    && sdpa_sme_blocks(q, k, *head_dim as usize, *v_head_dim as usize)
+                {
+                    Some(0)
+                } else {
+                    let s = q.max(k);
+                    Some(b * h * s * s)
+                }
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let mut sdpa_scores = vec![0f32; sdpa_need];
+
+    // Pre-allocate fused layer buffers (reused across all 12+ layers — zero malloc per layer)
+    let fl = thunks
+        .iter()
+        .filter_map(|t| match t {
+            Thunk::FusedBertLayer {
+                batch,
+                seq,
+                hs,
+                int_dim,
+                ..
+            } => {
+                let m = (*batch as usize) * (*seq as usize);
+                let h = *hs as usize;
+                let id = *int_dim as usize;
+                Some((m, h, id, m * (*seq as usize)))
+            }
+            Thunk::FusedNomicLayer {
+                batch,
+                seq,
+                hs,
+                int_dim,
+                ..
+            } => {
+                let m = (*batch as usize) * (*seq as usize);
+                let h = *hs as usize;
+                let id = *int_dim as usize;
+                Some((m, h, id, m * (*seq as usize)))
+            }
+            _ => None,
+        })
+        .fold((0, 0, 0, 0), |(mm, mh, mi, ms), (m, h, id, ss)| {
+            (mm.max(m), mh.max(h), mi.max(id), ms.max(ss))
+        });
+    let (fl_m, fl_h, fl_int, fl_ss) = fl;
+    let mut fl_qkv = vec![0f32; fl_m * 3 * fl_h];
+    let mut fl_attn = vec![0f32; fl_m * fl_h];
+    let mut fl_res = vec![0f32; fl_m * fl_h];
+    let mut fl_normed = vec![0f32; fl_m * fl_h];
+    let mut fl_ffn = vec![0f32; fl_m * fl_int.max(2 * fl_int)]; // Nomic needs 2×int for fused fc11+fc12
+    let mut fl_sc = vec![0f32; fl_ss.max(1)];
+
+    let trace_thunks = rlx_ir::env::var_os("RLX_TRACE_THUNK").is_some();
+    if trace_thunks {
+        eprintln!(
+            "[thunk] prealloc max_h={max_h} sdpa={} fl_m={fl_m} fl_h={fl_h} fl_int={fl_int}",
+            sdpa_need
+        );
+    }
+    let profile = rlx_ir::env::var_os("RLX_PROFILE_THUNKS").is_some();
+    // Time the previous thunk at the top of each iteration (avoids touching the
+    // giant match's many arms). The last thunk's tail is folded into the next
+    // step's first sample — negligible over a training run.
+    let mut prof_prev: Option<(&'static str, std::time::Instant)> = None;
+    // Byte-range write tracer (`RLX_ARENA_WRITE_TRACE=1`). Snapshots the arena
+    // around every thunk and reports the exact range each one dirtied, so a
+    // kernel that writes past its planned slot — the classic SIMD-tail overrun
+    // that corrupts whichever buffer the planner reused next — is named
+    // directly instead of inferred. O(arena) per thunk, so diagnostics only.
+    let write_trace = rlx_ir::env::var_os("RLX_ARENA_WRITE_TRACE").is_some();
+    let mut wt_before: Vec<u8> = if write_trace {
+        arena_buf.to_vec()
+    } else {
+        Vec::new()
+    };
+    // `RLX_CPU_WATCH=<byte_offset>:<n_floats>` reports the watched region's
+    // contents whenever they change, naming the thunk about to run — so the
+    // writer is the thunk *before* the one printed. A node written after its
+    // reader is a scheduling hazard invisible to the post-run arena dump,
+    // which only ever shows the final value.
+    let watch = rlx_ir::env::var("RLX_CPU_WATCH").and_then(|spec| {
+        let mut it = spec
+            .split(':')
+            .filter_map(|t| t.trim().parse::<usize>().ok());
+        Some((it.next()?, it.next()?))
+    });
+    let mut watch_prev: Option<Vec<f32>> = None;
+    // `RLX_CPU_DUMP_THUNKS=<lo>:<hi>` prints the compiled thunks in that index
+    // range, with their arena offsets and dimensions — the arguments a kernel
+    // actually receives, as opposed to the ones the graph implies.
+    if let Some(spec) = rlx_ir::env::var("RLX_CPU_DUMP_THUNKS") {
+        let mut it = spec
+            .split(':')
+            .filter_map(|t| t.trim().parse::<usize>().ok());
+        if let (Some(lo), Some(hi)) = (it.next(), it.next()) {
+            for (i, t) in thunks.iter().enumerate().take(hi.min(len)).skip(lo) {
+                let detail = match t {
+                    Thunk::FusedMmBiasAct {
+                        a,
+                        w,
+                        bias,
+                        c,
+                        m,
+                        k,
+                        n,
+                        act,
+                    } => format!(" a={a} w={w} bias={bias} c={c} m={m} k={k} n={n} act={act:?}"),
+                    Thunk::Sgemm { a, b, c, m, k, n } => {
+                        format!(" a={a} b={b} c={c} m={m} k={k} n={n}")
+                    }
+                    _ => String::new(),
+                };
+                eprintln!("[rlx-cpu-thunk] {i} {}{detail}", thunk_kind_name(t));
+            }
+        }
+    }
+    // Waves (`wave-exec`): independent runs of thunks execute level by level
+    // on the pool. Off under every per-thunk diagnostic, which assumes order.
+    #[cfg(feature = "wave-exec")]
+    let waves = (crate::thunk::waves_enabled()
+        && !profile
+        && !trace_thunks
+        && !write_trace
+        && watch.is_none())
+    .then(|| crate::thunk::plan_for(schedule).clone());
+    #[cfg(feature = "wave-exec")]
+    let (mut wave_cursor, mut wave_until) = (0usize, 0usize);
+    for i in 0..len {
+        #[cfg(feature = "wave-exec")]
+        if let Some(plan) = waves.as_deref() {
+            if i < wave_until {
+                continue;
+            }
+            if let Some(end) = crate::thunk::try_run_segment(
+                plan,
+                &mut wave_cursor,
+                i,
+                thunks,
+                base,
+                arena_buf.len(),
+            ) {
+                wave_until = end;
+                continue;
+            }
+        }
+        if profile {
+            if let Some((pn, pt)) = prof_prev.take() {
+                profile_record(pn, pt.elapsed());
+            }
+        }
+        let thunk = unsafe { thunks.get_unchecked(i) };
+        if let Some((woff, wlen)) = watch {
+            let cur: Vec<f32> =
+                unsafe { std::slice::from_raw_parts(base.add(woff) as *const f32, wlen) }.to_vec();
+            if watch_prev.as_deref() != Some(cur.as_slice()) {
+                let tabs: f64 = cur.iter().map(|&v| v.abs() as f64).sum();
+                eprintln!(
+                    "[rlx-cpu-watch] before thunk {i} ({}) tabs={tabs:.6}",
+                    thunk_kind_name(thunk)
+                );
+                watch_prev = Some(cur);
+            }
+        }
+        if trace_thunks && (i < 120 || i % 200 == 0 || i + 1 == len) {
+            eprintln!("[thunk {i}/{len}] {}", thunk_kind_name(thunk));
+        }
+        let trace_done = trace_thunks && i < 120;
+        if profile {
+            prof_prev = Some((thunk_kind_name(thunk), std::time::Instant::now()));
+        }
+        match thunk {
+            Thunk::Nop => exec_nop(thunk),
+            Thunk::ElementwiseRegion { .. } => exec_elementwise_region(thunk, base),
+            Thunk::GaussianSplatRender { .. } => exec_gaussian_splat_render(thunk, base),
+            Thunk::GaussianSplatRenderBackward { .. } => {
+                exec_gaussian_splat_render_backward(thunk, base)
+            }
+            Thunk::GaussianSplatPrepare { .. } => exec_gaussian_splat_prepare(thunk, base),
+            Thunk::GaussianSplatRasterize { .. } => exec_gaussian_splat_rasterize(thunk, base),
+            Thunk::Fft1d { .. } => exec_fft1d(thunk, base),
+            Thunk::Fft1dQ { .. } => exec_fft1d_q(thunk, base),
+            Thunk::FftButterflyStage { .. } => exec_fft_butterfly_stage(thunk, base),
+            Thunk::LogMel { .. } => exec_log_mel(thunk, base),
+            Thunk::LogMelBackward { .. } => exec_log_mel_backward(thunk, base),
+            Thunk::WelchPeaks { .. } => exec_welch_peaks(thunk, base),
+            Thunk::CustomFn { .. } => exec_custom_fn(thunk, base),
+            Thunk::Sgemm { .. } => exec_sgemm(thunk, base, arena_buf.len(), trace_thunks),
+
+            Thunk::SgemmHalf {
+                a,
+                b,
+                c,
+                m,
+                k,
+                n,
+                a_kind,
+                b_kind,
+                c_kind,
+            } => {
+                let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+                let (a_len, b_len, c_len) = (m * k, k * n, m * n);
+                unsafe {
+                    let a_buf;
+                    let a_sl: &[f32] = if a_kind.packed() {
+                        a_buf = crate::blas::widen_half_vec(
+                            sl_typed::<u16>(*a, base, a_len),
+                            *a_kind == crate::thunk::HalfKind::Bf16,
+                        );
+                        &a_buf
+                    } else {
+                        sl(*a, base, a_len)
+                    };
+                    let b_buf;
+                    let b_sl: &[f32] = if b_kind.packed() {
+                        b_buf = crate::blas::widen_half_vec(
+                            sl_typed::<u16>(*b, base, b_len),
+                            *b_kind == crate::thunk::HalfKind::Bf16,
+                        );
+                        &b_buf
+                    } else {
+                        sl(*b, base, b_len)
+                    };
+                    if c_kind.packed() {
+                        let mut tmp = vec![0f32; c_len];
+                        crate::blas::sgemm_auto(a_sl, b_sl, &mut tmp, m, k, n);
+                        let dst = sl_mut_typed::<u16>(*c, base, c_len);
+                        crate::blas::round_half_into(
+                            &tmp,
+                            dst,
+                            *c_kind == crate::thunk::HalfKind::Bf16,
+                        );
+                    } else {
+                        let c_sl = sl_mut(*c, base, c_len);
+                        crate::blas::sgemm_auto(a_sl, b_sl, c_sl, m, k, n);
+                    }
+                }
+            }
+
+            Thunk::SgemmBf16 { a, b, c, m, k, n } => {
+                let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+                let c_len = m.saturating_mul(n);
+                let a_len = m.saturating_mul(k);
+                let bn = k.saturating_mul(n);
+                unsafe {
+                    let a_sl = sl(*a, base, a_len);
+                    let b16 = sl_typed::<u16>(*b, base, bn);
+                    let c_sl = sl_mut(*c, base, c_len);
+                    crate::blas::sgemm_bf16_rhs(a_sl, b16, c_sl, m, k, n);
+                }
+            }
+
+            Thunk::SgemmF16 { a, b, c, m, k, n } => {
+                let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+                let c_len = m.saturating_mul(n);
+                let a_len = m.saturating_mul(k);
+                let bn = k.saturating_mul(n);
+                unsafe {
+                    let a_sl = sl(*a, base, a_len);
+                    let b16 = sl_typed::<u16>(*b, base, bn);
+                    let c_sl = sl_mut(*c, base, c_len);
+                    crate::blas::sgemm_f16_rhs(a_sl, b16, c_sl, m, k, n);
+                }
+            }
+
+            Thunk::SgemmT {
+                a,
+                b,
+                c,
+                m,
+                k,
+                n,
+                ta,
+                tb,
+            } => {
+                // C[m,n] = op(A) @ op(B). RowMajor cblas: lda/ldb = stored
+                // row-length of each operand → m if A is transposed else k;
+                // k if B is transposed else n. Element counts are m*k / k*n
+                // regardless of layout.
+                let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+                let lda = if *ta { m } else { k };
+                let ldb = if *tb { k } else { n };
+                if trace_thunks {
+                    eprintln!(
+                        "[sgemmT] m={m} k={k} n={n} ta={ta} tb={tb} a={a}..{} b={b}..{} c={c}..{}",
+                        a + m * k * 4,
+                        b + k * n * 4,
+                        c + m * n * 4
+                    );
+                }
+                let arena_len = arena_buf.len();
+                let a_len = (m * k).min((arena_len.saturating_sub(*a)) / 4);
+                let b_len = (k * n).min((arena_len.saturating_sub(*b)) / 4);
+                let c_len = (m * n).min((arena_len.saturating_sub(*c)) / 4);
+                unsafe {
+                    let a_sl = sl(*a, base, a_len);
+                    let b_sl = sl(*b, base, b_len);
+                    let c_sl = sl_mut(*c, base, c_len);
+                    let (ap, bp) = (a_sl.as_ptr(), b_sl.as_ptr());
+                    if arena_ranges_overlap(*a, a_len, *c, c_len)
+                        || arena_ranges_overlap(*b, b_len, *c, c_len)
+                    {
+                        let mut tmp = vec![0.0f32; c_len];
+                        crate::blas::sgemm_general(
+                            ap,
+                            bp,
+                            tmp.as_mut_ptr(),
+                            m,
+                            n,
+                            k,
+                            1.0,
+                            0.0,
+                            lda,
+                            ldb,
+                            n,
+                            *ta,
+                            *tb,
+                        );
+                        c_sl.copy_from_slice(&tmp);
+                    } else {
+                        crate::blas::sgemm_general(
+                            ap,
+                            bp,
+                            c_sl.as_mut_ptr(),
+                            m,
+                            n,
+                            k,
+                            1.0,
+                            0.0,
+                            lda,
+                            ldb,
+                            n,
+                            *ta,
+                            *tb,
+                        );
+                    }
+                }
+            }
+
+            Thunk::SgdMomentum { .. } => exec_sgd_momentum(thunk, base),
+            Thunk::CgemmC64 { .. } => exec_cgemm_c64(thunk, base),
+            Thunk::DenseSolveF64 { .. } => exec_dense_solve_f64(thunk, base),
+            Thunk::DenseSolveF32 { .. } => exec_dense_solve_f32(thunk, base),
+            Thunk::CholeskyF32 { .. } => exec_cholesky(thunk, base),
+            Thunk::TriangularSolveF32 { .. } => exec_triangular_solve(thunk, base),
+            Thunk::DetF32 { .. } => exec_det(thunk, base),
+            Thunk::SortF32 { .. } => exec_sort(thunk, base),
+            Thunk::SvdF32 { .. } => exec_svd(thunk, base),
+            Thunk::QrF32 { .. } => exec_qr(thunk, base),
+            Thunk::BatchedDenseSolveF64 { .. } => exec_batched_dense_solve_f64(thunk, base),
+            Thunk::BatchedDenseSolveF32 { .. } => exec_batched_dense_solve_f32(thunk, base),
+            Thunk::BatchedDgemmF64 { .. } => exec_batched_dgemm_f64(thunk, base),
+            Thunk::BatchedSgemm {
+                a,
+                b,
+                c,
+                batch,
+                m,
+                k,
+                n,
+                a_bcast,
+                b_bcast,
+            } => {
+                let (b_, m_, k_, n_) = (*batch as usize, *m as usize, *k as usize, *n as usize);
+                if trace_thunks {
+                    eprintln!(
+                        "[batched-sgemm] batch={b_} m={m_} k={k_} n={n_} a_bcast={a_bcast} b_bcast={b_bcast} a={} b={} c={}",
+                        *a, *b, *c
+                    );
+                }
+                let a_mat = m_.saturating_mul(k_); // per-matrix element count
+                let b_mat = k_.saturating_mul(n_);
+                let c_mat = m_.saturating_mul(n_);
+                // A broadcast operand (batch dim 1) has batch stride 0 → reuse
+                // matrix 0 for every output batch; else stride by its matrix size.
+                let a_bstride = if *a_bcast { 0 } else { a_mat };
+                let b_bstride = if *b_bcast { 0 } else { b_mat };
+                let arena_len = arena_buf.len();
+                let a_cap = (arena_len.saturating_sub(*a)) / 4;
+                let b_cap = (arena_len.saturating_sub(*b)) / 4;
+                let c_cap = (arena_len.saturating_sub(*c)) / 4;
+                let a_count = if *a_bcast { 1 } else { b_ };
+                let b_count = if *b_bcast { 1 } else { b_ };
+                let a_elems = (a_count * a_mat).min(a_cap);
+                let b_elems = (b_count * b_mat).min(b_cap);
+                let c_elems = (b_ * c_mat).min(c_cap);
+                // Whole-span aliasing, decided once for the batch.
+                //
+                // A per-item check cannot see the real hazard here: with an
+                // operand stack parked inside the output slot, writing `C[0]`
+                // destroys `B[1]`, and item 1's own guard compares only its own
+                // `B[1]` against its own `C[1]` — which do not overlap. The
+                // damage lands on whichever items ran after the one that
+                // clobbered them, so it moves with the worker schedule.
+                //
+                // So the operand *stacks* are compared against the output
+                // *stack*, and if they touch at all the whole batch goes through
+                // a scratch buffer.
+                let aliased = arena_ranges_overlap(*a, a_elems, *c, c_elems)
+                    || arena_ranges_overlap(*b, b_elems, *c, c_elems);
+                if aliased {
+                    unsafe {
+                        let a_full = sl(*a, base, a_elems).to_vec();
+                        let b_full = sl(*b, base, b_elems).to_vec();
+                        let mut out = vec![0f32; c_elems];
+                        for bi in 0..b_ {
+                            let (a0, b0, c0) = (bi * a_bstride, bi * b_bstride, bi * c_mat);
+                            if a0 + a_mat > a_full.len()
+                                || b0 + b_mat > b_full.len()
+                                || c0 + c_mat > out.len()
+                            {
+                                break;
+                            }
+                            crate::blas::sgemm_auto(
+                                &a_full[a0..a0 + a_mat],
+                                &b_full[b0..b0 + b_mat],
+                                &mut out[c0..c0 + c_mat],
+                                m_,
+                                k_,
+                                n_,
+                            );
+                        }
+                        sl_mut(*c, base, c_elems).copy_from_slice(&out);
+                    }
+                    continue;
+                }
+                unsafe {
+                    let a_full = sl(*a, base, a_elems);
+                    let b_full = sl(*b, base, b_elems);
+                    let c_full = sl_mut(*c, base, c_elems);
+                    // Parallelize independent batch GEMMs with Rayon (BLAS
+                    // stays 1-thread per worker). Each task gets enough GEMMs
+                    // to be worth a hand-off: SPD layers multiply batches of
+                    // tiny C×C matrices, and one per task drowned in wake-ups.
+                    let grain = crate::pool::grain_for(m_ * k_ * n_);
+                    if b_ >= 2 * grain && crate::pool::num_threads() > 1 {
+                        let a_ptr = a_full.as_ptr() as usize;
+                        let b_ptr = b_full.as_ptr() as usize;
+                        let c_ptr = c_full.as_mut_ptr() as usize;
+                        let a_len = a_full.len();
+                        let b_len = b_full.len();
+                        let c_len = c_full.len();
+                        crate::pool::par_for(b_, grain, &|off, cnt| {
+                            for bi in off..off + cnt {
+                                let a0 = bi * a_bstride;
+                                let b0 = bi * b_bstride;
+                                let c0 = bi * c_mat;
+                                if a0 + a_mat > a_len || b0 + b_mat > b_len || c0 + c_mat > c_len {
+                                    break;
+                                }
+                                // SAFETY: pointers from disjoint batch slices; c
+                                // ranges don't overlap across workers.
+                                let a_slice = std::slice::from_raw_parts(
+                                    (a_ptr as *const f32).add(a0),
+                                    a_mat,
+                                );
+                                let b_slice = std::slice::from_raw_parts(
+                                    (b_ptr as *const f32).add(b0),
+                                    b_mat,
+                                );
+                                let c_slice = std::slice::from_raw_parts_mut(
+                                    (c_ptr as *mut f32).add(c0),
+                                    c_mat,
+                                );
+                                if slices_overlap(a_slice, c_slice)
+                                    || slices_overlap(b_slice, c_slice)
+                                {
+                                    let mut tmp = vec![0.0f32; c_mat];
+                                    crate::blas::sgemm(a_slice, b_slice, &mut tmp, m_, k_, n_);
+                                    c_slice.copy_from_slice(&tmp);
+                                } else {
+                                    crate::blas::sgemm(a_slice, b_slice, c_slice, m_, k_, n_);
+                                }
+                            }
+                        });
+                    } else {
+                        for bi in 0..b_ {
+                            let a0 = bi * a_bstride;
+                            let b0 = bi * b_bstride;
+                            let c0 = bi * c_mat;
+                            if a0 + a_mat > a_full.len()
+                                || b0 + b_mat > b_full.len()
+                                || c0 + c_mat > c_full.len()
+                            {
+                                break;
+                            }
+                            let a_slice = &a_full[a0..a0 + a_mat];
+                            let b_slice = &b_full[b0..b0 + b_mat];
+                            let c_slice = &mut c_full[c0..c0 + c_mat];
+                            if slices_overlap(a_slice, c_slice) || slices_overlap(b_slice, c_slice)
+                            {
+                                let mut tmp = vec![0.0f32; c_mat];
+                                crate::blas::sgemm_auto(a_slice, b_slice, &mut tmp, m_, k_, n_);
+                                c_slice.copy_from_slice(&tmp);
+                            } else {
+                                crate::blas::sgemm_auto(a_slice, b_slice, c_slice, m_, k_, n_);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Thunk::Dgemm { .. } => exec_dgemm(thunk, base),
+            Thunk::TransposeF64 { .. } => exec_transpose_f64(thunk, base),
+            Thunk::ActivationF64 { .. } => exec_activation_f64(thunk, base),
+            Thunk::ReduceSumF64 { .. } => exec_reduce_sum_f64(thunk, base),
+            Thunk::CopyF64 { src, dst, len } => {
+                let mut len = *len as usize;
+                if *src == *dst || len == 0 {
+                    continue;
+                }
+                let arena_len = arena_buf.len();
+                let max_from_src = (arena_len.saturating_sub(*src)) / 8;
+                let max_from_dst = (arena_len.saturating_sub(*dst)) / 8;
+                len = len.min(max_from_src).min(max_from_dst);
+                if len == 0 {
+                    continue;
+                }
+                let byte_len = len.saturating_mul(8);
+                unsafe {
+                    std::ptr::copy(base.add(*src), base.add(*dst), byte_len);
+                }
+            }
+
+            Thunk::CopyI64 { src, dst, len } => {
+                let mut len = *len as usize;
+                if *src == *dst || len == 0 {
+                    continue;
+                }
+                let arena_len = arena_buf.len();
+                let max_from_src = (arena_len.saturating_sub(*src)) / 8;
+                let max_from_dst = (arena_len.saturating_sub(*dst)) / 8;
+                len = len.min(max_from_src).min(max_from_dst);
+                if len == 0 {
+                    continue;
+                }
+                let byte_len = len.saturating_mul(8);
+                unsafe {
+                    std::ptr::copy(base.add(*src), base.add(*dst), byte_len);
+                }
+            }
+
+            Thunk::CastF32ToI64 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl(*src, base, len);
+                    let out = sl_mut_i64(*dst, base, len);
+                    // ONNX Cast float→int truncates toward zero (not round-half).
+                    for i in 0..len {
+                        out[i] = inp[i] as i64;
+                    }
+                }
+            }
+
+            Thunk::CastF32ToF64 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl(*src, base, len);
+                    let out = sl_mut_f64(*dst, base, len);
+                    for i in 0..len {
+                        out[i] = inp[i] as f64;
+                    }
+                }
+            }
+
+            Thunk::CastF64ToF32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_f64(*src, base, len);
+                    let out = sl_mut(*dst, base, len);
+                    // f64 → f32 narrowing (round-to-nearest), not a bitcast.
+                    for i in 0..len {
+                        out[i] = inp[i] as f32;
+                    }
+                }
+            }
+
+            Thunk::CastF64ToI64 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_f64(*src, base, len);
+                    let out = sl_mut_i64(*dst, base, len);
+                    // ONNX Cast float→int truncates toward zero.
+                    for i in 0..len {
+                        out[i] = inp[i] as i64;
+                    }
+                }
+            }
+
+            Thunk::CastF64ToI32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_f64(*src, base, len);
+                    let out = sl_mut_i32(*dst, base, len);
+                    // ONNX Cast float→int truncates toward zero.
+                    for i in 0..len {
+                        out[i] = inp[i] as i32;
+                    }
+                }
+            }
+
+            Thunk::CastF64ToBool { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                // f64 = 8 bytes, bool = 1 byte — copy the input out first to
+                // avoid aliasing the arena while writing the narrower output.
+                let inp = unsafe { sl_f64(*src, base, len).to_vec() };
+                for i in 0..len {
+                    arena_buf[*dst + i] = u8::from(inp[i] != 0.0);
+                }
+            }
+
+            Thunk::CastI64ToI32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_i64(*src, base, len).to_vec();
+                    let out = sl_mut_i32(*dst, base, len);
+                    // Wrapping narrowing (matches Rust `as`, ONNX int→int).
+                    for i in 0..len {
+                        out[i] = inp[i] as i32;
+                    }
+                }
+            }
+
+            Thunk::CastI64ToF64 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_i64(*src, base, len).to_vec();
+                    let out = sl_mut_f64(*dst, base, len);
+                    for i in 0..len {
+                        out[i] = inp[i] as f64;
+                    }
+                }
+            }
+
+            Thunk::CastI32ToF64 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_i32(*src, base, len).to_vec();
+                    let out = sl_mut_f64(*dst, base, len);
+                    for i in 0..len {
+                        out[i] = inp[i] as f64;
+                    }
+                }
+            }
+
+            Thunk::CastF32ToF16 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                // f32 (4 bytes) → f16 (2 bytes). No sl_f16 accessor; copy the
+                // input out then write the LE f16 bytes into the arena.
+                let inp = unsafe { sl(*src, base, len).to_vec() };
+                for i in 0..len {
+                    let h = half::f16::from_f32(inp[i]);
+                    arena_buf[*dst + i * 2..*dst + i * 2 + 2].copy_from_slice(&h.to_le_bytes());
+                }
+            }
+
+            Thunk::CastF16ToF32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                // f16 (2 bytes) → f32 (4 bytes). Read the LE f16 bytes first,
+                // then write the widened f32 output.
+                let bytes: Vec<u8> = arena_buf[*src..*src + len * 2].to_vec();
+                unsafe {
+                    let out = sl_mut(*dst, base, len);
+                    for i in 0..len {
+                        out[i] =
+                            half::f16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]).to_f32();
+                    }
+                }
+            }
+
+            Thunk::CastF32ToBf16 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                let inp = unsafe { sl(*src, base, len).to_vec() };
+                for i in 0..len {
+                    let h = half::bf16::from_f32(inp[i]);
+                    arena_buf[*dst + i * 2..*dst + i * 2 + 2].copy_from_slice(&h.to_le_bytes());
+                }
+            }
+
+            Thunk::CastBf16ToF32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                let bytes: Vec<u8> = arena_buf[*src..*src + len * 2].to_vec();
+                unsafe {
+                    let out = sl_mut(*dst, base, len);
+                    for i in 0..len {
+                        out[i] =
+                            half::bf16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]).to_f32();
+                    }
+                }
+            }
+
+            Thunk::CastF32ToI32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl(*src, base, len);
+                    let out = sl_mut_i32(*dst, base, len);
+                    // ONNX Cast float→int truncates toward zero (not round-half).
+                    for i in 0..len {
+                        out[i] = inp[i] as i32;
+                    }
+                }
+            }
+
+            Thunk::CastI64ToF32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_i64(*src, base, len);
+                    let out = sl_mut(*dst, base, len);
+                    for i in 0..len {
+                        out[i] = inp[i] as f32;
+                    }
+                }
+            }
+
+            Thunk::CastBoolToI32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = &arena_buf[*src..*src + len];
+                    let out = sl_mut_i32(*dst, base, len);
+                    for i in 0..len {
+                        out[i] = i32::from(inp[i] != 0);
+                    }
+                }
+            }
+
+            Thunk::CastI32ToF32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_i32(*src, base, len);
+                    let out = sl_mut(*dst, base, len);
+                    for i in 0..len {
+                        out[i] = inp[i] as f32;
+                    }
+                }
+            }
+
+            Thunk::CastI32ToI64 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_i32(*src, base, len);
+                    let out = sl_mut_i64(*dst, base, len);
+                    for i in 0..len {
+                        out[i] = inp[i] as i64;
+                    }
+                }
+            }
+
+            Thunk::CastI32ToBool { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                // src/dst are byte offsets; i32 = 4 bytes, bool = 1 byte. Copy the
+                // input first to avoid aliasing the arena while writing the output.
+                let bytes: Vec<u8> = arena_buf[*src..*src + len * 4].to_vec();
+                for i in 0..len {
+                    let v = i32::from_le_bytes([
+                        bytes[i * 4],
+                        bytes[i * 4 + 1],
+                        bytes[i * 4 + 2],
+                        bytes[i * 4 + 3],
+                    ]);
+                    arena_buf[*dst + i] = u8::from(v != 0);
+                }
+            }
+
+            Thunk::CastI64ToBool { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                // i64 = 8 bytes, bool = 1 byte — copy first to avoid aliasing.
+                let bytes: Vec<u8> = arena_buf[*src..*src + len * 8].to_vec();
+                for i in 0..len {
+                    let v = i64::from_le_bytes([
+                        bytes[i * 8],
+                        bytes[i * 8 + 1],
+                        bytes[i * 8 + 2],
+                        bytes[i * 8 + 3],
+                        bytes[i * 8 + 4],
+                        bytes[i * 8 + 5],
+                        bytes[i * 8 + 6],
+                        bytes[i * 8 + 7],
+                    ]);
+                    arena_buf[*dst + i] = u8::from(v != 0);
+                }
+            }
+
+            Thunk::CastBoolToI64 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                let bools: Vec<u8> = arena_buf[*src..*src + len].to_vec();
+                for i in 0..len {
+                    let v = (bools[i] != 0) as i64;
+                    arena_buf[*dst + i * 8..*dst + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+
+            Thunk::CastBoolToF32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = &arena_buf[*src..*src + len];
+                    let out = sl_mut(*dst, base, len);
+                    for i in 0..len {
+                        out[i] = if inp[i] != 0 { 1.0 } else { 0.0 };
+                    }
+                }
+            }
+
+            Thunk::CastGeneric {
+                src,
+                dst,
+                len,
+                src_dtype,
+                dst_dtype,
+            } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                exec_cast_generic(*src, *dst, len, *src_dtype, *dst_dtype, base);
+            }
+
+            Thunk::CastF32ToBool { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl(*src, base, len).to_vec();
+                    let out = &mut arena_buf[*dst..*dst + len];
+                    for i in 0..len {
+                        out[i] = u8::from(inp[i] != 0.0);
+                    }
+                }
+            }
+
+            Thunk::BinaryFullF64 { .. } => exec_binary_full_f64(thunk, base),
+            Thunk::BinaryFullC64 { .. } => exec_binary_full_c64(thunk, base),
+            Thunk::ComplexNormSqF32 { .. } => exec_complex_norm_sq_f32(thunk, base),
+            Thunk::ComplexNormSqBackwardF32 { .. } => {
+                exec_complex_norm_sq_backward_f32(thunk, base)
+            }
+            Thunk::ConjugateC64 { .. } => exec_conjugate_c64(thunk, base),
+            Thunk::ActivationC64 { .. } => exec_activation_c64(thunk, base),
+            Thunk::While {
+                plan,
+                inputs,
+                output,
+            } => unsafe { super::execute_while(base, plan, inputs, *output) },
+            Thunk::Scan { .. } => exec_scan(thunk, base),
+            Thunk::ScanBackward {
+                body_vjp,
+                body_init,
+                body_carry_in_off,
+                body_x_offs,
+                body_d_output_off,
+                body_dcarry_out_off,
+                outer_init_off,
+                outer_traj_off,
+                outer_upstream_off,
+                outer_xs_offs,
+                outer_dinit_off,
+                length,
+                carry_bytes,
+                save_trajectory,
+                num_checkpoints,
+                forward_body,
+                forward_body_init,
+                forward_body_carry_in_off,
+                forward_body_output_off,
+                forward_body_x_offs,
+                carry_elem_size,
+            } => {
+                // Two backward paths share the same per-iteration body
+                // (body_vjp run + dcarry threading). The "All" path
+                // reads the carry directly from the saved trajectory
+                // each step. The "Recursive checkpointing" path stores
+                // only K saved checkpoints and reconstructs intermediate
+                // carries via Griewank-style recursive subdivision —
+                // see [`griewank_process_segment`]. Auxiliary memory
+                // is `O(log(segment_size) · carry_bytes)` for the
+                // recursion stack, vs the old segment-cache scheme's
+                // `O(segment_size · carry_bytes)`. Total recompute work
+                // grows from `O(length)` to `O(length · log)`, which
+                // is the canonical Griewank trade.
+                let cb = *carry_bytes as usize;
+                let n_steps = *length as usize;
+                let k_total = *num_checkpoints as usize;
+                let is_recursive = k_total != 0 && k_total != n_steps;
+                let checkpoint_t_for_k = |k: usize| -> usize {
+                    ((k + 1) * n_steps)
+                        .div_ceil(k_total)
+                        .saturating_sub(1)
+                        .min(n_steps - 1)
+                };
+
+                let mut fwd_buf: Vec<u8> = if is_recursive {
+                    (**forward_body_init.as_ref().unwrap()).clone()
+                } else {
+                    Vec::new()
+                };
+
+                let mut dcarry: Vec<u8> = vec![0u8; cb];
+                if !*save_trajectory {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            base.add(*outer_upstream_off),
+                            dcarry.as_mut_ptr(),
+                            cb,
+                        );
+                    }
+                }
+
+                let mut body_buf: Vec<u8> = (**body_init).clone();
+
+                // Per-iteration backward action — shared between the
+                // direct-trajectory (All) and Griewank (Recursive) paths.
+                // Both feed the same body_vjp run with carry-at-t,
+                // x_t_i, and d_output, then thread dcarry backward.
+                let process_iter =
+                    |t: usize, carry_in: &[u8], dcarry: &mut Vec<u8>, body_buf: &mut Vec<u8>| {
+                        if *save_trajectory {
+                            unsafe {
+                                let up_off = *outer_upstream_off + t * cb;
+                                match *carry_elem_size {
+                                    4 => {
+                                        let up_ptr = base.add(up_off) as *const f32;
+                                        let dc_ptr = dcarry.as_mut_ptr() as *mut f32;
+                                        let n_elems = cb / 4;
+                                        for i in 0..n_elems {
+                                            *dc_ptr.add(i) += *up_ptr.add(i);
+                                        }
+                                    }
+                                    8 => {
+                                        let up_ptr = base.add(up_off) as *const f64;
+                                        let dc_ptr = dcarry.as_mut_ptr() as *mut f64;
+                                        let n_elems = cb / 8;
+                                        for i in 0..n_elems {
+                                            *dc_ptr.add(i) += *up_ptr.add(i);
+                                        }
+                                    }
+                                    other => panic!(
+                                        "ScanBackward: unsupported carry elem size {other} \
+                                     (only f32/f64 carries are supported today)"
+                                    ),
+                                }
+                            }
+                        }
+                        body_buf[*body_carry_in_off..*body_carry_in_off + cb]
+                            .copy_from_slice(carry_in);
+                        unsafe {
+                            for (i, body_x_off) in body_x_offs.iter().enumerate() {
+                                let (outer_xs_off, per_step_bytes) = outer_xs_offs[i];
+                                let psb = per_step_bytes as usize;
+                                std::ptr::copy_nonoverlapping(
+                                    base.add(outer_xs_off + t * psb),
+                                    body_buf.as_mut_ptr().add(*body_x_off),
+                                    psb,
+                                );
+                            }
+                            std::ptr::copy_nonoverlapping(
+                                dcarry.as_ptr(),
+                                body_buf.as_mut_ptr().add(*body_d_output_off),
+                                cb,
+                            );
+                        }
+                        execute_thunks(body_vjp, body_buf);
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                body_buf.as_ptr().add(*body_dcarry_out_off),
+                                dcarry.as_mut_ptr(),
+                                cb,
+                            );
+                        }
+                    };
+
+                if is_recursive {
+                    // Griewank treeverse path. Process saved-checkpoint
+                    // segments from highest-t to lowest-t; within each,
+                    // recursive binary subdivision via
+                    // `griewank_process_segment`. Auxiliary memory:
+                    // O(log(seg_size) · cb) for the recursion stack
+                    // (vs O(seg_size · cb) for the older segment-cache
+                    // scheme); recompute work: O(seg_size · log).
+                    let leaf_threshold = 4usize;
+                    let fb_sched = forward_body.as_ref().unwrap();
+                    let fb_init = forward_body_init.as_ref().unwrap().as_slice();
+                    let mut segment_end = n_steps - 1;
+                    for seg_k in (0..k_total).rev() {
+                        let segment_start = if seg_k == 0 {
+                            0
+                        } else {
+                            checkpoint_t_for_k(seg_k - 1) + 1
+                        };
+                        let mut anchor: Vec<u8> = vec![0u8; cb];
+                        unsafe {
+                            let src = if seg_k == 0 {
+                                base.add(*outer_init_off)
+                            } else {
+                                base.add(*outer_traj_off + (seg_k - 1) * cb)
+                            };
+                            std::ptr::copy_nonoverlapping(src, anchor.as_mut_ptr(), cb);
+                        }
+                        // Closure adapter for the helper's signature
+                        // (mutably re-borrows dcarry / body_buf each call).
+                        let mut leaf_action = |t: usize, carry_in: &[u8]| {
+                            process_iter(t, carry_in, &mut dcarry, &mut body_buf);
+                        };
+                        unsafe {
+                            griewank_process_segment(
+                                segment_start,
+                                segment_end,
+                                &anchor,
+                                cb,
+                                fb_sched,
+                                fb_init,
+                                *forward_body_carry_in_off,
+                                *forward_body_output_off,
+                                forward_body_x_offs,
+                                base,
+                                outer_xs_offs,
+                                &mut fwd_buf,
+                                leaf_threshold,
+                                &mut leaf_action,
+                            );
+                        }
+                        if seg_k == 0 {
+                            break;
+                        }
+                        segment_end = segment_start - 1;
+                    }
+                } else {
+                    // All-trajectory path: read each carry directly
+                    // from the saved trajectory buffer.
+                    let mut carry_buf: Vec<u8> = vec![0u8; cb];
+                    for t in (0..n_steps).rev() {
+                        unsafe {
+                            let src = if t == 0 {
+                                base.add(*outer_init_off)
+                            } else {
+                                base.add(*outer_traj_off + (t - 1) * cb)
+                            };
+                            std::ptr::copy_nonoverlapping(src, carry_buf.as_mut_ptr(), cb);
+                        }
+                        process_iter(t, &carry_buf, &mut dcarry, &mut body_buf);
+                    }
+                }
+
+                unsafe {
+                    std::ptr::copy_nonoverlapping(dcarry.as_ptr(), base.add(*outer_dinit_off), cb);
+                }
+            }
+
+            Thunk::ScanBackwardXs { .. } => exec_scan_backward_xs(thunk, base),
+            Thunk::FusedMmBiasAct { .. } => exec_fused_mm_bias_act(thunk, base),
+            Thunk::FusedResidualLN {
+                x,
+                res,
+                bias,
+                g,
+                b,
+                out,
+                rows,
+                h,
+                eps,
+                has_bias,
+            } => {
+                let (rows, h) = (*rows as usize, *h as usize);
+                unsafe {
+                    let zero = &zero_bias[..h];
+                    let bi = if *has_bias { sl(*bias, base, h) } else { zero };
+                    let x_ptr = sl(*x, base, rows * h).as_ptr() as usize;
+                    let r_ptr = sl(*res, base, rows * h).as_ptr() as usize;
+                    let o_ptr = sl_mut(*out, base, rows * h).as_mut_ptr() as usize;
+                    let bi_ptr = bi.as_ptr() as usize;
+                    let g_ptr = sl(*g, base, h).as_ptr() as usize;
+                    let b_ptr = sl(*b, base, h).as_ptr() as usize;
+                    let e = *eps;
+                    crate::pool::par_for(rows, 4, &|off, cnt| {
+                        let xs =
+                            std::slice::from_raw_parts((x_ptr as *const f32).add(off * h), cnt * h);
+                        let rs =
+                            std::slice::from_raw_parts((r_ptr as *const f32).add(off * h), cnt * h);
+                        let os = std::slice::from_raw_parts_mut(
+                            (o_ptr as *mut f32).add(off * h),
+                            cnt * h,
+                        );
+                        let bi = std::slice::from_raw_parts(bi_ptr as *const f32, h);
+                        let g = std::slice::from_raw_parts(g_ptr as *const f32, h);
+                        let b = std::slice::from_raw_parts(b_ptr as *const f32, h);
+                        crate::kernels::residual_bias_layer_norm(xs, rs, bi, g, b, os, cnt, h, e);
+                    });
+                }
+            }
+
+            Thunk::FusedResidualRmsNorm {
+                x,
+                res,
+                bias,
+                g,
+                b,
+                out,
+                rows,
+                h,
+                eps,
+                has_bias,
+            } => {
+                let (rows, h) = (*rows as usize, *h as usize);
+                unsafe {
+                    let zero = &zero_bias[..h];
+                    let bi = if *has_bias { sl(*bias, base, h) } else { zero };
+                    let x_ptr = sl(*x, base, rows * h).as_ptr() as usize;
+                    let r_ptr = sl(*res, base, rows * h).as_ptr() as usize;
+                    let o_ptr = sl_mut(*out, base, rows * h).as_mut_ptr() as usize;
+                    let bi_ptr = bi.as_ptr() as usize;
+                    let g_ptr = sl(*g, base, h).as_ptr() as usize;
+                    let b_ptr = sl(*b, base, h).as_ptr() as usize;
+                    let e = *eps;
+                    crate::pool::par_for(rows, 4, &|off, cnt| {
+                        let xs =
+                            std::slice::from_raw_parts((x_ptr as *const f32).add(off * h), cnt * h);
+                        let rs =
+                            std::slice::from_raw_parts((r_ptr as *const f32).add(off * h), cnt * h);
+                        let os = std::slice::from_raw_parts_mut(
+                            (o_ptr as *mut f32).add(off * h),
+                            cnt * h,
+                        );
+                        let bi = std::slice::from_raw_parts(bi_ptr as *const f32, h);
+                        let g = std::slice::from_raw_parts(g_ptr as *const f32, h);
+                        let b = std::slice::from_raw_parts(b_ptr as *const f32, h);
+                        crate::kernels::residual_bias_rms_norm(xs, rs, bi, g, b, os, cnt, h, e);
+                    });
+                }
+            }
+
+            Thunk::BiasAdd { .. } => exec_bias_add(thunk, base),
+            Thunk::BinaryFull {
+                lhs,
+                rhs,
+                dst,
+                len,
+                lhs_len,
+                rhs_len,
+                op,
+                out_dims_bcast,
+                bcast_lhs_strides,
+                bcast_rhs_strides,
+                elem_bytes,
+            } => {
+                let len = *len as usize;
+                let ll = (*lhs_len as usize).max(1);
+                let rl = (*rhs_len as usize).max(1);
+                let eb = (*elem_bytes).max(1) as usize;
+                let arena_len = arena_buf.len();
+                let ll = ll.min((arena_len.saturating_sub(*lhs)) / eb);
+                let rl = rl.min((arena_len.saturating_sub(*rhs)) / eb);
+                let len = len.min((arena_len.saturating_sub(*dst)) / eb);
+                unsafe {
+                    if eb == 8 {
+                        let l = sl_i64(*lhs, base, ll);
+                        let r = sl_i64(*rhs, base, rl);
+                        let o = sl_mut_i64(*dst, base, len);
+                        // Same fused-index + hoisted-op + parallel treatment as
+                        // the f32 path below (bit-exact; elements independent).
+                        // Coalesced axes (size-1 dropped, contiguous pairs
+                        // merged): the same index map, fewer div/mods, and a
+                        // long innermost row — `[128,4,1]` walks as one 512 row.
+                        let (odb_c, lstr_c, rstr_c);
+                        let (odb, lstr, rstr) = if out_dims_bcast.is_empty() {
+                            (
+                                &out_dims_bcast[..],
+                                &bcast_lhs_strides[..],
+                                &bcast_rhs_strides[..],
+                            )
+                        } else {
+                            (odb_c, lstr_c, rstr_c) = coalesce_bcast_axes(
+                                out_dims_bcast,
+                                bcast_lhs_strides,
+                                bcast_rhs_strides,
+                            );
+                            (&odb_c[..], &lstr_c[..], &rstr_c[..])
+                        };
+                        let rank = odb.len();
+                        let idx = |i: usize| -> (usize, usize) {
+                            if rank == 0 {
+                                let li = if ll == 1 { 0 } else { i % ll };
+                                let ri = if rl == 1 { 0 } else { i % rl };
+                                (li, ri)
+                            } else {
+                                let mut rem = i;
+                                let (mut li, mut ri) = (0usize, 0usize);
+                                for ax in (0..rank).rev() {
+                                    let sz = odb[ax] as usize;
+                                    let c = rem % sz;
+                                    rem /= sz;
+                                    li += c * lstr[ax] as usize;
+                                    ri += c * rstr[ax] as usize;
+                                }
+                                (li, ri)
+                            }
+                        };
+                        macro_rules! bini64 {
+                            ($f:expr) => {{
+                                let f = $f;
+                                if crate::pool::should_parallelize(len) {
+                                    use rayon::prelude::*;
+                                    o.par_iter_mut()
+                                        .enumerate()
+                                        .with_min_len(crate::pool::chunk_floor(len))
+                                        .for_each(|(i, out)| {
+                                            let (li, ri) = idx(i);
+                                            *out = f(l[li], r[ri]);
+                                        });
+                                } else {
+                                    for i in 0..len {
+                                        let (li, ri) = idx(i);
+                                        o[i] = f(l[li], r[ri]);
+                                    }
+                                }
+                            }};
+                        }
+                        match op {
+                            BinaryOp::Add => bini64!(|a: i64, b: i64| a.wrapping_add(b)),
+                            BinaryOp::Sub => bini64!(|a: i64, b: i64| a.wrapping_sub(b)),
+                            BinaryOp::Mul => bini64!(|a: i64, b: i64| a.wrapping_mul(b)),
+                            BinaryOp::Div => {
+                                bini64!(|a: i64, b: i64| if b == 0 { 0 } else { a / b })
+                            }
+                            BinaryOp::Max => bini64!(|a: i64, b: i64| a.max(b)),
+                            BinaryOp::Min => bini64!(|a: i64, b: i64| a.min(b)),
+                            BinaryOp::Pow => bini64!(|a: i64, b: i64| a.pow(b.max(0) as u32)),
+                            BinaryOp::Mod => bini64!(|a: i64, b: i64| a % b),
+                            // atan2 is float-only; unreachable on integer tensors.
+                            BinaryOp::Atan2 => {
+                                bini64!(|a: i64, b: i64| (a as f64).atan2(b as f64) as i64)
+                            }
+                            BinaryOp::BitAnd => bini64!(|a: i64, b: i64| a & b),
+                            BinaryOp::BitOr => bini64!(|a: i64, b: i64| a | b),
+                            BinaryOp::BitXor => bini64!(|a: i64, b: i64| a ^ b),
+                            BinaryOp::Shl => bini64!(|a: i64, b: i64| a.wrapping_shl(b as u32)),
+                            BinaryOp::Shr => bini64!(|a: i64, b: i64| a.wrapping_shr(b as u32)),
+                        }
+                    } else {
+                        let l = sl(*lhs, base, ll);
+                        let r = sl(*rhs, base, rl);
+                        let o = sl_mut(*dst, base, len);
+                        // The f32 binary ops, once: `$m!(closure)` per op.
+                        macro_rules! f32_op {
+                            ($m:ident) => {
+                                match op {
+                                    BinaryOp::Add => $m!(|a: f32, b: f32| a + b),
+                                    BinaryOp::Sub => $m!(|a: f32, b: f32| a - b),
+                                    BinaryOp::Mul => $m!(|a: f32, b: f32| a * b),
+                                    BinaryOp::Div => $m!(|a: f32, b: f32| a / b),
+                                    BinaryOp::Max => $m!(|a: f32, b: f32| a.max(b)),
+                                    BinaryOp::Min => $m!(|a: f32, b: f32| a.min(b)),
+                                    BinaryOp::Pow => $m!(|a: f32, b: f32| a.powf(b)),
+                                    BinaryOp::Mod => $m!(|a: f32, b: f32| a % b),
+                                    BinaryOp::Atan2 => $m!(|a: f32, b: f32| a.atan2(b)),
+                                    BinaryOp::BitAnd => {
+                                        $m!(|a: f32, b: f32| ((a as i64) & (b as i64)) as f32)
+                                    }
+                                    BinaryOp::BitOr => {
+                                        $m!(|a: f32, b: f32| ((a as i64) | (b as i64)) as f32)
+                                    }
+                                    BinaryOp::BitXor => {
+                                        $m!(|a: f32, b: f32| ((a as i64) ^ (b as i64)) as f32)
+                                    }
+                                    BinaryOp::Shl => $m!(|a: f32, b: f32| (a as i64)
+                                        .wrapping_shl(b as u32)
+                                        as f32),
+                                    BinaryOp::Shr => $m!(|a: f32, b: f32| (a as i64)
+                                        .wrapping_shr(b as u32)
+                                        as f32),
+                                }
+                            };
+                        }
+                        if ll == len && rl == len {
+                            #[cfg(rlx_cpu_neon)]
+                            if matches!(op, BinaryOp::Add | BinaryOp::Mul) {
+                                use std::arch::aarch64::*;
+                                // one IEEE add/mul per element, whichever lane or
+                                // thread does it; parallel over chunks of a large
+                                // tensor (it was serial: 2.4 M elements, 538 µs)
+                                let add = matches!(op, BinaryOp::Add);
+                                let kernel = |l: &[f32], r: &[f32], o: &mut [f32]| {
+                                    let n = o.len();
+                                    let chunks = n / 4;
+                                    for c in 0..chunks {
+                                        let off = c * 4;
+                                        let vl = vld1q_f32(l.as_ptr().add(off));
+                                        let vr = vld1q_f32(r.as_ptr().add(off));
+                                        let res = if add {
+                                            vaddq_f32(vl, vr)
+                                        } else {
+                                            vmulq_f32(vl, vr)
+                                        };
+                                        vst1q_f32(o.as_mut_ptr().add(off), res);
+                                    }
+                                    for i in (chunks * 4)..n {
+                                        o[i] = if add { l[i] + r[i] } else { l[i] * r[i] };
+                                    }
+                                };
+                                if crate::pool::should_parallelize(len) {
+                                    use rayon::prelude::*;
+                                    let chunk = crate::pool::chunk_floor(len).next_multiple_of(4);
+                                    o.par_chunks_mut(chunk).enumerate().for_each(|(k, oc)| {
+                                        let off = k * chunk;
+                                        kernel(
+                                            &l[off..off + oc.len()],
+                                            &r[off..off + oc.len()],
+                                            oc,
+                                        );
+                                    });
+                                } else {
+                                    kernel(l, r, o);
+                                }
+                                continue;
+                            }
+                            // x86: contiguous same-shape Add/Mul/Sub — AVX2 when
+                            // available, else a plain parallel loop (no N-D index walk).
+                            #[cfg(rlx_cpu_x86)]
+                            if matches!(op, BinaryOp::Add | BinaryOp::Mul | BinaryOp::Sub) {
+                                let used = binary_contig_f32(l, r, o, *op);
+                                if used {
+                                    continue;
+                                }
+                            }
+                            // Contiguous fallback for other ops / arches: skip
+                            // broadcast index math entirely.
+                            macro_rules! bin_contig {
+                                ($f:expr) => {{
+                                    let f = $f;
+                                    if crate::pool::should_parallelize(len) {
+                                        use rayon::prelude::*;
+                                        o.par_iter_mut()
+                                            .zip(l.par_iter())
+                                            .zip(r.par_iter())
+                                            .with_min_len(crate::pool::chunk_floor(len))
+                                            .for_each(|((out, a), b)| *out = f(*a, *b));
+                                    } else {
+                                        for i in 0..len {
+                                            o[i] = f(l[i], r[i]);
+                                        }
+                                    }
+                                }};
+                            }
+                            f32_op!(bin_contig);
+                            continue;
+                        }
+                        // One operand is a single value (`x − mean`, a clamp):
+                        // a plain loop with it held, instead of the index walk
+                        // below (0.6–0.9 elements/ns there). Whatever the
+                        // broadcast dims say, a 1-element operand maps every
+                        // index to its one value, and an operand as long as the
+                        // output is not broadcast, so it is read in order.
+                        if (rl == 1 && ll == len) || (ll == 1 && rl == len) {
+                            let r_scalar = rl == 1;
+                            macro_rules! bin_scalar {
+                                ($f:expr) => {{
+                                    let f = $f;
+                                    let run = |off: usize, out: &mut [f32]| {
+                                        if r_scalar {
+                                            let b = r[0];
+                                            for (o, a) in out.iter_mut().zip(&l[off..]) {
+                                                *o = f(*a, b);
+                                            }
+                                        } else {
+                                            let a = l[0];
+                                            for (o, b) in out.iter_mut().zip(&r[off..]) {
+                                                *o = f(a, *b);
+                                            }
+                                        }
+                                    };
+                                    if crate::pool::should_parallelize(len) {
+                                        use rayon::prelude::*;
+                                        let chunk = crate::pool::chunk_floor(len);
+                                        o.par_chunks_mut(chunk)
+                                            .enumerate()
+                                            .for_each(|(k, oc)| run(k * chunk, oc));
+                                    } else {
+                                        run(0, o);
+                                    }
+                                }};
+                            }
+                            f32_op!(bin_scalar);
+                            continue;
+                        }
+                        // Trailing-row broadcast: rhs tiles every `rl` elements
+                        // (bias/scale along last dim). Covers empty dims and the
+                        // common `[…, D]` rhs with leading broadcast strides 0.
+                        if ll == len && rl > 0 && rl < len && len.is_multiple_of(rl) {
+                            let rhs_tile = out_dims_bcast.is_empty()
+                                || (bcast_rhs_strides.len() == out_dims_bcast.len()
+                                    && bcast_rhs_strides.last() == Some(&1)
+                                    && bcast_rhs_strides
+                                        [..bcast_rhs_strides.len().saturating_sub(1)]
+                                        .iter()
+                                        .all(|&s| s == 0));
+                            if rhs_tile {
+                                let used = binary_row_bcast_f32(l, r, o, *op, rl);
+                                if used {
+                                    continue;
+                                }
+                            }
+                        }
+                        // Broadcast / small-operand path. This scalar loop was
+                        // ~88% of a supertonic subgraph's CPU time. Three fixes,
+                        // all bit-exact (each output element is independent):
+                        //   1) fuse the coord decomposition with the stride
+                        //      dot-product — one pass, no per-call `coords` Vec,
+                        //      no second loop;
+                        //   2) hoist the op-match out of the per-element loop
+                        //      (one branch per call, not per element);
+                        //   3) parallelize across cores for large outputs.
+                        // Coalesced axes (size-1 dropped, contiguous pairs
+                        // merged): the same index map, fewer div/mods, and a
+                        // long innermost row — `[128,4,1]` walks as one 512 row.
+                        let (odb_c, lstr_c, rstr_c);
+                        let (odb, lstr, rstr) = if out_dims_bcast.is_empty() {
+                            (
+                                &out_dims_bcast[..],
+                                &bcast_lhs_strides[..],
+                                &bcast_rhs_strides[..],
+                            )
+                        } else {
+                            (odb_c, lstr_c, rstr_c) = coalesce_bcast_axes(
+                                out_dims_bcast,
+                                bcast_lhs_strides,
+                                bcast_rhs_strides,
+                            );
+                            (&odb_c[..], &lstr_c[..], &rstr_c[..])
+                        };
+                        let rank = odb.len();
+                        let idx = |i: usize| -> (usize, usize) {
+                            if rank == 0 {
+                                let li = if ll == 1 { 0 } else { i % ll };
+                                let ri = if rl == 1 { 0 } else { i % rl };
+                                (li, ri)
+                            } else {
+                                let mut rem = i;
+                                let (mut li, mut ri) = (0usize, 0usize);
+                                for ax in (0..rank).rev() {
+                                    let sz = odb[ax] as usize;
+                                    let c = rem % sz;
+                                    rem /= sz;
+                                    li += c * lstr[ax] as usize;
+                                    ri += c * rstr[ax] as usize;
+                                }
+                                (li, ri)
+                            }
+                        };
+                        // Row walk: one coord decomposition per innermost
+                        // row, then stride steps along it. Same (li, ri) pairs
+                        // as `idx`, so bit-exact; the per-element div/mod was
+                        // the top self-time in TensorCSPNet's scan backward.
+                        let n_in = if rank > 0 { odb[rank - 1] as usize } else { 0 };
+                        let row_walk = n_in > 1 && len.is_multiple_of(n_in);
+                        let (ls_in, rs_in) = if rank > 0 {
+                            (lstr[rank - 1] as usize, rstr[rank - 1] as usize)
+                        } else {
+                            (0, 0)
+                        };
+                        macro_rules! binf32 {
+                            ($f:expr) => {{
+                                let f = $f;
+                                if row_walk {
+                                    let row = |(k, out): (usize, &mut [f32])| {
+                                        let (l0, r0) = idx(k * n_in);
+                                        for (j, o) in out.iter_mut().enumerate() {
+                                            *o = f(l[l0 + j * ls_in], r[r0 + j * rs_in]);
+                                        }
+                                    };
+                                    if crate::pool::should_parallelize(len) {
+                                        use rayon::prelude::*;
+                                        o.par_chunks_mut(n_in)
+                                            .enumerate()
+                                            .with_min_len(
+                                                (crate::pool::chunk_floor(len) / n_in).max(1),
+                                            )
+                                            .for_each(row);
+                                    } else {
+                                        o.chunks_mut(n_in).enumerate().for_each(row);
+                                    }
+                                } else if crate::pool::should_parallelize(len) {
+                                    use rayon::prelude::*;
+                                    o.par_iter_mut()
+                                        .enumerate()
+                                        .with_min_len(crate::pool::chunk_floor(len))
+                                        .for_each(|(i, out)| {
+                                            let (li, ri) = idx(i);
+                                            *out = f(l[li], r[ri]);
+                                        });
+                                } else {
+                                    for i in 0..len {
+                                        let (li, ri) = idx(i);
+                                        o[i] = f(l[li], r[ri]);
+                                    }
+                                }
+                            }};
+                        }
+                        f32_op!(binf32)
+                    }
+                }
+            }
+
+            Thunk::Gather { .. } => exec_gather(thunk, base),
+            Thunk::Narrow {
+                src,
+                dst,
+                outer,
+                src_stride,
+                dst_stride,
+                inner,
+                elem_bytes,
+            } => {
+                let (outer, ss, ds, inner, eb) = (
+                    *outer as usize,
+                    *src_stride as usize,
+                    *dst_stride as usize,
+                    *inner as usize,
+                    *elem_bytes as usize,
+                );
+                let row_bytes = inner.saturating_mul(eb);
+                let src_row_stride = ss.saturating_mul(eb);
+                let dst_row_stride = ds.saturating_mul(eb);
+                if trace_thunks {
+                    eprintln!(
+                        "[narrow] src={} dst={} outer={outer} ss={ss} ds={ds} inner={inner} eb={eb} row={row_bytes} arena={}",
+                        *src,
+                        *dst,
+                        arena_buf.len()
+                    );
+                }
+                if row_bytes > 0 && *src != *dst {
+                    let arena_len = arena_buf.len();
+                    // Parallelize independent row copies for large narrows
+                    // (attention head splits, DiT reshape slices).
+                    if outer >= 4
+                        && row_bytes >= 64
+                        && crate::pool::num_threads() > 1
+                        && crate::pool::should_parallelize(outer.saturating_mul(row_bytes / 4))
+                    {
+                        let base_addr = base as usize;
+                        let src0 = *src;
+                        let dst0 = *dst;
+                        crate::pool::par_for(outer, 1, &|off, cnt| {
+                            for o in off..off + cnt {
+                                let s_off = src0 + o * src_row_stride;
+                                let d_off = dst0 + o * dst_row_stride;
+                                if s_off == d_off {
+                                    continue;
+                                }
+                                if s_off.saturating_add(row_bytes) > arena_len
+                                    || d_off.saturating_add(row_bytes) > arena_len
+                                {
+                                    break;
+                                }
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        (base_addr as *const u8).add(s_off),
+                                        (base_addr as *mut u8).add(d_off),
+                                        row_bytes,
+                                    );
+                                }
+                            }
+                        });
+                    } else {
+                        for o in 0..outer {
+                            let s_off = *src + o * src_row_stride;
+                            let d_off = *dst + o * dst_row_stride;
+                            if s_off == d_off {
+                                continue;
+                            }
+                            if s_off.saturating_add(row_bytes) > arena_len
+                                || d_off.saturating_add(row_bytes) > arena_len
+                            {
+                                break;
+                            }
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    base.add(s_off),
+                                    base.add(d_off),
+                                    row_bytes,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            Thunk::RoundHalf {
+                src,
+                dst,
+                len,
+                bf16,
+            } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                let inp = unsafe { sl(*src, base, len).to_vec() };
+                let out = unsafe { sl_mut(*dst, base, len) };
+                for (o, v) in out.iter_mut().zip(&inp) {
+                    *o = if *bf16 {
+                        half::bf16::from_f32(*v).to_f32()
+                    } else {
+                        half::f16::from_f32(*v).to_f32()
+                    };
+                }
+            }
+
+            Thunk::Copy { src, dst, len } => {
+                let mut len = *len as usize;
+                if *src == *dst || len == 0 {
+                    continue;
+                }
+                let arena_len = arena_buf.len();
+                let max_from_src = (arena_len.saturating_sub(*src)) / 4;
+                let max_from_dst = (arena_len.saturating_sub(*dst)) / 4;
+                len = len.min(max_from_src).min(max_from_dst);
+                if len == 0 {
+                    continue;
+                }
+                let byte_len = len.saturating_mul(4);
+                // Parallel memcpy for huge arena moves (DiT residual buffers).
+                if len >= 262_144 && crate::pool::num_threads() > 1 {
+                    let base_addr = base as usize;
+                    let src0 = *src;
+                    let dst0 = *dst;
+                    crate::pool::par_for(len, crate::pool::chunk_floor(len), &|off, cnt| {
+                        let n = cnt.saturating_mul(4);
+                        unsafe {
+                            std::ptr::copy(
+                                (base_addr as *const u8).add(src0 + off * 4),
+                                (base_addr as *mut u8).add(dst0 + off * 4),
+                                n,
+                            );
+                        }
+                    });
+                } else {
+                    unsafe {
+                        std::ptr::copy(base.add(*src), base.add(*dst), byte_len);
+                    }
+                }
+            }
+
+            Thunk::LayerNorm { .. } => exec_layer_norm(thunk, base),
+            Thunk::GroupNorm { .. } => exec_group_norm(thunk, base),
+            Thunk::BatchNormInference { .. } => exec_batch_norm_inference(thunk, base),
+            Thunk::LayerNorm2d { .. } => exec_layer_norm2d(thunk, base),
+            Thunk::ConvTranspose2d { .. } => exec_conv_transpose2d(thunk, base),
+            Thunk::ResizeNearest2x { .. } => exec_resize_nearest2x(thunk, base),
+            Thunk::Interpolate3d { .. } => exec_interpolate3d(thunk, base),
+            Thunk::AxialRope2d { .. } => exec_axial_rope2d(thunk, base),
+            Thunk::RmsNorm { .. } => exec_rms_norm(thunk, base),
+            Thunk::AdaLayerNorm { .. } => exec_ada_layer_norm(thunk, base),
+            Thunk::GatedResidual { .. } => exec_gated_residual(thunk, base),
+            Thunk::AdaLayerNormBackward { .. } => exec_ada_layer_norm_backward(thunk, base),
+            Thunk::GatedResidualBackward { .. } => exec_gated_residual_backward(thunk, base),
+            Thunk::Softmax { .. } => exec_softmax(thunk, base),
+            Thunk::Cumsum { .. } => exec_cumsum(thunk, base),
+            Thunk::CumScan { .. } => exec_cum_scan(thunk, base),
+            Thunk::Sample { .. } => exec_sample(thunk, base),
+            Thunk::RngNormal {
+                dst,
+                len,
+                mean,
+                scale,
+                key,
+                op_seed,
+            } => {
+                let n = *len as usize;
+                unsafe {
+                    let out = sl_mut(*dst, base, n);
+                    let opts = *schedule.rng.read().unwrap();
+                    rlx_ir::fill_normal_like(out, *mean, *scale, opts, *key, *op_seed);
+                }
+            }
+
+            Thunk::RngUniform {
+                dst,
+                len,
+                low,
+                high,
+                key,
+                op_seed,
+            } => {
+                let n = *len as usize;
+                unsafe {
+                    let out = sl_mut(*dst, base, n);
+                    let opts = *schedule.rng.read().unwrap();
+                    rlx_ir::fill_uniform_like(out, *low, *high, opts, *key, *op_seed);
+                }
+            }
+
+            Thunk::GatedDeltaNet { .. } => exec_gated_delta_net(thunk, base),
+            Thunk::GatedDeltaNetBackward { .. } => exec_gated_delta_net_backward(thunk, base),
+            Thunk::Lstm { .. } => exec_lstm(thunk, base),
+            Thunk::Gru { .. } => exec_gru(thunk, base),
+            Thunk::Rnn { .. } => exec_rnn(thunk, base),
+            Thunk::Mamba2 { .. } => exec_mamba2(thunk, base),
+            Thunk::SelectiveScan { .. } => exec_selective_scan(thunk, base),
+            Thunk::DequantMatMul { .. } => exec_dequant_mat_mul(thunk, base),
+            Thunk::SynthMatMul { .. } => exec_synth_mat_mul(thunk, base),
+            Thunk::SplineActivation { .. } => exec_spline_activation(thunk, base),
+            Thunk::DequantMatMulGguf { .. } => exec_dequant_mat_mul_gguf(thunk, base),
+            Thunk::DequantMatMulInt4 { .. } => exec_dequant_mat_mul_int4(thunk, base),
+            Thunk::DequantMatMulFp8 { .. } => exec_dequant_mat_mul_fp8(thunk, base),
+            Thunk::DequantMatMulNvfp4 { .. } => exec_dequant_mat_mul_nvfp4(thunk, base),
+            Thunk::DequantMatMulMxFp4x2 { .. } => exec_dequant_mat_mul_mxfp4x2(thunk, base),
+            Thunk::DequantMatMulMlx { .. } => exec_dequant_mat_mul_mlx(thunk, base),
+            Thunk::ScaledMatMul { .. } => exec_scaled_mat_mul(thunk, base),
+            Thunk::ScaledGroupedMatMul { .. } => exec_scaled_grouped_mat_mul(thunk, base),
+            Thunk::ScaledQuantize { .. } => exec_scaled_quantize(thunk, base),
+            Thunk::ScaledQuantScale { .. } => exec_scaled_quant_scale(thunk, base),
+            Thunk::ScaledDequantize { .. } => exec_scaled_dequantize(thunk, base),
+            Thunk::LoraMatMul { .. } => exec_lora_mat_mul(thunk, base),
+            Thunk::Attention {
+                q,
+                k,
+                v,
+                mask,
+                out,
+                batch,
+                seq,
+                kv_seq,
+                heads,
+                head_dim,
+                v_head_dim,
+                mask_kind,
+                scale,
+                softcap,
+                q_row_stride,
+                k_row_stride,
+                v_row_stride,
+                bhsd,
+                kv_heads,
+            } => {
+                let (b, q_s, k_s, nh, dh) = (
+                    *batch as usize,
+                    *seq as usize,
+                    *kv_seq as usize,
+                    *heads as usize,
+                    *head_dim as usize,
+                );
+                // V/output per-head width (== dh for symmetric SDPA; MLA differs).
+                let dh_v = *v_head_dim as usize;
+                let nkv = (*kv_heads as usize).max(1);
+                let group = (nh / nkv).max(1); // query heads per KV head (GQA/MQA)
+                let hs_v = nh * dh_v; // output row stride (V-width)
+                // For [B, H, S, D] layout each (b, h) tile is dense
+                // contiguous; the qrs/krs/vrs strides are not used.
+                let (qrs, krs, vrs) = if *bhsd {
+                    (dh, dh, dh_v)
+                } else {
+                    (
+                        *q_row_stride as usize,
+                        *k_row_stride as usize,
+                        *v_row_stride as usize,
+                    )
+                };
+                let bhsd = *bhsd;
+                let _ = (q_row_stride, k_row_stride, v_row_stride);
+                let scale = *scale;
+                let ss = q_s * k_s;
+                let cfg = crate::config::RuntimeConfig::global();
+                unsafe {
+                    // Slice lengths cover the strided span. When Q/K/V
+                    // alias the parent QKV (post-#46-fusion), the same
+                    // bytes back all three slices — compiler bounds
+                    // checks see the right size. For [B, H, S, D] the
+                    // buffer is densely B*H*S*D elements; the row
+                    // strides aren't used.
+                    let q_len = if bhsd {
+                        b * nh * q_s * dh
+                    } else {
+                        b * q_s * qrs
+                    };
+                    let k_len = if bhsd {
+                        b * nkv * k_s * dh
+                    } else {
+                        b * k_s * krs
+                    };
+                    let v_len = if bhsd {
+                        b * nkv * k_s * dh_v
+                    } else {
+                        b * k_s * vrs
+                    };
+                    let q_data = sl(*q, base, q_len);
+                    let k_data = sl(*k, base, k_len);
+                    let v_data = sl(*v, base, v_len);
+                    let mask_data: &[f32] = match mask_kind {
+                        rlx_ir::op::MaskKind::Custom => sl(*mask, base, b * k_s),
+                        rlx_ir::op::MaskKind::Bias => sl(*mask, base, b * nh * q_s * k_s),
+                        _ => &[],
+                    };
+                    let out_len = if bhsd {
+                        b * nh * q_s * dh_v
+                    } else {
+                        b * q_s * hs_v
+                    };
+                    let out_data = sl_mut(*out, base, out_len);
+
+                    // ── [B, H, S, D] fallback ──────────────────────
+                    // The NEON / strided-BLAS specializations below
+                    // are written for the [B, S, H, D] layout. When
+                    // the input is head-major ([B, H, S, D] —
+                    // matching rlx-cuda / rlx-rocm / rlx-tpu), bypass
+                    // them and run a simple (correct but slower)
+                    // scalar implementation. Production-CPU inference
+                    // graphs use [B, S, H, D] so they still hit the
+                    // hot path; cross-backend parity tests use
+                    // [B, H, S, D] and land here.
+                    if bhsd {
+                        let scores = &mut sdpa_scores[..ss];
+                        for bi in 0..b {
+                            for hi in 0..nh {
+                                let kv_hi = hi / group; // GQA/MQA: shared KV head
+                                let q_head_base = bi * nh * q_s * dh + hi * q_s * dh;
+                                let k_head_base = bi * nkv * k_s * dh + kv_hi * k_s * dh;
+                                // Q@K^T
+                                for qi in 0..q_s {
+                                    let q_base = q_head_base + qi * dh;
+                                    for ki in 0..k_s {
+                                        let k_base = k_head_base + ki * dh;
+                                        let mut dot = 0f32;
+                                        for d in 0..dh {
+                                            dot += q_data[q_base + d] * k_data[k_base + d];
+                                        }
+                                        scores[qi * k_s + ki] = dot * scale;
+                                        if matches!(mask_kind, rlx_ir::op::MaskKind::Custom)
+                                            && !mask_data.is_empty()
+                                            && mask_data[bi * k_s + ki] < mask_thr
+                                        {
+                                            scores[qi * k_s + ki] = mask_neg;
+                                        }
+                                    }
+                                }
+                                if matches!(mask_kind, rlx_ir::op::MaskKind::Bias) {
+                                    let off = (bi * nh + hi) * q_s * k_s;
+                                    for i in 0..q_s * k_s {
+                                        scores[i] += mask_data[off + i];
+                                    }
+                                }
+                                apply_synthetic_mask(scores, q_s, k_s, *mask_kind);
+                                // Gemma 2 attention logit soft-cap (post-mask, pre-softmax).
+                                if *softcap > 0.0 {
+                                    for s in scores.iter_mut() {
+                                        *s = *softcap * (*s / *softcap).tanh();
+                                    }
+                                }
+                                crate::kernels::neon_softmax(scores, q_s, k_s);
+                                // score @ V — V and output are dh_v-wide per head.
+                                let o_head_base = bi * nh * q_s * dh_v + hi * q_s * dh_v;
+                                let v_head_base = bi * nkv * k_s * dh_v + kv_hi * k_s * dh_v;
+                                for qi in 0..q_s {
+                                    let o_base = o_head_base + qi * dh_v;
+                                    for d in 0..dh_v {
+                                        out_data[o_base + d] = 0.0;
+                                    }
+                                    for ki in 0..k_s {
+                                        let sc = scores[qi * k_s + ki];
+                                        if sc > score_thr {
+                                            let v_base = v_head_base + ki * dh_v;
+                                            for d in 0..dh_v {
+                                                out_data[o_base + d] += sc * v_data[v_base + d];
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // ── Decode (one query row) on x86-64: a task per head ──
+                    // Short rows take the sequential path below, which runs
+                    // every head on one thread; long ones take the strided
+                    // path, which without a BLAS is two loop-nest GEMMs. Both
+                    // compute the Q·K dot for padded keys whose score the
+                    // Custom mask then overwrites. With one query row the
+                    // heads are independent, so split them over the pool and
+                    // skip the dot for masked keys — the bulk of a decode
+                    // bucket until the context fills it. Per element this is
+                    // the sequential path's arithmetic (bit-identical there),
+                    // with eight keys' dots run side by side in AVX lanes
+                    // (`dots_by_key_lanes`); past the threshold it is taken
+                    // only without a BLAS, at a 512-row bucket ~11 ms of a
+                    // ~30 ms step on three cores.
+                    #[cfg(rlx_cpu_x86)]
+                    if !crate::config::portable()
+                        && b == 1
+                        && q_s == 1
+                        && nh > 1
+                        && (k_s <= cfg.sdpa_seq_threshold || cfg!(not(rlx_cpu_blas)))
+                        && *softcap == 0.0
+                        && matches!(
+                            mask_kind,
+                            rlx_ir::op::MaskKind::Custom | rlx_ir::op::MaskKind::None
+                        )
+                    {
+                        let custom = matches!(mask_kind, rlx_ir::op::MaskKind::Custom)
+                            && !mask_data.is_empty();
+                        let (q_d, k_d, v_d) = (q_data, k_data, v_data);
+                        let live: Vec<usize> = (0..k_s)
+                            .filter(|&ki| !custom || mask_data[ki] >= mask_thr)
+                            .collect();
+                        // 8-wide softmax chunks holding a live key (all of
+                        // them without a mask): the rest are masked only.
+                        let mut live_chunks: Vec<usize> = live.iter().map(|&ki| ki / 8).collect();
+                        live_chunks.dedup();
+                        live_chunks.retain(|&c| c < k_s / 8);
+                        let sparse_softmax = !live.is_empty()
+                            && std::is_x86_feature_detected!("avx2")
+                            && std::is_x86_feature_detected!("fma");
+                        let o_addr = out_data.as_mut_ptr() as usize;
+                        crate::pool::par_for(nh, 1, &|off, cnt| {
+                            let mut scores = vec![0f32; k_s];
+                            let mut dots = vec![0f32; live.len()];
+                            for hi in off..off + cnt {
+                                let kv_hi = hi / group;
+                                let q = &q_d[hi * dh..(hi + 1) * dh];
+                                dots_by_key_lanes(q, k_d, &live, krs, kv_hi * dh, &mut dots);
+                                scores.fill(mask_neg);
+                                for (&ki, &dot) in live.iter().zip(&dots) {
+                                    scores[ki] = dot * scale;
+                                }
+                                if sparse_softmax {
+                                    // SAFETY: AVX2 + FMA detected above.
+                                    crate::kernels::softmax_row_avx2_chunks(
+                                        &mut scores,
+                                        &live_chunks,
+                                    );
+                                } else {
+                                    crate::kernels::neon_softmax(&mut scores, 1, k_s);
+                                }
+                                // SAFETY: each head writes only its own
+                                // `dh_v` output columns.
+                                let o = std::slice::from_raw_parts_mut(
+                                    (o_addr as *mut f32).add(hi * dh_v),
+                                    dh_v,
+                                );
+                                o.fill(0.0);
+                                for &ki in &live {
+                                    let sc = scores[ki];
+                                    if sc > score_thr {
+                                        let v_off = ki * vrs + kv_hi * dh_v;
+                                        for d in 0..dh_v {
+                                            o[d] += sc * v_d[v_off + d];
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        continue;
+                    }
+
+                    // ── Auto-select kernel: NEON dots vs strided BLAS ───
+                    // For tiny inputs (batch=1, short seq), per-head BLAS call
+                    // overhead (~0.5µs × 2 calls × num_heads × num_layers)
+                    // exceeds the NEON compute cost. Use direct strided NEON
+                    // with zero dispatch overhead.
+                    // For batch≥2: always BLAS + par_for (parallelism wins).
+                    if b == 1 && q_s.max(k_s) <= cfg.sdpa_seq_threshold {
+                        // ── Sequential NEON path (zero overhead) ──
+                        let scores = &mut sdpa_scores[..ss];
+                        #[cfg(rlx_cpu_neon)]
+                        let neon_chunks = dh / 4;
+                        #[cfg(rlx_cpu_neon)]
+                        let neon_chunks_v = dh_v / 4;
+
+                        for bi in 0..b {
+                            for hi in 0..nh {
+                                let kv_hi = hi / group; // GQA/MQA: shared KV head
+                                // Q@K^T via strided NEON dot products
+                                for qi in 0..q_s {
+                                    let q_off = bi * q_s * qrs + qi * qrs + hi * dh;
+                                    for ki in 0..k_s {
+                                        let k_off = bi * k_s * krs + ki * krs + kv_hi * dh;
+                                        let mut dot = 0f32;
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let mut acc = vdupq_n_f32(0.0);
+                                                for c in 0..neon_chunks {
+                                                    let vq = vld1q_f32(
+                                                        q_data.as_ptr().add(q_off + c * 4),
+                                                    );
+                                                    let vk = vld1q_f32(
+                                                        k_data.as_ptr().add(k_off + c * 4),
+                                                    );
+                                                    acc = vfmaq_f32(acc, vq, vk);
+                                                }
+                                                dot = vaddvq_f32(acc);
+                                                for d in (neon_chunks * 4)..dh {
+                                                    dot += q_data[q_off + d] * k_data[k_off + d];
+                                                }
+                                            },
+                                            {
+                                                for d in 0..dh {
+                                                    dot += q_data[q_off + d] * k_data[k_off + d];
+                                                }
+                                            }
+                                        );
+                                        scores[qi * k_s + ki] = dot * scale;
+                                        // Inner-loop Custom mask check —
+                                        // Causal / SlidingWindow / None
+                                        // apply outside the loop below.
+                                        // Skip for Bias — that mask is a
+                                        // per-head additive tensor, not a
+                                        // 0/1 key-padding mask.
+                                        if matches!(mask_kind, rlx_ir::op::MaskKind::Custom)
+                                            && !mask_data.is_empty()
+                                            && mask_data[bi * k_s + ki] < mask_thr
+                                        {
+                                            scores[qi * k_s + ki] = mask_neg;
+                                        }
+                                    }
+                                }
+
+                                if matches!(mask_kind, rlx_ir::op::MaskKind::Bias) {
+                                    let off = (bi * nh + hi) * q_s * k_s;
+                                    for i in 0..q_s * k_s {
+                                        scores[i] += mask_data[off + i];
+                                    }
+                                }
+                                apply_synthetic_mask(scores, q_s, k_s, *mask_kind);
+                                crate::kernels::neon_softmax(scores, q_s, k_s);
+
+                                // Score@V via strided NEON accumulation (zero-copy).
+                                // V/output are dh_v-wide per head (== dh unless MLA).
+                                for qi in 0..q_s {
+                                    let o_off = bi * q_s * hs_v + qi * hs_v + hi * dh_v;
+                                    // Zero output for this head position
+                                    for d in 0..dh_v {
+                                        out_data[o_off + d] = 0.0;
+                                    }
+                                    for ki in 0..k_s {
+                                        let sc = scores[qi * k_s + ki];
+                                        if sc > score_thr {
+                                            let v_off = bi * k_s * vrs + ki * vrs + kv_hi * dh_v;
+                                            neon_or!(
+                                                {
+                                                    use std::arch::aarch64::*;
+                                                    let vsc = vdupq_n_f32(sc);
+                                                    for c in 0..neon_chunks_v {
+                                                        let off = c * 4;
+                                                        let vo = vld1q_f32(
+                                                            out_data.as_ptr().add(o_off + off),
+                                                        );
+                                                        let vv = vld1q_f32(
+                                                            v_data.as_ptr().add(v_off + off),
+                                                        );
+                                                        vst1q_f32(
+                                                            out_data.as_mut_ptr().add(o_off + off),
+                                                            vfmaq_f32(vo, vsc, vv),
+                                                        );
+                                                    }
+                                                    // scalar tail if dh_v not a multiple of 4
+                                                    for d in (neon_chunks_v * 4)..dh_v {
+                                                        out_data[o_off + d] +=
+                                                            sc * v_data[v_off + d];
+                                                    }
+                                                },
+                                                {
+                                                    for d in 0..dh_v {
+                                                        out_data[o_off + d] +=
+                                                            sc * v_data[v_off + d];
+                                                    }
+                                                }
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if sdpa_row_blocked(q_s, k_s, *mask_kind, bhsd)
+                        && sdpa_sme_blocks(q_s, k_s, dh, dh_v)
+                    {
+                        // ── Row-blocked path (long sequences, SME2) ──
+                        // One task per (batch, head): Kᵀ and V packed once,
+                        // then blocks of query rows whose scores stay
+                        // cache-sized (instead of a q_s×k_s matrix per head).
+                        // Each product is the SME kernel's sequential FMA per
+                        // element, so this equals the strided path bit for bit.
+                        #[cfg(rlx_cpu_amx_sme)]
+                        {
+                            use crate::intrinsics::apple_amx::sme::{
+                                PackedB, StridedMat, pack_b, sme_sgemm_packed_with,
+                            };
+                            let bq = sdpa_row_block(q_s, k_s);
+                            let n_qb = q_s.div_ceil(bq);
+                            let q_addr = q_data.as_ptr() as usize;
+                            let k_addr = k_data.as_ptr() as usize;
+                            let v_addr = v_data.as_ptr() as usize;
+                            let m_addr = mask_data.as_ptr() as usize;
+                            let o_addr = out_data.as_mut_ptr() as usize;
+                            // 1. Kᵀ and V of every (batch, KV head), packed once.
+                            let n_kv = b * nkv;
+                            let mut packed: Vec<Option<(PackedB, PackedB)>> =
+                                (0..n_kv).map(|_| None).collect();
+                            let pk_addr = packed.as_mut_ptr() as usize;
+                            crate::pool::par_for(n_kv, 1, &|off, cnt| {
+                                for j in off..off + cnt {
+                                    let (bi, kv_hi) = (j / nkv, j % nkv);
+                                    let k_start =
+                                        (k_addr as *const f32).add(bi * k_s * krs + kv_hi * dh);
+                                    let v_start =
+                                        (v_addr as *const f32).add(bi * k_s * vrs + kv_hi * dh_v);
+                                    // B for Q·Kᵀ is Kᵀ (dh × k_s); B for S·V is V (k_s × dh_v)
+                                    let kp = pack_b(
+                                        dh,
+                                        k_s,
+                                        StridedMat {
+                                            ptr: k_start,
+                                            rs: 1,
+                                            cs: krs,
+                                        },
+                                    );
+                                    let vp = pack_b(
+                                        k_s,
+                                        dh_v,
+                                        StridedMat {
+                                            ptr: v_start,
+                                            rs: vrs,
+                                            cs: 1,
+                                        },
+                                    );
+                                    // SAFETY: slot j is written by this task only.
+                                    *(pk_addr as *mut Option<(PackedB, PackedB)>).add(j) =
+                                        Some((kp, vp));
+                                }
+                            });
+                            let packed_ref: &[Option<(PackedB, PackedB)>] = &packed;
+                            // 2. Every (batch, head, query block) as one flat parallel loop;
+                            //    each product on its task's thread.
+                            crate::pool::par_for(b * nh * n_qb, 1, &|off, cnt| {
+                                let mut sc = vec![0f32; bq * k_s];
+                                for idx in off..off + cnt {
+                                    let qb = idx % n_qb;
+                                    let bh = idx / n_qb;
+                                    let (bi, hi) = (bh / nh, bh % nh);
+                                    let (kp, vp) =
+                                        packed_ref[bi * nkv + hi / group].as_ref().unwrap();
+                                    let q0 = qb * bq;
+                                    let rows = bq.min(q_s - q0);
+                                    let sc = &mut sc[..rows * k_s];
+                                    let q_start = (q_addr as *const f32)
+                                        .add(bi * q_s * qrs + q0 * qrs + hi * dh);
+                                    let o_start = (o_addr as *mut f32)
+                                        .add(bi * q_s * hs_v + q0 * hs_v + hi * dh_v);
+                                    sme_sgemm_packed_with(
+                                        1,
+                                        rows,
+                                        StridedMat {
+                                            ptr: q_start,
+                                            rs: qrs,
+                                            cs: 1,
+                                        },
+                                        kp,
+                                        sc.as_mut_ptr(),
+                                        k_s,
+                                        scale,
+                                        0.0,
+                                    );
+                                    match mask_kind {
+                                        rlx_ir::op::MaskKind::Custom => {
+                                            let mask_bi = std::slice::from_raw_parts(
+                                                (m_addr as *const f32).add(bi * k_s),
+                                                k_s,
+                                            );
+                                            for ki in 0..k_s {
+                                                if mask_bi[ki] < mask_thr {
+                                                    for qi in 0..rows {
+                                                        sc[qi * k_s + ki] = mask_neg;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        rlx_ir::op::MaskKind::Bias => {
+                                            let bias = std::slice::from_raw_parts(
+                                                (m_addr as *const f32)
+                                                    .add((bi * nh + hi) * q_s * k_s + q0 * k_s),
+                                                rows * k_s,
+                                            );
+                                            for i in 0..rows * k_s {
+                                                sc[i] += bias[i];
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    crate::kernels::neon_softmax(sc, rows, k_s);
+                                    sme_sgemm_packed_with(
+                                        1,
+                                        rows,
+                                        StridedMat {
+                                            ptr: sc.as_ptr(),
+                                            rs: k_s,
+                                            cs: 1,
+                                        },
+                                        vp,
+                                        o_start,
+                                        hs_v,
+                                        1.0,
+                                        0.0,
+                                    );
+                                }
+                            });
+                        }
+                    } else {
+                        // ── Parallel strided BLAS path (high throughput) ──
+                        let total_work = b * nh;
+                        let q_addr = q_data.as_ptr() as usize;
+                        let k_addr = k_data.as_ptr() as usize;
+                        let v_addr = v_data.as_ptr() as usize;
+                        let m_addr = mask_data.as_ptr() as usize;
+                        let o_addr = out_data.as_mut_ptr() as usize;
+                        let sc_addr = sdpa_scores.as_mut_ptr() as usize;
+
+                        crate::pool::par_for(total_work, 1, &|off, cnt| {
+                            for idx in off..off + cnt {
+                                let bi = idx / nh;
+                                let hi = idx % nh;
+                                let kv_hi = hi / group; // GQA/MQA: shared KV head
+
+                                let q_start = (q_addr as *const f32).add(bi * q_s * qrs + hi * dh);
+                                let k_start =
+                                    (k_addr as *const f32).add(bi * k_s * krs + kv_hi * dh);
+                                // V/output are dh_v-wide per head (== dh unless MLA).
+                                let v_start =
+                                    (v_addr as *const f32).add(bi * k_s * vrs + kv_hi * dh_v);
+                                let o_start = (o_addr as *mut f32).add(bi * q_s * hs_v + hi * dh_v);
+                                let sc = std::slice::from_raw_parts_mut(
+                                    (sc_addr as *mut f32).add(idx * ss),
+                                    ss,
+                                );
+
+                                // LDA = qrs, LDB = krs (parent row strides
+                                // when fused; hs otherwise).
+                                crate::blas::sgemm_general(
+                                    q_start,
+                                    k_start,
+                                    sc.as_mut_ptr(),
+                                    q_s,
+                                    k_s,
+                                    dh,
+                                    scale,
+                                    0.0,
+                                    qrs,
+                                    krs,
+                                    k_s,
+                                    false,
+                                    true,
+                                );
+
+                                match mask_kind {
+                                    rlx_ir::op::MaskKind::Custom => {
+                                        let mask_bi = std::slice::from_raw_parts(
+                                            (m_addr as *const f32).add(bi * k_s),
+                                            k_s,
+                                        );
+                                        for ki in 0..k_s {
+                                            if mask_bi[ki] < mask_thr {
+                                                for qi in 0..q_s {
+                                                    sc[qi * k_s + ki] = mask_neg;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    rlx_ir::op::MaskKind::Bias => {
+                                        // Per-head additive bias slice.
+                                        let bias = std::slice::from_raw_parts(
+                                            (m_addr as *const f32).add((bi * nh + hi) * q_s * k_s),
+                                            q_s * k_s,
+                                        );
+                                        for i in 0..q_s * k_s {
+                                            sc[i] += bias[i];
+                                        }
+                                    }
+                                    _ => apply_synthetic_mask(sc, q_s, k_s, *mask_kind),
+                                }
+
+                                crate::kernels::neon_softmax(sc, q_s, k_s);
+
+                                // score@V: N = dh_v (output/V width), LDB = vrs
+                                // (V row stride), LDC = hs_v (output row stride).
+                                crate::blas::sgemm_general(
+                                    sc.as_ptr(),
+                                    v_start,
+                                    o_start,
+                                    q_s,
+                                    dh_v,
+                                    k_s,
+                                    1.0,
+                                    0.0,
+                                    k_s,
+                                    vrs,
+                                    hs_v,
+                                    false,
+                                    false,
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+
+            Thunk::AttentionBackward { .. } => exec_attention_backward(thunk, base),
+            Thunk::AttentionBackwardAll { .. } => exec_attention_backward_all(thunk, base),
+            Thunk::ActivationInPlace { .. } => exec_activation_in_place(thunk, base),
+            Thunk::FusedAttnBlock {
+                hidden,
+                qkv_w,
+                out_w,
+                mask,
+                mask_kind,
+                out,
+                qkv_b,
+                out_b,
+                cos,
+                sin,
+                cos_len,
+                batch,
+                seq,
+                hs,
+                nh,
+                dh,
+                in_dim,
+                out_dim,
+                has_bias,
+                has_rope,
+                interleaved,
+            } => {
+                let (b, s) = (*batch as usize, *seq as usize);
+                let (h, n_h, d_h) = (*hs as usize, *nh as usize, *dh as usize);
+                // QKV-proj input width and out-proj output width — differ from
+                // `h`(=hs) for MoonViT-style attention (hidden ≠ nh·dh).
+                let (in_dim, out_dim) = (*in_dim as usize, *out_dim as usize);
+                let interleaved = *interleaved;
+                let m = b * s;
+                let scale = (d_h as f32).powf(-0.5);
+                let half = d_h / 2;
+                // Only `Custom` consumes the per-key padding buffer; `Causal` /
+                // `SlidingWindow` are synthesized from (qi, ki) below, and have
+                // no mask buffer (so reading one would touch unrelated arena
+                // bytes). q_seq == kv_seq here (guaranteed at fusion time), so
+                // the absolute query position is just `qi`.
+                let use_custom_mask = matches!(mask_kind, rlx_ir::op::MaskKind::Custom);
+                unsafe {
+                    let inp = sl(*hidden, base, m * in_dim);
+                    let wq = sl(*qkv_w, base, in_dim * 3 * h);
+                    let wo = sl(*out_w, base, h * out_dim);
+                    let mk = if use_custom_mask {
+                        sl(*mask, base, b * s)
+                    } else {
+                        &[]
+                    };
+                    let dst = sl_mut(*out, base, m * out_dim);
+
+                    // Stack-allocated intermediates — all fit in L1 cache for small batch
+                    let mut qkv = vec![0f32; m * 3 * h];
+                    let mut attn_out = vec![0f32; m * h];
+
+                    // 1. QKV projection: [m, in_dim] @ [in_dim, 3h] → [m, 3h]
+                    crate::blas::par_sgemm(inp, wq, &mut qkv, m, in_dim, 3 * h);
+                    if *has_bias {
+                        let bias = sl(*qkv_b, base, 3 * h);
+                        crate::blas::bias_add(&mut qkv, bias, m, 3 * h);
+                    }
+
+                    // 2. Multi-head SDPA — PARALLEL across (batch, head). Each
+                    //    task owns its scores buffer and writes a DISJOINT
+                    //    head-slice of attn_out (`o_base` is unique per (bi,hi)),
+                    //    so the raw-pointer writes never alias; Q/K/V/cos/sin/mask
+                    //    are read-only. Serial per-head SDPA lost ~3× to the
+                    //    unfused Attention thunk (which is per-head parallel) on
+                    //    wide heads — e.g. MoonViT 12×128 @ seq 64.
+                    #[cfg(rlx_cpu_neon)]
+                    let neon_chunks = d_h / 4;
+                    let qkv_ptr = qkv.as_ptr() as usize;
+                    let out_ptr = attn_out.as_mut_ptr() as usize;
+                    let mk_ptr = mk.as_ptr() as usize;
+                    let mk_len = mk.len();
+                    let base_addr = base as usize;
+                    let (cos_off, sin_off, cl) = (*cos, *sin, *cos_len as usize);
+                    let has_rope_c = *has_rope;
+                    let mask_kind_c = *mask_kind;
+                    let n_tasks = b * n_h;
+                    crate::pool::par_for(n_tasks, 1, &|off, cnt| {
+                        // Read-only views (multiple immutable aliases are fine).
+                        let qkv = std::slice::from_raw_parts(qkv_ptr as *const f32, m * 3 * h);
+                        let out = out_ptr as *mut f32;
+                        let base = base_addr as *mut u8;
+                        let (cos_tab, sin_tab): (&[f32], &[f32]) = if has_rope_c {
+                            (sl(cos_off, base, cl), sl(sin_off, base, cl))
+                        } else {
+                            (&[], &[])
+                        };
+                        let mk = std::slice::from_raw_parts(mk_ptr as *const f32, mk_len);
+                        let mut scores = vec![0f32; s * s];
+                        for t in off..off + cnt {
+                            let bi = t / n_h;
+                            let hi = t % n_h;
+                            for qi in 0..s {
+                                let q_base = bi * s * 3 * h + qi * 3 * h + hi * d_h;
+                                for ki in 0..s {
+                                    let k_base = bi * s * 3 * h + ki * 3 * h + h + hi * d_h;
+                                    let mut dot = 0f32;
+                                    if has_rope_c {
+                                        // Inline RoPE per pair, then dot. Pair offsets:
+                                        //   NeoX (i, i+half)  GPT-J (2i, 2i+1).
+                                        let q_cos = qi * half;
+                                        let k_cos = ki * half;
+                                        for i in 0..half {
+                                            let (qo1, qo2, ko1, ko2) = if interleaved {
+                                                (2 * i, 2 * i + 1, 2 * i, 2 * i + 1)
+                                            } else {
+                                                (i, half + i, i, half + i)
+                                            };
+                                            let q1 = qkv[q_base + qo1];
+                                            let q2 = qkv[q_base + qo2];
+                                            let k1 = qkv[k_base + ko1];
+                                            let k2 = qkv[k_base + ko2];
+                                            let c_q = cos_tab[q_cos + i];
+                                            let s_q = sin_tab[q_cos + i];
+                                            let c_k = cos_tab[k_cos + i];
+                                            let s_k = sin_tab[k_cos + i];
+                                            let qr1 = q1 * c_q - q2 * s_q;
+                                            let kr1 = k1 * c_k - k2 * s_k;
+                                            let qr2 = q2 * c_q + q1 * s_q;
+                                            let kr2 = k2 * c_k + k1 * s_k;
+                                            dot += qr1 * kr1 + qr2 * kr2;
+                                        }
+                                    } else {
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let mut acc = vdupq_n_f32(0.0);
+                                                for c in 0..neon_chunks {
+                                                    let vq =
+                                                        vld1q_f32(qkv.as_ptr().add(q_base + c * 4));
+                                                    let vk =
+                                                        vld1q_f32(qkv.as_ptr().add(k_base + c * 4));
+                                                    acc = vfmaq_f32(acc, vq, vk);
+                                                }
+                                                dot = vaddvq_f32(acc);
+                                                for d in (neon_chunks * 4)..d_h {
+                                                    dot += qkv[q_base + d] * qkv[k_base + d];
+                                                }
+                                            },
+                                            {
+                                                for d in 0..d_h {
+                                                    dot += qkv[q_base + d] * qkv[k_base + d];
+                                                }
+                                            }
+                                        );
+                                    }
+                                    let mut sv = dot * scale;
+                                    let pos_masked = match mask_kind_c {
+                                        rlx_ir::op::MaskKind::Causal => ki > qi,
+                                        rlx_ir::op::MaskKind::SlidingWindow(w) => {
+                                            ki > qi || ki + w < qi
+                                        }
+                                        _ => false,
+                                    };
+                                    if pos_masked || (use_custom_mask && mk[bi * s + ki] < mask_thr)
+                                    {
+                                        sv = mask_neg;
+                                    }
+                                    scores[qi * s + ki] = sv;
+                                }
+                            }
+                            crate::kernels::neon_softmax(&mut scores[..s * s], s, s);
+                            // Score @ V accumulation (V at offset 2h in QKV).
+                            for qi in 0..s {
+                                let o_base = bi * s * h + qi * h + hi * d_h;
+                                for d in 0..d_h {
+                                    *out.add(o_base + d) = 0.0;
+                                }
+                                for ki in 0..s {
+                                    let sc = scores[qi * s + ki];
+                                    if sc > score_thr {
+                                        let v_base = bi * s * 3 * h + ki * 3 * h + 2 * h + hi * d_h;
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let vsc = vdupq_n_f32(sc);
+                                                for c in 0..neon_chunks {
+                                                    let o = c * 4;
+                                                    let vo = vld1q_f32(out.add(o_base + o));
+                                                    let vv =
+                                                        vld1q_f32(qkv.as_ptr().add(v_base + o));
+                                                    vst1q_f32(
+                                                        out.add(o_base + o),
+                                                        vfmaq_f32(vo, vsc, vv),
+                                                    );
+                                                }
+                                            },
+                                            {
+                                                for d in 0..d_h {
+                                                    *out.add(o_base + d) += sc * qkv[v_base + d];
+                                                }
+                                            }
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    // 3. Output projection: [m, h] @ [h, out_dim] → dst
+                    crate::blas::par_sgemm(&attn_out, wo, dst, m, h, out_dim);
+                    if *has_bias {
+                        let bias = sl(*out_b, base, out_dim);
+                        crate::blas::bias_add(dst, bias, m, out_dim);
+                    }
+                }
+            }
+
+            Thunk::Rope { .. } => exec_rope(thunk, base),
+            Thunk::FusedBertLayer {
+                hidden,
+                qkv_w,
+                qkv_b,
+                out_w,
+                out_b,
+                mask,
+                ln1_g,
+                ln1_b,
+                eps1,
+                fc1_w,
+                fc1_b,
+                fc2_w,
+                fc2_b,
+                ln2_g,
+                ln2_b,
+                eps2,
+                out,
+                batch,
+                seq,
+                hs,
+                nh,
+                dh,
+                int_dim,
+            } => {
+                let (b, s, h, n_h, d_h) = (
+                    *batch as usize,
+                    *seq as usize,
+                    *hs as usize,
+                    *nh as usize,
+                    *dh as usize,
+                );
+                let m = b * s;
+                let id = *int_dim as usize;
+                let scale = (d_h as f32).powf(-0.5);
+                let _half = d_h / 2;
+                #[cfg(rlx_cpu_neon)]
+                let neon_chunks = d_h / 4;
+                unsafe {
+                    let inp = sl(*hidden, base, m * h);
+                    let dst = sl_mut(*out, base, m * h);
+                    let mk = sl(*mask, base, b * s);
+
+                    // Pre-allocated buffers (zero malloc per layer — allocated once before thunk loop)
+                    let qkv = std::slice::from_raw_parts_mut(fl_qkv.as_mut_ptr(), m * 3 * h);
+                    let attn = std::slice::from_raw_parts_mut(fl_attn.as_mut_ptr(), m * h);
+                    let res = std::slice::from_raw_parts_mut(fl_res.as_mut_ptr(), m * h);
+                    let normed = std::slice::from_raw_parts_mut(fl_normed.as_mut_ptr(), m * h);
+                    let ffn = std::slice::from_raw_parts_mut(fl_ffn.as_mut_ptr(), m * id);
+                    let sc = std::slice::from_raw_parts_mut(fl_sc.as_mut_ptr(), s * s);
+
+                    // QKV (parallelized across cores — multiple AMX coprocessors)
+                    crate::blas::par_sgemm_bias(
+                        inp,
+                        sl(*qkv_w, base, h * 3 * h),
+                        sl(*qkv_b, base, 3 * h),
+                        qkv,
+                        m,
+                        h,
+                        3 * h,
+                    );
+
+                    // SDPA per head (sequential NEON, inline — zero overhead)
+                    for bi in 0..b {
+                        for hi in 0..n_h {
+                            for qi in 0..s {
+                                for ki in 0..s {
+                                    let q_base = bi * s * 3 * h + qi * 3 * h + hi * d_h;
+                                    let k_base = bi * s * 3 * h + ki * 3 * h + h + hi * d_h;
+                                    let mut dot = 0f32;
+                                    neon_or!(
+                                        {
+                                            use std::arch::aarch64::*;
+                                            let mut acc = vdupq_n_f32(0.0);
+                                            for c in 0..neon_chunks {
+                                                acc = vfmaq_f32(
+                                                    acc,
+                                                    vld1q_f32(qkv.as_ptr().add(q_base + c * 4)),
+                                                    vld1q_f32(qkv.as_ptr().add(k_base + c * 4)),
+                                                );
+                                            }
+                                            dot = vaddvq_f32(acc);
+                                        },
+                                        {
+                                            for d in 0..d_h {
+                                                dot += qkv[q_base + d] * qkv[k_base + d];
+                                            }
+                                        }
+                                    );
+                                    sc[qi * s + ki] = dot * scale;
+                                    if mk[bi * s + ki] < mask_thr {
+                                        sc[qi * s + ki] = mask_neg;
+                                    }
+                                }
+                            }
+                            crate::kernels::neon_softmax(&mut sc[..s * s], s, s);
+                            for qi in 0..s {
+                                let o = bi * s * h + qi * h + hi * d_h;
+                                for d in 0..d_h {
+                                    attn[o + d] = 0.0;
+                                }
+                                for ki in 0..s {
+                                    let w = sc[qi * s + ki];
+                                    if w > score_thr {
+                                        let v = bi * s * 3 * h + ki * 3 * h + 2 * h + hi * d_h;
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let vw = vdupq_n_f32(w);
+                                                for c in 0..neon_chunks {
+                                                    let off = c * 4;
+                                                    vst1q_f32(
+                                                        attn.as_mut_ptr().add(o + off),
+                                                        vfmaq_f32(
+                                                            vld1q_f32(attn.as_ptr().add(o + off)),
+                                                            vw,
+                                                            vld1q_f32(qkv.as_ptr().add(v + off)),
+                                                        ),
+                                                    );
+                                                }
+                                            },
+                                            {
+                                                for d in 0..d_h {
+                                                    attn[o + d] += w * qkv[v + d];
+                                                }
+                                            }
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Out proj (sgemm + bias fused) + residual add with NEON
+                    crate::blas::sgemm_bias(
+                        attn,
+                        sl(*out_w, base, h * h),
+                        sl(*out_b, base, h),
+                        res,
+                        m,
+                        h,
+                        h,
+                    );
+                    neon_or!(
+                        {
+                            use std::arch::aarch64::*;
+                            let chunks_h = (m * h) / 4;
+                            for c in 0..chunks_h {
+                                let off = c * 4;
+                                vst1q_f32(
+                                    res.as_mut_ptr().add(off),
+                                    vaddq_f32(
+                                        vld1q_f32(res.as_ptr().add(off)),
+                                        vld1q_f32(inp.as_ptr().add(off)),
+                                    ),
+                                );
+                            }
+                            for i in (chunks_h * 4)..(m * h) {
+                                res[i] += inp[i];
+                            }
+                        },
+                        {
+                            for i in 0..m * h {
+                                res[i] += inp[i];
+                            }
+                        }
+                    );
+
+                    // LN1 (fused residual already done above — just normalize)
+                    let g1 = sl(*ln1_g, base, h);
+                    let b1 = sl(*ln1_b, base, h);
+                    crate::kernels::layer_norm_rows(&res[..], g1, b1, &mut normed[..], m, h, *eps1);
+
+                    // FFN: fc1 (parallel across cores) + GELU
+                    crate::blas::par_sgemm_bias(
+                        normed,
+                        sl(*fc1_w, base, h * id),
+                        sl(*fc1_b, base, id),
+                        ffn,
+                        m,
+                        h,
+                        id,
+                    );
+                    crate::kernels::par_gelu_inplace(ffn);
+
+                    // fc2 + bias (parallel across cores) + residual with NEON
+                    crate::blas::par_sgemm_bias(
+                        ffn,
+                        sl(*fc2_w, base, id * h),
+                        sl(*fc2_b, base, h),
+                        res,
+                        m,
+                        id,
+                        h,
+                    );
+                    neon_or!(
+                        {
+                            use std::arch::aarch64::*;
+                            let chunks_h = (m * h) / 4;
+                            for c in 0..chunks_h {
+                                let off = c * 4;
+                                vst1q_f32(
+                                    res.as_mut_ptr().add(off),
+                                    vaddq_f32(
+                                        vld1q_f32(res.as_ptr().add(off)),
+                                        vld1q_f32(normed.as_ptr().add(off)),
+                                    ),
+                                );
+                            }
+                            for i in (chunks_h * 4)..(m * h) {
+                                res[i] += normed[i];
+                            }
+                        },
+                        {
+                            for i in 0..m * h {
+                                res[i] += normed[i];
+                            }
+                        }
+                    );
+
+                    // LN2 → output
+                    let g2 = sl(*ln2_g, base, h);
+                    let b2 = sl(*ln2_b, base, h);
+                    crate::kernels::layer_norm_rows(&res[..], g2, b2, &mut dst[..], m, h, *eps2);
+                }
+            }
+
+            Thunk::FusedNomicLayer {
+                hidden,
+                qkv_w,
+                out_w,
+                mask,
+                cos,
+                sin,
+                cos_len,
+                ln1_g,
+                ln1_b,
+                eps1,
+                fc11_w,
+                fc12_w: _,
+                fc2_w,
+                ln2_g,
+                ln2_b,
+                eps2,
+                out,
+                batch,
+                seq,
+                hs,
+                nh,
+                dh,
+                int_dim,
+                interleaved,
+            } => {
+                let interleaved = *interleaved;
+                let (b, s, h, n_h, d_h) = (
+                    *batch as usize,
+                    *seq as usize,
+                    *hs as usize,
+                    *nh as usize,
+                    *dh as usize,
+                );
+                let m = b * s;
+                let id = *int_dim as usize;
+                let scale = (d_h as f32).powf(-0.5);
+                let half_dh = d_h / 2;
+                #[cfg(rlx_cpu_neon)]
+                let neon_chunks = d_h / 4;
+                unsafe {
+                    let inp = sl(*hidden, base, m * h);
+                    let dst = sl_mut(*out, base, m * h);
+                    let mk = sl(*mask, base, b * s);
+                    let cos_tab = sl(*cos, base, *cos_len as usize);
+                    let sin_tab = sl(*sin, base, *cos_len as usize);
+                    // fc11_w is the fused [h, 2*int_dim] weight (fc11 || fc12 concatenated)
+                    let fused_fc_w = sl(*fc11_w, base, h * 2 * id);
+
+                    let mut qkv = vec![0f32; m * 3 * h];
+                    let mut attn = vec![0f32; m * h];
+                    let mut res = vec![0f32; m * h];
+                    let mut normed = vec![0f32; m * h];
+                    let mut ffn_concat = vec![0f32; m * 2 * id]; // fc11||fc12 output
+                    let mut sc = vec![0f32; s * s];
+
+                    // QKV (no bias)
+                    crate::blas::sgemm(inp, sl(*qkv_w, base, h * 3 * h), &mut qkv, m, h, 3 * h);
+
+                    // SDPA with inline RoPE
+                    for bi in 0..b {
+                        for hi in 0..n_h {
+                            for qi in 0..s {
+                                for ki in 0..s {
+                                    let q_base = bi * s * 3 * h + qi * 3 * h + hi * d_h;
+                                    let k_base = bi * s * 3 * h + ki * 3 * h + h + hi * d_h;
+                                    let mut dot = 0f32;
+                                    for i in 0..half_dh {
+                                        // NeoX pairs (i, i+half); GPT-J pairs (2i, 2i+1).
+                                        let (o1, o2) = if interleaved {
+                                            (2 * i, 2 * i + 1)
+                                        } else {
+                                            (i, half_dh + i)
+                                        };
+                                        let q1 = qkv[q_base + o1];
+                                        let q2 = qkv[q_base + o2];
+                                        let k1 = qkv[k_base + o1];
+                                        let k2 = qkv[k_base + o2];
+                                        let cq = cos_tab[qi * half_dh + i];
+                                        let sq = sin_tab[qi * half_dh + i];
+                                        let ck = cos_tab[ki * half_dh + i];
+                                        let sk = sin_tab[ki * half_dh + i];
+                                        dot += (q1 * cq - q2 * sq) * (k1 * ck - k2 * sk)
+                                            + (q2 * cq + q1 * sq) * (k2 * ck + k1 * sk);
+                                    }
+                                    sc[qi * s + ki] = dot * scale;
+                                    if mk[bi * s + ki] < mask_thr {
+                                        sc[qi * s + ki] = mask_neg;
+                                    }
+                                }
+                            }
+                            crate::kernels::neon_softmax(&mut sc[..s * s], s, s);
+                            for qi in 0..s {
+                                let o = bi * s * h + qi * h + hi * d_h;
+                                for d in 0..d_h {
+                                    attn[o + d] = 0.0;
+                                }
+                                for ki in 0..s {
+                                    let w = sc[qi * s + ki];
+                                    if w > score_thr {
+                                        let v = bi * s * 3 * h + ki * 3 * h + 2 * h + hi * d_h;
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let vw = vdupq_n_f32(w);
+                                                for c in 0..neon_chunks {
+                                                    let off = c * 4;
+                                                    vst1q_f32(
+                                                        attn.as_mut_ptr().add(o + off),
+                                                        vfmaq_f32(
+                                                            vld1q_f32(attn.as_ptr().add(o + off)),
+                                                            vw,
+                                                            vld1q_f32(qkv.as_ptr().add(v + off)),
+                                                        ),
+                                                    );
+                                                }
+                                            },
+                                            {
+                                                for d in 0..d_h {
+                                                    attn[o + d] += w * qkv[v + d];
+                                                }
+                                            }
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Out proj (no bias) + residual
+                    crate::blas::sgemm(&attn, sl(*out_w, base, h * h), &mut res, m, h, h);
+                    for i in 0..m * h {
+                        res[i] += inp[i];
+                    }
+
+                    // LN1
+                    let g1 = sl(*ln1_g, base, h);
+                    let b1 = sl(*ln1_b, base, h);
+                    crate::kernels::layer_norm_rows(&res[..], g1, b1, &mut normed[..], m, h, *eps1);
+
+                    // SwiGLU: fused fc11+fc12 sgemm, then split, silu, mul
+                    crate::blas::sgemm(&normed, fused_fc_w, &mut ffn_concat, m, h, 2 * id);
+                    // Split: first id cols = fc11 (up), second id cols = fc12 (gate)
+                    // SiLU on gate, then multiply up * gate → store in up region
+                    for row in 0..m {
+                        let bo = row * 2 * id;
+                        // SiLU in-place on gate portion
+                        for j in 0..id {
+                            let x = ffn_concat[bo + id + j];
+                            ffn_concat[bo + id + j] = x / (1.0 + (-x).exp());
+                        }
+                        // Multiply: up[j] *= gate[j]
+                        for j in 0..id {
+                            ffn_concat[bo + j] *= ffn_concat[bo + id + j];
+                        }
+                    }
+
+                    // fc2 (no bias) + residual. The up*silu(gate) product lives in
+                    // the FIRST `id` cols of each 2*id-wide ffn_concat row; gather
+                    // it contiguous and run the SAME `sgemm` dispatch the unfused
+                    // path uses (a strided `sgemm_general` here would force the
+                    // BLAS/scalar path and diverge from the unfused NEON sgemm).
+                    let mut swiglu_contig = vec![0f32; m * id];
+                    for row in 0..m {
+                        let bo = row * 2 * id;
+                        swiglu_contig[row * id..(row + 1) * id]
+                            .copy_from_slice(&ffn_concat[bo..bo + id]);
+                    }
+                    crate::blas::sgemm(
+                        &swiglu_contig,
+                        sl(*fc2_w, base, id * h),
+                        &mut res,
+                        m,
+                        id,
+                        h,
+                    );
+                    for i in 0..m * h {
+                        res[i] += normed[i];
+                    }
+
+                    // LN2 → output
+                    let g2 = sl(*ln2_g, base, h);
+                    let b2 = sl(*ln2_b, base, h);
+                    crate::kernels::layer_norm_rows(&res[..], g2, b2, &mut dst[..], m, h, *eps2);
+                }
+            }
+
+            Thunk::FusedSwiGLU { .. } => exec_fused_swi_g_l_u(thunk, base),
+            Thunk::Concat { .. } => exec_concat(thunk, base),
+            Thunk::KvAppend { .. } => exec_kv_append(thunk, base),
+            Thunk::DynamicUpdateSlice { .. } => exec_dynamic_update_slice(thunk, base),
+            Thunk::ConcatF64 { .. } => exec_concat_f64(thunk, base),
+            Thunk::ConcatHalf { .. } => exec_concat_half(thunk, base),
+            Thunk::ConcatBytes { .. } => exec_concat_bytes(thunk, base),
+            Thunk::Compare {
+                lhs,
+                rhs,
+                dst,
+                len,
+                op,
+                inputs_i64,
+                inputs_elem_bytes,
+                dst_elem_bytes,
+                lhs_scalar,
+                rhs_scalar,
+                lhs_len,
+                rhs_len,
+                out_dims_bcast,
+                bcast_lhs_strides,
+                bcast_rhs_strides,
+            } => {
+                let len = *len as usize;
+                let arena_len = arena_buf.len();
+                let elem = (*inputs_elem_bytes).max(1) as usize;
+                let dst_eb = (*dst_elem_bytes).max(1) as usize;
+                let max_l = (arena_len.saturating_sub(*lhs)) / elem;
+                let max_r = (arena_len.saturating_sub(*rhs)) / elem;
+                let max_d = (arena_len.saturating_sub(*dst)) / dst_eb;
+                if !out_dims_bcast.is_empty() {
+                    // Shape-aware broadcast (partial size-1 axes, e.g. `[.,L,1]`
+                    // vs `[.,L,L]`). Read each operand at its TRUE element count
+                    // and index via row-major coords · strides — the flat path
+                    // below would read past a partial operand into adjacent
+                    // arena memory. Mirrors `BinaryFull`'s broadcast loop.
+                    let len = len.min(max_d);
+                    let l_read = (*lhs_len as usize).min(max_l).max(1);
+                    let r_read = (*rhs_len as usize).min(max_r).max(1);
+                    let rank = out_dims_bcast.len();
+                    let bidx = |i: usize| -> (usize, usize) {
+                        let mut rem = i;
+                        let (mut li, mut ri) = (0usize, 0usize);
+                        for ax in (0..rank).rev() {
+                            let sz = out_dims_bcast[ax] as usize;
+                            let c = rem % sz;
+                            rem /= sz;
+                            li += c * bcast_lhs_strides[ax] as usize;
+                            ri += c * bcast_rhs_strides[ax] as usize;
+                        }
+                        (li, ri)
+                    };
+                    macro_rules! do_cmp {
+                        ($a:expr, $b:expr) => {
+                            match op {
+                                CmpOp::Eq => $a == $b,
+                                CmpOp::Ne => $a != $b,
+                                CmpOp::Lt => $a < $b,
+                                CmpOp::Le => $a <= $b,
+                                CmpOp::Gt => $a > $b,
+                                CmpOp::Ge => $a >= $b,
+                            }
+                        };
+                    }
+                    macro_rules! put {
+                        ($i:expr, $v:expr) => {
+                            if *dst_elem_bytes == 1 {
+                                arena_buf[*dst + $i] = u8::from($v);
+                            } else {
+                                let o = sl_mut(*dst, base, len);
+                                o[$i] = if $v { 1.0 } else { 0.0 };
+                            }
+                        };
+                    }
+                    if elem == 1 {
+                        let l = arena_buf[*lhs..*lhs + l_read].to_vec();
+                        let r = arena_buf[*rhs..*rhs + r_read].to_vec();
+                        for i in 0..len {
+                            let (li, ri) = bidx(i);
+                            let v = do_cmp!(l[li], r[ri]);
+                            unsafe { put!(i, v) }
+                        }
+                    } else if *inputs_i64 != 0 {
+                        unsafe {
+                            let l = sl_i64(*lhs, base, l_read);
+                            let r = sl_i64(*rhs, base, r_read);
+                            for i in 0..len {
+                                let (li, ri) = bidx(i);
+                                let v = do_cmp!(l[li], r[ri]);
+                                put!(i, v)
+                            }
+                        }
+                    } else {
+                        unsafe {
+                            let l = sl(*lhs, base, l_read);
+                            let r = sl(*rhs, base, r_read);
+                            for i in 0..len {
+                                let (li, ri) = bidx(i);
+                                let v = do_cmp!(l[li], r[ri]);
+                                put!(i, v)
+                            }
+                        }
+                    }
+                } else {
+                    let l_n = if *lhs_scalar { 1 } else { len };
+                    let r_n = if *rhs_scalar { 1 } else { len };
+                    // Keep full `len` when broadcasting scalars — only the
+                    // non-scalar operands (and dst) may shrink the loop.
+                    let mut len = len.min(max_d);
+                    if *lhs_scalar {
+                        if max_l < 1 {
+                            len = 0;
+                        }
+                    } else {
+                        len = len.min(max_l);
+                    }
+                    if *rhs_scalar {
+                        if max_r < 1 {
+                            len = 0;
+                        }
+                    } else {
+                        len = len.min(max_r);
+                    }
+                    if trace_thunks && len > 0 {
+                        eprintln!(
+                            "[compare] len={len} lhs={} rhs={} dst={} ls={} rs={}",
+                            *lhs, *rhs, *dst, *lhs_scalar, *rhs_scalar
+                        );
+                    }
+                    if elem == 1 {
+                        let l = arena_buf[*lhs..*lhs + l_n.min(max_l).max(1)].to_vec();
+                        let r = arena_buf[*rhs..*rhs + r_n.min(max_r).max(1)].to_vec();
+                        for i in 0..len {
+                            let li = if *lhs_scalar { 0 } else { i };
+                            let ri = if *rhs_scalar { 0 } else { i };
+                            let v = match op {
+                                CmpOp::Eq => l[li] == r[ri],
+                                CmpOp::Ne => l[li] != r[ri],
+                                CmpOp::Lt => l[li] < r[ri],
+                                CmpOp::Le => l[li] <= r[ri],
+                                CmpOp::Gt => l[li] > r[ri],
+                                CmpOp::Ge => l[li] >= r[ri],
+                            };
+                            if *dst_elem_bytes == 1 {
+                                arena_buf[*dst + i] = u8::from(v);
+                            } else {
+                                unsafe {
+                                    let o = sl_mut(*dst, base, len);
+                                    o[i] = if v { 1.0 } else { 0.0 };
+                                }
+                            }
+                        }
+                    } else if *inputs_i64 != 0 {
+                        unsafe {
+                            let l = sl_i64(*lhs, base, l_n.min(max_l).max(1));
+                            let r = sl_i64(*rhs, base, r_n.min(max_r).max(1));
+                            for i in 0..len {
+                                let li = if *lhs_scalar { 0 } else { i };
+                                let ri = if *rhs_scalar { 0 } else { i };
+                                let v = match op {
+                                    CmpOp::Eq => l[li] == r[ri],
+                                    CmpOp::Ne => l[li] != r[ri],
+                                    CmpOp::Lt => l[li] < r[ri],
+                                    CmpOp::Le => l[li] <= r[ri],
+                                    CmpOp::Gt => l[li] > r[ri],
+                                    CmpOp::Ge => l[li] >= r[ri],
+                                };
+                                if *dst_elem_bytes == 1 {
+                                    arena_buf[*dst + i] = u8::from(v);
+                                } else {
+                                    let o = sl_mut(*dst, base, len);
+                                    o[i] = if v { 1.0 } else { 0.0 };
+                                }
+                            }
+                        }
+                    } else {
+                        unsafe {
+                            let l = sl(*lhs, base, l_n.min(max_l).max(1));
+                            let r = sl(*rhs, base, r_n.min(max_r).max(1));
+                            for i in 0..len {
+                                let li = if *lhs_scalar { 0 } else { i };
+                                let ri = if *rhs_scalar { 0 } else { i };
+                                let v = match op {
+                                    CmpOp::Eq => l[li] == r[ri],
+                                    CmpOp::Ne => l[li] != r[ri],
+                                    CmpOp::Lt => l[li] < r[ri],
+                                    CmpOp::Le => l[li] <= r[ri],
+                                    CmpOp::Gt => l[li] > r[ri],
+                                    CmpOp::Ge => l[li] >= r[ri],
+                                };
+                                if *dst_elem_bytes == 1 {
+                                    arena_buf[*dst + i] = u8::from(v);
+                                } else {
+                                    let o = sl_mut(*dst, base, len);
+                                    o[i] = if v { 1.0 } else { 0.0 };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Thunk::Where {
+                cond,
+                on_true,
+                on_false,
+                dst,
+                len,
+                elem_bytes,
+                cond_elem_bytes,
+                cond_scalar,
+                true_scalar,
+                false_scalar,
+            } => {
+                let len = *len as usize;
+                let eb = *elem_bytes as usize;
+                let cond_eb = (*cond_elem_bytes).max(1) as usize;
+                let arena_len = arena_buf.len();
+                let c_n = if *cond_scalar { 1 } else { len };
+                let t_n = if *true_scalar { 1 } else { len };
+                let f_n = if *false_scalar { 1 } else { len };
+                let max_c = (arena_len.saturating_sub(*cond)) / cond_eb;
+                let max_t = (arena_len.saturating_sub(*on_true)) / eb;
+                let max_f = (arena_len.saturating_sub(*on_false)) / eb;
+                let max_d = (arena_len.saturating_sub(*dst)) / eb;
+                let mut len = len.min(max_d);
+                if *cond_scalar {
+                    if max_c < 1 {
+                        len = 0;
+                    }
+                } else {
+                    len = len.min(max_c);
+                }
+                if *true_scalar {
+                    if max_t < 1 {
+                        len = 0;
+                    }
+                } else {
+                    len = len.min(max_t);
+                }
+                if *false_scalar {
+                    if max_f < 1 {
+                        len = 0;
+                    }
+                } else {
+                    len = len.min(max_f);
+                }
+                unsafe {
+                    if *elem_bytes == 8 {
+                        let t = sl_i64(*on_true, base, t_n.min(max_t).max(1));
+                        let e = sl_i64(*on_false, base, f_n.min(max_f).max(1));
+                        let o = sl_mut_i64(*dst, base, len);
+                        if *cond_elem_bytes == 1 {
+                            let c = &arena_buf[*cond..*cond + c_n.min(max_c).max(1)];
+                            for i in 0..len {
+                                let ci = if *cond_scalar { 0 } else { i };
+                                let ti = if *true_scalar { 0 } else { i };
+                                let ei = if *false_scalar { 0 } else { i };
+                                o[i] = if c[ci] != 0 { t[ti] } else { e[ei] };
+                            }
+                        } else if *cond_elem_bytes == 4 {
+                            // Bool-as-f32 masks (f32-uniform arena).
+                            let c = sl(*cond, base, c_n.min(max_c).max(1));
+                            for i in 0..len {
+                                let ci = if *cond_scalar { 0 } else { i };
+                                let ti = if *true_scalar { 0 } else { i };
+                                let ei = if *false_scalar { 0 } else { i };
+                                o[i] = if c[ci] != 0.0 { t[ti] } else { e[ei] };
+                            }
+                        } else {
+                            let c = sl_i64(*cond, base, c_n.min(max_c).max(1));
+                            for i in 0..len {
+                                let ci = if *cond_scalar { 0 } else { i };
+                                let ti = if *true_scalar { 0 } else { i };
+                                let ei = if *false_scalar { 0 } else { i };
+                                o[i] = if c[ci] != 0 { t[ti] } else { e[ei] };
+                            }
+                        }
+                    } else if *cond_elem_bytes == 1 {
+                        let c = &arena_buf[*cond..*cond + c_n.min(max_c).max(1)];
+                        let t = sl(*on_true, base, t_n.min(max_t).max(1));
+                        let e = sl(*on_false, base, f_n.min(max_f).max(1));
+                        let o = sl_mut(*dst, base, len);
+                        for i in 0..len {
+                            let ci = if *cond_scalar { 0 } else { i };
+                            let ti = if *true_scalar { 0 } else { i };
+                            let ei = if *false_scalar { 0 } else { i };
+                            o[i] = if c[ci] != 0 { t[ti] } else { e[ei] };
+                        }
+                    } else {
+                        let c = sl(*cond, base, c_n.min(max_c).max(1));
+                        let t = sl(*on_true, base, t_n.min(max_t).max(1));
+                        let e = sl(*on_false, base, f_n.min(max_f).max(1));
+                        let o = sl_mut(*dst, base, len);
+                        for i in 0..len {
+                            let ci = if *cond_scalar { 0 } else { i };
+                            let ti = if *true_scalar { 0 } else { i };
+                            let ei = if *false_scalar { 0 } else { i };
+                            o[i] = if c[ci] != 0.0 { t[ti] } else { e[ei] };
+                        }
+                    }
+                }
+            }
+
+            Thunk::Fma {
+                a,
+                b,
+                c,
+                dst,
+                len,
+                elem_bytes,
+            } => {
+                let len = *len as usize;
+                let eb = (*elem_bytes).max(1) as usize;
+                let arena_len = arena_buf.len();
+                let len = len
+                    .min(arena_len.saturating_sub(*a) / eb)
+                    .min(arena_len.saturating_sub(*b) / eb)
+                    .min(arena_len.saturating_sub(*c) / eb)
+                    .min(arena_len.saturating_sub(*dst) / eb);
+                unsafe {
+                    if *elem_bytes == 8 {
+                        let av = sl_f64(*a, base, len);
+                        let bv = sl_f64(*b, base, len);
+                        let cv = sl_f64(*c, base, len);
+                        let o = sl_mut_f64(*dst, base, len);
+                        for i in 0..len {
+                            o[i] = av[i].mul_add(bv[i], cv[i]);
+                        }
+                    } else {
+                        let av = sl(*a, base, len);
+                        let bv = sl(*b, base, len);
+                        let cv = sl(*c, base, len);
+                        let o = sl_mut(*dst, base, len);
+                        for i in 0..len {
+                            o[i] = av[i].mul_add(bv[i], cv[i]);
+                        }
+                    }
+                }
+            }
+
+            Thunk::ScatterAdd { .. } => exec_scatter_add(thunk, base),
+            Thunk::ScatterNd { .. } => exec_scatter_nd(thunk, base),
+            Thunk::ScatterElements { .. } => exec_scatter_elements(thunk, base),
+            Thunk::GatherNd { .. } => exec_gather_nd(thunk, base),
+            Thunk::GatherElements { .. } => exec_gather_elements(thunk, base),
+            Thunk::GroupedMatMul {
+                input,
+                weight,
+                expert_idx,
+                dst,
+                m,
+                k_dim,
+                n,
+                num_experts,
+                w_transposed,
+            } => {
+                let m = *m as usize;
+                let k_dim = *k_dim as usize;
+                let n = *n as usize;
+                let num_experts = *num_experts as usize;
+                let w_transposed = *w_transposed;
+                unsafe {
+                    let inp = sl(*input, base, m * k_dim);
+                    let wt = sl(*weight, base, num_experts * k_dim * n);
+                    let ids = sl(*expert_idx, base, m);
+                    let out = sl_mut(*dst, base, m * n);
+
+                    // Counting-sort tokens by their assigned expert.
+                    // counts[e] = how many tokens routed to expert e.
+                    let mut counts = vec![0usize; num_experts];
+                    for i in 0..m {
+                        let e = ids[i] as usize;
+                        debug_assert!(
+                            e < num_experts,
+                            "expert_idx out of range: {e} >= {num_experts}"
+                        );
+                        counts[e] += 1;
+                    }
+                    // Cumulative offsets into the packed buffer.
+                    let mut offsets = vec![0usize; num_experts + 1];
+                    for e in 0..num_experts {
+                        offsets[e + 1] = offsets[e] + counts[e];
+                    }
+                    // Pack: each expert's rows land contiguously in `packed_in`.
+                    // `original_pos[packed_idx] = original_token_idx` for the
+                    // unpermute step at the end.
+                    let mut packed_in = vec![0f32; m * k_dim];
+                    let mut original_pos = vec![0usize; m];
+                    let mut write_idx = vec![0usize; num_experts];
+                    for i in 0..m {
+                        let e = ids[i] as usize;
+                        let dst_row = offsets[e] + write_idx[e];
+                        packed_in[dst_row * k_dim..(dst_row + 1) * k_dim]
+                            .copy_from_slice(&inp[i * k_dim..(i + 1) * k_dim]);
+                        original_pos[dst_row] = i;
+                        write_idx[e] += 1;
+                    }
+
+                    // One BLAS sgemm per expert. Skip experts with no
+                    // tokens — common at the tail when M is much smaller
+                    // than num_experts × k.
+                    let mut packed_out = vec![0f32; m * n];
+                    let expert_stride = k_dim * n;
+                    let gmm_ord = crate::moe_residency::next_gmm_ord();
+                    let moe_layer = gmm_ord / 3;
+                    for e in 0..num_experts {
+                        let count = counts[e];
+                        if count == 0 {
+                            continue;
+                        }
+                        crate::moe_residency::record_expert_tokens(moe_layer, e, count);
+                        let in_start = offsets[e];
+                        let in_slice = &packed_in[in_start * k_dim..(in_start + count) * k_dim];
+                        let w_slab: &[f32] =
+                            if !crate::moe_residency::expert_on_device_for_layer(moe_layer, e) {
+                                if let Some(ptr) =
+                                    crate::moe_residency::host_expert_weight_ptr(gmm_ord, e)
+                                {
+                                    // Residency hands over `[K, N]` slabs by
+                                    // construction. A folded transpose means the
+                                    // bank is `[N, K]`, so the two do not compose
+                                    // — and silently using one as the other reads
+                                    // a correctly-sized block of the wrong values,
+                                    // which no shape check would catch. Refuse.
+                                    assert!(
+                                        !w_transposed,
+                                        "rlx-cpu: MoE host residency supplies [K, N] expert \
+                                         slabs, but this GroupedMatMul folded a bank transpose \
+                                         and reads [N, K]. The two are not composed; unbind \
+                                         residency or disable the fold."
+                                    );
+                                    std::slice::from_raw_parts(ptr, expert_stride)
+                                } else {
+                                    &wt[e * expert_stride..(e + 1) * expert_stride]
+                                }
+                            } else {
+                                &wt[e * expert_stride..(e + 1) * expert_stride]
+                            };
+                        let out_slice = &mut packed_out[in_start * n..(in_start + count) * n];
+                        // Measured: routing this through `par_sgemm` REGRESSES decode
+                        // (0.069 -> 0.085 s/token). At m == 1 the per-call work is a
+                        // 1.5 MFLOP matvec, and decode issues 368 of these per token,
+                        // so ~368 Rayon hand-offs cost more than the extra memory
+                        // parallelism buys. Keep the serial call.
+                        if w_transposed {
+                            // Bank is `[E, N, K]`: B-transposed GEMM, no copy.
+                            crate::blas::sgemm_bt(
+                                in_slice, w_slab, out_slice, count, k_dim, n, 1.0,
+                            );
+                        } else {
+                            crate::blas::sgemm(in_slice, w_slab, out_slice, count, k_dim, n);
+                        }
+                    }
+
+                    // Unpermute back to original token order.
+                    for packed_idx in 0..m {
+                        let i = original_pos[packed_idx];
+                        out[i * n..(i + 1) * n]
+                            .copy_from_slice(&packed_out[packed_idx * n..(packed_idx + 1) * n]);
+                    }
+                }
+            }
+
+            Thunk::DequantGroupedMatMulGguf { .. } => {
+                exec_dequant_grouped_mat_mul_gguf(thunk, base)
+            }
+            Thunk::DequantGroupedMatMulMlx { .. } => exec_dequant_grouped_mat_mul_mlx(thunk, base),
+            Thunk::DequantMoEWeightsGguf { .. } => exec_dequant_mo_e_weights_gguf(thunk, base),
+            Thunk::TopK {
+                src,
+                dst,
+                outer,
+                axis_dim,
+                k,
+                indices_i64,
+            } => {
+                let outer = *outer as usize;
+                let axis_dim = *axis_dim as usize;
+                let k = *k as usize;
+                unsafe {
+                    let inp = sl(*src, base, outer * axis_dim);
+                    // Repeated argmax with masking. O(k * axis_dim) per row;
+                    // good enough for small k (MoE typical k=2–8). For larger
+                    // k a partial heap would win.
+                    let mut row_buf: Vec<f32> = vec![0.0; axis_dim];
+                    if *indices_i64 != 0 {
+                        let out = sl_mut_i64(*dst, base, outer * k);
+                        for o in 0..outer {
+                            row_buf.copy_from_slice(&inp[o * axis_dim..(o + 1) * axis_dim]);
+                            for ki in 0..k {
+                                let mut best_i = 0usize;
+                                let mut best_v = row_buf[0];
+                                for i in 1..axis_dim {
+                                    let v = row_buf[i];
+                                    if v > best_v {
+                                        best_v = v;
+                                        best_i = i;
+                                    }
+                                }
+                                out[o * k + ki] = best_i as i64;
+                                row_buf[best_i] = f32::NEG_INFINITY;
+                            }
+                        }
+                    } else {
+                        let out = sl_mut(*dst, base, outer * k);
+                        for o in 0..outer {
+                            row_buf.copy_from_slice(&inp[o * axis_dim..(o + 1) * axis_dim]);
+                            for ki in 0..k {
+                                let mut best_i = 0usize;
+                                let mut best_v = row_buf[0];
+                                for i in 1..axis_dim {
+                                    let v = row_buf[i];
+                                    if v > best_v {
+                                        best_v = v;
+                                        best_i = i;
+                                    }
+                                }
+                                out[o * k + ki] = best_i as f32;
+                                row_buf[best_i] = f32::NEG_INFINITY;
+                            }
+                        }
+                        if let Some(cap) = schedule.moe_topk_capture.as_ref() {
+                            cap.push_topk_f32(&out[..outer * k], axis_dim);
+                        }
+                    }
+                }
+            }
+
+            Thunk::Reduce { .. } => exec_reduce(thunk, base),
+            Thunk::Histogram { .. } => exec_histogram(thunk, base),
+            Thunk::ArgReduce { .. } => exec_arg_reduce(thunk, base),
+            Thunk::Conv2D1x1 { .. } => exec_conv2_d1x1(thunk, base),
+            Thunk::Conv2D { .. } => exec_conv2_d(thunk, base),
+            Thunk::Conv3d { .. } => exec_conv3d(thunk, base),
+            Thunk::ConvTranspose3d { .. } => exec_conv_transpose3d(thunk, base),
+            Thunk::Pool2D {
+                src,
+                dst,
+                n,
+                c,
+                h,
+                w,
+                h_out,
+                w_out,
+                kh,
+                kw,
+                sh,
+                sw,
+                ph,
+                pw,
+                kind,
+            } => {
+                let n = *n as usize;
+                let c = *c as usize;
+                let h = *h as usize;
+                let w = *w as usize;
+                let h_out = *h_out as usize;
+                let w_out = *w_out as usize;
+                let kh = *kh as usize;
+                let kw = *kw as usize;
+                let sh = *sh as usize;
+                let sw = *sw as usize;
+                let ph = *ph as usize;
+                let pw = *pw as usize;
+                let kernel_area = (kh * kw) as f32;
+                unsafe {
+                    let inp = sl(*src, base, n * c * h * w);
+                    let out = sl_mut(*dst, base, n * c * h_out * w_out);
+                    // Each (n, c) plane is independent and writes a disjoint
+                    // output region, so pooling fans out over the channel-batch
+                    // when RLX_FAST_CONV is set.
+                    let out_addr = out.as_mut_ptr() as usize;
+                    let is_max = matches!(kind, ReduceOp::Max);
+                    let is_mean = matches!(kind, ReduceOp::Mean);
+                    // No-padding windows are *usually* fully in-bounds (the
+                    // conv-net case), so the hot path drops the per-element
+                    // bounds branches and hoists the reduce-op choice out of the
+                    // loop. "Usually" is not "always": under ONNX `ceil_mode=1`
+                    // the final window may start inside the input and overhang
+                    // its end (259 frames, kernel/stride 100 -> 3 windows, the
+                    // last spanning 200..300), and the fast path then indexes
+                    // past the buffer. Require every window to fit before taking
+                    // it; the general path below already treats the overhang as
+                    // padding, which is what ONNX specifies.
+                    let windows_fit = h_out.saturating_sub(1) * sh + kh <= h
+                        && w_out.saturating_sub(1) * sw + kw <= w;
+                    let nopad = ph == 0 && pw == 0 && windows_fit;
+                    let pool_plane = |nc: usize| {
+                        let ni = nc / c;
+                        let ci = nc % c;
+                        let in_chan = ni * c * h * w + ci * h * w;
+                        let out_chan = ni * c * h_out * w_out + ci * h_out * w_out;
+                        let op = out_addr as *mut f32;
+                        for ho in 0..h_out {
+                            for wo in 0..w_out {
+                                let mut valid = 0.0f32;
+                                let acc = if nopad {
+                                    let row0 = in_chan + (ho * sh) * w + wo * sw;
+                                    let mut a = if is_max { f32::NEG_INFINITY } else { 0.0 };
+                                    for ki in 0..kh {
+                                        let row = row0 + ki * w;
+                                        if is_max {
+                                            for kj in 0..kw {
+                                                a = a.max(inp[row + kj]);
+                                            }
+                                        } else {
+                                            for kj in 0..kw {
+                                                a += inp[row + kj];
+                                            }
+                                        }
+                                    }
+                                    a
+                                } else {
+                                    let mut a = if is_max { f32::NEG_INFINITY } else { 0.0 };
+                                    for ki in 0..kh {
+                                        for kj in 0..kw {
+                                            let hi = ho * sh + ki;
+                                            let wi = wo * sw + kj;
+                                            if hi < ph || wi < pw {
+                                                continue;
+                                            }
+                                            let hi = hi - ph;
+                                            let wi = wi - pw;
+                                            if hi >= h || wi >= w {
+                                                continue;
+                                            }
+                                            let v = inp[in_chan + hi * w + wi];
+                                            if is_max {
+                                                a = a.max(v);
+                                            } else {
+                                                a += v;
+                                                valid += 1.0;
+                                            }
+                                        }
+                                    }
+                                    a
+                                };
+                                // Average over the elements that actually exist,
+                                // not over the nominal window. ONNX's default is
+                                // `count_include_pad = 0`, and a `ceil_mode`
+                                // window that overhangs the input is not padding
+                                // at all — those positions simply are not there.
+                                // ChatterBox's speaker encoder pools 259 frames
+                                // with kernel/stride 100: the third window holds
+                                // 59 real frames, and dividing it by 100 scaled
+                                // it by 0.59 against the reference.
+                                let denom = if nopad { kernel_area } else { valid.max(1.0) };
+                                let acc = if is_mean { acc / denom } else { acc };
+                                *op.add(out_chan + ho * w_out + wo) = acc;
+                            }
+                        }
+                    };
+                    if fast_conv_enabled() && crate::pool::should_parallelize(n * c * h_out * w_out)
+                    {
+                        crate::pool::par_for(
+                            n * c,
+                            crate::pool::outer_chunk(n * c),
+                            &|off, cnt| {
+                                for nc in off..off + cnt {
+                                    pool_plane(nc);
+                                }
+                            },
+                        );
+                    } else {
+                        for nc in 0..n * c {
+                            pool_plane(nc);
+                        }
+                    }
+                }
+            }
+
+            Thunk::Pool3D {
+                src,
+                dst,
+                n,
+                c,
+                d,
+                h,
+                w,
+                d_out,
+                h_out,
+                w_out,
+                kd,
+                kh,
+                kw,
+                sd,
+                sh,
+                sw,
+                pd,
+                ph,
+                pw,
+                kind,
+            } => {
+                let n = *n as usize;
+                let c = *c as usize;
+                let d = *d as usize;
+                let h = *h as usize;
+                let w = *w as usize;
+                let d_out = *d_out as usize;
+                let h_out = *h_out as usize;
+                let w_out = *w_out as usize;
+                let kd = *kd as usize;
+                let kh = *kh as usize;
+                let kw = *kw as usize;
+                let sd = *sd as usize;
+                let sh = *sh as usize;
+                let sw = *sw as usize;
+                let pd = *pd as usize;
+                let ph = *ph as usize;
+                let pw = *pw as usize;
+                let kernel_vol = (kd * kh * kw) as f32;
+                let is_max = matches!(kind, ReduceOp::Max);
+                let is_mean = matches!(kind, ReduceOp::Mean);
+                unsafe {
+                    let inp = sl(*src, base, n * c * d * h * w);
+                    let out = sl_mut(*dst, base, n * c * d_out * h_out * w_out);
+                    for ni in 0..n {
+                        for ci in 0..c {
+                            let in_base = (ni * c + ci) * d * h * w;
+                            let out_base = (ni * c + ci) * d_out * h_out * w_out;
+                            for od in 0..d_out {
+                                for ho in 0..h_out {
+                                    for wo in 0..w_out {
+                                        let mut acc = if is_max { f32::NEG_INFINITY } else { 0.0 };
+                                        for kz in 0..kd {
+                                            for ki in 0..kh {
+                                                for kj in 0..kw {
+                                                    let di = od * sd + kz;
+                                                    let hi = ho * sh + ki;
+                                                    let wi = wo * sw + kj;
+                                                    if di < pd || hi < ph || wi < pw {
+                                                        continue;
+                                                    }
+                                                    let di = di - pd;
+                                                    let hi = hi - ph;
+                                                    let wi = wi - pw;
+                                                    if di >= d || hi >= h || wi >= w {
+                                                        continue;
+                                                    }
+                                                    let v = inp[in_base + (di * h + hi) * w + wi];
+                                                    if is_max {
+                                                        acc = acc.max(v);
+                                                    } else {
+                                                        acc += v;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if is_mean {
+                                            acc /= kernel_vol;
+                                        }
+                                        out[out_base + (od * h_out + ho) * w_out + wo] = acc;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Thunk::ReluBackward { .. } => exec_relu_backward(thunk, base),
+            Thunk::ReluBackwardF64 { .. } => exec_relu_backward_f64(thunk, base),
+            Thunk::QMatMul { .. } => exec_q_mat_mul(thunk, base),
+            Thunk::QConv2d {
+                x,
+                w,
+                bias,
+                out,
+                n,
+                c_in,
+                h,
+                w_in,
+                c_out,
+                h_out,
+                w_out,
+                kh,
+                kw,
+                sh,
+                sw,
+                ph,
+                pw,
+                dh,
+                dw,
+                groups,
+                x_zp,
+                w_zp,
+                out_zp,
+                mult,
+            } => {
+                let n = *n as usize;
+                let c_in = *c_in as usize;
+                let h = *h as usize;
+                let w_in = *w_in as usize;
+                let c_out = *c_out as usize;
+                let h_out = *h_out as usize;
+                let w_out = *w_out as usize;
+                let kh = *kh as usize;
+                let kw = *kw as usize;
+                let sh = *sh as usize;
+                let sw = *sw as usize;
+                let ph = *ph as usize;
+                let pw = *pw as usize;
+                let dh = *dh as usize;
+                let dw = *dw as usize;
+                let groups = *groups as usize;
+                let c_in_per_g = c_in / groups;
+                let c_out_per_g = c_out / groups;
+                unsafe {
+                    let x_ptr = base.add(*x) as *const i8;
+                    let w_ptr = base.add(*w) as *const i8;
+                    let bias_ptr = base.add(*bias) as *const i32;
+                    let out_ptr = base.add(*out) as *mut i8;
+                    for ni in 0..n {
+                        for co in 0..c_out {
+                            let g = co / c_out_per_g;
+                            let ci_start = g * c_in_per_g;
+                            for ho in 0..h_out {
+                                for wo in 0..w_out {
+                                    let mut acc: i32 = *bias_ptr.add(co);
+                                    for ci_off in 0..c_in_per_g {
+                                        let ci = ci_start + ci_off;
+                                        let in_chan = ((ni * c_in) + ci) * h * w_in;
+                                        let wt_chan = ((co * c_in_per_g) + ci_off) * kh * kw;
+                                        for ki in 0..kh {
+                                            for kj in 0..kw {
+                                                let hi = ho * sh + ki * dh;
+                                                let wi = wo * sw + kj * dw;
+                                                if hi < ph || wi < pw {
+                                                    continue;
+                                                }
+                                                let hi = hi - ph;
+                                                let wi = wi - pw;
+                                                if hi >= h || wi >= w_in {
+                                                    continue;
+                                                }
+                                                let xv = *x_ptr.add(in_chan + hi * w_in + wi)
+                                                    as i32
+                                                    - *x_zp;
+                                                let wv = *w_ptr.add(wt_chan + ki * kw + kj) as i32
+                                                    - *w_zp;
+                                                acc += xv * wv;
+                                            }
+                                        }
+                                    }
+                                    let r = (acc as f32 * *mult).round() as i32 + *out_zp;
+                                    let r = r.clamp(-128, 127) as i8;
+                                    let dst = ((ni * c_out) + co) * h_out * w_out + ho * w_out + wo;
+                                    *out_ptr.add(dst) = r;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Thunk::Quantize { .. } => exec_quantize(thunk, base),
+            Thunk::Dequantize { .. } => exec_dequantize(thunk, base),
+            Thunk::FakeQuantize { .. } => exec_fake_quantize(thunk, base),
+            Thunk::RoundToFormat { .. } => exec_round_to_format(thunk, base),
+            Thunk::DoubleSingle { .. } => exec_double_single(thunk, base),
+            Thunk::ActivationBackward { .. } => exec_activation_backward(thunk, base),
+            Thunk::ActivationBackwardF64 { .. } => exec_activation_backward_f64(thunk, base),
+            Thunk::FakeQuantizeLSQ { .. } => exec_fake_quantize_l_s_q(thunk, base),
+            Thunk::FakeQuantizeLSQBackwardX { .. } => {
+                exec_fake_quantize_l_s_q_backward_x(thunk, base)
+            }
+            Thunk::FakeQuantizeLSQBackwardScale { .. } => {
+                exec_fake_quantize_l_s_q_backward_scale(thunk, base)
+            }
+            Thunk::FakeQuantizeBackward { .. } => exec_fake_quantize_backward(thunk, base),
+            Thunk::LayerNormBackwardInput { .. } => exec_layer_norm_backward_input(thunk, base),
+            Thunk::BatchNormInferenceBackwardInput { .. } => {
+                exec_batch_norm_inference_backward_input(thunk, base)
+            }
+            Thunk::BatchNormInferenceBackwardGamma { .. } => {
+                exec_batch_norm_inference_backward_gamma(thunk, base)
+            }
+            Thunk::BatchNormInferenceBackwardBeta { .. } => {
+                exec_batch_norm_inference_backward_beta(thunk, base)
+            }
+            Thunk::LayerNormBackwardGamma { .. } => exec_layer_norm_backward_gamma(thunk, base),
+            Thunk::RmsNormBackwardInput { .. } => exec_rms_norm_backward_input(thunk, base),
+            Thunk::RmsNormBackwardGamma { .. } => exec_rms_norm_backward_gamma(thunk, base),
+            Thunk::RmsNormBackwardBeta { .. } => exec_rms_norm_backward_beta(thunk, base),
+            Thunk::RopeBackward { .. } => exec_rope_backward(thunk, base),
+            Thunk::CumsumBackward { .. } => exec_cumsum_backward(thunk, base),
+            Thunk::GroupNormBackwardInput { .. } => exec_group_norm_backward_input(thunk, base),
+            Thunk::GroupNormBackwardGamma { .. } => exec_group_norm_backward_gamma(thunk, base),
+            Thunk::GroupNormBackwardBeta { .. } => exec_group_norm_backward_beta(thunk, base),
+            Thunk::GatherBackward { .. } => exec_gather_backward(thunk, base),
+            Thunk::MaxPool2dBackward { .. } => exec_max_pool2d_backward(thunk, base),
+            Thunk::Conv2dBackwardInput { .. } => exec_conv2d_backward_input(thunk, base),
+            Thunk::Conv2dBackwardWeight { .. } => exec_conv2d_backward_weight(thunk, base),
+            Thunk::MaxPool3dBackward { .. } => exec_max_pool3d_backward(thunk, base),
+            Thunk::Conv3dBackwardInput { .. } => exec_conv3d_backward_input(thunk, base),
+            Thunk::Conv3dBackwardWeight { .. } => exec_conv3d_backward_weight(thunk, base),
+            Thunk::Im2Col { .. } => exec_im2_col(thunk, base),
+            Thunk::SoftmaxCrossEntropyDense { .. } => exec_softmax_cross_entropy_dense(thunk, base),
+            Thunk::SoftmaxCrossEntropy { .. } => exec_softmax_cross_entropy(thunk, base),
+            Thunk::SoftmaxCrossEntropyBackward { .. } => {
+                exec_softmax_cross_entropy_backward(thunk, base)
+            }
+            Thunk::GatherAxis { .. } => exec_gather_axis(thunk, base),
+            Thunk::Transpose {
+                src,
+                dst,
+                in_total,
+                out_dims,
+                in_strides,
+                elem_bytes,
+            } => {
+                // N-D index walk: for each output flat index, decompose into
+                // multi-dim coords using out_dims, then dot with in_strides
+                // to find the source flat index. Stride 0 = broadcast (read
+                // the same input element repeatedly along that dim).
+                let rank = out_dims.len();
+                let total: usize = out_dims.iter().map(|&d| d as usize).product();
+                // Empty output (e.g. Zipformer downsample pad `Expand` → `[0,1,C]`
+                // when T is already a multiple of the stride) — nothing to write.
+                if total == 0 {
+                    // fall through
+                } else {
+                    let in_total = *in_total as usize;
+                    unsafe {
+                        if *elem_bytes == 1 {
+                            // 1-byte dtypes (Bool / I8 / U8). Without this branch the
+                            // `else` path below reads/writes 4 bytes per element via the
+                            // f32 slice, corrupting e.g. a broadcast of the VITS attention
+                            // mask (Bool, expanded over heads) — masking wrong positions.
+                            let inp = arena_buf[*src..*src + in_total].to_vec();
+                            let out = &mut arena_buf[*dst..*dst + total];
+                            let mut idx = vec![0usize; rank];
+                            for o in 0..total {
+                                let mut src_idx = 0usize;
+                                for d in 0..rank {
+                                    src_idx += idx[d] * in_strides[d] as usize;
+                                }
+                                out[o] = inp[broadcast_src_index(src_idx, in_total)];
+                                for d in (0..rank).rev() {
+                                    idx[d] += 1;
+                                    if idx[d] < out_dims[d] as usize {
+                                        break;
+                                    }
+                                    idx[d] = 0;
+                                }
+                            }
+                        } else if *elem_bytes == 8 {
+                            let inp = sl_i64(*src, base, in_total);
+                            let out = sl_mut_i64(*dst, base, total);
+                            let mut idx = vec![0usize; rank];
+                            for o in 0..total {
+                                let mut src_idx = 0usize;
+                                for d in 0..rank {
+                                    src_idx += idx[d] * in_strides[d] as usize;
+                                }
+                                out[o] = inp[broadcast_src_index(src_idx, in_total)];
+                                for d in (0..rank).rev() {
+                                    idx[d] += 1;
+                                    if idx[d] < out_dims[d] as usize {
+                                        break;
+                                    }
+                                    idx[d] = 0;
+                                }
+                            }
+                        } else if *elem_bytes == 16 {
+                            // 16-byte dtypes (C128 = 2×f64 native / 4×f32 lanes).
+                            // Copy each element as two i64 words; without this
+                            // branch the `else` f32 path below reads 4 bytes per
+                            // element and shatters the complex element (keeps only
+                            // the first f32, drops the other 12 bytes).
+                            let inp = sl_i64(*src, base, in_total * 2);
+                            let out = sl_mut_i64(*dst, base, total * 2);
+                            let mut idx = vec![0usize; rank];
+                            for o in 0..total {
+                                let mut src_idx = 0usize;
+                                for d in 0..rank {
+                                    src_idx += idx[d] * in_strides[d] as usize;
+                                }
+                                let s = broadcast_src_index(src_idx, in_total);
+                                out[o * 2] = inp[s * 2];
+                                out[o * 2 + 1] = inp[s * 2 + 1];
+                                for d in (0..rank).rev() {
+                                    idx[d] += 1;
+                                    if idx[d] < out_dims[d] as usize {
+                                        break;
+                                    }
+                                    idx[d] = 0;
+                                }
+                            }
+                        } else {
+                            let inp = sl(*src, base, in_total);
+                            let out = sl_mut(*dst, base, total);
+                            // a size-1 axis is never stepped along, so its stride
+                            // is whatever the layout said (`[N,C,1,W]` from a
+                            // `[1,C,1,1]` bias arrives with stride 1 there)
+                            let unused = |d: usize| in_strides[d] == 0 || out_dims[d] == 1;
+                            if rank == 4
+                                && unused(0)
+                                && unused(2)
+                                && unused(3)
+                                && in_strides[1] != 0
+                            {
+                                // Per-channel broadcast out[n,c,h,w] = in[c*sc] — how
+                                // a conv bias `[C]` reaches `[N,C,H,W]` (and its
+                                // recompute in the backward graph). Fill each (n,c)
+                                // plane with its scalar instead of an N-D index walk
+                                // over every element; parallel over the channel-batch.
+                                // Before size-1 axes counted as unused, EEGNet's and
+                                // ShallowConvNet's `[N,C,1,W]` biases took the index
+                                // walk: 88 % of their transpose time.
+                                let d1 = out_dims[1] as usize;
+                                let sc = in_strides[1] as usize;
+                                let plane = (out_dims[2] as usize) * (out_dims[3] as usize);
+                                let nc_total = (out_dims[0] as usize) * d1;
+                                let out_addr = out.as_mut_ptr() as usize;
+                                let fill = |nc0: usize, nc1: usize| {
+                                    let op = out_addr as *mut f32;
+                                    for nc in nc0..nc1 {
+                                        let v = inp[(nc % d1) * sc];
+                                        let base_off = nc * plane;
+                                        for k in 0..plane {
+                                            *op.add(base_off + k) = v;
+                                        }
+                                    }
+                                };
+                                if fast_conv_enabled() && crate::pool::should_parallelize(total) {
+                                    crate::pool::par_for(
+                                        nc_total,
+                                        crate::pool::outer_chunk(nc_total),
+                                        &|off, cnt| fill(off, off + cnt),
+                                    );
+                                } else {
+                                    fill(0, nc_total);
+                                }
+                            } else if rank == 2 && in_strides[0] != 0 && in_strides[1] != 0 {
+                                // Fast 2D transpose (the common matmul-backward case:
+                                // xᵀ, wᵀ). out[i,j] = in[i*s0 + j*s1]; tiled over
+                                // columns for write-locality, parallel over rows. Far
+                                // cheaper than the general per-element index walk.
+                                let d0 = out_dims[0] as usize;
+                                let d1 = out_dims[1] as usize;
+                                let s0 = in_strides[0] as usize;
+                                let s1 = in_strides[1] as usize;
+                                let out_addr = out.as_mut_ptr() as usize;
+                                let tile = |i0: usize, i1: usize| {
+                                    let op = out_addr as *mut f32;
+                                    const T: usize = 32;
+                                    let mut j0 = 0;
+                                    while j0 < d1 {
+                                        let j1 = (j0 + T).min(d1);
+                                        for i in i0..i1 {
+                                            let inb = i * s0;
+                                            let outb = i * d1;
+                                            for j in j0..j1 {
+                                                *op.add(outb + j) = inp[inb + j * s1];
+                                            }
+                                        }
+                                        j0 = j1;
+                                    }
+                                };
+                                if fast_conv_enabled() && crate::pool::should_parallelize(total) {
+                                    crate::pool::par_for(
+                                        d0,
+                                        crate::pool::outer_chunk(d0),
+                                        &|off, cnt| tile(off, off + cnt),
+                                    );
+                                } else {
+                                    tile(0, d0);
+                                }
+                            } else if rank >= 3
+                                && in_strides[rank - 2] == 1
+                                && in_strides[rank - 1] as usize == out_dims[rank - 2] as usize
+                                && {
+                                    // Leading axes untouched and contiguous, so
+                                    // each batch plane is one dense 2-D block.
+                                    let plane = (out_dims[rank - 2] as usize)
+                                        * (out_dims[rank - 1] as usize);
+                                    let mut expect = plane;
+                                    let mut ok = true;
+                                    for d in (0..rank - 2).rev() {
+                                        if in_strides[d] as usize != expect {
+                                            ok = false;
+                                            break;
+                                        }
+                                        expect *= out_dims[d] as usize;
+                                    }
+                                    ok
+                                }
+                            {
+                                // BATCHED 2-D transpose: the permutation swaps
+                                // only the last two axes.
+                                //
+                                // Neither branch above catches this. The
+                                // innermost stride is not 1 (it is the input's
+                                // inner extent), and the rank is not 2, so it
+                                // used to fall through to the general
+                                // per-element index walk — measured at
+                                // **103 MB/s** on an M4 Pro, against ~20 GB/s of
+                                // memory bandwidth. A `[8, 2048, 1024]` f32
+                                // bank took 653 ms.
+                                //
+                                // It is not a rare shape: `GroupedMatMul` wants
+                                // `[E, in, out]` while GGUF stores expert banks
+                                // as `[E, out, in]`, so every dense MoE layer
+                                // transposes all three of its banks, and
+                                // attention permutes `[B, H, S, D]` the same
+                                // way. Reuse the tiling the rank-2 branch uses,
+                                // once per plane.
+                                let d_i = out_dims[rank - 2] as usize;
+                                let d_o = out_dims[rank - 1] as usize;
+                                let plane = d_i * d_o;
+                                let batches = total / plane.max(1);
+                                let out_addr = out.as_mut_ptr() as usize;
+                                let in_addr = inp.as_ptr() as usize;
+                                let plane_tp = |b0: usize, b1: usize| {
+                                    const T: usize = 32;
+                                    for b in b0..b1 {
+                                        let ip = (in_addr as *const f32).add(b * plane);
+                                        let op = (out_addr as *mut f32).add(b * plane);
+                                        let mut i0 = 0;
+                                        while i0 < d_i {
+                                            let i1 = (i0 + T).min(d_i);
+                                            let mut o0 = 0;
+                                            while o0 < d_o {
+                                                let o1 = (o0 + T).min(d_o);
+                                                for i in i0..i1 {
+                                                    for o in o0..o1 {
+                                                        *op.add(i * d_o + o) = *ip.add(o * d_i + i);
+                                                    }
+                                                }
+                                                o0 = o1;
+                                            }
+                                            i0 = i1;
+                                        }
+                                    }
+                                };
+                                if crate::pool::should_parallelize(total) && batches >= 2 {
+                                    crate::pool::par_for(
+                                        batches,
+                                        crate::pool::outer_chunk(batches),
+                                        &|off, cnt| plane_tp(off, off + cnt),
+                                    );
+                                } else {
+                                    plane_tp(0, batches);
+                                }
+                            } else if rank >= 3
+                                && *in_strides.last().unwrap_or(&0) == 1
+                                && out_dims[rank - 1] as usize >= 8
+                            {
+                                // Innermost dim contiguous in both layouts: copy one
+                                // row at a time (memcpy) instead of per-element index
+                                // walk. Covers attention BSHD↔BHSD and most Expand/
+                                // permute patterns in DiT.
+                                let row = out_dims[rank - 1] as usize;
+                                let planes = total / row;
+                                let s_last = in_strides[rank - 1] as usize; // 1
+                                let _ = s_last;
+                                let out_addr = out.as_mut_ptr() as usize;
+                                let in_addr = inp.as_ptr() as usize;
+                                let dims = out_dims.to_vec();
+                                let strides = in_strides.to_vec();
+                                let copy_planes = |p0: usize, p1: usize| {
+                                    let mut idx = vec![0usize; rank];
+                                    let mut rem = p0;
+                                    // Decode plane index into leading coords (exclude last dim).
+                                    for d in (0..rank - 1).rev() {
+                                        let dim = dims[d] as usize;
+                                        idx[d] = rem % dim;
+                                        rem /= dim;
+                                    }
+                                    for p in p0..p1 {
+                                        let mut src = 0usize;
+                                        for d in 0..rank - 1 {
+                                            src += idx[d] * strides[d] as usize;
+                                        }
+                                        std::ptr::copy_nonoverlapping(
+                                            (in_addr as *const f32).add(src),
+                                            (out_addr as *mut f32).add(p * row),
+                                            row,
+                                        );
+                                        for d in (0..rank - 1).rev() {
+                                            idx[d] += 1;
+                                            if idx[d] < dims[d] as usize {
+                                                break;
+                                            }
+                                            idx[d] = 0;
+                                        }
+                                    }
+                                };
+                                if crate::pool::should_parallelize(total) && planes >= 4 {
+                                    crate::pool::par_for(
+                                        planes,
+                                        crate::pool::outer_chunk(planes),
+                                        &|off, cnt| copy_planes(off, off + cnt),
+                                    );
+                                } else {
+                                    copy_planes(0, planes);
+                                }
+                            } else if fast_conv_enabled() && crate::pool::should_parallelize(total)
+                            {
+                                // Parallel: each chunk seeds its starting multi-index
+                                // from `off`, then walks incrementally. Output writes
+                                // are disjoint per `o`.
+                                let out_addr = out.as_mut_ptr() as usize;
+                                crate::pool::par_for(
+                                    total,
+                                    crate::pool::chunk_floor(total),
+                                    &|off, cnt| {
+                                        let mut idx = vec![0usize; rank];
+                                        let mut rem = off;
+                                        for d in (0..rank).rev() {
+                                            let dim = out_dims[d] as usize;
+                                            idx[d] = rem % dim;
+                                            rem /= dim;
+                                        }
+                                        for o in off..off + cnt {
+                                            let mut src_idx = 0usize;
+                                            for d in 0..rank {
+                                                src_idx += idx[d] * in_strides[d] as usize;
+                                            }
+                                            let v = inp[broadcast_src_index(src_idx, in_total)];
+                                            *((out_addr as *mut f32).add(o)) = v;
+                                            for d in (0..rank).rev() {
+                                                idx[d] += 1;
+                                                if idx[d] < out_dims[d] as usize {
+                                                    break;
+                                                }
+                                                idx[d] = 0;
+                                            }
+                                        }
+                                    },
+                                );
+                            } else {
+                                let mut idx = vec![0usize; rank];
+                                for o in 0..total {
+                                    let mut src_idx = 0usize;
+                                    for d in 0..rank {
+                                        src_idx += idx[d] * in_strides[d] as usize;
+                                    }
+                                    out[o] = inp[broadcast_src_index(src_idx, in_total)];
+                                    for d in (0..rank).rev() {
+                                        idx[d] += 1;
+                                        if idx[d] < out_dims[d] as usize {
+                                            break;
+                                        }
+                                        idx[d] = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } // total != 0
+            }
+
+            Thunk::CustomOp { .. } => exec_custom_op(thunk, base, arena_buf.len()),
+            Thunk::Reverse { .. } => exec_reverse(thunk, base),
+        }
+        if trace_done {
+            eprintln!("[thunk {i} done]");
+        }
+        if write_trace {
+            let lo = wt_before
+                .iter()
+                .zip(arena_buf.iter())
+                .position(|(a, b)| a != b);
+            match lo {
+                None => eprintln!("[wt {i}] {} wrote nothing", thunk_kind_name(thunk)),
+                Some(lo) => {
+                    let hi = wt_before.len()
+                        - wt_before
+                            .iter()
+                            .zip(arena_buf.iter())
+                            .rev()
+                            .position(|(a, b)| a != b)
+                            .unwrap();
+                    // Hash the CONTENT, not the offsets: under
+                    // `RLX_ARENA_NO_REUSE` every slot moves, so only a
+                    // content checksum lines up thunk-for-thunk between the
+                    // two layouts and pins down the first op that diverges.
+                    let h = arena_buf[lo..hi]
+                        .iter()
+                        .fold(0xcbf2_9ce4_8422_2325u64, |a, b| {
+                            (a ^ *b as u64).wrapping_mul(0x1000_0000_01b3)
+                        });
+                    eprintln!(
+                        "[wt {i}] {} wrote [{lo},{hi}) len={} hash={h:016x}",
+                        thunk_kind_name(thunk),
+                        hi - lo
+                    );
+                    wt_before.copy_from_slice(arena_buf);
+                }
+            }
+        }
+    }
+    if profile {
+        if let Some((pn, pt)) = prof_prev.take() {
+            profile_record(pn, pt.elapsed());
+        }
+        // Auto-dump under RLX_PROFILE_THUNKS so any binary shows where the run's
+        // time went (per execute_thunks call — the hot subgraph stands out).
+        dump_thunk_profile();
+    }
+}
+
+/// `dots[j] = Σ_d q[d]·k[keys[j]·stride + off + d]`, summed in `d` order with
+/// one multiply and one add per term — exactly the scalar loop
+/// `dot += q[d] * k[d]`, so bit-identical to it. The scalar loop is a serial
+/// dependency on one accumulator (an add latency per element); here eight keys
+/// run in the eight lanes of one AVX register, fed by an 8×8 transpose of
+/// their rows.
+#[cfg(rlx_cpu_x86)]
+pub(super) fn dots_by_key_lanes(
+    q: &[f32],
+    k: &[f32],
+    keys: &[usize],
+    stride: usize,
+    off: usize,
+    dots: &mut [f32],
+) {
+    let n = q.len();
+    let avx = {
+        static AVX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVX.get_or_init(|| std::is_x86_feature_detected!("avx"))
+    };
+    let lanes = if avx && n.is_multiple_of(8) {
+        keys.len()
+    } else {
+        0
+    };
+    for (j, group) in keys[..lanes].chunks(8).enumerate() {
+        // A short last group repeats its last key in the spare lanes.
+        let rows: [&[f32]; 8] = std::array::from_fn(|l| {
+            let ki = group[l.min(group.len() - 1)];
+            &k[ki * stride + off..ki * stride + off + n]
+        });
+        // SAFETY: AVX was detected; every row holds `n` floats.
+        let out = unsafe { dot8_avx(q, rows) };
+        dots[8 * j..8 * j + group.len()].copy_from_slice(&out[..group.len()]);
+    }
+    for (o, &ki) in dots[lanes..].iter_mut().zip(&keys[lanes..]) {
+        let row = &k[ki * stride + off..ki * stride + off + n];
+        let mut dot = 0f32;
+        for d in 0..n {
+            dot += q[d] * row[d];
+        }
+        *o = dot;
+    }
+}
+
+/// Eight [`dots_by_key_lanes`] dots, one per lane. `q.len()` is a multiple
+/// of 8.
+#[cfg(rlx_cpu_x86)]
+#[target_feature(enable = "avx")]
+unsafe fn dot8_avx(q: &[f32], rows: [&[f32]; 8]) -> [f32; 8] {
+    use std::arch::x86_64::*;
+    let mut acc = _mm256_setzero_ps();
+    for d0 in (0..q.len()).step_by(8) {
+        // SAFETY: `d0 + 8 <= n` for `q` and every row. (Not `array::from_fn`:
+        // a closure does not inherit `#[target_feature]`.)
+        let mut r = [_mm256_setzero_ps(); 8];
+        for (rl, row) in r.iter_mut().zip(rows) {
+            *rl = unsafe { _mm256_loadu_ps(row[d0..].as_ptr()) };
+        }
+        // 8×8 transpose: `t[d]` holds element `d0 + d` of the eight rows.
+        let a0 = _mm256_unpacklo_ps(r[0], r[1]);
+        let a1 = _mm256_unpackhi_ps(r[0], r[1]);
+        let a2 = _mm256_unpacklo_ps(r[2], r[3]);
+        let a3 = _mm256_unpackhi_ps(r[2], r[3]);
+        let a4 = _mm256_unpacklo_ps(r[4], r[5]);
+        let a5 = _mm256_unpackhi_ps(r[4], r[5]);
+        let a6 = _mm256_unpacklo_ps(r[6], r[7]);
+        let a7 = _mm256_unpackhi_ps(r[6], r[7]);
+        let b0 = _mm256_shuffle_ps::<0x44>(a0, a2);
+        let b1 = _mm256_shuffle_ps::<0xEE>(a0, a2);
+        let b2 = _mm256_shuffle_ps::<0x44>(a1, a3);
+        let b3 = _mm256_shuffle_ps::<0xEE>(a1, a3);
+        let b4 = _mm256_shuffle_ps::<0x44>(a4, a6);
+        let b5 = _mm256_shuffle_ps::<0xEE>(a4, a6);
+        let b6 = _mm256_shuffle_ps::<0x44>(a5, a7);
+        let b7 = _mm256_shuffle_ps::<0xEE>(a5, a7);
+        let t = [
+            _mm256_permute2f128_ps::<0x20>(b0, b4),
+            _mm256_permute2f128_ps::<0x20>(b1, b5),
+            _mm256_permute2f128_ps::<0x20>(b2, b6),
+            _mm256_permute2f128_ps::<0x20>(b3, b7),
+            _mm256_permute2f128_ps::<0x31>(b0, b4),
+            _mm256_permute2f128_ps::<0x31>(b1, b5),
+            _mm256_permute2f128_ps::<0x31>(b2, b6),
+            _mm256_permute2f128_ps::<0x31>(b3, b7),
+        ];
+        for (d, td) in t.into_iter().enumerate() {
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_set1_ps(q[d0 + d]), td));
+        }
+    }
+    let mut out = [0f32; 8];
+    // SAFETY: `out` holds 8 floats.
+    unsafe { _mm256_storeu_ps(out.as_mut_ptr(), acc) };
+    out
+}
+
+#[inline(always)]
+pub(crate) fn exec_nop(t: &Thunk) {
+    let Thunk::Nop = t else { unreachable!() };
+    {}
+}
+
+/// Score-matrix size above which an attention head runs row-blocked
+/// (`RLX_SDPA_BLOCK_MIN`, default 4M floats = 16 MB): every mask that needs
+/// no query position (none, per-key `Custom`, additive `Bias`), `[B, S, H, D]`.
+pub(crate) fn sdpa_row_blocked(
+    q_s: usize,
+    k_s: usize,
+    mask: rlx_ir::op::MaskKind,
+    bhsd: bool,
+) -> bool {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let min = *MIN.get_or_init(|| {
+        rlx_ir::env::var("RLX_SDPA_BLOCK_MIN")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1 << 22)
+    });
+    !bhsd
+        && q_s.saturating_mul(k_s) > min
+        && matches!(
+            mask,
+            rlx_ir::op::MaskKind::None | rlx_ir::op::MaskKind::Custom | rlx_ir::op::MaskKind::Bias
+        )
+}
+
+/// Query rows per block: ~2M scores (8 MB), a multiple of 32 (the SME tile).
+/// Only the SME row-blocked attention path uses it.
+#[cfg(rlx_cpu_amx_sme)]
+pub(crate) fn sdpa_row_block(q_s: usize, k_s: usize) -> usize {
+    let rows = ((1usize << 21) / k_s.max(1)).max(32) / 32 * 32;
+    rows.clamp(32, q_s.max(1))
+}
+
+/// The row-blocked attention path runs on SME2 (packed Kᵀ / V reused across
+/// blocks): only when that route is compiled in, enabled, and takes both
+/// products at block size — so it is also what the per-head path would use.
+/// (Re-packing per block through a generic GEMM was measured 1.5× slower than
+/// the per-head path on V-JEPA2-giant.)
+pub(crate) fn sdpa_sme_blocks(q_s: usize, k_s: usize, dh: usize, dh_v: usize) -> bool {
+    #[cfg(all(rlx_cpu_amx_sme, not(rlx_cpu_blas)))]
+    {
+        use crate::intrinsics::apple_amx::sme::{dispatch_enabled, worth_sme};
+        let bq = sdpa_row_block(q_s, k_s);
+        dispatch_enabled()
+            && worth_sme(bq, dh, k_s)
+            && worth_sme(bq, k_s, dh_v)
+            && worth_sme(q_s, dh, k_s)
+            && worth_sme(q_s, k_s, dh_v)
+    }
+    #[cfg(not(all(rlx_cpu_amx_sme, not(rlx_cpu_blas))))]
+    {
+        let _ = (q_s, k_s, dh, dh_v);
+        false
+    }
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    use super::coalesce_bcast_axes;
+
+    fn index_map(dims: &[u32], ls: &[u32], rs: &[u32]) -> Vec<(usize, usize)> {
+        let n: usize = dims.iter().map(|&d| d as usize).product();
+        (0..n)
+            .map(|i| {
+                let (mut rem, mut li, mut ri) = (i, 0usize, 0usize);
+                for ax in (0..dims.len()).rev() {
+                    let c = rem % dims[ax] as usize;
+                    rem /= dims[ax] as usize;
+                    li += c * ls[ax] as usize;
+                    ri += c * rs[ax] as usize;
+                }
+                (li, ri)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coalescing_keeps_the_index_map() {
+        // Shapes seen in TensorCSPNet / GraphCSPNet training, plus edge cases.
+        let cases: &[(&[u32], &[u32], &[u32])] = &[
+            (&[128, 4, 4], &[16, 4, 1], &[0, 4, 1]),
+            (&[128, 4, 1], &[0, 0, 0], &[4, 1, 0]),
+            (&[128, 4, 1], &[4, 1, 0], &[0, 0, 0]),
+            (&[128, 4, 4], &[4, 1, 0], &[0, 4, 1]),
+            (&[128, 8, 8], &[0, 8, 1], &[64, 8, 1]),
+            (&[128, 4, 4], &[16, 4, 1], &[4, 1, 0]),
+            (&[32], &[1], &[0]),
+            (&[1, 1, 1], &[0, 0, 0], &[0, 0, 0]),
+            (&[3, 1, 5], &[5, 0, 1], &[0, 0, 1]),
+            (&[2, 3, 4, 5], &[60, 20, 5, 1], &[0, 5, 0, 1]),
+        ];
+        for &(d, l, r) in cases {
+            let (cd, cl, cr) = coalesce_bcast_axes(d, l, r);
+            assert!(cd.len() <= d.len());
+            assert_eq!(
+                index_map(&cd, &cl, &cr),
+                index_map(d, l, r),
+                "{d:?} {l:?} {r:?}"
+            );
+        }
+        // `[128,4,1]` with a broadcast scalar walks as one 512-element row.
+        assert_eq!(
+            coalesce_bcast_axes(&[128, 4, 1], &[4, 1, 0], &[0, 0, 0]).0,
+            vec![512]
+        );
+    }
+}

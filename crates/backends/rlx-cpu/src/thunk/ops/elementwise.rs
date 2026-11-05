@@ -1609,7 +1609,109 @@ pub(crate) fn exec_activation_f64(t: &Thunk, base: *mut u8) {
         unsafe {
             let inp = sl_f64(*src, base, len);
             let out = sl_mut_f64(*dst, base, len);
-            apply_activation_f64(inp, out, *kind);
+            if crate::pool::should_parallelize(len) {
+                use rayon::prelude::*;
+                let n = crate::pool::chunk_floor(len).max(1);
+                out.par_chunks_mut(n)
+                    .zip(inp.par_chunks(n))
+                    .for_each(|(o, i)| apply_activation_f64(i, o, *kind));
+            } else {
+                apply_activation_f64(inp, out, *kind);
+            }
+        }
+    }
+}
+
+/// `d[i] = f(l[i], r[i])`.
+#[inline(always)]
+fn binary_f64_same(d: &mut [f64], l: &[f64], r: &[f64], f: impl Fn(f64, f64) -> f64 + Sync) {
+    let len = d.len();
+    if crate::pool::should_parallelize(len) {
+        use rayon::prelude::*;
+        let n = crate::pool::chunk_floor(len).max(1);
+        d.par_chunks_mut(n)
+            .zip(l.par_chunks(n))
+            .zip(r.par_chunks(n))
+            .for_each(|((o, a), b)| {
+                for ((o, a), b) in o.iter_mut().zip(a).zip(b) {
+                    *o = f(*a, *b);
+                }
+            });
+    } else {
+        for ((o, a), b) in d.iter_mut().zip(l).zip(r) {
+            *o = f(*a, *b);
+        }
+    }
+}
+
+/// The offset into a strided operand of output row `row`, the last axis
+/// excluded: each output row is one walk along that axis.
+#[inline(always)]
+fn row_offset(mut row: usize, dims: &[u32], strides: &[u32]) -> usize {
+    let mut off = 0;
+    for ax in (0..dims.len() - 1).rev() {
+        let sz = dims[ax] as usize;
+        off += (row % sz) * strides[ax] as usize;
+        row /= sz;
+    }
+    off
+}
+
+/// `f` over a NumPy-style broadcast: row by row, so the index arithmetic is
+/// per row and the common last-axis strides (0 or 1) run as plain loops.
+#[inline(always)]
+pub(crate) fn binary_f64_broadcast(
+    d: &mut [f64],
+    l: &[f64],
+    r: &[f64],
+    dims: &[u32],
+    ls: &[u32],
+    rs: &[u32],
+    f: impl Fn(f64, f64) -> f64 + Sync,
+) {
+    let len = d.len();
+    let rank = dims.len();
+    let inner = dims[rank - 1] as usize;
+    if len == 0 || inner == 0 {
+        return;
+    }
+    let (sl, sr) = (ls[rank - 1] as usize, rs[rank - 1] as usize);
+    let one_row = |k: usize, o: &mut [f64]| {
+        let (lb, rb) = (row_offset(k, dims, ls), row_offset(k, dims, rs));
+        match (sl, sr) {
+            (1, 1) => {
+                for ((o, a), b) in o.iter_mut().zip(&l[lb..]).zip(&r[rb..]) {
+                    *o = f(*a, *b);
+                }
+            }
+            (0, 1) => {
+                let a = l[lb];
+                for (o, b) in o.iter_mut().zip(&r[rb..]) {
+                    *o = f(a, *b);
+                }
+            }
+            (1, 0) => {
+                let b = r[rb];
+                for (o, a) in o.iter_mut().zip(&l[lb..]) {
+                    *o = f(*a, b);
+                }
+            }
+            _ => {
+                for (i, o) in o.iter_mut().enumerate() {
+                    *o = f(l[lb + i * sl], r[rb + i * sr]);
+                }
+            }
+        }
+    };
+    if crate::pool::should_parallelize(len) {
+        use rayon::prelude::*;
+        d.par_chunks_mut(inner)
+            .with_min_len((crate::pool::chunk_floor(len) / inner).max(1))
+            .enumerate()
+            .for_each(|(k, o)| one_row(k, o));
+    } else {
+        for (k, o) in d.chunks_mut(inner).enumerate() {
+            one_row(k, o);
         }
     }
 }
@@ -1639,31 +1741,43 @@ pub(crate) fn exec_binary_full_f64(t: &Thunk, base: *mut u8) {
             let l = sl_f64(*lhs, base, lhs_len);
             let r = sl_f64(*rhs, base, rhs_len);
             let d = sl_mut_f64(*dst, base, len);
+            // the operator chosen once, not per element
+            macro_rules! with_op {
+                ($run:ident) => {
+                    match *op {
+                        BinaryOp::Add => $run!(|a: f64, b: f64| a + b),
+                        BinaryOp::Sub => $run!(|a: f64, b: f64| a - b),
+                        BinaryOp::Mul => $run!(|a: f64, b: f64| a * b),
+                        BinaryOp::Div => $run!(|a: f64, b: f64| a / b),
+                        other => $run!(|a: f64, b: f64| binary_op_f64(other, a, b)),
+                    }
+                };
+            }
             if lhs_len == len && rhs_len == len {
-                for i in 0..len {
-                    d[i] = binary_op_f64(*op, l[i], r[i]);
+                macro_rules! run {
+                    ($f:expr) => {
+                        binary_f64_same(d, l, r, $f)
+                    };
                 }
+                with_op!(run);
             } else if !out_dims_bcast.is_empty() {
                 // Shape-aware broadcast path: correct for
                 // arbitrary NumPy-style broadcasts including
                 // bidirectional `[N,1] op [1,S]`.
-                let rank = out_dims_bcast.len();
-                let mut coords = vec![0u32; rank];
-                for i in 0..len {
-                    let mut rem = i;
-                    for ax in (0..rank).rev() {
-                        let sz = out_dims_bcast[ax] as usize;
-                        coords[ax] = (rem % sz) as u32;
-                        rem /= sz;
-                    }
-                    let mut li: usize = 0;
-                    let mut ri: usize = 0;
-                    for ax in 0..rank {
-                        li += coords[ax] as usize * bcast_lhs_strides[ax] as usize;
-                        ri += coords[ax] as usize * bcast_rhs_strides[ax] as usize;
-                    }
-                    d[i] = binary_op_f64(*op, l[li], r[ri]);
+                macro_rules! run {
+                    ($f:expr) => {
+                        binary_f64_broadcast(
+                            d,
+                            l,
+                            r,
+                            out_dims_bcast,
+                            bcast_lhs_strides,
+                            bcast_rhs_strides,
+                            $f,
+                        )
+                    };
                 }
+                with_op!(run);
             } else {
                 // Fallback: legacy modulo path (preserved for
                 // dynamic-shape graphs where strides can't be
@@ -3730,20 +3844,42 @@ pub(crate) fn transpose_walk_f64(
     in_strides: &[u32],
 ) {
     let rank = out_dims.len();
-    let mut idx = vec![0u32; rank];
-    for o in 0..out.len() {
-        let mut src_off = 0usize;
-        for d in 0..rank {
-            src_off += idx[d] as usize * in_strides[d] as usize;
-        }
-        out[o] = inp[broadcast_src_index(src_off, inp.len())];
-        // Increment index — last dim varies fastest.
-        for d in (0..rank).rev() {
-            idx[d] += 1;
-            if idx[d] < out_dims[d] {
-                break;
+    let len = out.len();
+    if len == 0 {
+        return;
+    }
+    if rank == 0 {
+        out[0] = inp[broadcast_src_index(0, inp.len())];
+        return;
+    }
+    let inner = out_dims[rank - 1] as usize;
+    let stride = in_strides[rank - 1] as usize;
+    let one_row = |k: usize, o: &mut [f64]| {
+        let base = row_offset(k, out_dims, in_strides);
+        if base + (inner - 1) * stride >= inp.len() {
+            // past the source's end: wrapped, element by element
+            for (i, o) in o.iter_mut().enumerate() {
+                *o = inp[broadcast_src_index(base + i * stride, inp.len())];
             }
-            idx[d] = 0;
+        } else if stride == 0 {
+            o.fill(inp[base]);
+        } else if stride == 1 {
+            o.copy_from_slice(&inp[base..base + inner]);
+        } else {
+            for (i, o) in o.iter_mut().enumerate() {
+                *o = inp[base + i * stride];
+            }
+        }
+    };
+    if crate::pool::should_parallelize(len) {
+        use rayon::prelude::*;
+        out.par_chunks_mut(inner)
+            .with_min_len((crate::pool::chunk_floor(len) / inner).max(1))
+            .enumerate()
+            .for_each(|(k, o)| one_row(k, o));
+    } else {
+        for (k, o) in out.chunks_mut(inner).enumerate() {
+            one_row(k, o);
         }
     }
 }

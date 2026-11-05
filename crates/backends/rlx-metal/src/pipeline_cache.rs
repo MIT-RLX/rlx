@@ -40,13 +40,16 @@ fn cache_paths(msl: &str) -> (PathBuf, PathBuf) {
     )
 }
 
+/// `xcrun metal SRC -o OUT`. No `-c`: that stops at an AIR object, which
+/// `newLibraryWithFile` rejects, so every start used to miss this cache, run
+/// the compiler again, and then compile the source in-process as well (~4 s
+/// of every Metal process start, the cache costing more than it saved).
 fn compile_msl_file_to_metallib(src: &Path, out: &Path) -> bool {
     Command::new("xcrun")
         .args([
             "-sdk",
             "macosx",
             "metal",
-            "-c",
             src.to_str().unwrap_or_default(),
             "-o",
             out.to_str().unwrap_or_default(),

@@ -7037,6 +7037,50 @@ impl MetalExecutable {
                     fill,
                     elem_bytes,
                 } => {
+                    // Zero-fill f32 padding along one axis (a causal conv's
+                    // left pad, a sequence's tail) stays on the GPU: zero the
+                    // output, then copy the input in after the leading pad.
+                    // On the host it splits the command buffer and runs a
+                    // scalar loop over the tensor: a 44.1 kHz codec decode
+                    // spent 870 ms a window there against 3 ms of GPU work.
+                    if let Some((outer, dst_axis, src_axis, inner, lead)) =
+                        gpu_zero_pad_axis(in_dims, before, after, *mode, fill, *elem_bytes, *dst)
+                    {
+                        let n = outer as u64 * dst_axis as u64 * inner as u64;
+                        let enc = e!();
+                        let n32 = n as u32;
+                        enc.set_compute_pipeline_state(&k.zero_f32);
+                        enc.set_buffer(0, Some(&self.arena.buffer), *dst as u64);
+                        enc.set_bytes(1, 4, &n32 as *const u32 as *const _);
+                        enc.dispatch_threads(
+                            crate::mtl::MTLSize {
+                                width: n,
+                                height: 1,
+                                depth: 1,
+                            },
+                            crate::mtl::MTLSize {
+                                width: 256.min(n),
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                        // The copy overwrites part of what was zeroed.
+                        crate::backend::encode::ops::intra_thunk_barrier(enc);
+                        let shifted = *dst + lead as usize * inner as usize * 4;
+                        encode_concat_midaxis(
+                            enc,
+                            k,
+                            &self.arena.buffer,
+                            shifted,
+                            outer,
+                            dst_axis,
+                            inner,
+                            crate::thunk::HalfFlag::F32,
+                            &[(*src, src_axis)],
+                            &[crate::thunk::HalfFlag::F32],
+                        );
+                        continue;
+                    }
                     deferred_host.push(DeferredHostOp::Pad {
                         src: *src,
                         dst: *dst,
@@ -8935,16 +8979,18 @@ impl MetalExecutable {
                                     if force_gemv { " (per-row)" } else { "" }
                                 );
                             }
+                            // `x` and `dst` are byte offsets, the rows f32
+                            let f = std::mem::size_of::<f32>();
                             for r in 0..(*m as usize) {
                                 encode_dequant_matmul_mlx_gemv(
                                     e!(),
                                     &k.dequant_matmul_mlx_gemv,
                                     &self.arena.buffer,
-                                    *x + r * (*kk as usize),
+                                    *x + r * (*kk as usize) * f,
                                     *w_q,
                                     *scale,
                                     *zp,
-                                    *dst + r * (*n as usize),
+                                    *dst + r * (*n as usize) * f,
                                     *kk,
                                     *n,
                                     kind,
@@ -9352,4 +9398,48 @@ fn find_shared_x_q1_partner(
         }
     }
     None
+}
+
+/// A `Pad` the GPU path takes: constant mode, all-zero fill, f32, padded
+/// along exactly one axis, its output under 4 GiB into the arena (the segment
+/// copy binds there). `(outer, padded extent, input extent, inner, leading
+/// pad)` of that axis.
+fn gpu_zero_pad_axis(
+    in_dims: &[u32],
+    before: &[u32],
+    after: &[u32],
+    mode: rlx_ir::op::PadMode,
+    fill: &[u8],
+    elem_bytes: u8,
+    dst: usize,
+) -> Option<(u32, u32, u32, u32, u32)> {
+    if !matches!(mode, rlx_ir::op::PadMode::Constant(_))
+        || elem_bytes != 4
+        || fill.iter().any(|&b| b != 0)
+        || rlx_ir::env::flag("RLX_METAL_PAD_HOST")
+    {
+        return None;
+    }
+    let mut padded = (0..in_dims.len()).filter(|&i| before[i] + after[i] > 0);
+    let axis = padded.next()?;
+    if padded.next().is_some() {
+        return None;
+    }
+    let outer: u64 = in_dims[..axis].iter().map(|&d| d as u64).product();
+    let inner: u64 = in_dims[axis + 1..].iter().map(|&d| d as u64).product();
+    let extent = in_dims[axis] as u64 + before[axis] as u64 + after[axis] as u64;
+    let bytes = outer * extent * inner * 4;
+    if bytes == 0
+        || dst as u64 + bytes > u32::MAX as u64
+        || outer * extent * inner > u32::MAX as u64
+    {
+        return None;
+    }
+    Some((
+        outer as u32,
+        extent as u32,
+        in_dims[axis],
+        inner as u32,
+        before[axis],
+    ))
 }

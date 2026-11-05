@@ -65,3 +65,26 @@ fn grad_linear_layer() {
     // dL/dw = x^T @ ones[1,2] = [[1,1],[2,2]]
     approx(&g[0].to_vec(), &[1.0, 1.0, 2.0, 2.0]);
 }
+
+#[test]
+fn grad_of_f64_loss_is_seeded_with_f64_one() {
+    // d/dv sum(v·v) = 2v, in f64 (the seed was f32 bytes: ×5.26e-315)
+    let v = Tensor::from_f64(vec![0.5, 1.0, -3.0], [3]);
+    let g = (&v * &v).sum([0], false).grad(&[&v]);
+    assert_eq!(g[0].to_vec_f64(), vec![1.0, 2.0, -6.0]);
+}
+
+#[test]
+fn fake_quantize_rows_and_straight_through() {
+    // Two rows, 4-bit, one scale per row: s = max|x| / 7.
+    let x = Tensor::from_vec(vec![0.7, -0.35, 0.12, 0.0, 14.0, 3.0, -5.1, 1.0], [2, 4]);
+    let q = x.fake_quantize(4, Some(0), rlx_tensor::SteKind::Identity);
+    // Row 0: s = 0.1 → 7, -3.5→-4 (half away from zero), 1.2→1, 0.
+    // Row 1: s = 2   → 7, 1.5→2, -2.55→-3, 0.5→1.
+    approx(&q.to_vec(), &[0.7, -0.4, 0.1, 0.0, 14.0, 4.0, -6.0, 2.0]);
+    // The identity STE passes the upstream gradient through unchanged.
+    let w = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4]);
+    let loss = (&q * &w).sum([0, 1], false);
+    let g = loss.grad(&[&x]);
+    approx(&g[0].to_vec(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+}

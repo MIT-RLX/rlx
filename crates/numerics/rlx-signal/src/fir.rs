@@ -71,6 +71,24 @@ pub fn firwin(
     pass_zero: bool,
     fs: Option<f64>,
 ) -> Result<Vec<f64>, String> {
+    firwin_windowed(numtaps, cutoff, &get_window(window, numtaps), pass_zero, fs)
+}
+
+/// [`firwin`] with an explicit window `win` (`numtaps` values) — e.g.
+/// [`crate::resample::kaiser`] for `window=("kaiser", beta)`.
+pub fn firwin_windowed(
+    numtaps: usize,
+    cutoff: &[f64],
+    win: &[f64],
+    pass_zero: bool,
+    fs: Option<f64>,
+) -> Result<Vec<f64>, String> {
+    if win.len() != numtaps {
+        return Err(format!(
+            "window has {} values for {numtaps} taps",
+            win.len()
+        ));
+    }
     let fs = fs.unwrap_or(2.0);
     let nyq = 0.5 * fs;
     let cutoff: Vec<f64> = cutoff.iter().map(|c| c / nyq).collect();
@@ -120,8 +138,7 @@ pub fn firwin(
         }
     }
     let mut h = h.unwrap();
-    let win = get_window(window, numtaps);
-    for (hi, wi) in h.iter_mut().zip(&win) {
+    for (hi, wi) in h.iter_mut().zip(win) {
         *hi *= wi;
     }
     let (left, right) = (edges[0], edges[1]);

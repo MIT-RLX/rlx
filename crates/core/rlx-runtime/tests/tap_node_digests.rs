@@ -7,6 +7,8 @@
 //! a changed input diverges first at the node that reads it, the text form
 //! round-trips, and a subset taps only its nodes.
 
+mod common;
+
 use std::rc::Rc;
 
 use rlx_ir::{DType, Graph, GraphExt, NodeId, Shape};
@@ -81,6 +83,7 @@ fn digests_bisect_to_the_first_differing_node() {
 /// tag is a constant output.
 #[test]
 fn runs_pair_with_the_compile_that_ran() {
+    let _gpu = common::serialize_gpu();
     #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
     let mut devices = vec![Device::Cpu];
     #[cfg(feature = "gpu")]

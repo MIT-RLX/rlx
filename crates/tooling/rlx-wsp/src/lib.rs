@@ -11,6 +11,8 @@
 //! agent loop or MCP server can register as-is, and a forward-pass budget that
 //! is the agent's only way to run the network.
 //!
+//! - [`graphops`] — model-independent units (`node[i]`), channel provenance
+//!   and graph rewrites (masks, inserted linear maps).
 //! - [`env`] — scored environments with labelled observations (`Bounce`).
 //! - [`orchard`] — `Orchard`: many objects, fruit and bombs; a planner reference.
 //!   `Gusts`: the same game with motion rules the agent must discover.
@@ -32,16 +34,29 @@ pub mod agent;
 pub mod baselines;
 pub mod blocks;
 pub mod bundle;
+pub mod checks;
+pub mod edits;
 pub mod env;
+pub mod explore;
 pub mod export;
+pub mod graphops;
+pub mod jobs;
+pub mod lm;
+pub mod lora;
 pub mod mcp;
+pub mod measure;
 pub mod mlp;
 pub mod mnist;
+pub mod opal;
 pub mod orchard;
 pub mod pg;
+pub mod pipeline;
+pub mod pkgrun;
+pub mod pkgsrc;
 pub mod roles;
 pub mod script;
 pub mod space;
+pub mod steer;
 pub mod tasks;
 pub mod tools;
 pub mod train;

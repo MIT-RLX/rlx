@@ -450,12 +450,13 @@ fn after_its_trial_a_failure_on_one_rank_stops_the_run_with_a_crash_marker() {
                 DecisionOutcome::default()
             }
         }
-        let mut agent = AgentOptimizer::new(
-            config(&root_path.join(format!("r{r}")), 30, 1),
-            Box::new(Toy { rank: r }),
-            Box::new(Rule),
-        )
-        .unwrap();
+        // Rank 0 trains on alone after rank 1 stops, which a real run cannot
+        // (its next gradient all-reduce waits for rank 1): no collective here
+        // but the protocol's own, so no periodic replica check either.
+        let mut cfg = config(&root_path.join(format!("r{r}")), 30, 1);
+        cfg.replica_check_every = 0;
+        let mut agent =
+            AgentOptimizer::new(cfg, Box::new(Toy { rank: r }), Box::new(Rule)).unwrap();
         agent.set_process_group(g);
         let mut w = vec![1.0f32, -2.0, 0.5];
         let out = run_toy(&mut agent, &mut w, 1, 30);
@@ -468,4 +469,39 @@ fn after_its_trial_a_failure_on_one_rank_stops_the_run_with_a_crash_marker() {
         "{err}"
     );
     assert!(ranks[1].1.join("crashed-v001-r1.json").exists());
+}
+
+#[test]
+fn replicas_that_drift_apart_are_resynced_at_the_periodic_check() {
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().to_path_buf();
+    let ranks = per_rank(2, move |r, g| {
+        let mut cfg = config(&root_path.join(format!("r{r}")), 30, 1);
+        cfg.replica_check_every = 10;
+        let host = RuleHost::new(&json!({"kind": "sgd", "lr": 0.1})).unwrap();
+        let mut agent = AgentOptimizer::new(cfg, Box::new(host), Box::new(Keep)).unwrap();
+        agent.set_process_group(g);
+        let mut w = vec![1.0f32, -2.0, 0.5];
+        run_toy(&mut agent, &mut w, 1, 7).unwrap();
+        if r == 1 {
+            // What a program keeping state per rank would do.
+            w[0] += 0.25;
+        }
+        run_toy(&mut agent, &mut w, 8, 30).unwrap();
+        let resynced: Vec<Value> = events(agent.run_dir())
+            .into_iter()
+            .filter(|e| e["kind"] == "ranks_resynced")
+            .collect();
+        (w, resynced)
+    });
+    assert_eq!(ranks[0].0, ranks[1].0, "equal again after the check");
+    let mut expect = vec![1.0f32, -2.0, 0.5];
+    for _ in 0..30 {
+        expect.iter_mut().for_each(|p| *p -= 0.1 * *p);
+    }
+    assert_eq!(ranks[0].0, expect, "rank 0's params were kept");
+    assert_eq!(ranks[0].1.len(), 1, "{:?}", ranks[0].1);
+    assert_eq!(ranks[0].1[0]["update"], 10);
+    assert_eq!(ranks[0].1[0]["names"], json!(["w"]));
+    assert!(ranks[1].1.is_empty(), "rank 0 records it");
 }

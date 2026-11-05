@@ -8,12 +8,15 @@
 //! a Qwen3 MLP has them — turned every gradient of a LoRA backward to NaN on
 //! Metal while the CPU's hand-written kernel stayed finite.
 
+mod common;
+
 use rlx_ir::op::Activation;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
 #[test]
 fn activation_gradients_are_finite_and_agree_on_extreme_inputs() {
+    let _gpu = common::serialize_gpu();
     // The old NaN window, the clamp edges, and the far tails.
     let mut xs: Vec<f32> = (0..=64).map(|i| -88.5 + i as f32 * 0.0625).collect();
     xs.extend([

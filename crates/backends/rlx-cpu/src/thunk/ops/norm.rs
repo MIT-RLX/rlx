@@ -323,7 +323,8 @@ pub(crate) fn compile_group_norm(
     };
     {
         let in_shape = &graph.node(node.inputs[0]).shape;
-        let (n, c, h, w) = conv_nchw_dims(in_shape);
+        // Any rank: NCDHW volumes (MONAI SegResNet / UNETR) as well as NCHW.
+        let (n, c, h, w) = norm_nc_rest_dims(in_shape);
         Thunk::GroupNorm {
             src: node_offset(arena, node.inputs[0]),
             g: node_offset(arena, node.inputs[1]),

@@ -531,6 +531,27 @@ cargo rlx dist cluster.toml --set MODE=model --set PKG=qwen3.rlxp --set TASK=inf
   over mm4 (Metal) + CUDA + ROCm, split pinned, same tokens: 60 tokens of
   prose 12.0 → 8.2–10.1 s, 120 of code 17.9 → 11.6–15.2 s (the range is
   load on the Metal node). It keeps 60% and 92% of the drafts.
+  `rlx-export --variant mtp --speculate N` chains `N` drafts: each one is the
+  MTP head run again on its own hidden and pick, one position on. The
+  verify step then has `N + 1` rows. The gated delta-net states and the MTP
+  hidden are replaced by a pass, not appended to, so a pass can't keep only
+  some of its rows. When only some drafts are right, the run drops the pass and
+  replays the kept tokens and the correction. That pass is padded at the end
+  to the step's width, and the `ROWS` value (`model::distributed::ROWS`)
+  tells each stage how many rows are real. The package's `verify.rows` names the inputs
+  that carry the padding (`DecodeEntry::feeds_padded`). Qwen3.5-0.8B Q8_0
+  on one CPU, 128 new tokens, tokens per pass (prompt passes excluded),
+  the same tokens as one-token decoding in every run:
+
+  | drafts | prose | code | list |
+  |---|---|---|---|
+  | 1 | 1.73 | 1.88 | 1.86 |
+  | 2 | 2.10 | 2.61 | 2.33 |
+  | 3 | 2.10 | 3.12 | 2.91 |
+
+  A replay pass carries no draft and yields one token. Prose meets about 23 of
+  them in 128 tokens, which is why its third draft adds nothing.
+  `DraftStats::passes` counts the passes that read the prompt too.
 - **Layout.** A cut may move up to 25% of its stage's share (by FLOPs) to
   where the fewest bytes cross (`split_function_cut`). One cut between a
   KV cache and the attention reading it sent the whole expanded cache,

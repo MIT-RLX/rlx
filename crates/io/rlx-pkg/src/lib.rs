@@ -25,7 +25,7 @@
 //! - `write` (default) — [`write_package`], [`build`], auto-tiering, [`package_from_bake`]
 //! - `convert` (default) — the `*_to_rlxp` importers (GGUF, MLX, DDUF, NeMo, PyTorch)
 //! - `parallel` (default) — warm blocks decoded on rayon
-//! - `zstd-native` — libzstd for the warm/cold codec (native; faster, real levels)
+//! - `zstd-native` — libzstd's algorithm (zstd-pure-rs, Rust) for the warm/cold codec (native)
 //! - `encrypt` — [`seal_bytes`] / [`unseal_bytes`] (`RLXSEAL1`)
 //! - `remote` — [`RemoteFlat`] HTTP Range reader
 

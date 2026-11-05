@@ -283,7 +283,10 @@ pub(crate) struct DecisionFacts<'a> {
     pub program_ms: Option<f64>,
     pub start_ms: Option<f64>,
     pub decisions_left: usize,
-    pub cost_so_far: f64,
+    /// `Some`: tell the agent its next scheduled decision (`None` in it: none left).
+    pub next_decision: Option<Option<u64>>,
+    /// The agent's cost so far, when its prompt shows it (not the built-in ones).
+    pub cost_so_far: Option<f64>,
     pub files: Vec<&'a str>,
     pub aggressive: bool,
 }
@@ -437,11 +440,21 @@ pub(crate) fn decision(d: &DecisionFacts<'_>) -> String {
     for n in d.notes {
         lines.push(format!("Note from the person running this training: {n}"));
     }
+    if d.decisions_left == 0 {
+        lines.push("This is your last decision in this run.".into());
+    } else if let Some(next) = d.next_decision {
+        lines.push(match next {
+            Some(u) => format!("The next scheduled decision is at update {u}."),
+            None => "No scheduled decisions remain.".into(),
+        });
+    }
     lines.push(format!(
-        "Decisions so far: {}; decisions left after this one: {}; agent cost so far: ${:.2}.",
+        "Decisions so far: {}; decisions left after this one: {}{}.",
         d.k - 1,
         d.decisions_left,
         d.cost_so_far
+            .map(|c| format!("; agent cost so far: ${c:.2}"))
+            .unwrap_or_default()
     ));
     lines.push(if d.aggressive {
         format!(

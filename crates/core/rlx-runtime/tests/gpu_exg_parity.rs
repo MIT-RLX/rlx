@@ -99,6 +99,17 @@ fn check_interpolate1d(dev: Device) {
     });
 }
 
+fn check_interpolate1d_nearest(dev: Device) {
+    parity("interpolate1d_nearest", dev, f32::MIN_POSITIVE, &|g| {
+        let data: Vec<f32> = (0..2 * 3 * 7)
+            .map(|i| (i as f32 * 0.37).sin() * 3.0)
+            .collect();
+        let x = const_f32(g, &data, &[2, 3, 7]);
+        let y = g.interpolate1d(x, 16, InterpMode::Nearest);
+        vec![y]
+    });
+}
+
 fn check_conv_transpose1d(dev: Device) {
     parity("conv_transpose1d", dev, 1e-3, &|g| {
         let x = const_f32(g, &[1.0, 2.0, 3.0, 4.0], &[1, 1, 4]);
@@ -197,6 +208,11 @@ mod metal {
         check_interpolate1d(Device::Metal);
     }
     #[test]
+    fn interpolate1d_nearest() {
+        let _gpu = common::serialize_gpu();
+        check_interpolate1d_nearest(Device::Metal);
+    }
+    #[test]
     fn conv_transpose1d() {
         let _gpu = common::serialize_gpu();
         check_conv_transpose1d(Device::Metal);
@@ -255,6 +271,11 @@ mod mlx {
         check_interpolate1d(Device::Mlx);
     }
     #[test]
+    fn interpolate1d_nearest() {
+        let _gpu = common::serialize_gpu();
+        check_interpolate1d_nearest(Device::Mlx);
+    }
+    #[test]
     fn conv_transpose1d() {
         let _gpu = common::serialize_gpu();
         check_conv_transpose1d(Device::Mlx);
@@ -305,6 +326,11 @@ mod wgpu {
         check_interpolate1d(Device::Gpu);
     }
     #[test]
+    fn interpolate1d_nearest() {
+        let _gpu = common::serialize_gpu();
+        check_interpolate1d_nearest(Device::Gpu);
+    }
+    #[test]
     fn conv_transpose1d() {
         let _gpu = common::serialize_gpu();
         check_conv_transpose1d(Device::Gpu);
@@ -353,6 +379,11 @@ mod cuda {
     fn interpolate1d() {
         let _gpu = common::serialize_gpu();
         check_interpolate1d(Device::Cuda);
+    }
+    #[test]
+    fn interpolate1d_nearest() {
+        let _gpu = common::serialize_gpu();
+        check_interpolate1d_nearest(Device::Cuda);
     }
     #[test]
     fn conv_transpose1d() {

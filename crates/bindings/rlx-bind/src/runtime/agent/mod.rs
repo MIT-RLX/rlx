@@ -76,7 +76,7 @@ pub use backend::{Backend, CliAgent, DecisionOutcome, DecisionRequest, Keep, bac
 pub use mailbox::Mailbox;
 pub use message::{FIELDS as PROMPT_FIELDS, Prompt};
 pub use observe::Integrity;
-pub use program::{Files, ParamInfo, Program, ProgramHost, RuleHost, StepCtx};
+pub use program::{DevicePlan, Files, ParamInfo, Program, ProgramHost, RuleHost, StepCtx};
 pub use records::{final_program, redact, say};
 pub use rlx_agent::{self, AgentCli};
 pub use schedule::{Spread, decision_updates};
@@ -84,7 +84,7 @@ pub use schedule::{Spread, decision_updates};
 use records::Run;
 
 use super::opts::Opts;
-use super::train::{OptItem, ProcessGroup, ReduceKind, StepInfo, Trainer};
+use super::train::{DeviceState, OptItem, ProcessGroup, ReduceKind, StepInfo, Trainer};
 use crate::panics::catch;
 use crate::{ApiError, ApiResult};
 
@@ -187,6 +187,10 @@ pub struct AgentConfig {
     pub max_lag_updates: u64,
     /// A new program's trial window, in updates. Default 20.
     pub trial_steps: u64,
+    /// Data-parallel runs: check every this many updates (and after the last)
+    /// that the ranks hold the same params; when they do not, rank 0's are
+    /// sent to all and the agent is told. 0: never. Default 100.
+    pub replica_check_every: u64,
     /// The largest params copy kept to undo a failing first update. Default 2 GiB.
     pub snapshot_limit_bytes: usize,
     /// Stop asking once the agent has cost this much.
@@ -211,6 +215,9 @@ pub struct AgentConfig {
     /// script, the model's source).
     pub share: Vec<PathBuf>,
     pub prompt: Prompt,
+    /// Tell the agent at each decision when its next scheduled one is.
+    /// Default: on with the built-in prompts, off with a template.
+    pub show_next_decision: Option<bool>,
 }
 
 /// Updates timed before an estimated schedule is set.
@@ -231,6 +238,7 @@ impl AgentConfig {
             waiting: Waiting::Always,
             max_lag_updates: 100,
             trial_steps: 20,
+            replica_check_every: 100,
             snapshot_limit_bytes: 2 << 30,
             max_cost_usd: None,
             run_root: PathBuf::from("rlx_runs"),
@@ -242,12 +250,14 @@ impl AgentConfig {
             facts: TaskFacts::default(),
             share: Vec::new(),
             prompt: Prompt::Neutral,
+            show_next_decision: None,
         }
     }
 
     /// `{goal, total_steps, decisions, seconds_per_decision, max_wait_ratio,
     /// spread ("front" | "uniform"), every, blocking (true | false | "auto"),
-    /// max_lag_updates, trial_steps, snapshot_limit_gb, max_cost_usd,
+    /// max_lag_updates, trial_steps, replica_check_every, show_next_decision,
+    /// snapshot_limit_gb, max_cost_usd,
     /// run_root, pause_on_nonfinite, validation, validation_size,
     /// eval_integrity, integrity_threshold, epochs, train_size, batch_size,
     /// same_order_each_epoch, task_facts, share ([paths]), prompt ("neutral" |
@@ -290,6 +300,9 @@ impl AgentConfig {
         };
         c.max_lag_updates = o.u64("max_lag_updates")?.unwrap_or(c.max_lag_updates);
         c.trial_steps = o.u64("trial_steps")?.unwrap_or(c.trial_steps);
+        c.replica_check_every = o
+            .u64("replica_check_every")?
+            .unwrap_or(c.replica_check_every);
         if let Some(gb) = o.f64("snapshot_limit_gb")? {
             c.snapshot_limit_bytes = (gb.max(0.0) * (1u64 << 30) as f64) as usize;
         }
@@ -331,6 +344,15 @@ impl AgentConfig {
         if let Some(p) = o.str("prompt")? {
             c.prompt = Prompt::parse(p);
         }
+        c.show_next_decision = match o.get("show_next_decision") {
+            Some(Value::Bool(b)) => Some(*b),
+            None => None,
+            Some(other) => {
+                return Err(ApiError::type_(format!(
+                    "agent: show_next_decision is a boolean, got {other}"
+                )));
+            }
+        };
         o.finish()?;
         c.check()?;
         Ok(c)
@@ -412,6 +434,28 @@ const MAX_SHOWN: usize = 200;
 const NOTES: &str = "NOTES.md";
 const CHECKPOINT: &str = "agent.json";
 const CHECKPOINT_STATE: &str = "agent_state.bin";
+/// The interface's addition when the run trains on the device.
+const DEVICE_NOTE: &str = "\n- This run trains on the device: the update is fused into the training \
+    step, so every group's kind must be adam, adamw, muon or muon_adamw, skip_if is not available, \
+    and the reports have grad_norm, weight_norm and update_ratio (from the report after \
+    the decision that asks for it) but not grad_cosine.";
+/// What a report update reads on the device: the gradient norms from the
+/// fused step, and the trainable params after the update and before it when
+/// the analysis asks for them.
+struct DeviceMeasured {
+    grad_norms: Vec<f32>,
+    params: Option<Vec<Vec<f32>>>,
+    before: Option<Vec<Vec<f32>>>,
+}
+
+/// Where the training script's own schedule is shown to the agent.
+const SCRIPT_SCHEDULE_AT: [f64; 12] = [
+    0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.85, 1.0,
+];
+
+/// The trainer's checkpoint in a [`AgentOptimizer::save_with`] folder.
+#[cfg(feature = "gguf-io")]
+const TRAINER_CHECKPOINT: &str = "trainer.gguf";
 
 /// The optimizer of a run with an agent in the loop.
 pub struct AgentOptimizer {
@@ -461,6 +505,19 @@ pub struct AgentOptimizer {
     // what the training script reported
     validation: Vec<Value>,
     integrity: Option<Integrity>,
+    /// How many boundary findings the programs' sources had.
+    boundary_flags: usize,
+    /// The trainer fuses the update on the device ([`Self::train_step`] on a
+    /// resident trainer): programs run as device plans.
+    device: bool,
+    /// On the device: the trainer's state before the program on trial made
+    /// its first update, to go back to.
+    device_snapshot: Option<DeviceState>,
+    /// On the device, what this update's report is made from.
+    device_measured: Option<DeviceMeasured>,
+    /// The training script's own schedule, sampled as (fraction of training,
+    /// learning rate) at the first [`Self::train_step`]; empty without one.
+    script_schedule: Option<Vec<(f64, f32)>>,
     recent_losses: Vec<f32>,
     // timing
     program_ms: Option<f64>,
@@ -612,6 +669,11 @@ impl AgentOptimizer {
             nonfinite_episode: false,
             nonfinite_at: None,
             skips_in_a_row: 0,
+            boundary_flags: 0,
+            device: false,
+            device_snapshot: None,
+            device_measured: None,
+            script_schedule: None,
             validation: Vec::new(),
             integrity,
             recent_losses: Vec::new(),
@@ -658,18 +720,152 @@ impl AgentOptimizer {
     }
 
     /// One training step through `trainer`, the update made by the agent's
-    /// program → the loss.
+    /// program → the loss. On a resident trainer ([`Trainer::is_fused`]) the
+    /// program runs on the device as its [`Program::device_plan`]: the
+    /// trainer's fused step makes the update with each param's rule and rate,
+    /// a program whose rules differ builds the fused step again (moments kept
+    /// where the rule's family is the same), and the protocol runs on the
+    /// loss: no gradient statistics, and a non-finite loss during a trial
+    /// takes the params and moments back to before its first update.
     pub fn train_step(
         &mut self,
         trainer: &mut Trainer,
         inputs: &[(&str, &[f32])],
     ) -> ApiResult<f32> {
+        if self.script_schedule.is_none() {
+            let total = self.cfg.total_steps;
+            self.script_schedule = Some(
+                SCRIPT_SCHEDULE_AT
+                    .iter()
+                    .filter_map(|&f| {
+                        let step = ((f * total as f64).round() as u64).min(total.saturating_sub(1));
+                        trainer.lr_at(step).map(|lr| (f, lr))
+                    })
+                    .collect(),
+            );
+        }
+        if trainer.is_fused() {
+            return self.device_step(trainer, inputs);
+        }
         if self.group.is_none()
             && let Some(g) = trainer.process_group()
         {
             self.group = Some(g.clone());
         }
         trainer.step_with(inputs, |items, info| self.step(items, info))
+    }
+
+    fn device_step(&mut self, trainer: &mut Trainer, inputs: &[(&str, &[f32])]) -> ApiResult<f32> {
+        if !self.device {
+            self.device = true;
+            self.params = trainer
+                .trainable()
+                .iter()
+                .map(|n| ParamInfo {
+                    name: n.clone(),
+                    shape: trainer
+                        .param_shape(n)
+                        .map(<[usize]>::to_vec)
+                        .unwrap_or_default(),
+                })
+                .collect();
+        }
+        let u = trainer.steps() + 1;
+        let lr = trainer.next_lr();
+        if let Some(lr) = lr {
+            self.base_lr = Some(lr);
+        }
+        if self.program.is_none() {
+            self.update = u;
+            self.start(&[])?;
+        }
+        let ctx = StepCtx {
+            update: u,
+            total: self.cfg.total_steps,
+            base_lr: self.base_lr,
+            loss: None,
+        };
+        let plan = self
+            .program
+            .as_ref()
+            .expect("started above")
+            .device_plan(&ctx, &self.params)
+            .map_err(|why| {
+                ApiError::type_(format!(
+                    "agent: the program cannot run on the device: {why}"
+                ))
+            })?;
+        trainer.set_device_plan(&plan.rules, &plan.lrs, &plan.carry)?;
+        // A report update reads the gradient norms (scalars) and, when the
+        // analysis asks, the trainable params; other updates read the loss.
+        let report_due = u.is_multiple_of(self.analysis.every) || u == self.cfg.total_steps;
+        let loss = if report_due {
+            let before = self
+                .analysis
+                .wants_update_ratio()
+                .then(|| trainer.trainable_params());
+            let (loss, grad_norms) = trainer.step_with_grad_norms(inputs)?;
+            let params = self
+                .analysis
+                .wants_params()
+                .then(|| trainer.trainable_params());
+            self.device_measured = Some(DeviceMeasured {
+                grad_norms,
+                params,
+                before,
+            });
+            loss
+        } else {
+            trainer.step(inputs)?
+        };
+        if !loss.is_finite() && self.trial.is_some() {
+            let exact = match self.device_snapshot.take() {
+                Some(state) => {
+                    trainer.set_device_state(&state)?;
+                    true
+                }
+                None => false,
+            };
+            if let Some(t) = &mut self.trial {
+                t.first_pending = exact;
+                t.snapshot = if exact {
+                    Ok(Vec::new())
+                } else {
+                    Err("no copy of the device state was kept".into())
+                };
+            }
+            self.recover(
+                &mut [],
+                u,
+                Some(loss),
+                ApiError::runtime(
+                    "the training loss became non-finite during the program's trial (on the \
+                     device, every update of the trial is undone: the params and moments go back \
+                     to before its first update)",
+                ),
+            )?;
+        }
+        let trial_before = self.trial.as_ref().map(|t| (t.until, self.version));
+        self.step(
+            &mut [],
+            &StepInfo {
+                update: u,
+                loss,
+                outputs: &[],
+                lr,
+            },
+        )?;
+        // A program that took over in this step makes its first update next:
+        // keep the state from before it.
+        let trial_now = self.trial.as_ref().map(|t| (t.until, self.version));
+        if trial_now.is_some() && trial_now != trial_before {
+            let state = trainer.device_state()?;
+            self.device_snapshot =
+                (state.bytes() <= self.cfg.snapshot_limit_bytes).then_some(state);
+        } else if trial_now.is_none() {
+            self.device_snapshot = None;
+        }
+        Ok(loss)
     }
 
     /// Run the protocol over the ranks of a data-parallel run (as OPAL does
@@ -730,22 +926,73 @@ impl AgentOptimizer {
 
     /// Whether every rank holds the same params (a strided sample, by min and max).
     fn params_agree(&self, items: &[OptItem<'_>]) -> ApiResult<bool> {
+        Ok(self.differing_params(items)?.is_empty())
+    }
+
+    /// The params whose strided sample differs between ranks (by min and max).
+    fn differing_params(&self, items: &[OptItem<'_>]) -> ApiResult<Vec<String>> {
         let Some(g) = self.group.as_ref().filter(|g| g.world_size() > 1) else {
-            return Ok(true);
+            return Ok(Vec::new());
         };
-        let mut lo: Vec<f32> = items
-            .iter()
-            .flat_map(|it| {
-                it.param
-                    .iter()
-                    .step_by(it.param.len().div_ceil(256).max(1))
-                    .copied()
-            })
-            .collect();
+        let mut owner = Vec::new();
+        let mut lo: Vec<f32> = Vec::new();
+        for (i, it) in items.iter().enumerate() {
+            for &x in it.param.iter().step_by(it.param.len().div_ceil(256).max(1)) {
+                lo.push(x);
+                owner.push(i);
+            }
+        }
         let mut hi = lo.clone();
         g.all_reduce(&mut lo, ReduceKind::Min).map_err(collective)?;
         g.all_reduce(&mut hi, ReduceKind::Max).map_err(collective)?;
-        Ok(lo.iter().zip(&hi).all(|(a, b)| a.to_bits() == b.to_bits()))
+        let mut differ = vec![false; items.len()];
+        for ((a, b), &i) in lo.iter().zip(&hi).zip(&owner) {
+            differ[i] |= a.to_bits() != b.to_bits();
+        }
+        Ok(items
+            .iter()
+            .zip(differ)
+            .filter(|(_, d)| *d)
+            .map(|(it, _)| it.name.to_string())
+            .collect())
+    }
+
+    /// The periodic replica check outside a trial: rank 0's params to every
+    /// rank when they differ, and the agent told (the program's state is not
+    /// sent: a program that keeps state per rank drifts again).
+    fn check_replicas(&mut self, items: &mut [OptItem<'_>], u: u64) -> ApiResult<()> {
+        let names = self.differing_params(items)?;
+        if names.is_empty() {
+            return Ok(());
+        }
+        self.resync(items)?;
+        let mut shown = names
+            .iter()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if names.len() > 20 {
+            shown.push_str(&format!(" and {} more", names.len() - 20));
+        }
+        let msg = format!(
+            "the params differed across ranks at update {u} ({} of {} tensors: {shown}); rank 0's \
+             params were sent to every rank, the program's state was not. The program must act the \
+             same on every rank: state it keeps per rank (or randomness that differs between ranks) \
+             makes them drift again.",
+            names.len(),
+            items.len()
+        );
+        if self.rank0() {
+            eprintln!("[rlx agent] {msg}");
+            self.errors
+                .push(json!({"update": u, "where": "replica check", "error": msg}));
+            self.run.event(
+                "ranks_resynced",
+                json!({"update": u, "version": self.version, "tensors": names.len(), "names": names}),
+            );
+        }
+        Ok(())
     }
 
     /// Rank 0's params on every rank.
@@ -822,15 +1069,59 @@ impl AgentOptimizer {
         {
             self.run.event("integrity", flag);
         }
+        let every = self.cfg.replica_check_every;
+        if multi
+            && every > 0
+            && self.trial.is_none()
+            && (update.is_multiple_of(every) || update == self.cfg.total_steps)
+        {
+            self.check_replicas(items, update)?;
+        }
         if report_due {
             let losses = std::mem::take(&mut self.report_window);
-            let (report, wake) = self.analysis.report(
-                update,
-                &losses,
-                items,
-                before.as_deref(),
-                info.outputs,
-                self.program_ms,
+            let (mut report, wake) = match (self.device, self.device_measured.take()) {
+                (true, d) => {
+                    let d = d.as_ref();
+                    fn slices(v: &Option<Vec<Vec<f32>>>) -> Option<Vec<&[f32]>> {
+                        v.as_ref().map(|v| v.iter().map(Vec::as_slice).collect())
+                    }
+                    let measured = analysis::Measured {
+                        names: self.params.iter().map(|p| p.name.as_str()).collect(),
+                        grad_norms: d
+                            .filter(|d| d.grad_norms.len() == self.params.len())
+                            .map(|d| d.grad_norms.iter().map(|&g| g as f64).collect()),
+                        grads: None,
+                        params: d.and_then(|d| slices(&d.params)),
+                        before: d.and_then(|d| slices(&d.before)),
+                    };
+                    self.analysis.report_measured(
+                        update,
+                        &losses,
+                        &measured,
+                        info.outputs,
+                        self.program_ms,
+                    )
+                }
+                (false, _) => self.analysis.report(
+                    update,
+                    &losses,
+                    items,
+                    before.as_deref(),
+                    info.outputs,
+                    self.program_ms,
+                ),
+            };
+            let lrs = self
+                .program
+                .as_ref()
+                .map(|p| p.learning_rates())
+                .unwrap_or_default();
+            if !lrs.is_empty() && report.is_object() {
+                report["lr"] = Value::Object(lrs.into_iter().map(|(k, v)| (k, json!(v))).collect());
+            }
+            self.run.append(
+                "reports.jsonl",
+                &json!({"version": self.version, "report": report}).to_string(),
             );
             if self.reports.len() == MAX_REPORTS {
                 self.reports.remove(0);
@@ -976,6 +1267,7 @@ impl AgentOptimizer {
         results["last_validation"] = json!(self.validation.last());
         results["best_validation"] = json!(best);
         results["integrity_flags"] = json!(self.integrity.as_ref().map(|i| &i.flags));
+        results["boundary_flags"] = json!(self.boundary_flags);
         self.run.write(
             "results.json",
             &(serde_json::to_string_pretty(&results).unwrap() + "\n"),
@@ -1053,6 +1345,7 @@ impl AgentOptimizer {
             "skipped": self.skipped,
             "validation": self.validation,
             "integrity_flags": self.integrity.as_ref().map(|i| &i.flags),
+            "boundary_flags": self.boundary_flags,
             "decision_seconds": self.decision_seconds,
             "inflight": self.inflight.as_ref().map(|f| f.k),
             "trial_open": self.trial.is_some(),
@@ -1071,6 +1364,42 @@ impl AgentOptimizer {
                    "dir": dir.display().to_string(), "state_saved": state.is_some()}),
         );
         Ok(())
+    }
+
+    /// [`Self::save`] and the trainer's [`Trainer::save`] in one folder
+    /// (`trainer.gguf` beside the agent's files): the whole run's checkpoint.
+    /// Resume it with [`Self::resume_with`]. Data-parallel ranks each save
+    /// their own folder.
+    #[cfg(feature = "gguf-io")]
+    pub fn save_with(&mut self, trainer: &mut Trainer, dir: &Path) -> ApiResult<()> {
+        fs::create_dir_all(dir)
+            .map_err(|e| ApiError::runtime(format!("agent checkpoint {}: {e}", dir.display())))?;
+        trainer.save(&dir.join(TRAINER_CHECKPOINT).display().to_string())?;
+        self.save(dir)
+    }
+
+    /// Continue the run [`Self::save_with`] wrote in `dir`: the trainer's
+    /// params (and step count) loaded into `trainer`, the agent resumed as
+    /// [`Self::resume`] does. Errors when the two were not saved together.
+    #[cfg(feature = "gguf-io")]
+    pub fn resume_with(
+        cfg: AgentConfig,
+        host: Box<dyn ProgramHost>,
+        backend: Box<dyn Backend>,
+        dir: &Path,
+        trainer: &mut Trainer,
+    ) -> ApiResult<Self> {
+        trainer.load(&dir.join(TRAINER_CHECKPOINT).display().to_string())?;
+        let a = Self::resume(cfg, host, backend, dir)?;
+        if trainer.steps() != a.update {
+            return Err(ApiError::type_(format!(
+                "agent checkpoint {}: the trainer is at update {} but the agent at {}",
+                dir.display(),
+                trainer.steps(),
+                a.update
+            )));
+        }
+        Ok(a)
     }
 
     /// Continue a run from [`Self::save`]'s `dir`, in its run folder when that
@@ -1190,6 +1519,7 @@ impl AgentOptimizer {
         a.previous = ck["previous"].as_str().map(str::to_string);
         a.start_ms = ck["start_ms"].as_f64();
         a.decision_seconds = ck["decision_seconds"].as_f64();
+        a.boundary_flags = ck["boundary_flags"].as_u64().unwrap_or(0) as usize;
         if let (Some(i), Some(flags)) = (&mut a.integrity, ck["integrity_flags"].as_array()) {
             i.flags = flags.clone();
         }
@@ -1247,13 +1577,17 @@ impl AgentOptimizer {
     // ── setup ───────────────────────────────────────────────────
 
     fn start(&mut self, items: &[OptItem<'_>]) -> ApiResult<()> {
-        self.params = items
-            .iter()
-            .map(|it| ParamInfo {
-                name: it.name.to_string(),
-                shape: it.shape.to_vec(),
-            })
-            .collect();
+        // On the device the params never come to the host: the trainer named them.
+        if !(self.device && items.is_empty()) {
+            self.params = items
+                .iter()
+                .map(|it| ParamInfo {
+                    name: it.name.to_string(),
+                    shape: it.shape.to_vec(),
+                })
+                .collect();
+        }
+        self.record_boundary(&self.files.clone(), self.version);
         let mut program = self.host.build(&self.files, &self.params, None)?;
         if let Some(r) = self.restore.take() {
             let restored = r.state.as_ref().is_some_and(|s| program.load_state_dict(s));
@@ -1285,6 +1619,10 @@ impl AgentOptimizer {
             .write("workspace/reference/parameters.txt", &table)?;
         self.run
             .write_files("workspace/reference/starting", &self.host.starting_files())?;
+        self.run.write_files(
+            "workspace/reference",
+            &self.host.examples(self.cfg.prompt.is_aggressive()),
+        )?;
         self.write_system_prompt()
     }
 
@@ -1324,11 +1662,35 @@ impl AgentOptimizer {
                 facts: self.cfg.facts.sentence(),
                 validation,
                 code,
-                interface: format!("{}\n\n{}", self.host.interface(), Analysis::interface()),
+                interface: format!(
+                    "{}{}{}\n\n{}",
+                    self.host.interface(),
+                    if self.device { DEVICE_NOTE } else { "" },
+                    self.script_schedule_note(),
+                    Analysis::interface()
+                ),
                 params: &self.params,
             },
         );
         self.run.write("system_prompt.txt", &self.system)
+    }
+
+    /// The interface's line on the training script's own schedule, when it
+    /// has one.
+    fn script_schedule_note(&self) -> String {
+        let Some(points) = self.script_schedule.as_ref().filter(|p| !p.is_empty()) else {
+            return String::new();
+        };
+        let shown: Vec<String> = points
+            .iter()
+            .map(|(f, lr)| format!("[{f}, {lr:.3e}]"))
+            .collect();
+        format!(
+            "\n- The training script's learning rate follows its own schedule, as [fraction of \
+             training, learning rate]: {}. Your groups' rates scale with it (the formula above), \
+             so it is already in every update: a decay in your schedule multiplies this one.",
+            shown.join(", ")
+        )
     }
 
     /// Set the schedule from the time of the updates so far.
@@ -1380,6 +1742,61 @@ impl AgentOptimizer {
     }
 
     // ── checks and decisions ────────────────────────────────────
+
+    /// `reference/check.json` for the host's `check_program` command, as the
+    /// run is now → the command (empty when the host has none).
+    fn write_check(&self) -> Vec<String> {
+        let Some((command, host)) = self.host.check() else {
+            return Vec::new();
+        };
+        let spec = json!({
+            "host": host,
+            "params": self.params.iter().map(|p| json!({"name": p.name, "shape": p.shape})).collect::<Vec<_>>(),
+            "files": self.files.keys().collect::<Vec<_>>(),
+            "total_updates": self.cfg.total_steps,
+            "update": self.update,
+            "base_lr": self.base_lr,
+        });
+        match self.run.write(
+            "workspace/reference/check.json",
+            &serde_json::to_string_pretty(&spec).unwrap(),
+        ) {
+            Ok(()) => command,
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Record the host's boundary findings for `files` (rank 0, before each
+    /// build): `boundary` events, and a line on stderr. Not a rejection.
+    fn record_boundary(&mut self, files: &Files, version: u32) {
+        if !self.rank0() {
+            return;
+        }
+        let flags = self.host.boundary_flags(files);
+        if flags.is_empty() {
+            return;
+        }
+        let mut categories: Vec<&str> = flags
+            .iter()
+            .filter_map(|f| f["category"].as_str())
+            .collect();
+        categories.sort();
+        categories.dedup();
+        eprintln!(
+            "[rlx agent] boundary flags: v{version:03}, {} ({}); see events.jsonl and the report; \
+             the program runs as written (no sandbox)",
+            flags.len(),
+            categories.join(", ")
+        );
+        for f in &flags {
+            let mut e = json!({"version": version});
+            if let (Value::Object(e), Value::Object(f)) = (&mut e, f) {
+                e.extend(f.clone());
+            }
+            self.run.event("boundary", e);
+        }
+        self.boundary_flags += flags.len();
+    }
 
     /// Whether the decision about to be asked waits for its answer.
     fn waits(&self, new_nonfinite: bool) -> bool {
@@ -1530,7 +1947,13 @@ impl AgentOptimizer {
             program_ms: self.program_ms,
             start_ms: self.start_ms,
             decisions_left: self.max_decisions.saturating_sub(k),
-            cost_so_far: self.cost,
+            next_decision: self
+                .cfg
+                .show_next_decision
+                .unwrap_or(!matches!(self.cfg.prompt, Prompt::Template(_)))
+                .then(|| self.next_scheduled()),
+            // The built-in prompts leave cost out, as OPAL's neutral ones do.
+            cost_so_far: matches!(self.cfg.prompt, Prompt::Template(_)).then_some(self.cost),
             files: self.files.keys().map(String::as_str).collect(),
             aggressive: self.cfg.prompt.is_aggressive(),
         });
@@ -1545,6 +1968,7 @@ impl AgentOptimizer {
             message,
             system: self.system.clone(),
             budget_left: self.cfg.max_cost_usd.map(|c| (c - self.cost).max(0.0)),
+            check: self.write_check(),
         };
         let backend = Arc::clone(&self.backend);
         let handle = std::thread::spawn(move || {
@@ -1684,11 +2108,28 @@ impl AgentOptimizer {
             None
         };
         let program = if updater_changed {
+            self.record_boundary(&files, version);
             let current = self.program.as_deref();
             let built = catch("building the new program", || {
                 self.host.build(&files, &self.params, current)
             })
             .and_then(|r| r);
+            // On the device it must also be a device plan.
+            let probe = StepCtx {
+                update: u,
+                total: self.cfg.total_steps,
+                base_lr: self.base_lr,
+                loss: None,
+            };
+            let built = match built {
+                Ok(p) if self.device => match p.device_plan(&probe, &self.params) {
+                    Ok(_) => Ok(p),
+                    Err(why) => Err(ApiError::type_(format!(
+                        "this run trains on the device, where the program cannot run: {why}"
+                    ))),
+                },
+                other => other,
+            };
             // Every rank installs it, or none does.
             if !self.agree(built.is_ok())? {
                 let e = built.err().unwrap_or_else(|| {

@@ -111,6 +111,35 @@ pub fn with_param_sharing_scope<R>(label: &str, f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// Run `f` with strict f32 matmuls where a backend's default trades precision
+/// for speed: CUDA's TF32 tensor cores (as `RLX_CUDA_NO_TF32=1` would, for
+/// `f`'s duration). For a computation whose result is a discrete decision on
+/// near-equal scores, such as a codec's nearest-codebook search, where TF32
+/// moves enough values to change the codes. Elsewhere `f` runs as is.
+///
+/// Process-wide, like [`with_param_sharing_scope`]: work on other threads
+/// during `f` runs strict too.
+pub fn with_strict_f32<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "cuda")]
+    {
+        struct Restore(rlx_cuda::CudaRuntimeConfig);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                rlx_cuda::install_runtime_config(self.0.clone());
+            }
+        }
+        let before = rlx_cuda::runtime_config();
+        if !before.matmul_parity_mode() {
+            let mut strict = before.clone();
+            strict.no_tf32 = true;
+            rlx_cuda::install_runtime_config(strict);
+            let _restore = Restore(before);
+            return f();
+        }
+    }
+    f()
+}
+
 pub mod aot_cache;
 pub mod attn_mask;
 pub mod backend;

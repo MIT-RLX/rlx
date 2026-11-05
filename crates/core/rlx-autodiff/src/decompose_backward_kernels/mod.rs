@@ -89,6 +89,52 @@ fn static_dim5(shape: &Shape) -> Option<[usize; 5]> {
     Some(out)
 }
 
+/// The im2col patches of `flat_x` as ONE gather: `index[i]` is the element of
+/// `flat_x` patch entry `i` reads, `None` in the padding (zero). `flat_x` gets
+/// a trailing zero for those, so the whole matrix is a concat, a constant and a
+/// gather (the f32 index form [`gather_flat_f32`] uses), not one scalar gather
+/// per entry: EEGNet's training graph was 4.8 M nodes that way. `None` when an
+/// index would not be exact in f32 (the caller then builds it entry by entry).
+fn gather_patches(
+    g: &mut Graph,
+    flat_x: NodeId,
+    zero: NodeId,
+    index: &[Option<usize>],
+) -> Option<NodeId> {
+    let flat_n = g.node(flat_x).shape.dim(0).unwrap_static();
+    if flat_n >= 1 << 24 {
+        return None;
+    }
+    let dt = g.node(flat_x).shape.dtype();
+    let padded = g.concat_(vec![flat_x, zero], 0);
+    let idx: Vec<f32> = index.iter().map(|i| i.unwrap_or(flat_n) as f32).collect();
+    let idx = f32_tensor_const(idx, Shape::new(&[index.len()], dt), g);
+    Some(g.gather_(padded, idx, 0))
+}
+
+/// `dy` `[N, C, …spatial]` as the `[C, N·spatial]` matrix that pairs with
+/// im2col rows ordered `(n, …spatial)`: the batch axis moves behind the
+/// channels first. A bare reshape is that matrix only when N = 1 (it was used
+/// for every N: each conv's weight gradient was wrong at batch > 1).
+fn channel_major(g: &mut Graph, dy: NodeId, c: usize, m: Dim) -> NodeId {
+    let shape = g.node(dy).shape.clone();
+    let moved = if matches!(shape.dim(0), Dim::Static(1)) {
+        dy
+    } else {
+        let mut perm: Vec<usize> = (0..shape.rank()).collect();
+        perm.swap(0, 1);
+        g.transpose_(dy, perm)
+    };
+    let out = Shape::from_dims(&[Dim::Static(c), m], shape.dtype());
+    g.add_node(
+        Op::Reshape {
+            new_shape: vec![c as i64, -1],
+        },
+        vec![moved],
+        out,
+    )
+}
+
 fn gather_flat_f32(g: &mut Graph, flat_x: NodeId, index: usize, dt: DType) -> NodeId {
     let idx = f32_tensor_const(vec![index as f32], Shape::new(&[1], dt), g);
     g.gather_(flat_x, idx, 0)
@@ -492,6 +538,26 @@ fn build_im2col_rows(
     m_start: usize,
     m_end: usize,
 ) -> NodeId {
+    let mut index = Vec::with_capacity((m_end - m_start) * k);
+    for pos in m_start..m_end {
+        let (ni, r) = (pos / (h_out * w_out), pos % (h_out * w_out));
+        let (ho, wo) = (r / w_out, r % w_out);
+        for ci in 0..c_in {
+            for ki in 0..kh {
+                for kj in 0..kw {
+                    let hi = ho * sh + ki * dh;
+                    let wi = wo * sw + kj * dw_d;
+                    index.push(
+                        (hi >= ph && wi >= pw && hi - ph < h && wi - pw < w_in)
+                            .then(|| ((ni * c_in + ci) * h + (hi - ph)) * w_in + (wi - pw)),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(cols) = gather_patches(g, flat_x, zero, &index) {
+        return cols;
+    }
     let mut rows: Vec<NodeId> = Vec::with_capacity(m_end - m_start);
     let mut flat = 0usize;
     'outer: for ni in 0..n {
@@ -555,6 +621,34 @@ fn build_im2col3d_rows(
     m_start: usize,
     m_end: usize,
 ) -> NodeId {
+    let mut index = Vec::with_capacity((m_end - m_start) * k);
+    for pos in m_start..m_end {
+        let ni = pos / (d_out * h_out * w_out);
+        let r = pos % (d_out * h_out * w_out);
+        let (do_, ho, wo) = (r / (h_out * w_out), (r / w_out) % h_out, r % w_out);
+        for ci in 0..c_in {
+            for kz in 0..kd {
+                for ki in 0..kh {
+                    for kj in 0..kw {
+                        let (di, hi, wi) =
+                            (do_ * sd + kz * dd, ho * sh + ki * dh, wo * sw + kj * dw_d);
+                        let inside = di >= pd
+                            && hi >= ph
+                            && wi >= pw
+                            && di - pd < d
+                            && hi - ph < h
+                            && wi - pw < w_in;
+                        index.push(inside.then(|| {
+                            (((ni * c_in + ci) * d + (di - pd)) * h + (hi - ph)) * w_in + (wi - pw)
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(cols) = gather_patches(g, flat_x, zero, &index) {
+        return cols;
+    }
     let mut rows: Vec<NodeId> = Vec::with_capacity(m_end - m_start);
     let mut flat = 0usize;
     'outer: for ni in 0..n {

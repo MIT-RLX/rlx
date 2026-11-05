@@ -84,6 +84,158 @@ class Updater:
         return self.opt.load_state_dict(state)
 "#;
 
+/// `reference/example_updater.py`: the starting optimizer split into groups,
+/// each with its own options and rate multiplier, under a schedule, at values
+/// that change nothing (the aggressive prompt's copy adds a controller of the
+/// rates, off).
+const EXAMPLE_PY: &str = r#""""An example updater: the starting optimizer in groups (matrices, the rest), each with its own options and
+learning-rate multiplier, under a piecewise-linear schedule of the rate. Nothing here is a recommendation: the
+options, multipliers and knots are left at values that change nothing, so as written it trains exactly as the
+starting program does.{controller_note}
+"""
+import json
+
+import numpy as np
+import pyrlx
+
+START = json.loads(r'''{start}''')
+
+# (key, which params: a test of name and shape, options over START, rate multiplier). First match wins.
+GROUPS = [
+    ("matrices", lambda name, shape: len(shape) == 2, {}, 1.0),
+    ("rest", lambda name, shape: True, {}, 1.0),
+]
+# (fraction of training, multiplier of the rate), linear between them.
+KNOTS = [(0.0, 1.0), (1.0, 1.0)]
+{controller_constants}
+
+def schedule(fraction):
+    xs, ys = zip(*KNOTS)
+    return float(np.interp(fraction, xs, ys))
+{controller}
+
+def build(params, previous, spec):
+    return Updater(params, previous)
+
+
+class Updater:
+    def __init__(self, params, previous):
+        self.members = {key: [] for key, _, _, _ in GROUPS}
+        for name, shape in params:
+            key = next(k for k, test, _, _ in GROUPS if test(name, shape))
+            self.members[key].append(name)
+        self.opts = {key: pyrlx.Optimizer(**{**START, **over}) for key, _, over, _ in GROUPS}
+        self.mult = {key: m for key, _, _, m in GROUPS}
+        if previous is not None and hasattr(previous, "state_dict"):  # its state carries over, param by param
+            self.load_state_dict(previous.state_dict())
+        {controller_init}
+
+    def step(self, params, grads, ctx):
+        base = ctx["base_lr"] if ctx["base_lr"] is not None else START.get("lr")
+        factor = schedule(ctx["update"] / ctx["total_updates"])
+        for key, names in self.members.items():
+            if not names:
+                continue
+            opt = self.opts[key]
+            if base is not None:
+                opt.set_lr(base * self.mult[key] * factor)
+            {controller_before}
+            out = opt.step({name: (params[name], grads[name]) for name in names})
+            for name in names:
+                params[name][...] = out[name]
+            {controller_after}
+
+    def state_dict(self):
+        step, buffers = 0, {}
+        for key, opt in self.opts.items():
+            s = opt.state_dict()
+            step = max(step, s["step"])
+            buffers.update({f"{key}:{k}": v for k, v in s["buffers"].items()})
+        return {"step": step, "buffers": buffers}
+
+    def load_state_dict(self, state):
+        # Buffers are keyed "<slot>/<param>", here "<group>:<slot>/<param>": each group takes its params'.
+        for key, opt in self.opts.items():
+            names, own = set(self.members[key]), {}
+            for k, v in state["buffers"].items():
+                k = k.split(":", 1)[1] if ":" in k else k
+                if k.partition("/")[2] in names:
+                    own[k] = v
+            opt.load_state_dict({"step": state["step"], "buffers": own})
+"#;
+
+/// The aggressive prompt's additions to [`EXAMPLE_PY`], by placeholder.
+const CONTROLLER_PY: [(&str, &str); 6] = [
+    (
+        "{controller_note}",
+        " The feedback controller of the\nlearning rates below is off.",
+    ),
+    (
+        "{controller_constants}",
+        r#"
+# A feedback controller of the learning rates, off by default: after each update it measures each group's
+# update-to-weight ratio, keeps a running mean of it, and lr_rule() turns that into the group's rate multiplier.
+# To use it, set LR_CONTROLLER = True and SIGNAL_DECAY (the weight of the newest measurement in the running
+# mean), and write lr_rule() from your own measurements.
+LR_CONTROLLER = False
+SIGNAL_DECAY = None
+"#,
+    ),
+    (
+        "{controller}",
+        r#"
+
+def lr_rule(signal, multiplier, update, total):
+    """Your rule: a group's new rate multiplier from its signal (the running mean of its update-to-weight ratio)
+    and its current multiplier. As written it changes nothing."""
+    return multiplier
+"#,
+    ),
+    (
+        "{controller_init}",
+        r#"self.signal = {key: 0.0 for key in self.opts}
+        if LR_CONTROLLER and SIGNAL_DECAY is None:
+            raise ValueError("set SIGNAL_DECAY to use the learning-rate controller")"#,
+    ),
+    (
+        "{controller_before}",
+        "before = {name: params[name].copy() for name in names} if LR_CONTROLLER else None",
+    ),
+    (
+        "{controller_after}",
+        r#"if LR_CONTROLLER:
+                moved = np.sqrt(sum(float(np.sum((params[n] - before[n]) ** 2)) for n in names))
+                size = np.sqrt(sum(float(np.sum(before[n] ** 2)) for n in names))
+                ratio = moved / max(size, np.finfo(np.float32).tiny)
+                self.signal[key] = (1 - SIGNAL_DECAY) * self.signal[key] + SIGNAL_DECAY * ratio
+                self.mult[key] = lr_rule(self.signal[key], self.mult[key], ctx["update"], ctx["total_updates"])"#,
+    ),
+];
+
+/// [`EXAMPLE_PY`] for the starting optimizer `start`, with the controller when `aggressive`.
+fn example_py(start: &Value, aggressive: bool) -> String {
+    let mut text = EXAMPLE_PY.replace("{start}", &start.to_string());
+    for (field, piece) in CONTROLLER_PY {
+        text = text.replace(field, if aggressive { piece } else { "" });
+    }
+    // Without the controller its placeholders leave blank lines behind.
+    let mut out = String::new();
+    let mut blank = 0;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            blank += 1;
+            if blank > 2 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
 /// A Python exception as the agent should read it: traceback, then the error.
 fn error_text(py: Python<'_>, e: &PyErr) -> String {
     let tb = e
@@ -167,6 +319,45 @@ impl ProgramHost for PyHost {
         })
     }
 
+    fn examples(&self, aggressive: bool) -> Files {
+        Files::from([(
+            "example_updater.py".to_string(),
+            example_py(&self.start, aggressive),
+        )])
+    }
+
+    fn check(&self) -> Option<(Vec<String>, Value)> {
+        let exe = Python::with_gil(|py| {
+            py.import_bound("sys")
+                .and_then(|m| m.getattr("executable"))
+                .and_then(|e| e.extract::<String>())
+        })
+        .ok()?;
+        Some((
+            vec![
+                exe,
+                "-m".into(),
+                "pyrlx.agent".into(),
+                "check-program".into(),
+            ],
+            json!({"program": "python", "optimizer": self.start}),
+        ))
+    }
+
+    fn boundary_flags(&self, files: &Files) -> Vec<Value> {
+        Python::with_gil(|py| -> PyResult<Vec<Value>> {
+            let found = py
+                .import_bound("pyrlx._boundary")?
+                .getattr("check")?
+                .call1((files.clone().into_py(py),))?;
+            match to_json(&found)? {
+                Value::Array(a) => Ok(a),
+                _ => Ok(Vec::new()),
+            }
+        })
+        .unwrap_or_default()
+    }
+
     fn interface(&self) -> String {
         format!(
             "Your updater is {UPDATER_PY}, a Python module in this folder (reference/starting/{UPDATER_PY} \
@@ -189,7 +380,11 @@ impl ProgramHost for PyHost {
              - numpy and pyrlx are available. pyrlx.Optimizer(kind, **options) runs one of rlx-optim's \
              algorithms ({}) over named arrays: step({{name: (param, grad)}}) returns the updated \
              arrays; set_lr(lr), state_dict(), load_state_dict(state).\n\
-             - Your code runs inside the training process: use only what it is given.",
+             - Your code runs inside the training process: use only what it is given (what it reaches \
+             besides, such as files, sys.modules, __main__, gc or frames, is recorded).\n\
+             - reference/example_updater.py splits the starting optimizer into groups, each with its own \
+             options and rate multiplier, under a schedule, at values that make it the starting \
+             program: an example of the form, not a recommendation.",
             rlx_bind::runtime::train::KINDS.join(", ")
         )
     }
@@ -311,7 +506,11 @@ fn parts(
     cfg["total_steps"] = json!(total_steps);
     let cfg = AgentConfig::from_json(&cfg).map_err(to_py)?;
     let host: Box<dyn ProgramHost> = match program {
-        "rules" => Box::new(RuleHost::new(&optimizer).map_err(to_py)?),
+        "rules" => Box::new(
+            RuleHost::new(&optimizer)
+                .map_err(to_py)?
+                .with_check_command(own_check_command(py)?),
+        ),
         "python" => Box::new(PyHost::new(&optimizer, total_steps).map_err(to_py)?),
         other => {
             return Err(PyTypeError::new_err(format!(
@@ -329,6 +528,17 @@ fn parts(
     }
     let backend = backend_from_json(backend, &bopts).map_err(to_py)?;
     Ok((cfg, host, backend))
+}
+
+/// `python -m pyrlx.agent check-program`, with this interpreter.
+fn own_check_command(py: Python<'_>) -> PyResult<Vec<String>> {
+    let exe: String = py.import_bound("sys")?.getattr("executable")?.extract()?;
+    Ok(vec![
+        exe,
+        "-m".into(),
+        "pyrlx.agent".into(),
+        "check-program".into(),
+    ])
 }
 
 /// `python -m pyrlx.workspace_mcp`, with this interpreter.
@@ -398,11 +608,12 @@ impl PyAgentOptimizer {
         })
     }
 
-    /// `AgentOptimizer.resume(path, goal, total_steps, …)`: continue from
-    /// `save(path)`, with the same arguments as at the start.
+    /// `AgentOptimizer.resume(path, goal, total_steps, …, trainer=None)`:
+    /// continue from `save(path)`, with the same arguments as at the start;
+    /// with `trainer`, from `save(path, trainer)`, loading the trainer too.
     #[staticmethod]
     #[pyo3(signature = (path, goal, total_steps, optimizer = None, program = "rules",
-                        backend = "keep", backend_options = None, **options))]
+                        backend = "keep", backend_options = None, trainer = None, **options))]
     #[allow(clippy::too_many_arguments)]
     fn resume(
         py: Python<'_>,
@@ -413,6 +624,7 @@ impl PyAgentOptimizer {
         program: &str,
         backend: &str,
         backend_options: Option<&Bound<'_, PyDict>>,
+        trainer: Option<&Bound<'_, PyTrainer>>,
         options: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let (cfg, host, backend) = parts(
@@ -425,8 +637,15 @@ impl PyAgentOptimizer {
             backend_options,
             options,
         )?;
-        let agent = AgentOptimizer::resume(cfg, host, backend, std::path::Path::new(path))
-            .map_err(to_py)?;
+        let dir = std::path::Path::new(path);
+        let agent = match trainer {
+            Some(t) => {
+                let mut t = t.borrow_mut();
+                AgentOptimizer::resume_with(cfg, host, backend, dir, &mut t.inner)
+            }
+            None => AgentOptimizer::resume(cfg, host, backend, dir),
+        }
+        .map_err(to_py)?;
         Ok(Self { inner: Some(agent) })
     }
 
@@ -531,11 +750,20 @@ impl PyAgentOptimizer {
         Ok(self.agent()?.schedule().map(<[u64]>::to_vec))
     }
 
-    /// Checkpoint the agent's side of the run into `path` (save the trainer too).
-    fn save(&mut self, path: &str) -> PyResult<()> {
-        self.agent_mut()?
-            .save(std::path::Path::new(path))
-            .map_err(to_py)
+    /// Checkpoint the agent's side of the run into `path`; with `trainer`,
+    /// the trainer's too (`trainer.gguf` beside it): the whole run.
+    #[pyo3(signature = (path, trainer = None))]
+    fn save(&mut self, path: &str, trainer: Option<&Bound<'_, PyTrainer>>) -> PyResult<()> {
+        let dir = std::path::Path::new(path);
+        match trainer {
+            Some(t) => {
+                let mut t = t.borrow_mut();
+                self.agent_mut()?
+                    .save_with(&mut t.inner, dir)
+                    .map_err(to_py)
+            }
+            None => self.agent_mut()?.save(dir).map_err(to_py),
+        }
     }
 
     /// Finish → the run's summary.
@@ -569,14 +797,20 @@ pub(crate) fn serve_workspace_mcp(py: Python<'_>, args: Vec<String>) -> PyResult
         .map_err(PyRuntimeError::new_err)
 }
 
+/// `check-program`'s host for `updater.py` programs.
+fn python_host(spec: &Value, total: u64) -> ApiResult<Box<dyn ProgramHost>> {
+    Ok(Box::new(PyHost::new(&spec["optimizer"], total)?))
+}
+
 /// `python -m pyrlx.agent <command> …`: `rlx-agent-opt` (doctor, estimate,
-/// show, watch, report, compare, say, broker), with this extension's own
+/// show, watch, report, compare, say, broker, check-program), with this extension's own
 /// workspace server → the exit code.
 #[pyfunction]
 #[pyo3(name = "_agent_cli")]
 pub(crate) fn agent_cli(py: Python<'_>, args: Vec<String>) -> PyResult<i32> {
     let defaults = CliDefaults {
         mcp_command: Some(own_mcp_command(py)?),
+        host: Some(python_host),
     };
     Ok(py.allow_threads(|| main_with(&args, &defaults)))
 }

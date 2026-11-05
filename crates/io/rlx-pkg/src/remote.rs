@@ -7,21 +7,34 @@
 use anyhow::{Context, Result, bail};
 use std::io::Read;
 
+/// The HTTP client: rustls with the pure-Rust RustCrypto provider, installed
+/// process-wide once (another crate's provider, if installed first, stays).
+#[cfg(feature = "remote")]
+fn client() -> Result<reqwest::blocking::Client> {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls_rustcrypto::provider().install_default();
+    });
+    Ok(reqwest::blocking::Client::builder()
+        .user_agent(concat!("rlx-pkg/", env!("CARGO_PKG_VERSION")))
+        .build()?)
+}
+
 /// Fetch a byte range from `url` (`Range: bytes=start-end` inclusive).
 #[cfg(feature = "remote")]
 pub fn http_range(url: &str, start: u64, end_inclusive: u64) -> Result<Vec<u8>> {
     let range = format!("bytes={start}-{end_inclusive}");
-    let resp = ureq::get(url)
-        .set("Range", &range)
-        .call()
+    let resp = client()?
+        .get(url)
+        .header("Range", &range)
+        .send()
         .with_context(|| format!("GET {url} Range {range}"))?;
-    let status = resp.status();
+    let status = resp.status().as_u16();
     if status != 206 && status != 200 {
         bail!("unexpected HTTP {status} for Range request");
     }
     let mut buf = Vec::new();
-    resp.into_reader()
-        .take(end_inclusive.saturating_sub(start).saturating_add(1) + 64)
+    resp.take(end_inclusive.saturating_sub(start).saturating_add(1) + 64)
         .read_to_end(&mut buf)
         .context("read range body")?;
     Ok(buf)

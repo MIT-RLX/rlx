@@ -6,6 +6,8 @@
 //! default (half graphs execute in f32) and rounds to the format under
 //! `HalfCasts::Round` — on every available backend.
 
+mod common;
+
 use rlx_ir::number_format::FloatFormat;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{CompileOptions, Device, HalfCasts, Session};
@@ -31,6 +33,7 @@ fn round_trip(from: DType, to: DType, n: usize) -> Graph {
 
 #[test]
 fn half_casts_widen_by_default_and_round_on_request() {
+    let _gpu = common::serialize_gpu();
     // Below f16's and bf16's mantissa step, a large value, and one past f16's range.
     let xs = [1.0f32 + 2f32.powi(-12), -3.140625, 70_000.0, 1.0e-6];
     let devices: Vec<Device> = rlx_runtime::available_devices()

@@ -26,6 +26,19 @@ pub(crate) fn conv_nchw_dims(shape: &Shape) -> (u32, u32, u32, u32) {
     }
 }
 
+/// `[N, C, ...]` of any rank >= 2 → `(n, c, 1, prod(rest))`, for kernels
+/// (GroupNorm) whose only spatial notion is "everything after the channel".
+pub(crate) fn norm_nc_rest_dims(shape: &Shape) -> (u32, u32, u32, u32) {
+    let dims: Vec<usize> = shape.dims().iter().map(|d| d.unwrap_static()).collect();
+    assert!(
+        dims.len() >= 2,
+        "norm_nc_rest_dims: expected rank >= 2, got {}",
+        dims.len()
+    );
+    let rest: usize = dims[2..].iter().product();
+    (dims[0] as u32, dims[1] as u32, 1, rest as u32)
+}
+
 /// (N, C, D, H, W) for a rank-5 NCDHW conv tensor.
 pub(crate) fn conv_ncdhw_dims(shape: &Shape) -> (u32, u32, u32, u32, u32) {
     assert_eq!(

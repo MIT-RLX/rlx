@@ -25,87 +25,90 @@ pub fn unit_importance(
 }
 
 /// [`unit_importance`] restricted to `only` (all used units when `None`).
+/// Units are the channels of every activation node of the graph; a channel
+/// counts as used unless the weight column and bias that produce it are both
+/// zero. Each is zeroed with a mask in the graph, so this works on any
+/// network.
 pub fn unit_importance_of(
     ws: &mut WeightSpace,
     episodes: usize,
     only: Option<&BTreeSet<String>>,
 ) -> Result<Vec<(String, f32)>, String> {
-    if ws.state.graph.is_some() {
-        return Err("unit importance addresses MLP units".into());
+    if ws.is_loaded() {
+        return Err("unit importance needs a scored task".into());
     }
-    let live = ws.state.params.clone();
+    let g = ws.base_graph()?;
     let base = score(ws, episodes)?;
     let mut out = Vec::new();
-    for k in 0..ws.state.mlp.n_layers() - 1 {
-        let w = &live[&format!("l{k}.w")];
-        let b = &live[&format!("l{k}.b")];
-        for i in 0..w.cols {
-            let used = b.data[i] != 0.0 || (0..w.rows).any(|r| w.at(r, i) != 0.0);
-            if !used {
+    for node in crate::graphops::unit_nodes(&g) {
+        let id = crate::graphops::find_node(&g, &node).expect("named");
+        let w = crate::graphops::width(&g, id).unwrap_or(0);
+        let cp = crate::graphops::channel_params(&g, id);
+        let labels = ws.unit_channel_labels(&node)?;
+        for i in 0..w {
+            let weight_used = cp
+                .weight
+                .as_ref()
+                .and_then(|p| ws.param(p).ok())
+                .is_none_or(|t| (0..t.rows).any(|r| t.at(r, i) != 0.0));
+            let bias_used = cp
+                .bias
+                .as_ref()
+                .and_then(|p| ws.param(p).ok())
+                .is_some_and(|t| t.data[i] != 0.0);
+            if !weight_used && !bias_used {
                 continue;
             }
-            let unit = format!("l{k}.h{i}");
+            let unit = labels
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("{node}[{i}]"));
             if only.is_some_and(|o| !o.contains(&unit)) {
                 continue;
             }
-            let off = ws.ablated(std::slice::from_ref(&unit))?;
-            ws.set_params(off);
-            let s = score(ws, episodes)?;
-            out.push((unit, s - base));
+            ws.set_masks(vec![crate::graphops::Unit {
+                node: node.clone(),
+                index: i,
+            }]);
+            let s = score(ws, episodes);
+            ws.set_masks(Vec::new());
+            out.push((unit, s? - base));
         }
     }
-    ws.set_params(live);
     out.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
     Ok(out)
 }
 
-/// Hidden units whose incoming column, bias or outgoing row differs between
-/// `before` and `after` — the units an agent's edits touched.
-pub fn edited_units(
-    widths: &[usize],
-    before: &BTreeMap<String, Tensor>,
-    after: &BTreeMap<String, Tensor>,
-) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let layers = widths.len() - 1;
-    for k in 0..layers - 1 {
-        let (wi, bi, wo) = (
-            format!("l{k}.w"),
-            format!("l{k}.b"),
-            format!("l{}.w", k + 1),
-        );
-        for i in 0..widths[k + 1] {
-            let col = (0..widths[k]).any(|r| before[&wi].at(r, i) != after[&wi].at(r, i));
-            let bias = before[&bi].data[i] != after[&bi].data[i];
-            let row = (0..widths[k + 2]).any(|c| before[&wo].at(i, c) != after[&wo].at(i, c));
-            if col || bias || row {
-                out.insert(format!("l{k}.h{i}"));
-            }
-        }
-    }
-    out
-}
-
 /// The post-run check. Networks written from zero: every used unit's
 /// ablation effect against the units the agent's text names
-/// ([`claim_check`]). Repair tasks: what the agent changed and what each
-/// change is worth ([`edit_check`]) — a whole trained unit reads digits, so
-/// switching it off says nothing about the repair.
+/// ([`claim_check`]), plus measured roles. Repair / fix tasks: what the
+/// agent changed and what each change is worth ([`edit_check`]) — a whole
+/// trained unit does many things, so switching it off says little about the
+/// repair. Reading tasks are scored by the answer alone.
 pub fn check_run(ws: &mut WeightSpace, text: &str, episodes: usize) -> Result<Value, String> {
     if ws.state.env.is_reading() {
         return Ok(json!({ "scope": "reading task: scored by the answer, no edits checked" }));
+    }
+    // Unit claims are about control networks: on a question-answering
+    // package there are none to measure, only a held-out pass to pay for.
+    if ws.state.qa.is_some() {
+        return Ok(json!({ "scope": "question answering: no unit claims to check" }));
     }
     if ws.state.env == crate::env::EnvKind::FixPolicy {
         let before = crate::tasks::fix_policy_params()?;
         return edit_check(ws, &before, episodes);
     }
     if ws.state.env.is_classifier() {
-        let before = crate::mnist::trained(ws.state.env.trigger())?;
+        let before = if ws.state.env == crate::env::EnvKind::MnistSteer {
+            crate::mnist::trained(None)?
+        } else {
+            crate::mnist::trained(ws.state.env.trigger())?
+        };
         return edit_check(ws, &before, episodes);
     }
     let imp = unit_importance(ws, episodes)?;
     let mut r = claim_check(text, &imp, 0.5);
-    r["scope"] = json!("every hidden unit with any weight");
+    r["scope"] = json!("every used channel of every activation node");
     let important: Vec<String> = imp
         .iter()
         .filter(|(_, d)| d.abs() >= 0.5)
@@ -130,7 +133,14 @@ pub fn edit_check(
     let now = ws.held_out(episodes)?;
     let mut tensors = Vec::new();
     for (name, after) in &live {
-        let old = &before[name];
+        let Some(old) = before.get(name) else {
+            tensors.push(json!({ "param": name, "added": true }));
+            continue;
+        };
+        if old.data.len() != after.data.len() {
+            tensors.push(json!({ "param": name, "reshaped": true }));
+            continue;
+        }
         let changed: usize = after
             .data
             .iter()
@@ -156,6 +166,7 @@ pub fn edit_check(
         tensors.push(json!({
             "param": name,
             "changed_entries": changed,
+            "changed_fraction": changed as f64 / after.data.len() as f64,
             "changed_rows": rows.len(),
             "rows": rows.iter().take(32).collect::<Vec<_>>(),
             "changed_cols": cols.len(),
@@ -164,15 +175,33 @@ pub fn edit_check(
             "detail_with_this_reverted": undone["detail"],
         }));
     }
-    ws.set_params(before.clone());
-    let original = ws.held_out(episodes)?;
+    let total: usize = live.values().map(|t| t.data.len()).sum();
+    let changed_total: usize = live
+        .iter()
+        .filter_map(|(n, a)| before.get(n).map(|b| (a, b)))
+        .filter(|(a, b)| a.data.len() == b.data.len())
+        .map(|(a, b)| a.data.iter().zip(&b.data).filter(|(x, y)| x != y).count())
+        .sum();
+    let originals: BTreeMap<String, Tensor> = live
+        .keys()
+        .filter_map(|n| before.get(n).map(|t| (n.clone(), t.clone())))
+        .collect();
+    let all_undone = if originals.len() == live.len() {
+        ws.set_params(originals);
+        let o = ws.held_out(episodes)?;
+        Some(o)
+    } else {
+        None
+    };
     ws.set_params(live);
     Ok(json!({
         "scope": "edits relative to the model as handed over",
         "score_now": now["score"],
         "detail_now": now["detail"],
-        "score_all_edits_undone": original["score"],
-        "detail_all_edits_undone": original["detail"],
+        "changed_weights": changed_total,
+        "changed_fraction": changed_total as f64 / total.max(1) as f64,
+        "score_all_edits_undone": all_undone.as_ref().map(|o| o["score"].clone()),
+        "detail_all_edits_undone": all_undone.as_ref().map(|o| o["detail"].clone()),
         "tensors": tensors,
     }))
 }
@@ -258,34 +287,39 @@ fn text_at(chars: &[char], i: usize, s: &str) -> bool {
             .all(|(a, b)| a.to_ascii_lowercase() == *b)
 }
 
+/// Whether `segment` names `unit`: its exact label (`node[i]`, an action
+/// name, ...), or for MLP aliases `l{k}.h{i}` the forms `l{k}.h{i}`, `h{i}`,
+/// ranges such as `h0–h9`.
+pub fn names_unit(segment: &str, unit: &str) -> bool {
+    if segment.contains(unit) {
+        return true;
+    }
+    let Some((k, i)) = unit
+        .strip_prefix('l')
+        .and_then(|s| s.split_once(".h"))
+        .and_then(|(k, i)| Some((k.parse::<usize>().ok()?, i.parse::<usize>().ok()?)))
+    else {
+        return false;
+    };
+    let m = mentioned_units(segment);
+    m.contains(&(Some(k), i)) || m.contains(&(None, i))
+}
+
 /// Compare measured unit importance with the units `text` names.
 /// `threshold` is the score change that counts as "matters".
 pub fn claim_check(text: &str, importance: &[(String, f32)], threshold: f32) -> Value {
-    let mentioned = mentioned_units(text);
-    let parse = |u: &str| -> (usize, usize) {
-        let (k, i) = u[1..].split_once(".h").expect("unit name");
-        (k.parse().expect("layer"), i.parse().expect("index"))
-    };
-    let named =
-        |k: usize, i: usize| mentioned.contains(&(Some(k), i)) || mentioned.contains(&(None, i));
     let important: Vec<&(String, f32)> = importance
         .iter()
         .filter(|(_, d)| d.abs() >= threshold)
         .collect();
     let unmentioned: Vec<Value> = important
         .iter()
-        .filter(|(u, _)| {
-            let (k, i) = parse(u);
-            !named(k, i)
-        })
+        .filter(|(u, _)| !names_unit(text, u))
         .map(|(u, d)| json!([u, d]))
         .collect();
     let inert: Vec<Value> = importance
         .iter()
-        .filter(|(u, d)| {
-            let (k, i) = parse(u);
-            d.abs() < threshold / 5.0 && mentioned.contains(&(Some(k), i))
-        })
+        .filter(|(u, d)| d.abs() < threshold / 5.0 && text.contains(u.as_str()))
         .map(|(u, d)| json!([u, d]))
         .collect();
     json!({
@@ -293,10 +327,9 @@ pub fn claim_check(text: &str, importance: &[(String, f32)], threshold: f32) -> 
         "units_measured": importance.len(),
         "important_units": important.iter().map(|(u, d)| json!([u, d])).collect::<Vec<_>>(),
         "important_but_not_mentioned": unmentioned,
-        "mentioned_with_layer_but_inert": inert,
-        "mentions_parsed": mentioned.len(),
-        "note": "heuristic: mentions are parsed from free text; an index without a layer \
-                 counts for every layer",
+        "mentioned_but_inert": inert,
+        "note": "heuristic: mentions are parsed from free text; for MLP aliases an index \
+                 without a layer counts for every layer",
     })
 }
 

@@ -321,6 +321,16 @@ impl Model for Entries {
         self.of_kind("generate")?.generate_text(prompt, options)
     }
 
+    fn generate_text_until(
+        &mut self,
+        prompt: &str,
+        options: &Value,
+        done: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String> {
+        self.of_kind("generate")?
+            .generate_text_until(prompt, options, done)
+    }
+
     fn generate_batch(&mut self, prompts: &[&str], options: &Value) -> Result<Vec<String>> {
         self.of_kind("generate")?.generate_batch(prompts, options)
     }

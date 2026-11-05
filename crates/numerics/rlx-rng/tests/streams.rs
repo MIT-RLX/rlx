@@ -371,3 +371,44 @@ fn the_free_randperm_still_matches_the_method() {
         assert_eq!(torch::randperm(n, 3), g.randperm(n), "n = {n}");
     }
 }
+
+/// `np.random.default_rng(seed).choice(pop, size, replace=False)` (numpy 2.4.3): FNV-1a of
+/// the int64 result in order, plus its first values. Covers both of numpy's algorithms —
+/// Floyd (pop ≤ 10000, or size ≤ pop/50) and the tail shuffle (seeds 2, 3, 6).
+#[test]
+fn generator_choice_without_replacement_matches_numpy() {
+    let cases: [(u128, usize, usize, u64, &[u64]); 7] = [
+        (0, 20, 5, 0xc9c630d1c14271c8, &[10, 9, 5]),
+        (1, 6000, 5000, 0x6825e29237c2a158, &[3548, 890, 4168]),
+        (2, 12000, 5000, 0x41ecc3c8f8a6fb5e, &[8575, 9194, 6680]),
+        (
+            3,
+            300000,
+            5000,
+            0x62a8e09efd30be95,
+            &[246261, 55555, 201038],
+        ),
+        (4, 10, 10, 0x7f1ebbbca9dd3b04, &[7, 1, 5]),
+        (5, 50, 1, 0xaa745007bf41ab84, &[33]),
+        (6, 10001, 9000, 0x5b347364b75bbe26, &[2395, 2016, 9153]),
+    ];
+    for (seed, pop, size, fnv, head) in cases {
+        let mut g = numpy::Generator::new(seed);
+        let got = numpy::choice_without_replacement(&mut g, pop, size, true);
+        assert_eq!(
+            &got[..head.len()],
+            head,
+            "seed {seed} pop {pop} size {size}"
+        );
+        let mut h: u64 = 0xcbf29ce484222325;
+        for v in &got {
+            for b in v.to_le_bytes() {
+                h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+            }
+        }
+        assert_eq!(
+            h, fnv,
+            "seed {seed} pop {pop} size {size}: order/content differs"
+        );
+    }
+}

@@ -553,6 +553,81 @@ pub fn integers(g: &mut Generator, high: u64, size: usize) -> Vec<u64> {
         .collect()
 }
 
+/// numpy's `random_bounded_uint64(bitgen, 0, rng, 0, use_masked=False)` — one Lemire draw
+/// on `[0, rng]` (no draw at all for `rng == 0`).
+fn bounded(g: &mut Generator, rng: u64) -> u64 {
+    if rng == 0 {
+        0
+    } else {
+        integers(g, rng + 1, 1)[0]
+    }
+}
+
+/// `Generator.choice(pop, size, replace=False, shuffle=shuffle)` with `p=None`.
+///
+/// numpy picks one of two algorithms by size (`cutoff = 50` when shuffling, else `20`):
+/// for `pop > 10000 && size > pop / cutoff` a **tail shuffle** of `arange(pop)` (the last
+/// `size` slots of a partial Fisher-Yates), otherwise **Floyd's** algorithm with an
+/// open-addressing hash set, followed by a Fisher-Yates shuffle of the result. Both draw
+/// with Lemire (`random_bounded_uint64`), not the masked draw [`Generator::shuffle`] uses.
+pub fn choice_without_replacement(
+    g: &mut Generator,
+    pop: usize,
+    size: usize,
+    shuffle: bool,
+) -> Vec<u64> {
+    assert!(
+        size <= pop,
+        "Cannot take a larger sample than population when replace is False"
+    );
+    let cutoff = if shuffle { 50 } else { 20 };
+    let shuffle_int = |g: &mut Generator, data: &mut [u64], n: usize, first: usize| {
+        for i in (first..n).rev() {
+            let j = bounded(g, i as u64) as usize;
+            data.swap(i, j);
+        }
+    };
+    if pop > 10000 && size > pop / cutoff {
+        let mut idx: Vec<u64> = (0..pop as u64).collect();
+        shuffle_int(g, &mut idx, pop, (pop - size).max(1));
+        return idx[pop - size..].to_vec();
+    }
+    let mut idx = vec![0u64; size];
+    // smallest power of two above 1.2·size, as `_gen_mask(<uint64_t>(1.2 * size))`
+    let set_size = (1.2 * size as f64) as u64;
+    let mask = if set_size == 0 {
+        0
+    } else {
+        u64::MAX >> set_size.leading_zeros()
+    };
+    let empty = u64::MAX;
+    let mut hash = vec![empty; (mask + 1) as usize];
+    for j in (pop - size)..pop {
+        let val = bounded(g, j as u64);
+        let mut loc = (val & mask) as usize;
+        while hash[loc] != empty && hash[loc] != val {
+            loc = (loc + 1) & mask as usize;
+        }
+        let pick = if hash[loc] == empty {
+            hash[loc] = val;
+            val
+        } else {
+            // `val` was already chosen: take `j`, which no earlier step could have drawn
+            let mut loc = (j as u64 & mask) as usize;
+            while hash[loc] != empty {
+                loc = (loc + 1) & mask as usize;
+            }
+            hash[loc] = j as u64;
+            j as u64
+        };
+        idx[j - (pop - size)] = pick;
+    }
+    if shuffle {
+        shuffle_int(g, &mut idx, size, 1);
+    }
+    idx
+}
+
 /// `Generator.choice([-1.0, 1.0], size)` — uniform over two items with
 /// replacement, which numpy implements as `integers(0, 2, size)`.
 pub fn choice_pm1(g: &mut Generator, size: usize) -> Vec<f32> {

@@ -20,6 +20,23 @@ cd crates/bindings/pyrlx && maturin develop --features cpu
 python examples/inference.py
 ```
 
+## The agent optimizer
+
+A coding agent rewrites the optimizer while the model trains
+([`docs/agent-optimizer.md`](../../../../docs/agent-optimizer.md)). Both scripts
+check first that a run with no agent (`--backend keep`) is the plain run.
+
+| Script | What it shows |
+|--------|---------------|
+| [`agent_mnist.py`](agent_mnist.py) | an MLP on MNIST (`--data ~/.mnist`); the plain run and the agent's on the same batches, both runs' test accuracy |
+| [`agent_qwen35.py`](agent_qwen35.py) | LoRA on Qwen3.5 0.8B from a package (`rlx-export … --variant train`), next-token training on text files or folders, a validation loss the agent sees and a test loss it never does; `--plain` measures a plain `Trainer` at the same updates |
+
+```bash
+maturin develop --release --features cpu,metal
+python examples/agent_mnist.py --backend keep
+python examples/agent_qwen35.py qwen-train.rlxp tokenizer.json train/ heldout/ --backend keep --plain
+```
+
 ## Export PyTorch models to RLX
 
 `pyrlx.from_torch(model, example_inputs, out_dir, ...)` converts a live

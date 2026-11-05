@@ -7,6 +7,8 @@
 //! as the permuted values on every backend, not the un-permuted input (a view
 //! the matmul folded into its strides).
 
+mod common;
+
 use rlx_ir::{DType, Graph, GraphExt, Shape};
 use rlx_runtime::{Device, Session};
 
@@ -30,6 +32,7 @@ fn run(device: Device, perm: &[usize], dims: &[usize], x: &[f32], w: &[f32]) -> 
 
 #[test]
 fn tapped_transpose_output_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(unused_mut))]
     let mut devices: Vec<Device> = vec![];
     #[cfg(feature = "gpu")]

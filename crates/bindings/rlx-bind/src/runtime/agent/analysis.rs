@@ -58,6 +58,17 @@ struct Wake {
     firing: bool,
 }
 
+/// What a report is made from: each param's name and, where measured, its
+/// gradient norm, gradient, weights after the update and before it (all in
+/// `names` order). A statistic whose inputs are missing is left out.
+pub struct Measured<'a> {
+    pub names: Vec<&'a str>,
+    pub grad_norms: Option<Vec<f64>>,
+    pub grads: Option<Vec<&'a [f32]>>,
+    pub params: Option<Vec<&'a [f32]>>,
+    pub before: Option<Vec<&'a [f32]>>,
+}
+
 /// A parsed `analysis.json`, with what it remembers between reports.
 #[derive(Clone, Debug)]
 pub struct Analysis {
@@ -158,6 +169,11 @@ impl Analysis {
         self.stats.update_ratio
     }
 
+    /// Whether the report needs the params (after the update).
+    pub fn wants_params(&self) -> bool {
+        self.stats.weight_norm || self.stats.update_ratio
+    }
+
     /// The report of update `u` (made after it) and the reasons, if any, to
     /// ask for a decision now. `before` are the params before the update, in
     /// `items` order, when [`Self::wants_update_ratio`].
@@ -170,27 +186,51 @@ impl Analysis {
         outputs: &[(String, Vec<f32>)],
         program_ms: Option<f64>,
     ) -> (Value, Vec<String>) {
+        let measured = Measured {
+            names: items.iter().map(|it| it.name).collect(),
+            grad_norms: Some(items.iter().map(|it| norm(it.grad)).collect()),
+            grads: Some(items.iter().map(|it| it.grad).collect()),
+            params: Some(items.iter().map(|it| &*it.param).collect()),
+            before: before.map(|b| b.iter().map(Vec::as_slice).collect()),
+        };
+        self.report_measured(u, losses, &measured, outputs, program_ms)
+    }
+
+    /// [`Self::report`] from what was measured: on the device, the gradient
+    /// norms the fused step read back and the weights read at this update.
+    pub fn report_measured(
+        &mut self,
+        u: u64,
+        losses: &[f32],
+        m: &Measured<'_>,
+        outputs: &[(String, Vec<f32>)],
+        program_ms: Option<f64>,
+    ) -> (Value, Vec<String>) {
         let finite: Vec<f32> = losses.iter().copied().filter(|x| x.is_finite()).collect();
         let mean =
             (!finite.is_empty()).then(|| finite.iter().sum::<f32>() as f64 / finite.len() as f64);
         let max = finite.iter().copied().reduce(f32::max).map(f64::from);
         let min = finite.iter().copied().reduce(f32::min).map(f64::from);
-        let grad_norms: Vec<f64> = items.iter().map(|it| norm(it.grad)).collect();
-        let total = grad_norms.iter().map(|g| g * g).sum::<f64>().sqrt();
+        let total = m
+            .grad_norms
+            .as_ref()
+            .map(|g| g.iter().map(|g| g * g).sum::<f64>().sqrt());
 
-        let mut picked: Vec<usize> = (0..items.len())
-            .filter(|&i| self.params.iter().any(|g| glob(g, items[i].name)))
+        let mut picked: Vec<usize> = (0..m.names.len())
+            .filter(|&i| self.params.iter().any(|g| glob(g, m.names[i])))
             .collect();
         if picked.len() > MAX_SHOWN {
-            picked.sort_by(|&a, &b| grad_norms[b].total_cmp(&grad_norms[a]));
+            if let Some(g) = &m.grad_norms {
+                picked.sort_by(|&a, &b| g[b].total_cmp(&g[a]));
+            }
             picked.truncate(MAX_SHOWN);
         }
         let table = |f: &dyn Fn(usize) -> Option<f64>| -> Value {
-            let m: Map<String, Value> = picked
+            let t: Map<String, Value> = picked
                 .iter()
-                .filter_map(|&i| f(i).map(|v| (items[i].name.to_string(), json!(round(v)))))
+                .filter_map(|&i| f(i).map(|v| (m.names[i].to_string(), json!(round(v)))))
                 .collect();
-            Value::Object(m)
+            Value::Object(t)
         };
         let mut r = json!({
             "update": u,
@@ -198,7 +238,7 @@ impl Analysis {
             "loss_min": min.map(round),
             "loss_max": max.map(round),
             "nonfinite_losses": losses.len() - finite.len(),
-            "grad_norm_total": round(total),
+            "grad_norm_total": total.map(round),
             "program_ms_per_update": program_ms.map(round),
         });
         let captured: Map<String, Value> = outputs
@@ -209,35 +249,40 @@ impl Analysis {
         if !captured.is_empty() {
             r["activations"] = Value::Object(captured);
         }
-        if self.stats.grad_norm {
-            r["grad_norm"] = table(&|i| Some(grad_norms[i]));
+        if self.stats.grad_norm
+            && let Some(g) = &m.grad_norms
+        {
+            r["grad_norm"] = table(&|i| Some(g[i]));
         }
-        if self.stats.weight_norm {
-            r["weight_norm"] = table(&|i| Some(norm(items[i].param)));
+        if self.stats.weight_norm
+            && let Some(p) = &m.params
+        {
+            r["weight_norm"] = table(&|i| Some(norm(p[i])));
         }
         if self.stats.update_ratio
-            && let Some(before) = before
+            && let (Some(p), Some(before)) = (&m.params, &m.before)
         {
             r["update_ratio"] = table(&|i| {
-                let w = norm(&before[i]);
-                let d = items[i]
-                    .param
+                let w = norm(before[i]);
+                let d = p[i]
                     .iter()
-                    .zip(&before[i])
+                    .zip(before[i])
                     .map(|(a, b)| ((a - b) as f64).powi(2))
                     .sum::<f64>()
                     .sqrt();
                 (w > 0.0).then(|| d / w)
             });
         }
-        if self.stats.grad_cosine {
+        if self.stats.grad_cosine
+            && let (Some(grads), Some(norms)) = (&m.grads, &m.grad_norms)
+        {
             let prev = &self.previous_grads;
             r["grad_cosine"] = table(&|i| {
-                let p = prev.get(items[i].name)?;
-                let (a, b) = (norm(p), grad_norms[i]);
+                let p = prev.get(m.names[i])?;
+                let (a, b) = (norm(p), norms[i]);
                 (a > 0.0 && b > 0.0).then(|| {
                     p.iter()
-                        .zip(items[i].grad)
+                        .zip(grads[i])
                         .map(|(x, y)| *x as f64 * *y as f64)
                         .sum::<f64>()
                         / (a * b)
@@ -245,7 +290,7 @@ impl Analysis {
             });
             self.previous_grads = picked
                 .iter()
-                .map(|&i| (items[i].name.to_string(), items[i].grad.to_vec()))
+                .map(|&i| (m.names[i].to_string(), grads[i].to_vec()))
                 .collect();
         }
         let mut reasons = Vec::new();
@@ -253,7 +298,7 @@ impl Analysis {
             let value = match w.stat {
                 WakeStat::LossMean => mean,
                 WakeStat::LossMax => max,
-                WakeStat::GradNormTotal => Some(total),
+                WakeStat::GradNormTotal => total,
             };
             let Some(v) = value else { continue };
             let hit = w.above.is_some_and(|x| v > x) || w.below.is_some_and(|x| v < x);

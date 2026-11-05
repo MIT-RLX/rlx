@@ -802,6 +802,16 @@ impl CompiledGraph {
         inputs: &[(&str, &[f32])],
         read_indices: Option<&[usize]>,
     ) -> Vec<Vec<f32>> {
+        // A tap reads its appended outputs from every run: read them all.
+        if self.tap_extra != 0
+            && let Some(ix) = read_indices
+        {
+            let mut outs = self.run(inputs);
+            return ix
+                .iter()
+                .filter_map(|&i| outs.get_mut(i).map(std::mem::take))
+                .collect();
+        }
         self.ensure_prepared();
         match self.staging.as_ref() {
             Some(st) if !st.bound => {

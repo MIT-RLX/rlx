@@ -622,7 +622,8 @@ pub fn metal_sgemm_f16w_bufs(
     }
 }
 
-/// C = A_f32 @ B_bf16 → C_f32 for decode-sized `m` (≤ 4), reading the packed
+/// C = A_f32 @ B_bf16 → C_f32 for decode-sized `m` (≤ 4, or ≤ 8 when
+/// `n % 8 == 0`), reading the packed
 /// bf16 weight in-kernel. Returns `false` (nothing encoded) for shapes it does
 /// not cover; the caller then unpacks to f32 and runs the general GEMM.
 #[allow(clippy::too_many_arguments)]
@@ -638,8 +639,9 @@ pub fn metal_sgemm_bf16w_small_bufs(
     k: usize,
     n: usize,
 ) -> bool {
+    let rows8 = n.is_multiple_of(8) && !rlx_ir::env::flag("RLX_METAL_BF16W_ROWS_DISABLE");
     if m == 0
-        || m > 4
+        || m > if rows8 { 8 } else { 4 }
         || n < 64
         || !n.is_multiple_of(2)
         || rlx_ir::env::flag("RLX_METAL_BF16W_DISABLE")
@@ -702,6 +704,30 @@ pub fn metal_sgemm_bf16w_small_bufs(
             MTLSize {
                 width: 32,
                 height: KSPLIT,
+                depth: 1,
+            },
+        );
+    } else if rows8 {
+        // 2–8 rows: the split-K kernels above with every row per weight
+        // load, each row summed in their order (bit-identical to one row).
+        let (pipe, tg) = if tile == 64 {
+            (&kk.gemv_bf16w_splitk8_n64_rows, (8, 64))
+        } else {
+            (&kk.gemv_bf16w_splitk8_rows, (32, 16))
+        };
+        enc.set_compute_pipeline_state(pipe);
+        enc.set_bytes(3, 4, &m_u as *const _ as *const _);
+        enc.set_bytes(4, 4, &k_u as *const _ as *const _);
+        enc.set_bytes(5, 4, &n_u as *const _ as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: (n as u64).div_ceil(tile as u64),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg.0,
+                height: tg.1,
                 depth: 1,
             },
         );

@@ -54,18 +54,18 @@ pub fn handle_message(ws: &mut WeightSpace, msg: &Value) -> Option<Value> {
             "instructions": INSTRUCTIONS,
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": match &ws.state.tools {
-            Some(list) => Value::Array(
-                mcp_tools()
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|t| list.iter().any(|n| t["name"] == n.as_str()))
-                    .cloned()
-                    .collect(),
-            ),
-            None => mcp_tools(),
-        } })),
+        "tools/list" => Ok(json!({ "tools": Value::Array(
+            mcp_tools()
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|t| {
+                    ws.state.tools.as_ref().is_none_or(|list| list.iter().any(|n| t["name"] == n.as_str()))
+                        && !ws.state.denied_tools.iter().any(|n| t["name"] == n.as_str())
+                })
+                .cloned()
+                .collect(),
+        ) })),
         "tools/call" => call_tool(ws, params),
         _ => Err((-32601, format!("method not found: {method}"))),
     };
@@ -87,7 +87,23 @@ fn call_tool(ws: &mut WeightSpace, params: &Value) -> Result<Value, (i64, String
         _ => return Err((-32602, "`arguments` must be an object".into())),
     };
     call.insert("tool".into(), json!(name));
-    let reply = handle_json(ws, &Value::Object(call).to_string());
+    let body = Value::Object(call).to_string();
+    // A client that asked for progress gets notifications during long passes.
+    let reply = match params["_meta"]["progressToken"].clone() {
+        Value::Null => handle_json(ws, &body),
+        token => crate::lm::with_progress(
+            Box::new(move |done, total, what| {
+                use std::io::Write;
+                let n = json!({ "jsonrpc": "2.0", "method": "notifications/progress",
+                    "params": { "progressToken": token, "progress": done, "total": total,
+                                "message": format!("{what} {done}/{total}") } });
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(out, "{n}");
+                let _ = out.flush();
+            }),
+            || handle_json(ws, &body),
+        ),
+    };
     // Tool failures are results the model reads, not protocol errors.
     let (text, is_error) = match (reply.get("ok"), reply.get("error")) {
         (Some(ok), _) => (ok.to_string(), false),

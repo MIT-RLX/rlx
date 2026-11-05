@@ -164,14 +164,7 @@ pub(super) fn compose_conv2d_backward_weight_im2col_group(
     let x_col = g.im2col(x, kernel_size, stride, padding, dilation);
     let m_dim = g.node(x_col).shape.dim(0);
     let k = g.node(x_col).shape.dim(1).unwrap_static();
-    let dy_r_shape = Shape::from_dims(&[Dim::Static(c_out), m_dim], dt);
-    let dy_r = g.add_node(
-        Op::Reshape {
-            new_shape: vec![c_out as i64, -1],
-        },
-        vec![dy],
-        dy_r_shape,
-    );
+    let dy_r = channel_major(g, dy, c_out, m_dim);
     let dw_mat_shape = Shape::new(&[c_out, k], dt);
     let prod = g.matmul(dy_r, x_col, dw_mat_shape);
     g.reshape_(prod, vec![c_out as i64, c_in as i64, kh as i64, kw as i64])
@@ -199,7 +192,8 @@ pub(super) fn compose_conv2d_backward_weight_group(
     let (ph, pw) = (padding[0], padding[1]);
     let (dh, dw_d) = (dilation[0], dilation[1]);
 
-    if w_in == 1 && kw == 1 {
+    // (its slices are reshaped as one sample: batch 1 only)
+    if w_in == 1 && kw == 1 && n == 1 {
         return compose_conv2d_backward_weight_w1_h(
             g, x, dy, c_in, c_out, h, h_out, kh, sh, ph, dh, dw_shape,
         );
@@ -213,7 +207,7 @@ pub(super) fn compose_conv2d_backward_weight_group(
     let dt = dw_shape.dtype();
     let zero = f32_tensor_const(vec![0.0], Shape::new(&[1], dt), g);
 
-    let dy_r = g.reshape_(dy, vec![c_out as i64, m as i64]);
+    let dy_r = channel_major(g, dy, c_out, Dim::Static(m));
     let dw_mat_shape = Shape::new(&[c_out, k], DType::F32);
 
     let matmul_dw = |g: &mut Graph, dy_slice: NodeId, x_col: NodeId| -> NodeId {
@@ -603,7 +597,7 @@ fn compose_conv3d_backward_weight_group(
     let flat_x = g.reshape_(x, vec![flat_n as i64]);
     let dt = dw_shape.dtype();
     let zero = f32_tensor_const(vec![0.0], Shape::new(&[1], dt), g);
-    let dy_r = g.reshape_(dy, vec![c_out as i64, m as i64]);
+    let dy_r = channel_major(g, dy, c_out, Dim::Static(m));
     let dw_mat_shape = Shape::new(&[c_out, k], DType::F32);
 
     let x_col = build_im2col3d_rows(

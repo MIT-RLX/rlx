@@ -54,6 +54,51 @@ pub struct CoremlExecutable {
     lower_opts: LowerOptions,
     plan: ExecutionPlan,
     mil_slots: Vec<MilSlot>,
+    /// Constants fed as inputs on every run; see [`lift_constants`].
+    lifted: Vec<(String, Vec<f32>)>,
+}
+
+/// A program with no inputs at all: every value is known at compile time, and
+/// CoreML's compiler tries to fold it. At f16 it stayed in BNNS past 100 s and
+/// 2.5 GB on 16 × 241 points, where the same program with inputs compiles at
+/// once. So its float array constants that only feed arithmetic become hidden
+/// inputs, and there is nothing left to fold; `run` supplies them.
+fn lift_constants(graph: &mut Graph) -> Vec<(String, Vec<f32>)> {
+    let leaf = |n: &rlx_ir::Node| matches!(n.op, Op::Input { .. } | Op::Param { .. });
+    if graph.nodes().iter().any(leaf) {
+        return Vec::new();
+    }
+    let mut arithmetic_only = vec![true; graph.nodes().len()];
+    for n in graph.nodes() {
+        if !matches!(n.op, Op::Binary(_) | Op::Activation(_)) {
+            for i in &n.inputs {
+                arithmetic_only[i.0 as usize] = false;
+            }
+        }
+    }
+    for o in &graph.outputs {
+        arithmetic_only[o.0 as usize] = false;
+    }
+    let mut lifted = Vec::new();
+    for n in graph.nodes_mut() {
+        let id = n.id.0 as usize;
+        let Op::Constant { data } = &n.op else {
+            continue;
+        };
+        if !arithmetic_only[id]
+            || !matches!(n.shape.dtype(), DType::F32 | DType::F16)
+            || n.shape.num_elements().unwrap_or(0) < 10
+        {
+            continue;
+        }
+        let Ok(values) = bytes_to_f32(data, &n.shape) else {
+            continue;
+        };
+        let name = format!("__rlx_const_{id}");
+        n.op = Op::Input { name: name.clone() };
+        lifted.push((name, values));
+    }
+    lifted
 }
 
 /// CoreML's ML Program is value-typed with no I64 storage and strict per-op type
@@ -440,6 +485,7 @@ impl CoremlExecutable {
             );
         }
 
+        let lifted = lift_constants(&mut graph);
         let plan = hybrid::plan_execution(&graph).unwrap_or_else(|e| {
             panic!("CoreML hybrid plan failed: {e}");
         });
@@ -452,6 +498,7 @@ impl CoremlExecutable {
             lower_opts,
             plan,
             mil_slots,
+            lifted,
         }
     }
 
@@ -466,6 +513,7 @@ impl CoremlExecutable {
             compute_units: self.compute_units,
             lower_opts: self.lower_opts,
             plan: self.plan.clone(),
+            lifted: self.lifted.clone(),
             mil_slots: self
                 .mil_slots
                 .iter()
@@ -609,6 +657,15 @@ impl CoremlExecutable {
     /// Run a prediction. `inputs` are `(ir_input_name, f32_data)`. Outputs
     /// are returned in graph-output order.
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> {
+        let lifted = std::mem::take(&mut self.lifted);
+        let mut all = inputs.to_vec();
+        all.extend(lifted.iter().map(|(n, v)| (n.as_str(), v.as_slice())));
+        let outs = self.run_all(&all);
+        self.lifted = lifted;
+        outs
+    }
+
+    fn run_all(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> {
         let outs = match self.plan.clone() {
             ExecutionPlan::MilOnly => {
                 self.finalize()?;

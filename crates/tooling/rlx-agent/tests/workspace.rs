@@ -119,7 +119,13 @@ fn the_binary_serves_json_rpc_over_stdio() {
         .collect();
     assert_eq!(
         names,
-        ["list_files", "read_file", "write_file", "edit_file"]
+        [
+            "list_files",
+            "read_file",
+            "search",
+            "write_file",
+            "edit_file"
+        ]
     );
     let wrote = ask(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                            "params": {"name": "write_file", "arguments": {"path": "updater.json", "content": "{}"}}}));
@@ -159,4 +165,118 @@ fn the_server_entry_carries_the_folder_and_its_writable_names() {
     );
     assert_eq!(Workspace::from_args(&s.args[1..]).unwrap(), ws);
     assert!(Workspace::from_args(&["--write".into()]).is_err());
+}
+
+#[test]
+fn reads_line_ranges_and_searches_the_files() {
+    let d = folder("search");
+    std::fs::write(d.join("losses.csv"), "update,loss\n1,2.5\n2,2.25\n3,2.0\n").unwrap();
+    let ws = Workspace::new(&d, ["updater.json"]);
+    assert_eq!(
+        ws.call(
+            "read_file",
+            &json!({"path": "losses.csv", "start_line": 2, "lines": 2})
+        )
+        .unwrap(),
+        "     2  1,2.5\n     3  2,2.25\n[lines 2–3 of 4]"
+    );
+    assert!(
+        ws.call("read_file", &json!({"path": "losses.csv", "start_line": 9}))
+            .unwrap_err()
+            .contains("has 4 lines")
+    );
+    assert_eq!(
+        ws.call("search", &json!({"text": "LR", "ignore_case": true}))
+            .unwrap(),
+        "updater.json:1: {\"lr\": 1}"
+    );
+    assert_eq!(
+        ws.call("search", &json!({"text": "2.25"})).unwrap(),
+        "losses.csv:3: 2,2.25"
+    );
+    assert!(
+        ws.call("search", &json!({"text": "lr", "path": "inbox"}))
+            .unwrap()
+            .starts_with("no line contains")
+    );
+}
+
+#[test]
+fn a_json_file_written_with_a_syntax_error_says_so() {
+    let d = folder("json");
+    let ws = Workspace::new(&d, ["updater.json"]);
+    let reply = ws
+        .call(
+            "write_file",
+            &json!({"path": "updater.json", "content": "{\"lr\": }"}),
+        )
+        .unwrap();
+    assert!(reply.contains("not valid JSON yet"), "{reply}");
+    let reply = ws
+        .call(
+            "edit_file",
+            &json!({"path": "updater.json", "old": "}", "new": "1}"}),
+        )
+        .unwrap();
+    assert_eq!(reply, "edited updater.json", "valid again");
+}
+
+#[cfg(unix)]
+#[test]
+fn links_out_of_the_folder_are_not_followed() {
+    let d = folder("links");
+    let outside = folder("links-outside");
+    std::fs::write(outside.join("secret.txt"), "key").unwrap();
+    std::os::unix::fs::symlink(outside.join("secret.txt"), d.join("leak.txt")).unwrap();
+    std::os::unix::fs::symlink(&outside, d.join("leakdir")).unwrap();
+    let ws = Workspace::new(&d, ["updater.json"]);
+    assert!(
+        ws.call("read_file", &json!({"path": "leak.txt"}))
+            .unwrap_err()
+            .contains("leads outside the workspace")
+    );
+    let list = ws.call("list_files", &json!({})).unwrap();
+    assert!(!list.contains("leak"), "{list}");
+    assert!(
+        ws.call("search", &json!({"text": "key"}))
+            .unwrap()
+            .starts_with("no line")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_program_runs_its_command_on_the_folder() {
+    let d = folder("check");
+    let ws = Workspace::new(&d, ["updater.json"]);
+    assert!(
+        !ws.tools().to_string().contains("check_program"),
+        "no command, no tool"
+    );
+    assert!(ws.call("check_program", &json!({})).is_err());
+
+    let ok = ws.clone().with_check(vec![
+        "sh".into(),
+        "-c".into(),
+        "echo checked \"$0\"; cat updater.json".into(),
+    ]);
+    assert!(ok.tools().to_string().contains("check_program"));
+    let out = ok.call("check_program", &json!({})).unwrap();
+    assert_eq!(out, format!("checked {}\n{{\"lr\": 1}}", d.display()));
+
+    let fails = ws.clone().with_check(vec![
+        "sh".into(),
+        "-c".into(),
+        "echo 'update 1: not finite' >&2; exit 3".into(),
+    ]);
+    let err = fails.call("check_program", &json!({})).unwrap_err();
+    assert!(
+        err.contains("the check failed") && err.contains("update 1: not finite"),
+        "{err}"
+    );
+
+    // `--check` words reach the served copy.
+    let server = ok.server("rlx_files", "rlx-agent", &["workspace-mcp".to_string()]);
+    let served = Workspace::from_args(&server.args[1..]).unwrap();
+    assert_eq!(served, ok);
 }

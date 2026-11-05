@@ -696,3 +696,34 @@ fn missing_param_is_an_error() {
     // No params provided → must error rather than silently produce a bad model.
     assert!(lower_graph(&g, &HashMap::new(), &Default::default()).is_err());
 }
+
+#[test]
+fn only_a_compile_time_concat_goes_through_rank_2() {
+    let build = |runtime: bool| {
+        let s = Shape::new(&[2, 4, 3, 8], DType::F32);
+        let mut g = Graph::new("cat");
+        let data: Vec<u8> = vec![0; 192 * 4];
+        let x = g.add_node(Op::Constant { data: data.clone() }, vec![], s.clone());
+        let y = if runtime {
+            g.input("y", s)
+        } else {
+            g.add_node(Op::Constant { data }, vec![], s)
+        };
+        let o = g.add_node(
+            Op::Concat { axis: 3 },
+            vec![x, y],
+            Shape::new(&[2, 4, 3, 16], DType::F32),
+        );
+        g.set_outputs(vec![o]);
+        g
+    };
+    let reshapes = |g: &Graph| {
+        let low = lower_graph(g, &HashMap::new(), &Default::default()).expect("lower");
+        op_types(main_block(&low.model))
+            .iter()
+            .filter(|t| *t == "reshape")
+            .count()
+    };
+    assert_eq!(reshapes(&build(false)), 3);
+    assert_eq!(reshapes(&build(true)), 0);
+}

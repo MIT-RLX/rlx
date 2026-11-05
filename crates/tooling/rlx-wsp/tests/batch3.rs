@@ -149,34 +149,40 @@ fn logic_and_gate_blocks_fire_as_specified() {
 }
 
 #[test]
-fn insert_layer_keeps_the_function() {
-    let mut ws = bounce(1);
+fn insert_linear_keeps_the_function_on_any_node() {
+    let mut ws = bounce(2);
     let before = ok(
         &mut ws,
         json!({"tool": "probe", "observations": [{"active": ["ball>(x=8,y=0)", "paddle(x=5)"]}]}),
     );
-    let r = ok(
-        &mut ws,
-        json!({"tool": "insert_layer", "after": 0, "width": 40}),
-    );
-    assert_eq!(r["widths"], json!([210, 32, 40, 32, 3]));
-    assert_eq!(ws.state.mlp.widths, vec![210, 32, 40, 32, 3]);
+    let r = ok(&mut ws, json!({"tool": "insert_linear", "after": "l0.h"}));
+    assert_eq!(r["param"], "l0.h.ins0.w");
+    assert_eq!(ws.param("l0.h.ins0.w").unwrap().rows, 32);
     assert_eq!(ws.evaluate(64, 4).mean_return, 22.0);
-    let mut ws2 = WeightSpace::from_state(ws.state.clone());
-    ws2.state.used = 0;
     let after = ok(
-        &mut ws2,
+        &mut ws,
         json!({"tool": "probe", "observations": [{"active": ["ball>(x=8,y=0)", "paddle(x=5)"]}]}),
     );
-    for (a, b) in before[0]["logits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .zip(after[0]["logits"].as_array().unwrap())
-    {
-        assert!((a.as_f64().unwrap() - b.as_f64().unwrap()).abs() < 1e-3);
-    }
-    assert!(handle_json(&mut ws, r#"{"tool":"insert_layer","after":5}"#)["error"].is_string());
+    assert_eq!(before[0]["logits"], after[0]["logits"]);
+    // The new map is programmable with the same tools, by its unit labels.
+    let r = ok(
+        &mut ws,
+        json!({"tool": "inject", "units": ["l0.h.ins0.w.out[0]"], "spec": {"block": "relay", "inputs": ["l0.h0"], "gain": 1.0}}),
+    );
+    assert_eq!(r["written"][0]["inputs"][0][0], "l0.h0");
+    // Labels survived the switch to a graph space.
+    let s = ok(
+        &mut ws,
+        json!({"tool": "slice", "name": "l0.w", "rows": [200, 202], "cols": [0, 2]}),
+    );
+    assert_eq!(s["rows"][0]["label"], "paddle(x=0)");
+    // An ablation mask works on any node, the inserted one included.
+    ws.state.budget += 2;
+    let a = ok(
+        &mut ws,
+        json!({"tool": "ablate", "units": ["l0.h.ins0.w.out[1]"], "episodes": 32, "seed": 4}),
+    );
+    assert!(a["b_minus_a"].as_f64().unwrap() < -5.0, "{a}");
 }
 
 #[test]
@@ -275,8 +281,8 @@ fn rl_baseline_reports_curves() {
 
 #[test]
 fn measured_roles_find_the_comparator() {
-    let ws = bounce(0);
-    let roles = rlx_wsp::roles::measure(&ws, 4).unwrap();
+    let mut ws = bounce(0);
+    let roles = rlx_wsp::roles::measure(&mut ws, 4).unwrap();
     let (_, f, r) = roles.iter().find(|(u, _, _)| u == "l0.h0").unwrap();
     assert_eq!(*f, "target_minus_paddle");
     assert!(*r > 0.5);

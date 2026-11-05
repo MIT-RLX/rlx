@@ -32,8 +32,8 @@ rlx-ir = { workspace = true, features = ["serialize"] }
 rlx-compile = { workspace = true }
 rlx-fusion = { workspace = true }
 rlx-gguf = { workspace = true }
-# libzstd for warm/cold tiers: real compression levels when baking (rlx-pkg's
-# pure-Rust encoder only has its fastest level).
+# libzstd's encoder for warm/cold tiers (zstd-pure-rs, Rust: no C), so a bake
+# writes the same bytes as when it linked libzstd.
 rlx-pkg = { workspace = true, features = ["write", "convert", "parallel", "zstd-native"] }
 rlx-mlx-io = { workspace = true, features = ["io"] }
 rlx-dduf = { workspace = true }

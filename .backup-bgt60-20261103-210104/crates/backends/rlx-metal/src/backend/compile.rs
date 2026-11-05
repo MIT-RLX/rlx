@@ -1,0 +1,1580 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! `compile` — extracted from the `backend` module for navigability (see `mod.rs`).
+
+#![allow(unused_imports)]
+
+use crate::arena::Arena;
+use crate::device::metal_device;
+use crate::kernels::kernels;
+use crate::thunk::{Thunk, ThunkSchedule};
+use rlx_ir::{Graph, NodeId, Op};
+use rlx_opt::memory;
+use std::collections::HashMap;
+
+use super::*;
+
+impl MetalExecutable {
+    /// Compile at the requested precision.
+    pub fn compile_with_precision(graph: Graph, precision: MetalPrecision) -> Self {
+        // F16 compilation requires every kernel in the graph to have an f16
+        // variant. Until they do, transparently fall back to F32 with a note.
+        let effective = if precision == MetalPrecision::F16 {
+            let verbose = rlx_ir::env::var("RLX_VERBOSE")
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(0)
+                >= 1;
+            if verbose {
+                eprintln!(
+                    "[rlx-metal] F16 requested but full-graph f16 kernels are WIP; using F32"
+                );
+            }
+            MetalPrecision::F32
+        } else {
+            precision
+        };
+        let mut exe = Self::compile(graph);
+        exe.precision = effective;
+        exe
+    }
+
+    pub fn compile(graph: Graph) -> Self {
+        Self::compile_inner(
+            graph,
+            None,
+            None,
+            false,
+            rlx_ir::RngOptions::default(),
+            false,
+        )
+    }
+
+    /// Compile with an optional `PrecisionPolicy`. The pass runs *after*
+    /// fusion to avoid breaking pattern-match-based fusion via interleaved
+    /// Cast nodes.
+    pub fn compile_with_policy(
+        graph: Graph,
+        policy: Option<rlx_opt::PrecisionPolicy>,
+        supported_ops: Option<&'static [rlx_ir::OpKind]>,
+        rng: rlx_ir::RngOptions,
+    ) -> Self {
+        Self::compile_inner(graph, policy, supported_ops, false, rng, false)
+    }
+
+    /// Compile a graph that already went through the fusion pipeline
+    /// (e.g. from [`rlx_ir::LirModule`]). Skips re-fusion so backends
+    /// invoked via `Backend::compile_lir` do not undo fused ops.
+    pub fn compile_from_fused(
+        graph: Graph,
+        policy: Option<rlx_opt::PrecisionPolicy>,
+        supported_ops: Option<&'static [rlx_ir::OpKind]>,
+        rng: rlx_ir::RngOptions,
+        disable_mpsgraph: bool,
+    ) -> Self {
+        Self::compile_inner(graph, policy, supported_ops, true, rng, disable_mpsgraph)
+    }
+
+    /// One autorelease pool per compile. Lowering to MPSGraph, its
+    /// executable and the arrays bound to the arena are autoreleased objects
+    /// that retain the arena: with no pool on the stack they are freed only
+    /// when the thread exits, so a dropped executable kept its memory.
+    pub(crate) fn compile_inner(
+        graph: Graph,
+        policy: Option<rlx_opt::PrecisionPolicy>,
+        supported_ops: Option<&'static [rlx_ir::OpKind]>,
+        skip_fusion: bool,
+        rng: rlx_ir::RngOptions,
+        disable_mpsgraph: bool,
+    ) -> Self {
+        crate::mtl::autoreleasepool(|| {
+            Self::compile_unpooled(
+                graph,
+                policy,
+                supported_ops,
+                skip_fusion,
+                rng,
+                disable_mpsgraph,
+            )
+        })
+    }
+
+    fn compile_unpooled(
+        graph: Graph,
+        policy: Option<rlx_opt::PrecisionPolicy>,
+        supported_ops: Option<&'static [rlx_ir::OpKind]>,
+        skip_fusion: bool,
+        rng: rlx_ir::RngOptions,
+        disable_mpsgraph: bool,
+    ) -> Self {
+        assert_bf16_compute_unsupported(policy.as_ref());
+        let verbose = rlx_ir::env::var("RLX_VERBOSE")
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(0)
+            >= 1;
+
+        if verbose {
+            eprintln!("[rlx-metal] compiling graph: {} nodes", graph.len());
+        }
+
+        // Drop the global MPSMatrix / MPSMatrixDescriptor / MPSMatrixMul
+        // caches before building this compile's arena. The cache keys
+        // include the Buffer-wrapper address, which CAN recycle when
+        // the prior `MetalExecutable` is dropped — without this reset
+        // a fresh Sam (e.g. CPU → Metal in the same process) gets
+        // back stale `MPSMatrix` wrappers pointing at freed memory and
+        // produces NaN outputs.
+        crate::mps_blas::invalidate_caches();
+
+        // Backend-aware fusion: only emit fused ops Metal can lower.
+        // AutoMixed / F16 residual streams are thunk-native today: MPSGraph
+        // hybrid mis-types f16+f32 adds (abort in mps.add). Keep AMP on the
+        // all-thunks path until MPS lowering is dtype-clean.
+        let amp_active = policy
+            .as_ref()
+            .is_some_and(|p| !matches!(p, rlx_opt::PrecisionPolicy::AlwaysF32));
+        let fused = if skip_fusion {
+            graph
+        } else {
+            let mut pipe = rlx_opt::CompilePipeline::new(rlx_opt::FusionTarget::Metal)
+                .with_assert_fusion_clean(false);
+            if let Some(ops) = supported_ops {
+                pipe = pipe.with_supported_ops(ops);
+            }
+            let compile_result = pipe.compile_graph(graph);
+            if verbose {
+                eprintln!(
+                    "[rlx-metal] fusion: {} → {} nodes",
+                    compile_result.fusion.nodes_before, compile_result.fusion.nodes_after
+                );
+            }
+            compile_result.lir.into_graph()
+        };
+
+        // AutoMixedPrecision runs AFTER fusion: Cast nodes interleave between
+        // the (now flattened) ops without breaking earlier pattern matchers.
+        let fused = match policy {
+            Some(p) => {
+                use rlx_opt::pass::Pass;
+                let g = rlx_opt::AutoMixedPrecision::new(p).run(fused);
+                if verbose {
+                    eprintln!("[rlx-metal] after AutoMixedPrecision: {} nodes", g.len());
+                }
+                g
+            }
+            None => fused,
+        };
+
+        // `FusedAttentionBlock` is a claimed op (the fusion pipeline / upstream
+        // stages may emit it). Keep the native `fused_attn_block` kernel path
+        // for f32, no-bias blocks whose `[seq,seq]` scores fit threadgroup
+        // memory (`seq ≤ 64`); decompose every other FAB to the primitive
+        // chain (matmul → narrow → rope → attention → matmul). Runs after AMP
+        // so the f32 gate sees the final dtype. FAB-only — Metal's native
+        // FusedMatMulBiasAct / FusedResidualLN / FusedSwiGLU survive.
+        let fused = lower_fab_for_metal(fused);
+        // Claimed for coverage but no Metal / CPU HostOp path: expand to
+        // primitives Metal already lowers (keeps SwiGLU / FMBA / ResidualLN).
+        let fused = lower_cpu_nop_fused_for_metal(fused);
+        // Apple MPSGraph + the fused sgemm epilogue mis-execute an erf-GELU
+        // fused onto matmul→bias (O(1) divergence); split it into matmul+bias
+        // and a standalone (correct) GELU. No-op unless such a node exists.
+        let fused = split_erf_gelu_fmba_for_metal(fused);
+
+        // Metal is an f32-arena backend: every compute kernel (compare, cast,
+        // gather, transpose/expand, elementwise, matmul) reads and writes f32.
+        // Integer & bool tensors — VITS sequence masks (`arange(t) < lengths`),
+        // comparison results, gather indices, one-hot casts — must therefore be
+        // materialized as f32 in the arena, exactly like rlx-wgpu's f32-uniform
+        // arena. Without this, an i64 `arange` constant (8 B/elem) or a Bool
+        // compare result (1 B/elem) is read back through an f32 pointer as
+        // garbage → all-zero sequence mask → dead text encoder (TinyTTS). Weights
+        // stay untouched (Op::Param packed/quant blocks are read as raw bytes by
+        // DequantMatMul), and integer index/mask activations lose nothing: Metal's
+        // gather already truncates indices through f32, so values must already fit
+        // the f32 mantissa.
+        let fused = widen_integer_activations_to_f32(fused);
+        // Core SPD-manifold ops (BiMap / ReEig / LogEig / SpdBatchNorm /
+        // SpdKarcherMean + backwards) run F64 on the CPU host-fallback
+        // (`crate::spd`), but the Metal arena stays f32-uniform for them: widen
+        // the SPD subgraph's F64 tensors to F32 so the input feed / output
+        // readback and the surrounding Narrow/Reshape see plain f32. The
+        // `Thunk::SpdHost` carries the real F64 shapes; `spd::eval` does the
+        // f32↔f64 conversion. No-op when the graph has no SPD op.
+        let fused = widen_spd_f64_to_f32(fused);
+        // Per-node (qkv, attn) BYTE offsets for the surviving native FAB nodes,
+        // relative to the FAB scratch base (resolved against the arena below).
+        let (fab_scratch_bytes, fab_scratch_rel) = fab_scratch_layout(&fused);
+
+        if verbose {
+            eprintln!("[rlx-metal] after fusion: {} nodes", fused.len());
+        }
+
+        // Memory plan with GPU-aligned cache lines (128B on Apple Silicon)
+        let gdn_scratch = gdn_ephemeral_state_bytes(&fused);
+        let dequant_scratch = dequant_gguf_scratch_bytes(&fused);
+        let synth_mm_scratch = synth_matmul_scratch_bytes(&fused);
+        let conv_bwd_scratch = conv_bwd_scratch_bytes(&fused);
+        let attn_bwd_scratch = crate::attention_bwd_gpu::scratch_bytes(&fused);
+        let rms_norm_bwd_scratch = rms_norm_bwd_scratch_bytes(&fused);
+        let rnn_gru_scratch = rnn_gru_scratch_bytes(&fused);
+        let onnx_qmatmul_act_scratch = if crate::onnx_qmatmul::ingraph_gpu_enabled() {
+            crate::onnx_qmatmul::act_scratch_bytes(&fused)
+        } else {
+            0
+        };
+        // Plan with the conservative output-ancestor liveness pin — correct for
+        // every op, including recurrent ones (GRU) on the not-strictly-in-order
+        // MPSGraph. Only if the resulting arena would exceed the device's
+        // single-buffer limit (`maxBufferLength`) do we re-plan WITHOUT the pin to
+        // restore slot reuse and shrink the arena. That's required for deep
+        // feed-forward decoders (e.g. the Moshi 7B temporal stack, which emits a KV
+        // tensor per layer so almost every node becomes an output-ancestor → 45 GB
+        // pinned vs 27 GB reused) and is safe for them (no buffer is read after a
+        // later op has reused its slot).
+        //
+        // Graphs with host indexing (ScatterNd / Gather*) are NOT safe to unpin:
+        // mid-schedule CPU reads see whatever later GPU ops reused into those
+        // slots. F5 DiT is the canary — unpinning a ~9 GiB arena (still over the
+        // 4 GiB MPS cliff) saved almost nothing and drifted the ODE.
+        let has_host_indexing = fused.nodes().iter().any(|n| {
+            matches!(
+                &n.op,
+                Op::ScatterNd { .. }
+                    | Op::ScatterElements { .. }
+                    | Op::GatherNd { .. }
+                    | Op::GatherElements { .. }
+            )
+        });
+        // The DequantMatMul activation-input liveness extension (memory.rs,
+        // task #50) guards ONLY the deferred-host dequant flush. When EVERY
+        // dequant matmul runs on-GPU (GPU dequant enabled + every scheme has a
+        // Metal kernel; scratch is always allocated when a scratch-needing dequant
+        // exists), there is no host flush to guard, so keep the extension OFF to
+        // restore slot reuse. Without this, the chain-walk pins nearly every
+        // activation in a packed prefill to the graph end (qwen3.5 8K packed
+        // prefill: 61.9 GB pinned → OOM, vs ~4 GB reused). Matches the runtime
+        // deferred condition in encode (`!use_gpu_dequant || !has_metal_dequant_kernel`).
+        let dequant_host_fallback = crate::runtime_config().dequant_gpu_disable
+            || fused.nodes().iter().any(|n| match &n.op {
+                Op::DequantMatMul { scheme, .. } | Op::DequantGroupedMatMul { scheme, .. } => {
+                    !crate::backend::has_metal_dequant_kernel(*scheme)
+                }
+                _ => false,
+            });
+        let mut plan = memory::plan_memory_with_options_policy(
+            &fused,
+            128,
+            memory::MemoryPlanOptions {
+                // `thunk::compile` folds a conv3d's LeakyReLU epilogue into its
+                // store and its Concat/upsample producers into its gather. Both
+                // move memory traffic outside the schedule the planner assumed,
+                // so the planner has to account for them — see
+                // `rlx_opt::memory::conv3d_epilogue_folds`, which both sides
+                // consult. Without this the folds are exact at 64^3 and 128^3
+                // and 17-19% of full scale wrong at 192^3.
+                fold_conv3d_epilogue: true,
+                // CPU-fallback thunks (conv/maxpool backward) read arena buffers
+                // AFTER the whole command buffer completes — including later GPU
+                // ops that reused those slots. Slot reuse is unsafe in that mix;
+                // RLX_ARENA_NO_REUSE pins every buffer to avoid the clobber.
+                arena_no_reuse: rlx_ir::env::flag("RLX_ARENA_NO_REUSE"),
+                // DIAG: force liveness-based slot reuse in the initial plan (drop
+                // the output-ancestor pin unconditionally) to measure the true
+                // reuse-enabled footprint vs the pinned default.
+                pin_output_ancestors: !rlx_ir::env::flag("RLX_METAL_UNPIN_ALL"),
+                dequant_host_fallback,
+                // The bank transpose feeding a decode-path grouped matmul is
+                // folded into the `_bt` kernel and never executed, so reserving
+                // it costs a full second copy of every expert bank — on a
+                // resident 288-expert MoE that is gigabytes per layer, never
+                // written and never read. Gated to small `m` because that is
+                // where the transposed kernel exists; the same gated predicate
+                // decides which thunks become Nop, so the two cannot disagree.
+                elide_bank_transposes: true,
+                elide_requires_small_m: true,
+                ..Default::default()
+            },
+            memory::ArenaWidthPolicy::NativeBf16Widened,
+        );
+        let max_buffer = crate::device::metal_device()
+            .map(|d| d.device.max_buffer_length() as usize)
+            .unwrap_or(usize::MAX);
+        // ≥4 GiB: MPSGraph / hybrid no-copy binds fail on high offsets. Prefer
+        // dropping the output-ancestor pin (Metal thunk + hybrid dispatch is
+        // in-order) so F16-weight models like Zonos fit under the cliff —
+        // but only when the unpin actually helps and the graph has no host
+        // indexing. Override with RLX_METAL_FORCE_PIN_OUTPUT_ANCESTORS=1.
+        const MPS_BIND_CLIFF: usize = 1usize << 32;
+        // Norms / biases stay in the activation arena (RmsNorm uses a single
+        // buffer base + absolute offsets). Large Linear / embedding weights go
+        // to a separate MTLBuffer so the act arena can drop under 4 GiB.
+        const EXTERNAL_WEIGHT_MIN: usize = 256 * 1024;
+        /// Whether this scheme's fused Metal encoders bind the external weight
+        /// buffer (rather than offsetting into the activation arena). Only these
+        /// may have their packed weights externalized; anything else silently
+        /// reads the wrong memory. Extend as encoders grow a `w_buffer` arg.
+        fn metal_encoder_binds_weight_buffer(scheme: rlx_ir::quant::QuantScheme) -> bool {
+            matches!(scheme, rlx_ir::quant::QuantScheme::GgufQ1_0)
+        }
+        let mut weight_layout: Vec<(rlx_ir::NodeId, usize, usize, rlx_ir::DType)> = Vec::new();
+        let force_pin = rlx_ir::env::flag("RLX_METAL_FORCE_PIN_OUTPUT_ANCESTORS");
+        // Debug / regression: force the pre-fix unpin path even on ScatterNd
+        // graphs (F5 DiT). Takes precedence over has_host_indexing.
+        let force_unpin = rlx_ir::env::flag("RLX_METAL_FORCE_UNPIN_OUTPUT_ANCESTORS");
+        let try_unpin = !force_pin
+            && (force_unpin || !has_host_indexing)
+            && should_try_unpin(plan.arena_size, max_buffer);
+        if try_unpin {
+            if verbose {
+                eprintln!(
+                    "[rlx-metal] arena {} B (≥ cliff {} / maxBufferLength {}); \
+                     trying re-plan without output-ancestor pin{}",
+                    plan.arena_size,
+                    MPS_BIND_CLIFF,
+                    max_buffer,
+                    if force_unpin {
+                        " (RLX_METAL_FORCE_UNPIN_OUTPUT_ANCESTORS)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            let unpinned = memory::plan_memory_with_options_policy(
+                &fused,
+                128,
+                memory::MemoryPlanOptions {
+                    // Same fold accounting as the primary plan above — every
+                    // plan this backend might use has to agree, or the folds
+                    // touch slots one of them never reserved.
+                    // Load-bearing: this is the plan the arena is built from.
+                    // With the fold accounting missing *here* — and present in
+                    // the other two — SynthStrip was 18% of full scale wrong at
+                    // 192^3 and `RLX_METAL_FOLD_AUDIT=1` reported 83 conflicts.
+                    fold_conv3d_epilogue: true,
+                    pin_output_ancestors: false,
+                    arena_no_reuse: rlx_ir::env::flag("RLX_ARENA_NO_REUSE"),
+                    dequant_host_fallback,
+                    ..Default::default()
+                },
+                memory::ArenaWidthPolicy::NativeBf16Widened,
+            );
+            // Keep the pinned plan unless unpin meaningfully helps: under the
+            // MPS cliff, or under maxBufferLength when we were over it.
+            // FORCE_UNPIN always accepts (repro / bisect old F5 DiT drift).
+            let accept = accept_unpinned(
+                plan.arena_size,
+                unpinned.arena_size,
+                max_buffer,
+                force_unpin,
+            );
+            if accept {
+                if verbose {
+                    eprintln!(
+                        "[rlx-metal] accepting unpinned plan {} B (was {} B)",
+                        unpinned.arena_size, plan.arena_size
+                    );
+                }
+                plan = unpinned;
+            } else if verbose {
+                eprintln!(
+                    "[rlx-metal] keeping pinned plan {} B (unpinned {} B still ≥ cliff / no win)",
+                    plan.arena_size, unpinned.arena_size
+                );
+            }
+        } else if verbose && has_host_indexing && plan.arena_size >= MPS_BIND_CLIFF {
+            eprintln!(
+                "[rlx-metal] arena {} B ≥ cliff but graph has ScatterNd/Gather*; \
+                 keeping output-ancestor pin",
+                plan.arena_size
+            );
+        }
+        // EXPERIMENTAL (opt-in, default OFF): externalize packed U8/I8 GGUF
+        // weights even when the arena is UNDER the MPS cliff, so a dedicated
+        // weight buffer exists to SHARE across the many small-arena decode
+        // buckets (m=1 → tiny activations keep the arena below 4 GiB, so the
+        // cliff alone never triggers the split). This would collapse the decode
+        // buckets' ~3.8 GB-each inline duplication to one shared copy. It is
+        // CORRECT within any single decode bucket (fused Q1_0 mv/mm resolve the
+        // WEIGHT_BUF_TAG via `resolve_off`), but a generation that CROSSES from a
+        // low bucket to the next corrupts once the arena is re-planned by the
+        // split (host-fed KV / output-slot offsets diverge across the differently
+        // laid-out bucket arenas). Off by default until that transition is fixed.
+        // See `RLX_METAL_EXTERNALIZE_QUANT` and memory `bonsai27b_metal_fused_q1`.
+        let ext_quant_split = rlx_ir::env::flag("RLX_METAL_EXTERNALIZE_QUANT")
+            && fused.nodes().iter().any(|n| {
+                matches!(&n.op, Op::Param { .. })
+                    && matches!(n.shape.dtype(), rlx_ir::DType::U8 | rlx_ir::DType::I8)
+                    && n.shape.num_elements().unwrap_or(0) * n.shape.dtype().size_bytes()
+                        >= EXTERNAL_WEIGHT_MIN
+            });
+        // Share-driven split: externalize large *non-quant* weights once they are
+        // big enough that duplicating them per executable dominates, even when the
+        // arena is under the MPS cliff.
+        //
+        // The cliff test above exists to dodge MPS's 4 GiB binding limit, not to
+        // save memory — so a model whose arena sits just under it inlines its own
+        // copy of the weights into every graph. A transformer keeps several alive
+        // (a prefill graph per prompt length, a decode graph per KV bucket), and
+        // measured on an f32 0.6B that was ~2.4 GB duplicated per graph: 2.95 GB
+        // after load, 12.89 GB after two prefill shapes and two decode buckets.
+        // With the weights in their own buffer, `share_weights_from` retains one
+        // copy for all of them.
+        //
+        // Restricted to F32/F16 on purpose. Packed U8/I8 weights are the bigger
+        // prize but the fused GGUF encoders bind the activation arena directly and
+        // never resolve `WEIGHT_BUF_TAG`, so externalizing them reads the wrong
+        // memory — see the note on `RLX_METAL_EXTERNALIZE_QUANT`. The per-param
+        // `all_consumers_tag_aware` test below is what keeps this honest: a param
+        // whose consumers cannot resolve the tag stays in the arena regardless.
+        let share_split_bytes: usize = fused
+            .nodes()
+            .iter()
+            .filter(|n| matches!(&n.op, Op::Param { .. }))
+            .filter(|n| {
+                matches!(n.shape.dtype(), rlx_ir::DType::F32 | rlx_ir::DType::F16)
+                    || is_shareable_fp8_weight(&fused, n)
+            })
+            .map(|n| n.shape.num_elements().unwrap_or(0) * n.shape.dtype().size_bytes())
+            .filter(|nb| *nb >= EXTERNAL_WEIGHT_MIN)
+            .sum();
+        // Only worth the re-plan when the duplicate would be substantial; small
+        // models keep the simpler single-arena layout. Overridable so a test can
+        // exercise the split without allocating half a gigabyte.
+        const SHARE_SPLIT_MIN: usize = 512 * 1024 * 1024;
+        let share_split_min = rlx_ir::env::var("RLX_METAL_WEIGHT_SPLIT_MIN")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(SHARE_SPLIT_MIN);
+        let share_split =
+            share_split_bytes >= share_split_min && !rlx_ir::env::flag("RLX_METAL_NO_WEIGHT_SPLIT");
+        if verbose && share_split {
+            eprintln!(
+                "[rlx-metal] share-driven weight split: {:.2} GB of large F32/F16 params",
+                share_split_bytes as f64 / 1e9
+            );
+        }
+        if (plan.arena_size >= MPS_BIND_CLIFF || ext_quant_split || share_split)
+            && !rlx_ir::env::flag("RLX_METAL_FORCE_INLINE_PARAMS")
+        {
+            // Keep output-ancestor pin when host indexing is present (F5 DiT
+            // ScatterNd) — unpinning the act arena here used to undo the guard
+            // above just to park large Linears externally.
+            // FORCE_UNPIN overrides for A/B repro.
+            let pin_act = (force_pin || has_host_indexing) && !force_unpin;
+            let mut act_plan = memory::plan_memory_with_options_policy(
+                &fused,
+                128,
+                memory::MemoryPlanOptions {
+                    fold_conv3d_epilogue: true,
+                    allocate_params: false,
+                    pin_output_ancestors: pin_act,
+                    arena_no_reuse: rlx_ir::env::flag("RLX_ARENA_NO_REUSE"),
+                    dequant_host_fallback,
+                    ..Default::default()
+                },
+                memory::ArenaWidthPolicy::NativeBf16Widened,
+            );
+            // Append small params into the activation arena; large ones → weight buf.
+            let mut tail = act_plan.arena_size;
+            let align = 256usize;
+            let mut external: Vec<(rlx_ir::NodeId, usize, usize, rlx_ir::DType)> = Vec::new();
+            let mut ext_f16 = 0usize;
+            let mut ext_f32 = 0usize;
+            for node in fused.nodes() {
+                if !matches!(&node.op, Op::Param { .. }) {
+                    continue;
+                }
+                let ne = node.shape.num_elements().unwrap_or(0);
+                let dt = node.shape.dtype();
+                let nbytes = ne * dt.size_bytes();
+                if nbytes == 0 {
+                    continue;
+                }
+                // Packed GGUF quant weights (U8/I8) feed the fused DequantMatMul
+                // thunk kernels, which read the packed bytes straight from the
+                // activation arena. The external weight buffer is only wired for
+                // the MPS/F16-Linear path; a quant weight parked there reads back
+                // wrong (Bonsai-27B Q1_0 → coarse-lower projections → "a a a…").
+                // Packed quant weights ALWAYS stay in the activation arena.
+                //
+                // There used to be an opt-in (RLX_METAL_EXTERNALIZE_QUANT) that
+                // let U8/I8 packed GGUF weights into the shared weight buffer,
+                // documented as "correct for the prefill GEMM (m>1) path". It
+                // is not correct for any path: measured on the 1.63 GB
+                // dflash-kquant checkpoint (m=16, so squarely the m>1 GEMM), the
+                // split fires — 36 params, 1.62 GB weight buffer, act arena
+                // 0.01 GB — and the forward comes out non-finite. Disabling the
+                // fused GEMMs so it routes through dequant-scratch + MPS instead
+                // gives the same non-finite result, so BOTH paths ignore the tag.
+                //
+                // Cause: `DequantMatMul` was listed as tag-aware below, but every
+                // GGUF encoder binds a single buffer (`self.arena.buffer`) with
+                // x, w and dst all offset into it — none of them call
+                // `resolve_off`. Externalizing therefore silently redirects each
+                // packed weight read into the activation arena.
+                //
+                // Externalizing quant is still the thing that would let
+                // `share_weights_from` back prefill and every decode bucket with
+                // ONE copy. The prerequisite is a second buffer binding on the
+                // fused GGUF kernels (weights from the weight buffer, x/dst from
+                // the arena) — until that exists this must stay off, and an env
+                // flag that silently corrupts is worse than no flag.
+                //
+                // Q1_0 is the exception and stays enabled: its encoders
+                // (`encode_q1_0_mv_f32_sg_flags` and friends) already take a
+                // separate `w_buffer` argument, which is exactly the shape the
+                // K-quant encoders need to grow.
+                let ext_quant = rlx_ir::env::flag("RLX_METAL_EXTERNALIZE_QUANT");
+                // Block-FP8 is the exception that needs no flag: every Metal path
+                // it can take (fused GEMV, dequant-to-scratch) binds the weight
+                // buffer, and the host fallback is ruled out by requiring GPU
+                // dequant. So an FP8 weight read only by FP8 `DequantMatMul`s
+                // can be shared across executables like an f32 one.
+                let fp8_weight = is_shareable_fp8_weight(&fused, node);
+                let is_quant = matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8)
+                    && !ext_quant
+                    && !fp8_weight;
+                // The external weight buffer is only read back correctly by ops
+                // whose Metal thunk resolves the WEIGHT_BUF_TAG (matmul + gather,
+                // via `resolve_off`). Ops like `Rope` bind the activation arena
+                // directly with raw offsets, so a large param they consume — e.g.
+                // the RoPE cos/sin tables [262144,128] f32 — parked in the weight
+                // buffer reads back garbage → wrong RoPE → wrong attention → the
+                // Bonsai-27B "a a a…" regression. Only externalize a param when
+                // EVERY consumer is tag-aware (else leave it in the arena).
+                let mut has_consumer = false;
+                let mut all_consumers_tag_aware = true;
+                for c in fused.nodes() {
+                    if c.inputs.contains(&node.id) {
+                        has_consumer = true;
+                        // Only ops whose Metal encoder actually binds the
+                        // weight buffer. DequantMatMul qualifies ONLY for the
+                        // schemes whose encoders take a `w_buffer` — see the
+                        // `is_quant` note above for what happens otherwise.
+                        let tag_aware =
+                            matches!(c.op, Op::MatMul | Op::DotGeneral { .. } | Op::Gather { .. })
+                                || fp8_weight
+                                || (ext_quant
+                                    && match &c.op {
+                                        Op::DequantMatMul { scheme } => {
+                                            metal_encoder_binds_weight_buffer(*scheme)
+                                        }
+                                        _ => false,
+                                    });
+                        if !tag_aware {
+                            all_consumers_tag_aware = false;
+                            break;
+                        }
+                    }
+                }
+                let externalizable = has_consumer && all_consumers_tag_aware;
+                if nbytes < EXTERNAL_WEIGHT_MIN || is_quant || !externalizable {
+                    tail = (tail + align - 1) & !(align - 1);
+                    act_plan.assignments.insert(
+                        node.id,
+                        memory::BufferSlot {
+                            offset: tail,
+                            size: nbytes,
+                        },
+                    );
+                    tail += nbytes;
+                } else {
+                    match dt {
+                        rlx_ir::DType::F16 => ext_f16 += 1,
+                        rlx_ir::DType::F32 => ext_f32 += 1,
+                        _ => {}
+                    }
+                    if rlx_ir::env::flag("RLX_METAL_EXT_TRACE") {
+                        let consumers: std::collections::BTreeSet<String> = fused
+                            .nodes()
+                            .iter()
+                            .filter(|c| c.inputs.contains(&node.id))
+                            .map(|c| format!("{:?}", c.op).chars().take(32).collect())
+                            .collect();
+                        eprintln!(
+                            "[rlx-metal] EXT node={:?} dt={dt:?} nbytes={nbytes} consumers={consumers:?}",
+                            node.id
+                        );
+                    }
+                    external.push((node.id, ne, nbytes, dt));
+                }
+            }
+            act_plan.arena_size = tail;
+            let ext_bytes: usize = external.iter().map(|(_, _, nb, _)| nb).sum();
+            let weight_padded = {
+                let mut c = 0usize;
+                for &(_, _, nb, _) in &external {
+                    c = (c + align - 1) & !(align - 1);
+                    c += nb;
+                }
+                c
+            };
+            if verbose {
+                eprintln!(
+                    "[rlx-metal] weight-split candidates: {} large (f16={} f32={}) raw={:.2}GB pad={:.2}GB act={:.2}GB",
+                    external.len(),
+                    ext_f16,
+                    ext_f32,
+                    ext_bytes as f64 / 1e9,
+                    weight_padded as f64 / 1e9,
+                    act_plan.arena_size as f64 / 1e9
+                );
+            }
+            // NOTE: do NOT relax `weight_padded < MPS_BIND_CLIFF` to let a
+            // multi-GB packed checkpoint into the external weight buffer.
+            // Tried it: with RLX_METAL_EXTERNALIZE_QUANT=1 the split does fire
+            // (417 params, 15.10 GB weight buf, act arena 0.01 GB) and the model
+            // then emits pure garbage. `DequantMatMul` is listed as tag-aware
+            // above, but the FUSED GGUF encoders bind `self.arena.buffer`
+            // directly and never resolve WEIGHT_BUF_TAG, so every packed weight
+            // read lands in the activation arena. Enabling weight-buffer sharing
+            // for packed models needs those encoders taught to bind the weight
+            // buffer first; until then this cap is what keeps the flag inert
+            // (and therefore harmless) on big models.
+            // Past the cliff the weight buffer is still read right by the
+            // thunk path (only MPSGraph binds fail there, so such an executable
+            // stays off MPSGraph below); worth it when the weights are then
+            // one copy across executables (`crate::shared_weights`).
+            if act_plan.arena_size < MPS_BIND_CLIFF
+                && (weight_padded < MPS_BIND_CLIFF || sharing_weights())
+                && !external.is_empty()
+            {
+                if verbose {
+                    eprintln!(
+                        "[rlx-metal] split weights: act arena {:.2} GB, weight buf {:.2} GB \
+                         ({} large params, {} B threshold)",
+                        act_plan.arena_size as f64 / 1e9,
+                        weight_padded as f64 / 1e9,
+                        external.len(),
+                        EXTERNAL_WEIGHT_MIN
+                    );
+                }
+                let _ = ext_bytes;
+                plan = act_plan;
+                weight_layout = external;
+            } else if verbose {
+                eprintln!(
+                    "[rlx-metal] weight split skipped (act={:.2}GB weight={:.2}GB external={})",
+                    act_plan.arena_size as f64 / 1e9,
+                    weight_padded as f64 / 1e9,
+                    external.len()
+                );
+            }
+        }
+        let mut tail = plan.arena_size;
+        let gdn_scratch_off = if gdn_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + gdn_scratch;
+            off
+        } else {
+            0
+        };
+        let dequant_scratch_off = if dequant_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + dequant_scratch;
+            off
+        } else {
+            0
+        };
+        let synth_matmul_scratch_off = if synth_mm_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + synth_mm_scratch;
+            off
+        } else {
+            0
+        };
+        let conv_bwd_scratch_off = if conv_bwd_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + conv_bwd_scratch;
+            off
+        } else {
+            0
+        };
+        let attn_bwd_scratch_off = if attn_bwd_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + attn_bwd_scratch;
+            off
+        } else {
+            0
+        };
+        let rms_norm_bwd_scratch_off = if rms_norm_bwd_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + rms_norm_bwd_scratch;
+            off
+        } else {
+            0
+        };
+        let rnn_gru_scratch_off = if rnn_gru_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + rnn_gru_scratch;
+            off
+        } else {
+            0
+        };
+        let onnx_qmatmul_act_scratch_off = if onnx_qmatmul_act_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + onnx_qmatmul_act_scratch;
+            off
+        } else {
+            0
+        };
+        // Native `Op::FusedAttentionBlock` packed-QKV + attn scratch.
+        let fab_scratch_off = if fab_scratch_bytes > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + fab_scratch_bytes;
+            off
+        } else {
+            0
+        };
+        plan.arena_size = tail;
+        // Resolve per-node relative offsets to absolute arena byte offsets.
+        let fab_scratch: std::collections::HashMap<rlx_ir::NodeId, (usize, usize)> =
+            fab_scratch_rel
+                .iter()
+                .map(|(id, qkv_rel, attn_rel)| {
+                    (*id, (fab_scratch_off + qkv_rel, fab_scratch_off + attn_rel))
+                })
+                .collect();
+        if verbose && gdn_scratch > 0 {
+            eprintln!(
+                "[rlx-metal] GatedDeltaNet scratch: {} bytes @ offset {}",
+                gdn_scratch, gdn_scratch_off
+            );
+        }
+        if verbose && dequant_scratch > 0 {
+            eprintln!(
+                "[rlx-metal] DequantMatMul scratch: {} bytes @ offset {}",
+                dequant_scratch, dequant_scratch_off
+            );
+        }
+        if verbose && conv_bwd_scratch > 0 {
+            eprintln!(
+                "[rlx-metal] Conv2dBackwardWeight scratch: {} bytes @ offset {}",
+                conv_bwd_scratch, conv_bwd_scratch_off
+            );
+        }
+        if verbose && attn_bwd_scratch > 0 {
+            eprintln!(
+                "[rlx-metal] AttentionBackward scratch: {} bytes @ offset {}",
+                attn_bwd_scratch, attn_bwd_scratch_off
+            );
+        }
+        if verbose && rms_norm_bwd_scratch > 0 {
+            eprintln!(
+                "[rlx-metal] RmsNormBackward param scratch: {} bytes @ offset {}",
+                rms_norm_bwd_scratch, rms_norm_bwd_scratch_off
+            );
+        }
+        if verbose && onnx_qmatmul_act_scratch > 0 {
+            eprintln!(
+                "[rlx-metal] onnx.QMatMul act scratch: {} bytes @ offset {}",
+                onnx_qmatmul_act_scratch, onnx_qmatmul_act_scratch_off
+            );
+        }
+        if verbose {
+            eprintln!(
+                "[rlx-metal] arena: {} bytes, {} buffers",
+                plan.arena_size,
+                plan.assignments.len()
+            );
+        }
+        if rlx_ir::env::var_os("RLX_METAL_DEBUG").is_some() {
+            let mut sizes: Vec<(usize, usize)> = plan
+                .assignments
+                .values()
+                .map(|s| (s.offset, s.size))
+                .collect();
+            sizes.sort_by_key(|&(_, sz)| std::cmp::Reverse(sz));
+            let total: usize = plan.assignments.values().map(|s| s.size).sum();
+            let max_end = plan
+                .assignments
+                .values()
+                .map(|s| s.offset + s.size)
+                .max()
+                .unwrap_or(0);
+            eprintln!(
+                "[rlx-metal] arena_size={:.2} GB, {} buffers, sum_slot_bytes={:.2} GB, max_end={:.2} GB",
+                plan.arena_size as f64 / 1e9,
+                plan.assignments.len(),
+                total as f64 / 1e9,
+                max_end as f64 / 1e9,
+            );
+            for (off, sz) in sizes.iter().take(6) {
+                eprintln!(
+                    "    slot off={:.2}GB size={:.3}GB",
+                    *off as f64 / 1e9,
+                    *sz as f64 / 1e9
+                );
+            }
+        }
+        // Build precision-aware arena: per-node DType drives buffer sizing
+        // and downstream kernel dispatch.
+        let mut arena = Arena::from_plan_with_graph(plan, Some(&fused));
+        // A pure view (a `Narrow` at 0, say) has no slot: the planner aliases
+        // it to its root. Give it the root's offset, or every thunk that reads
+        // it gets `usize::MAX` — a stateful decode step's attention mask
+        // (`iota[0..cap] <= position`) read as all ones.
+        for (view, (root, byte_off)) in memory::collect_view_aliases(&fused) {
+            if arena.offsets.contains_key(&view) {
+                continue;
+            }
+            let Some(&base) = arena.offsets.get(&root) else {
+                continue;
+            };
+            let shape = &fused.node(view).shape;
+            let n = shape.num_elements().unwrap_or(0);
+            let per = arena.bytes_per_elem(root).max(1);
+            arena.offsets.insert(view, base + byte_off);
+            arena.element_counts.insert(view, n);
+            arena.dtypes.insert(view, shape.dtype());
+            arena.slot_bytes.insert(view, n * per);
+        }
+
+        // Pack large params into a separate Shared MTLBuffer. Under a sharing
+        // scope each starts on a page, so its pages can be another
+        // executable's (`crate::shared_weights`).
+        #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+        let share_scope = crate::shared_weights::scope().filter(|_| !weight_layout.is_empty());
+        #[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
+        let share_scope: Option<String> = None;
+        #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+        let align = if share_scope.is_some() {
+            crate::shared_weights::page_size()
+        } else {
+            256usize
+        };
+        #[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
+        let align = 256usize;
+        let mut weight_offs: HashMap<NodeId, usize> = HashMap::new();
+        let mut weight_slots: HashMap<NodeId, WeightParamSlot> = HashMap::new();
+        let mut weight_cursor = 0usize;
+        for &(id, nelems, nbytes, dtype) in &weight_layout {
+            weight_cursor = (weight_cursor + align - 1) & !(align - 1);
+            weight_offs.insert(id, weight_cursor);
+            weight_slots.insert(
+                id,
+                WeightParamSlot {
+                    offset: weight_cursor,
+                    nbytes,
+                    nelems,
+                    dtype,
+                },
+            );
+            weight_cursor += nbytes;
+        }
+        let mut weight_pages: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> = None;
+        let mut shared_resident = std::collections::HashSet::new();
+        let weight_buffer = if weight_cursor > 0 {
+            let dev = metal_device().expect("Metal device");
+            #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+            let shared = share_scope.as_deref().and_then(|scope| {
+                shared_weight_buffer(&fused, scope, &weight_slots, weight_cursor, dev)
+            });
+            #[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
+            let shared: Option<(crate::mtl::Buffer, _, _)> = None;
+            match shared {
+                Some((buf, pages, resident)) => {
+                    weight_pages = Some(pages);
+                    shared_resident = resident;
+                    Some(buf)
+                }
+                None => Some(dev.alloc_shared(weight_cursor.max(64))),
+            }
+        } else {
+            None
+        };
+
+        // Initialize `Op::Constant` slots with their literal data. The
+        // arena is shared-storage MTLBuffer (unified memory on Apple
+        // Silicon) so we can write directly via `contents()`. F64 + I32 +
+        // similar non-F32 dtypes go in as raw bytes; F32 also as raw
+        // bytes (a constant's `data` field is little-endian dtype-native
+        // already). Without this step, custom-op kernels reading from
+        // a Constant input slot see zeros.
+        for node in fused.nodes() {
+            if let Op::Constant { data } = &node.op
+                && !data.is_empty()
+                && arena.has_buffer(node.id)
+            {
+                let off = arena.byte_offset(node.id);
+                unsafe {
+                    let dst = (arena.buffer.contents() as *mut u8).add(off);
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+                }
+            }
+        }
+
+        let schedule = ThunkSchedule::compile_with_rng_fab_weights(
+            &fused,
+            &arena,
+            rng,
+            &fab_scratch,
+            &weight_offs,
+        );
+
+        if verbose {
+            let nop_count = schedule
+                .thunks
+                .iter()
+                .filter(|t| matches!(t, crate::thunk::Thunk::Nop))
+                .count();
+            eprintln!(
+                "[rlx-metal] schedule: {} thunks ({} compute, {} nop)",
+                schedule.thunks.len(),
+                schedule.thunks.len() - nop_count,
+                nop_count
+            );
+        }
+
+        let mut input_ids = HashMap::new();
+        let mut param_ids = HashMap::new();
+        for node in fused.nodes() {
+            match &node.op {
+                Op::Input { name } => {
+                    input_ids.insert(name.clone(), node.id);
+                }
+                Op::Param { name } => {
+                    param_ids.insert(name.clone(), node.id);
+                }
+                _ => {}
+            }
+        }
+
+        let output_slots: Vec<(usize, usize)> = fused
+            .outputs
+            .iter()
+            .map(|&id| {
+                let off = if arena.has_buffer(id) {
+                    arena.byte_offset(id)
+                } else {
+                    0
+                };
+                let shape = &fused.node(id).shape;
+                let logical = shape.num_elements().unwrap_or(0);
+                // Host f32-lane length: C64/C128 occupy 2/4 lanes per element
+                // (matches `Arena::read_as_f32` / `write_from_f32`).
+                let f32_len = match shape.dtype() {
+                    rlx_ir::DType::C64 => logical * 2,
+                    rlx_ir::DType::C128 => logical * 4,
+                    rlx_ir::DType::F64 => logical * 2,
+                    _ => logical,
+                };
+                (off, f32_len)
+            })
+            .collect();
+
+        // Pre-resolve input slots in graph-input order
+        let mut input_slots = Vec::new();
+        for node in fused.nodes() {
+            if let Op::Input { name } = &node.op {
+                let off = if arena.has_buffer(node.id) {
+                    arena.byte_offset(node.id)
+                } else {
+                    0
+                };
+                let len = node.shape.num_elements().unwrap_or(0);
+                input_slots.push((name.clone(), off, len));
+            }
+        }
+
+        // MPSGraph lowering: on by default whenever every op is
+        // supported by the bridge. Apple's fused MPSGraph kernels
+        // outperform our per-op MSL encoder across the qwen3 prefill
+        // range once RmsNorm + SDPA are wired (see mps_graph.rs).
+        // Opt out with RLX_DISABLE_MPSGRAPH=1.
+        // MPSGraph's no-copy binds fail past 4 GiB into a buffer: a weight
+        // buffer that big (shared weights) keeps the executable on thunks.
+        let weights_past_cliff = weight_cursor >= MPS_BIND_CLIFF_BYTES;
+        let mps_plan = if disable_mpsgraph
+            || amp_active
+            || weights_past_cliff
+            || crate::runtime_config().disable_mpsgraph
+        {
+            None
+        } else {
+            let plan = crate::mps_graph_lower::try_lower(&fused);
+            if verbose {
+                match &plan {
+                    Some(_) => eprintln!("[rlx-metal] MPSGraph lowering: success"),
+                    None => eprintln!(
+                        "[rlx-metal] MPSGraph lowering: unsupported op or dynamic shape; falling back to thunks"
+                    ),
+                }
+            }
+            plan
+        };
+        let mps_hybrid = if !disable_mpsgraph
+            && !amp_active
+            && !weights_past_cliff
+            && mps_plan.is_none()
+            && !crate::runtime_config().disable_mpsgraph
+            && !crate::runtime_config().disable_mpsgraph_hybrid
+            // The interior rank≥4 reduction (HC / KV-pool) that makes the full plan
+            // bail also miscompiles inside a hybrid MPSGraph segment — keep the
+            // whole graph on the correct thunk path.
+            && !crate::mps_graph_lower::graph_has_mps_hostile_reduce(&fused)
+            && !crate::mps_graph_lower::graph_has_bf16_activation(&fused)
+        {
+            crate::mps_graph_hybrid::build_hybrid_plan(&fused, None, &schedule.node_start)
+                .filter(|steps| crate::mps_graph_hybrid::hybrid_has_mps(steps))
+        } else {
+            None
+        };
+        if verbose && mps_hybrid.is_some() {
+            eprintln!("[rlx-metal] MPSGraph hybrid lowering: enabled");
+        }
+
+        // Optional ICB pre-encoding: opt-in via env var. Pre-encodes the
+        // ICB-compatible thunks (small element-wise / norm / copy ops) into
+        // an IndirectCommandBuffer at compile time so encode_and_run can
+        // issue them as one `executeCommandsInBuffer` call instead of N
+        // individual `set_pipeline + set_buffer + dispatch` round-trips.
+        // Skip when large weights live in a separate MTLBuffer; the current
+        // ICB path is only validated on the arena-only schedules below.
+        let icb_segments = if rlx_ir::env::flag("RLX_USE_ICB") && weight_buffer.is_none() {
+            let dev_ref = metal_device().expect("Metal device required");
+            let segs =
+                crate::icb::compile_segments(&schedule.thunks, &arena.buffer, &dev_ref.device);
+            if verbose {
+                let total_cmds: u64 = segs.iter().map(|r| r.segment.command_count).sum();
+                eprintln!(
+                    "[rlx-metal] ICB pre-encoded {} segments / {} commands",
+                    segs.len(),
+                    total_cmds
+                );
+            }
+            segs
+        } else {
+            Vec::new()
+        };
+
+        let max_matmul_flops = max_matmul_flops_in(&fused);
+        let has_bf16_matmul = graph_has_bf16_matmul(&fused);
+        let cfg = crate::runtime_config();
+
+        let cache_load = cfg.sdpa_tune_cache_load;
+        let cache_persist = cfg.sdpa_tune_cache_persist;
+        let cache_max_entries = cfg.sdpa_tune_cache_max_entries.max(1);
+        let cache_eviction = cfg.sdpa_tune_cache_eviction;
+        let sdpa_kernel_plan = crate::kernel_plan::KernelPlanBuilder::new(
+            crate::kernel_plan::KernelFamily::SdpaDecode,
+        )
+        .autotune(crate::kernel_plan::TunePolicy::balanced_defaults())
+        .tune_cache(cache_load, cache_persist, cache_max_entries)
+        .tune_cache_eviction(cache_eviction)
+        .build_plan()
+        .expect("rlx-metal: valid sdpa kernel plan");
+
+        let mut me = Self {
+            sdpa_kernel_plan,
+            sdpa_tune_winners: std::cell::RefCell::new(HashMap::new()),
+            sdpa_tune_last_used: std::cell::RefCell::new(HashMap::new()),
+            sdpa_tune_tick: std::cell::Cell::new(0),
+            sdpa_tune_loaded: std::cell::Cell::new(false),
+            graph: fused,
+            arena,
+            schedule,
+            input_ids,
+            param_ids,
+            weight_buffer,
+            weight_slots,
+            weight_pages,
+            shared_resident,
+            input_slots,
+            output_slots,
+            precision: MetalPrecision::F32,
+            mps_plan,
+            mps_hybrid,
+            icb_segments,
+            pending_cmd_bufs: Vec::new(),
+            active_extent: None,
+            max_matmul_flops,
+            has_bf16_matmul,
+            mps_params_frozen: false,
+            gdn_scratch_off,
+            dequant_scratch_off,
+            synth_matmul_scratch_off,
+            conv_bwd_scratch_off,
+            attn_bwd_scratch_off,
+            rms_norm_bwd_scratch_off,
+            rnn_gru_scratch_off,
+            onnx_qmatmul_act_scratch_off,
+            f16_weight_scratch: std::cell::RefCell::new(None),
+            baked_weight_concats: std::cell::RefCell::new(std::collections::HashSet::new()),
+            sdpa_flash_scratch: std::cell::RefCell::new(None),
+            sdpa_w8a8_scratch: std::cell::RefCell::new(None),
+            qmatmul_weight_cache: std::cell::RefCell::new(
+                crate::onnx_qmatmul::QMatMulWeightCache::new(),
+            ),
+            gpu_handles: HashMap::new(),
+            gpu_handle_feeds: HashMap::new(),
+            gpu_handle_resident: std::collections::HashSet::new(),
+            kv_row_feeds: HashMap::new(),
+        };
+        // Bind the MPSGraph executable's input/output arrays to the
+        // arena once. After this, run_cached() avoids all per-call
+        // ObjC allocation. Arena buffer + per-node byte offsets are
+        // fixed across runs, so the cached arrays stay valid for the
+        // lifetime of `me`.
+        me.bind_mps_executable_to_arena();
+        me
+    }
+}
+
+/// Dtypes materialized as f32 in the Metal arena. Metal's compute kernels are
+/// f32/f16-only, so integer & bool *activations/constants/indices* must live as
+/// f32 (their values already fit the mantissa — Metal's gather truncates indices
+/// through f32 regardless). Packed/quantized weights (`Op::Param`, e.g. GGUF
+/// U8/I8 blocks read raw by DequantMatMul) are handled elsewhere and must keep
+/// their true byte width, so U8/I8 are deliberately excluded here.
+/// True when any `Op::MatMul` in the graph has a BF16 input operand. Such
+/// matmuls are correct only on the MPSGraph path (which casts bf16→f32); the
+/// thunk `Sgemm` has no bf16-weight kernel and would misread the bytes as f32.
+/// ≥4 GiB: MPSGraph / hybrid no-copy binds fail on high offsets.
+pub(crate) const MPS_BIND_CLIFF_BYTES: usize = 1usize << 32;
+
+/// Below this an unpinned re-plan cannot save enough to be worth the host pass.
+pub(crate) const UNPIN_CONSIDER_MIN_BYTES: usize = 64 << 20;
+
+/// Whether to re-plan without the output-ancestor pin at all.
+///
+/// Callers must additionally require `!force_pin` and
+/// (`force_unpin || !has_host_indexing`) — those are correctness conditions,
+/// this is only about whether a saving is plausible enough to pay for a second
+/// planning pass.
+pub(crate) fn should_try_unpin(pinned: usize, max_buffer: usize) -> bool {
+    pinned > max_buffer || pinned >= MPS_BIND_CLIFF_BYTES || pinned >= UNPIN_CONSIDER_MIN_BYTES
+}
+
+/// Whether the unpinned plan is worth taking over the pinned one.
+///
+/// Three regimes, all the same shape — take it if it clears a hard limit, or if
+/// it saves a *substantial* fraction:
+///
+/// * over `maxBufferLength`: getting under it is the win (5% floor otherwise);
+/// * over the MPS bind cliff: getting under it restores MPSGraph fusion;
+/// * under both: nothing is broken, so only a large saving justifies it.
+///
+/// That last regime used not to exist — the re-plan was an overflow escape
+/// hatch, so a graph whose pinned arena fit under the cliff kept it forever.
+/// Measured cost of that: OmniSR ×4 held 2.9 GB where 395 MB was enough, and
+/// CPU and CoreML planned the same graph at ~400 MB.
+///
+/// The 25% floor is deliberate. The F5 DiT case that motivated the
+/// host-indexing guard "saved almost nothing", so a quarter stays well clear of
+/// it while still catching the reductions that matter (4.6× on Real-CUGAN,
+/// 7.5× on OmniSR — both entirely under the cliff).
+pub(crate) fn accept_unpinned(
+    pinned: usize,
+    unpinned: usize,
+    max_buffer: usize,
+    force_unpin: bool,
+) -> bool {
+    if force_unpin {
+        return true;
+    }
+    if pinned > max_buffer {
+        return unpinned <= max_buffer || unpinned + (pinned / 20) < pinned;
+    }
+    if pinned < MPS_BIND_CLIFF_BYTES {
+        return unpinned + (pinned / 4) < pinned;
+    }
+    unpinned < MPS_BIND_CLIFF_BYTES || unpinned + (pinned / 4) < pinned
+}
+
+fn graph_has_bf16_matmul(graph: &Graph) -> bool {
+    graph.nodes().iter().any(|n| {
+        matches!(n.op, Op::MatMul)
+            && n.inputs
+                .iter()
+                .any(|&i| graph.node(i).shape.dtype() == rlx_ir::DType::BF16)
+    })
+}
+
+#[inline]
+fn metal_widened_dtype(dt: rlx_ir::DType) -> bool {
+    matches!(
+        dt,
+        rlx_ir::DType::I64 | rlx_ir::DType::I32 | rlx_ir::DType::U32 | rlx_ir::DType::Bool
+    )
+}
+
+/// Reinterpret little-endian integer/bool bytes as f32 values (byte-encoded).
+fn int_bytes_to_f32_bytes(data: &[u8], dt: rlx_ir::DType) -> Vec<u8> {
+    use rlx_ir::DType;
+    match dt {
+        DType::I64 => data
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .flat_map(|c| (i64::from_le_bytes(*c) as f32).to_le_bytes())
+            .collect(),
+        DType::I32 => data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|c| (i32::from_le_bytes(*c) as f32).to_le_bytes())
+            .collect(),
+        DType::U32 => data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|c| (u32::from_le_bytes(*c) as f32).to_le_bytes())
+            .collect(),
+        DType::Bool => data
+            .iter()
+            .flat_map(|&b| (b as f32).to_le_bytes())
+            .collect(),
+        _ => data.to_vec(),
+    }
+}
+
+/// Rewrite every non-param integer/bool tensor node to F32 (converting `Constant`
+/// payloads and `Cast` targets) so the whole graph runs through Metal's f32
+/// kernels + f32-sized arena slots. See the call site for the rationale. Mirrors
+/// rlx-wgpu's f32-uniform arena, which widens the same class of tensors on upload.
+fn widen_integer_activations_to_f32(mut graph: Graph) -> Graph {
+    use rlx_ir::DType;
+    // `Op::Custom` ops (Sparse-LU/mat_vec, FFT, …) run as host kernels against
+    // the unified-memory arena directly and read each input — and write each
+    // output — at its declared dtype (e.g. CSR `col_idx`/`row_ptr` as I32 via
+    // `expect_i32`, Bool masks). Widening those tensors to f32 would corrupt them
+    // / make the host kernel reject the buffer, so any Custom node and any
+    // tensor consumed by a Custom node keep their true byte width — only the
+    // native f32 GPU kernels need the widened form.
+    // `Op::FftQ` is in the same position: a host kernel whose whole point is
+    // that it operates on true i32. Widening it to f32 would hand the fixed-
+    // point transform a float bit pattern.
+    let custom_operands: std::collections::HashSet<rlx_ir::NodeId> = graph
+        .nodes()
+        .iter()
+        .filter(|n| matches!(n.op, Op::Custom { .. } | Op::FftQ { .. }))
+        .flat_map(|n| std::iter::once(n.id).chain(n.inputs.iter().copied()))
+        .collect();
+    for node in graph.nodes_mut() {
+        // Packed/quantized weight params (U8/I8) and floating params keep
+        // their true byte width. Integer *control* params (duration carry,
+        // masks, trip counts) must widen to F32 — otherwise `set_param_typed`
+        // writes raw i64 bytes into a slot that f32 kernels (Where/Expand)
+        // read as denormals (e.g. i64 3 → 4e-45), zeroing Kitten alignment.
+        if matches!(node.op, Op::Param { .. }) {
+            let old = node.shape.dtype();
+            if matches!(
+                old,
+                DType::U8 | DType::I8 | DType::F16 | DType::BF16 | DType::F32 | DType::F64
+            ) {
+                continue;
+            }
+            if metal_widened_dtype(old) {
+                node.shape = node.shape.clone().with_dtype(DType::F32);
+            }
+            continue;
+        }
+        // Host Custom kernels that need true integer widths (CSR I32
+        // indices, Bool masks, …) keep I32/U32/Bool. I64 tensors that
+        // feed ScatterElements / GatherND are widened to F32 so Metal's
+        // f32 kernels don't densify float bytes into 8-byte arena slots
+        // (which then look like garbage when read back as i64).
+        if custom_operands.contains(&node.id) {
+            let dt = node.shape.dtype();
+            if matches!(
+                dt,
+                DType::I32 | DType::U32 | DType::Bool | DType::I8 | DType::U8 | DType::I16
+            ) {
+                continue;
+            }
+        }
+        let old = node.shape.dtype();
+        // Convert Constant literals up front (needs the pre-rewrite dtype).
+        if metal_widened_dtype(old)
+            && let Op::Constant { data } = &mut node.op
+        {
+            *data = int_bytes_to_f32_bytes(data, old);
+        }
+        // Cast → integer: keep `Op::Cast { to: I64/… }` as the truncation signal
+        // for `CastTruncF32` in thunk compile, but still widen the *tensor*
+        // shape to F32 so Unsqueeze/Copy/Gather stay on the f32 arena. Turning
+        // `to` into F32 made Cast a no-op and zeroed Vocos fringe masks
+        // (`view - floor(view)`).
+        if metal_widened_dtype(old) {
+            node.shape = node.shape.clone().with_dtype(DType::F32);
+        }
+    }
+    graph
+}
+
+/// Reinterpret little-endian F64 bytes as F32 values (byte-encoded).
+fn f64_bytes_to_f32_bytes(data: &[u8]) -> Vec<u8> {
+    data.as_chunks::<8>()
+        .0
+        .iter()
+        .flat_map(|c| (f64::from_le_bytes(*c) as f32).to_le_bytes())
+        .collect()
+}
+
+/// Widen the F64 nodes of the SPD-manifold subgraph (BiMap / ReEig / LogEig /
+/// SpdBatchNorm / SpdKarcherMean + backwards) to F32 so the Metal arena is
+/// f32-uniform for them — exactly like rlx-wgpu / rlx-vulkan. The SPD ops
+/// themselves run F64 on the CPU host-fallback (`crate::spd`), which widens the
+/// f32 arena bytes to f64 for the compute and narrows the result back; the
+/// `Thunk::SpdHost` carries the REAL F64 shapes so the packed / backward layouts
+/// resolve. Widening the arena side means the graph boundary (input feed /
+/// output readback) and the surrounding `Narrow` / `Reshape` structural ops all
+/// see plain f32 — the same class those Metal kernels already handle.
+///
+/// Scope: only F64 nodes in the **connected component** (undirected, via graph
+/// edges) of an SPD op are touched. F64 tensors elsewhere (e.g. a genuine
+/// `Op::Fft` F64 slot, which the FFT host path reads as 8-byte f64) keep their
+/// width. No-op when the graph has no SPD op.
+fn widen_spd_f64_to_f32(mut graph: Graph) -> Graph {
+    use rlx_ir::DType;
+    use std::collections::HashSet;
+
+    // Seed the frontier with every SPD op and its operands.
+    let mut frontier: Vec<rlx_ir::NodeId> = Vec::new();
+    for node in graph.nodes() {
+        if crate::spd::is_spd_host(&node.op) {
+            frontier.push(node.id);
+            frontier.extend(node.inputs.iter().copied());
+        }
+    }
+    if frontier.is_empty() {
+        return graph;
+    }
+
+    // Build the undirected adjacency (node ↔ each of its inputs) once.
+    let mut adj: std::collections::HashMap<rlx_ir::NodeId, Vec<rlx_ir::NodeId>> =
+        std::collections::HashMap::new();
+    for node in graph.nodes() {
+        for &inp in &node.inputs {
+            adj.entry(node.id).or_default().push(inp);
+            adj.entry(inp).or_default().push(node.id);
+        }
+    }
+
+    // Flood-fill the component, staying on F64 nodes so unrelated dtypes (and
+    // the boundary between the SPD F64 block and any f32 tensors it touches) are
+    // not crossed. The SPD ops / their inputs are always F64, so this captures
+    // the packed forward output → `Narrow` → `Reshape` chain and F64 params.
+    let is_f64 = |id: rlx_ir::NodeId| graph.node(id).shape.dtype() == DType::F64;
+    let mut component: HashSet<rlx_ir::NodeId> = HashSet::new();
+    let mut stack: Vec<rlx_ir::NodeId> = frontier.into_iter().filter(|&id| is_f64(id)).collect();
+    while let Some(id) = stack.pop() {
+        if !component.insert(id) {
+            continue;
+        }
+        if let Some(neighbors) = adj.get(&id) {
+            for &nb in neighbors {
+                if is_f64(nb) && !component.contains(&nb) {
+                    stack.push(nb);
+                }
+            }
+        }
+    }
+
+    for node in graph.nodes_mut() {
+        if !component.contains(&node.id) {
+            continue;
+        }
+        // Params stay at their true byte width elsewhere, but SPD F64 params
+        // (e.g. the learnable SPD bias `G`) must be f32 in this f32-uniform
+        // subgraph so the arena slot and the host widening agree. Convert
+        // Constant literals up front (needs the pre-rewrite F64 dtype).
+        if let Op::Constant { data } = &mut node.op {
+            *data = f64_bytes_to_f32_bytes(data);
+        }
+        node.shape = node.shape.clone().with_dtype(DType::F32);
+    }
+    graph
+}
+
+/// Metal has no bf16 compute kernels, so refuse a policy that asks for them.
+///
+/// `HalfFlag` is `{F32, F16}` and `From<DType>` maps everything else — BF16
+/// included — to `F32`. A bf16-tagged node therefore runs an f32 kernel over
+/// bf16 bytes: two bf16 values are read as one f32. Measured on a 32×32 matmul
+/// under `AutoMixedBf16`, that produced a non-finite output and a relative error
+/// of 2.3e38, with no error raised anywhere.
+///
+/// BF16 as *weight storage* is fine and unaffected — those paths widen on load
+/// and never take a bf16 element size through `HalfFlag`. It is bf16 **compute**
+/// that has no kernel.
+///
+/// Refusing loudly is the same call as `rlx-runtime`'s host-fallback rule: a
+/// backend that cannot execute something must say so, not return numbers.
+fn assert_bf16_compute_unsupported(policy: Option<&rlx_opt::PrecisionPolicy>) {
+    use rlx_opt::{OpKind, Precision};
+    let Some(policy) = policy else { return };
+    let offenders: Vec<&str> = [
+        (OpKind::Compute, "compute"),
+        (OpKind::Reduction, "reduction"),
+        (OpKind::Elementwise, "elementwise"),
+        (OpKind::DataMovement, "dataMovement"),
+        (OpKind::Boundary, "boundary"),
+    ]
+    .into_iter()
+    .filter(|(kind, _)| policy.precision_for(*kind) == Precision::BF16)
+    .map(|(_, name)| name)
+    .collect();
+    assert!(
+        offenders.is_empty(),
+        "rlx-metal: this precision policy asks for BF16 on {}, and Metal has no \
+         bf16 compute kernels — the f32 kernel would read two bf16 values as one \
+         f32 and return non-finite garbage rather than an error. Use f16 (or \
+         'mixed', which keeps compute at f32). BF16 weight STORAGE is unaffected.",
+        offenders.join(", ")
+    );
+}
+
+/// The weight buffer as a VM region whose weights are the shared copies in
+/// `scope` (`crate::shared_weights`): the buffer, what keeps its memory
+/// alive, and the slots mapped from a copy already made. `None` (the caller
+/// allocates privately) when the VM or Metal calls fail.
+#[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+fn shared_weight_buffer(
+    graph: &Graph,
+    scope: &str,
+    slots: &HashMap<NodeId, WeightParamSlot>,
+    len: usize,
+    dev: &crate::device::MetalDevice,
+) -> Option<(
+    crate::mtl::Buffer,
+    std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    std::collections::HashSet<NodeId>,
+)> {
+    use crate::shared_weights::{VmRegion, place};
+    let region = VmRegion::new(len)?;
+    let mut held = Vec::new();
+    let mut resident = std::collections::HashSet::new();
+    for (&id, slot) in slots {
+        let Op::Param { name } = &graph.node(id).op else {
+            continue;
+        };
+        if let Some((pages, mapped)) =
+            place(scope, name, slot.dtype, slot.nbytes, &region, slot.offset)
+        {
+            held.push(pages);
+            if mapped {
+                resident.insert(id);
+            }
+        }
+    }
+    let buf = dev.device.new_buffer_with_bytes_no_copy(
+        region.ptr().cast(),
+        region.len() as u64,
+        crate::mtl::MTLResourceOptions::StorageModeShared,
+    );
+    if buf.contents().is_null() {
+        return None;
+    }
+    if rlx_ir::env::flag("RLX_VERBOSE") {
+        eprintln!(
+            "[rlx-metal] shared weights: {} of {} mapped from another executable ({:.2} GB region)",
+            resident.len(),
+            slots.len(),
+            region.len() as f64 / 1e9
+        );
+    }
+    Some((buf, std::sync::Arc::new((region, held)), resident))
+}
+
+/// Whether weights compiled now are shared across executables
+/// (`crate::shared_weights`).
+fn sharing_weights() -> bool {
+    #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+    return crate::shared_weights::scope().is_some();
+    #[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
+    false
+}
+
+/// A packed block-FP8 weight that can live in the external weight buffer: a
+/// `Param` read only as the weight of FP8 `DequantMatMul`s, with GPU dequant on.
+/// Every Metal path such a matmul takes (the fused decode GEMV, dequant to
+/// scratch) binds the weight buffer, and requiring GPU dequant rules out the
+/// host fallback, which reads the activation arena.
+fn is_shareable_fp8_weight(graph: &rlx_ir::Graph, param: &rlx_ir::Node) -> bool {
+    use rlx_ir::quant::QuantScheme;
+    if !matches!(param.op, Op::Param { .. }) || crate::runtime_config().dequant_gpu_disable {
+        return false;
+    }
+    let mut readers = graph
+        .nodes()
+        .iter()
+        .filter(|c| c.inputs.contains(&param.id))
+        .peekable();
+    readers.peek().is_some()
+        && readers.all(|c| {
+            matches!(
+                c.op,
+                Op::DequantMatMul {
+                    scheme: QuantScheme::Fp8E4m3B128 | QuantScheme::Fp8E5m2B128
+                }
+            ) && c.inputs.get(1) == Some(&param.id)
+                && c.inputs.first() != Some(&param.id)
+        })
+}
+
+#[cfg(test)]
+mod unpin_tests {
+    use super::*;
+
+    const GB: usize = 1 << 30;
+    const MB: usize = 1 << 20;
+    const HUGE: usize = usize::MAX;
+
+    /// The regression this guards: a graph whose pinned arena is *under* the
+    /// cliff was never re-planned, so it paid the pinned footprint forever.
+    /// OmniSR ×4 measured 2.9 GB pinned against 395 MB unpinned.
+    #[test]
+    fn a_large_saving_under_the_cliff_is_taken() {
+        assert!(should_try_unpin(2900 * MB, HUGE));
+        assert!(accept_unpinned(2900 * MB, 395 * MB, HUGE, false));
+    }
+
+    /// A marginal saving is not worth changing the plan — this keeps the F5 DiT
+    /// class of graph on the pinned plan.
+    #[test]
+    fn a_marginal_saving_is_declined() {
+        assert!(!accept_unpinned(1000 * MB, 900 * MB, HUGE, false));
+        assert!(accept_unpinned(1000 * MB, 700 * MB, HUGE, false));
+    }
+
+    /// Small graphs are not re-planned: a second pass cannot pay for itself
+    /// when the whole arena is a few megabytes.
+    #[test]
+    fn small_arenas_are_not_reconsidered() {
+        assert!(!should_try_unpin(8 * MB, HUGE));
+        assert!(should_try_unpin(64 * MB, HUGE));
+    }
+
+    /// Crossing back under the MPS bind cliff restores MPSGraph fusion, so it
+    /// is taken even when the byte saving is small.
+    #[test]
+    fn crossing_under_the_cliff_is_always_worth_it() {
+        assert!(accept_unpinned(5 * GB, 4 * GB - 1, HUGE, false));
+    }
+
+    /// Over `maxBufferLength` the allocation simply fails, so a 5% floor
+    /// applies rather than 25%.
+    #[test]
+    fn over_max_buffer_length_takes_even_a_small_win() {
+        let max = 2 * GB;
+        assert!(accept_unpinned(3 * GB, 2 * GB, max, false));
+        assert!(!accept_unpinned(3 * GB, 3 * GB - MB, max, false));
+    }
+
+    #[test]
+    fn force_unpin_always_accepts() {
+        assert!(accept_unpinned(100 * MB, 100 * MB, HUGE, true));
+    }
+}

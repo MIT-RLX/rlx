@@ -21,7 +21,7 @@
 //! term an exact software FMA ([`crate::avx2_mirror::simd::fma_f32x4`]):
 //! slower, but the result of every other portable build.
 
-use core::arch::wasm32::*;
+use crate::wasm_arch::*;
 
 const MR: usize = 4;
 const NR: usize = 8;

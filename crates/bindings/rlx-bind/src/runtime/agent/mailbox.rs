@@ -236,6 +236,8 @@ pub fn serve(
                 message: req["message"].as_str().unwrap_or_default().to_string(),
                 system: req["system"].as_str().unwrap_or_default().to_string(),
                 budget_left: req["budget_left"].as_f64(),
+                // The broker's machine has no training run to build programs in.
+                check: Vec::new(),
             };
             log(&format!("answering {id}"));
             let backend = match backends.get_mut(&run) {

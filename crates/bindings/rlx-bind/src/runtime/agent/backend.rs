@@ -37,6 +37,8 @@ pub struct DecisionRequest {
     pub system: String,
     /// Dollars the run may still spend, when it has a cap.
     pub budget_left: Option<f64>,
+    /// The workspace server's `check_program` command; empty: no such tool.
+    pub check: Vec<String>,
 }
 
 /// What came of a decision.
@@ -154,6 +156,14 @@ const UNAVAILABLE: [&str; 12] = [
     "network is unreachable",
 ];
 
+/// What a CLI says when it was started wrongly: calling it again changes nothing.
+const MISCONFIGURED: &[&str] = &[
+    "invalid mcp configuration",
+    "mcp config file not found",
+    "unknown option",
+    "unexpected argument",
+];
+
 /// Whether a failed call's text says the agent is unavailable.
 pub fn unavailable(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
@@ -165,6 +175,8 @@ struct Launch {
     outcome: DecisionOutcome,
     timed_out: bool,
     unavailable: bool,
+    /// Started wrongly (`MISCONFIGURED`): not worth calling again.
+    misconfigured: bool,
 }
 
 impl CliAgent {
@@ -236,7 +248,7 @@ impl CliAgent {
 
     /// The invocation for `req`, and the prompt it is given.
     pub fn agent_run(&self, req: &DecisionRequest) -> (AgentRun, String) {
-        let ws = Workspace::new(&req.workspace, req.writable.clone());
+        let ws = Workspace::new(&req.workspace, req.writable.clone()).with_check(req.check.clone());
         let (program, prefix) = self
             .mcp_command
             .split_first()
@@ -288,6 +300,7 @@ impl CliAgent {
                 ..Default::default()
             },
             timed_out: false,
+            misconfigured: false,
         };
         if let Err(e) = std::fs::create_dir_all(&req.record)
             .map_err(|e| format!("{}: {e}", req.record.display()))
@@ -315,6 +328,7 @@ impl CliAgent {
             },
             timed_out: out.timed_out,
             unavailable: false,
+            misconfigured: false,
         };
         if out.timed_out {
             launch.outcome.error = Some(format!(
@@ -344,15 +358,23 @@ impl CliAgent {
         } else if out.exit_code == Some(0) && !unavailable_result(&clean) {
             self.started = true;
         } else {
-            launch.unavailable = unavailable(&text) || unavailable(&clean);
+            let stderr = redact(&out.stderr);
+            launch.unavailable = unavailable(&text) || unavailable(&clean) || unavailable(&stderr);
+            let lower = stderr.to_ascii_lowercase();
+            launch.misconfigured = MISCONFIGURED.iter().any(|w| lower.contains(w));
+            let said = if text.is_empty() {
+                stderr.as_str()
+            } else {
+                text.as_str()
+            };
             launch.outcome.error = Some(format!(
                 "{} exited with {:?}{}; its output is in {}",
                 self.cli.program(),
                 out.exit_code,
-                if text.is_empty() {
+                if said.trim().is_empty() {
                     String::new()
                 } else {
-                    format!(": {}", tail(&text))
+                    format!(": {}", tail(said))
                 },
                 out.transcript.display()
             ));
@@ -405,7 +427,7 @@ impl Backend for CliAgent {
             let Some(err) = out.error.clone() else {
                 return out;
             };
-            if l.timed_out {
+            if l.timed_out || l.misconfigured {
                 return out;
             }
             if l.unavailable {

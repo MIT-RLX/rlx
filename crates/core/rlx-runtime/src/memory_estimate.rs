@@ -450,14 +450,23 @@ mod tests {
             return;
         };
         assert!(before > 1 << 20, "RSS {before} B is not a running process");
-        // black_box: in release an unused buffer is optimised away
-        let buf = std::hint::black_box(vec![1u8; 64 << 20]);
-        let after = process_rss_bytes().unwrap();
-        assert!(
-            after >= before + (48 << 20),
-            "RSS {before} → {after} after touching 64 MiB"
+        // In a test binary the allocator holds memory other tests freed, already
+        // resident, and one buffer can come from there: RSS need not move. So
+        // the buffers are kept until they outgrow what it had.
+        let mut kept = Vec::new();
+        let mut after = before;
+        for _ in 0..24 {
+            // black_box: in release an unused buffer is optimised away
+            kept.push(std::hint::black_box(vec![1u8; 64 << 20]));
+            after = process_rss_bytes().unwrap();
+            if after >= before + (48 << 20) {
+                return;
+            }
+        }
+        panic!(
+            "RSS {before} → {after} after touching {} MiB",
+            kept.len() * 64
         );
-        drop(buf);
     }
 
     #[test]

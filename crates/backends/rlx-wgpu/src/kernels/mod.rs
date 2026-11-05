@@ -2242,6 +2242,17 @@ pub struct Kernel {
     pub bgl: wgpu::BindGroupLayout,
 }
 
+// SAFETY: in a shared-memory (atomics) wasm build a WebGPU object is a JS
+// value that exists only in the worker that made it, so wgpu's types are not
+// `Send`/`Sync` there. rlx-wgpu pins the device to the one thread that
+// initialised it (`device::wgpu_device` is `None` on every other thread), and a
+// pipeline can only be built from that device, so every `Kernel` is created
+// and used on that thread: the statics are never read from another one.
+#[cfg(all(target_family = "wasm", target_feature = "atomics"))]
+unsafe impl Send for Kernel {}
+#[cfg(all(target_family = "wasm", target_feature = "atomics"))]
+unsafe impl Sync for Kernel {}
+
 impl Kernel {
     pub fn bind_two(
         &self,

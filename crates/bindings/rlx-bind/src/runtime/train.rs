@@ -47,7 +47,9 @@ use rlx_optim::{
 };
 /// Learning-rate schedules ([`TrainingOptions::schedule`]).
 pub use rlx_optim::{LrSchedule, ScheduleKind};
-use rlx_runtime::train::{AdamSpec, FusedRule, MuonSpec, ResidentTrainer};
+use rlx_runtime::train::ResidentTrainer;
+/// The fused rules a device plan ([`Trainer::set_device_plan`]) is made of.
+pub use rlx_runtime::train::{AdamSpec, FusedRule, MuonSpec};
 use rlx_runtime::{CompiledGraph, Device, PrecisionPolicy};
 use serde_json::{Value, json};
 
@@ -583,6 +585,38 @@ pub struct Trainer {
     skipped: u64,
     /// Data-parallel: the ranks training replicas of this model on their own batches.
     group: Option<ProcessGroup>,
+    /// The resident path: what rebuilds its fused step ([`Self::set_device_plan`]).
+    rebuild: Option<Rebuild>,
+    /// The resident path's rules per param, once a device plan set them.
+    device_rules: Option<Vec<FusedRule>>,
+}
+
+/// What a resident trainer's fused step is built from, to build it again.
+struct Rebuild {
+    /// The rule of the trainer's own optimizer, every param's at the start.
+    rule: FusedRule,
+    forward: Graph,
+    slots: Vec<rlx_runtime::train::TrainableParam>,
+    options: rlx_runtime::CompileOptions,
+}
+
+/// A resident trainer's whole state, as [`Trainer::device_state`] reads it:
+/// the params, the moments, each param's step count and the rules.
+#[derive(Clone, Debug)]
+pub struct DeviceState {
+    params: HashMap<String, Vec<f32>>,
+    moments: Vec<(String, Vec<f32>, Vec<f32>)>,
+    steps: Vec<u64>,
+    rules: Option<Vec<FusedRule>>,
+}
+
+impl DeviceState {
+    /// Bytes it holds.
+    pub fn bytes(&self) -> usize {
+        let p: usize = self.params.values().map(Vec::len).sum();
+        let m: usize = self.moments.iter().map(|(_, m, v)| m.len() + v.len()).sum();
+        4 * (p + m)
+    }
 }
 
 /// What [`Trainer::step_with`]'s update knows about its step besides the params.
@@ -843,6 +877,8 @@ impl Trainer {
             scale_good: 0,
             skipped: 0,
             group: None,
+            rebuild: None,
+            device_rules: None,
         })
     }
 
@@ -885,79 +921,8 @@ impl Trainer {
                  the fused path never brings them back. Drop one of the two.",
             ));
         }
-        let o = Opts::new("optimizer", &spec.options)?;
-        let rule = match kind.as_str() {
-            "muon" => {
-                let d = Muon::new(spec.lr);
-                Some(FusedRule::Muon(MuonSpec {
-                    lr: spec.lr,
-                    momentum: o.f32("momentum", d.momentum)?,
-                    nesterov: o.bool("nesterov", d.nesterov)?,
-                    weight_decay: o.f32("weight_decay", d.weight_decay)?,
-                    ns_steps: d.ns_steps,
-                    ns_coeffs: d.ns_coeffs,
-                    adamw: None,
-                    muon_scale: 1.0,
-                }))
-            }
-            "muon_adamw" => {
-                let d = MuonAdamW::new(spec.lr);
-                let scale = o.f32("muon_scale", d.muon_scale)?;
-                let adamw = AdamSpec {
-                    lr: spec.lr,
-                    beta1: o.f32("beta1", d.adamw.beta1)?,
-                    beta2: o.f32("beta2", d.adamw.beta2)?,
-                    eps: o.f32("eps", d.adamw.eps)?,
-                    weight_decay: o.f32("weight_decay", 0.0)?,
-                };
-                Some(FusedRule::Muon(MuonSpec {
-                    lr: spec.lr * scale,
-                    momentum: o.f32("momentum", d.muon.momentum)?,
-                    nesterov: o.bool("nesterov", d.muon.nesterov)?,
-                    weight_decay: 0.0,
-                    ns_steps: d.muon.ns_steps,
-                    ns_coeffs: d.muon.ns_coeffs,
-                    adamw: Some(adamw),
-                    muon_scale: scale,
-                }))
-            }
-            _ => None,
-        };
-        // Defaults come from the host optimizer this replaces: `AdamW::new`
-        // defaults `weight_decay` to 0.01 (as PyTorch does), and hardcoding 0
-        // here once trained a different objective on the two paths.
-        let (d_beta1, d_beta2, d_eps, d_wd) = if kind == "adam" {
-            let d = Adam::new(spec.lr);
-            (d.beta1, d.beta2, d.eps, d.weight_decay)
-        } else {
-            let d = AdamW::new(spec.lr);
-            (d.beta1, d.beta2, d.eps, d.weight_decay)
-        };
-        let weight_decay = if rule.is_some() {
-            0.0
-        } else {
-            o.f32("weight_decay", d_wd)?
-        };
-        // Classic Adam folds L2 into the gradient; the fused graph implements
-        // AdamW's decoupled decay — different algorithms when decay is nonzero.
-        if kind == "adam" && weight_decay != 0.0 {
-            return Err(ApiError::type_(
-                "Trainer(resident) with 'adam' and a nonzero weight_decay / weightDecay: classic \
-                 Adam folds \
-                 decay into the gradient, while the fused update applies AdamW's decoupled \
-                 decay. Use 'adamw', or drop `resident`.",
-            ));
-        }
-        let rule = match rule {
-            Some(r) => r,
-            None => FusedRule::Adam(AdamSpec {
-                lr: spec.lr,
-                beta1: o.f32("beta1", d_beta1)?,
-                beta2: o.f32("beta2", d_beta2)?,
-                eps: o.f32("eps", d_eps)?,
-                weight_decay,
-            }),
-        };
+        let rule = fused_rule(&spec)
+            .map_err(|e| ApiError::new(e.kind, format!("Trainer(resident): {}", e.message)))?;
         let slots: Vec<rlx_runtime::train::TrainableParam> = cfg
             .wrt
             .iter()
@@ -1009,6 +974,13 @@ impl Trainer {
             scale_good: 0,
             skipped: 0,
             group: None,
+            rebuild: Some(Rebuild {
+                rule,
+                forward,
+                slots,
+                options: compile_opts,
+            }),
+            device_rules: None,
         })
     }
 
@@ -1049,6 +1021,16 @@ impl Trainer {
     }
 
     fn resident_step(&mut self, inputs: &[(&str, &[f32])], evaluate_only: bool) -> ApiResult<f32> {
+        self.resident_run(inputs, evaluate_only, false)
+            .map(|(loss, _)| loss)
+    }
+
+    fn resident_run(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        evaluate_only: bool,
+        grad_norms: bool,
+    ) -> ApiResult<(f32, Vec<f32>)> {
         let pairs = Self::with_seed(inputs);
         let trainer = self
             .resident
@@ -1059,20 +1041,207 @@ impl Trainer {
             self.lr = lr;
             trainer.set_lr(lr);
         }
-        let outputs = catch("Trainer step (resident)", || {
+        let (outputs, norms) = catch("Trainer step (resident)", || {
             if evaluate_only {
-                trainer.forward_only(&pairs)
+                (trainer.forward_only(&pairs), Vec::new())
+            } else if grad_norms {
+                trainer.step_with_grad_norms(&pairs)
             } else {
-                trainer.step(&pairs)
+                (trainer.step(&pairs), Vec::new())
             }
         })?;
         if !evaluate_only {
             self.steps = trainer.steps();
         }
-        Ok(outputs
+        let loss = outputs
             .first()
             .and_then(|o| o.first().copied())
-            .unwrap_or(f32::NAN))
+            .unwrap_or(f32::NAN);
+        Ok((loss, norms))
+    }
+
+    /// The resident path: give each trainable param (in [`Self::trainable`]'s
+    /// order) its own fused rule and learning rate for the next steps — an
+    /// optimizer program's groups on the device. The rates alone change
+    /// nothing compiled; different rules build the fused step again, keeping
+    /// the params, and each param's moments and step count where `carry` says
+    /// (else from zero) → whether it was rebuilt.
+    pub fn set_device_plan(
+        &mut self,
+        rules: &[FusedRule],
+        lrs: &[f32],
+        carry: &[bool],
+    ) -> ApiResult<bool> {
+        let n = self.names.len();
+        if rules.len() != n || lrs.len() != n || carry.len() != n {
+            return Err(ApiError::type_(format!(
+                "Trainer.set_device_plan: {n} trainable params, but {} rules, {} rates and {} carry flags",
+                rules.len(),
+                lrs.len(),
+                carry.len()
+            )));
+        }
+        if self.resident.is_none() {
+            return Err(ApiError::type_(
+                "Trainer.set_device_plan: a device plan is for a resident trainer",
+            ));
+        }
+        let rebuilt = self.device_rules.as_deref() != Some(rules);
+        if rebuilt {
+            // Moments mean the same only within a family of rules.
+            let old: Vec<FusedRule> = match (&self.device_rules, &self.rebuild) {
+                (Some(r), _) => r.clone(),
+                (None, Some(rb)) => vec![rb.rule; n],
+                (None, None) => rules.to_vec(),
+            };
+            let same = |a: &FusedRule, b: &FusedRule| match (a, b) {
+                (FusedRule::Adam(_), FusedRule::Adam(_)) => true,
+                (FusedRule::Muon(x), FusedRule::Muon(y)) => x.adamw.is_some() == y.adamw.is_some(),
+                _ => false,
+            };
+            let carry: Vec<bool> = (0..n)
+                .map(|i| carry[i] && same(&old[i], &rules[i]))
+                .collect();
+            let t = self.resident.as_mut().expect("checked above");
+            let steps = t.param_steps().unwrap_or_else(|| vec![t.steps(); n]);
+            let mut moments = t.moments();
+            for (i, (_, m, v)) in moments.iter_mut().enumerate() {
+                if !carry[i] {
+                    m.fill(0.0);
+                    v.fill(0.0);
+                }
+            }
+            let state = DeviceState {
+                params: t.params(),
+                moments,
+                steps: steps
+                    .iter()
+                    .zip(&carry)
+                    .map(|(&s, &c)| if c { s } else { 0 })
+                    .collect(),
+                rules: Some(rules.to_vec()),
+            };
+            self.rebuild_resident(&state)?;
+        }
+        let t = self.resident.as_mut().expect("checked above");
+        for (name, &lr) in self.names.iter().zip(lrs) {
+            t.set_param_lr(name, lr);
+        }
+        Ok(rebuilt)
+    }
+
+    /// Build the resident step again for `state`'s rules, then load its
+    /// params, moments and step counts (the total step count stays).
+    fn rebuild_resident(&mut self, state: &DeviceState) -> ApiResult<()> {
+        let (Some(rb), Some(old)) = (self.rebuild.as_ref(), self.resident.as_ref()) else {
+            return Err(ApiError::type_("Trainer: not a resident trainer"));
+        };
+        let total = old.steps();
+        let mut seed: HashMap<String, Vec<f32>> = self.fixed.iter().cloned().collect();
+        seed.extend(state.params.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let device = self.device;
+        let mut t = match &state.rules {
+            Some(rules) => catch("Trainer(resident) rebuild", || {
+                ResidentTrainer::with_rules(
+                    &rb.forward,
+                    &rb.slots,
+                    &seed,
+                    rules,
+                    device,
+                    &rb.options,
+                )
+            })?,
+            None => {
+                return Err(ApiError::type_(
+                    "Trainer: this device state has no rules per param to rebuild with",
+                ));
+            }
+        }
+        .map_err(|e| ApiError::type_(format!("Trainer(resident): {e}")))?;
+        t.restore_moments(&state.moments, total);
+        for (name, &s) in self.names.iter().zip(&state.steps) {
+            t.set_param_steps(name, s);
+        }
+        for (name, &held) in self.names.iter().zip(&self.frozen) {
+            if held {
+                t.set_frozen(name, true);
+            }
+        }
+        self.resident = Some(t);
+        self.device_rules = state.rules.clone();
+        Ok(())
+    }
+
+    /// The resident path: params, moments, step counts and rules, read back
+    /// from the device (a copy of the whole state: for undoing a trial).
+    pub fn device_state(&mut self) -> ApiResult<DeviceState> {
+        let rules = self.device_rules.clone();
+        let t = self
+            .resident
+            .as_mut()
+            .ok_or_else(|| ApiError::type_("Trainer.device_state: not a resident trainer"))?;
+        let n = self.names.len();
+        Ok(DeviceState {
+            steps: t.param_steps().unwrap_or_else(|| vec![t.steps(); n]),
+            params: t.params(),
+            moments: t.moments(),
+            rules,
+        })
+    }
+
+    /// Back to a [`Self::device_state`]: its rules, params, moments and step
+    /// counts (the total step count stays).
+    pub fn set_device_state(&mut self, state: &DeviceState) -> ApiResult<()> {
+        if state.rules.is_some() && self.device_rules != state.rules {
+            return self.rebuild_resident(state);
+        }
+        let t = self
+            .resident
+            .as_mut()
+            .ok_or_else(|| ApiError::type_("Trainer.set_device_state: not a resident trainer"))?;
+        let total = t.steps();
+        t.set_params(&state.params);
+        t.restore_moments(&state.moments, total);
+        for (name, &s) in self.names.iter().zip(&state.steps) {
+            t.set_param_steps(name, s);
+        }
+        Ok(())
+    }
+
+    /// The learning rate the next step's schedule (or `set_lr`) sets, when one does.
+    pub fn next_lr(&self) -> Option<f32> {
+        match &self.training.schedule {
+            Some(s) => Some((self.base_lr as f64 * s.factor(self.steps())) as f32),
+            None => self.lr_driven.then_some(self.lr),
+        }
+    }
+
+    /// The learning rate the trainer's own schedule gives after `step`
+    /// updates (`None` without a schedule).
+    pub fn lr_at(&self, step: u64) -> Option<f32> {
+        let s = self.training.schedule.as_ref()?;
+        Some((self.base_lr as f64 * s.factor(step)) as f32)
+    }
+
+    /// Whether the update is fused into the graph (`resident`), on device
+    /// buffers or not.
+    pub fn is_fused(&self) -> bool {
+        self.resident.is_some()
+    }
+
+    /// The resident path's [`Self::step`], also reading back each trainable
+    /// param's gradient norm (in [`Self::trainable`]'s order) → (the loss, the
+    /// norms): one scalar per param, no gradient download.
+    pub fn step_with_grad_norms(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+    ) -> ApiResult<(f32, Vec<f32>)> {
+        if self.resident.is_none() {
+            return Err(ApiError::type_(
+                "Trainer.step_with_grad_norms: for a resident trainer (the host path has the gradients)",
+            ));
+        }
+        self.resident_run(inputs, false, true)
     }
 
     /// One optimizer update on `inputs` → the loss.
@@ -1330,6 +1499,21 @@ impl Trainer {
             .is_some_and(ResidentTrainer::is_resident)
     }
 
+    /// The trainable params' values, in [`Self::trainable`]'s order (read
+    /// back from the device on the resident path).
+    pub fn trainable_params(&mut self) -> Vec<Vec<f32>> {
+        match self.resident.as_mut() {
+            Some(t) => {
+                let mut all = t.params();
+                self.names
+                    .iter()
+                    .map(|n| all.remove(n).unwrap_or_default())
+                    .collect()
+            }
+            None => self.values.clone(),
+        }
+    }
+
     /// Every parameter, trainable and fixed — feed it straight to an inference
     /// graph's `set_params`. (Returning only the trainable set once left a
     /// LoRA run's base weights at zero at evaluation.)
@@ -1562,6 +1746,92 @@ impl RunStats {
     }
 }
 
+/// The fused (device) form of the optimizer `spec`, for the resident path:
+/// `adam`, `adamw`, `muon` or `muon_adamw` with their options; an error for
+/// any other kind, and for `adam` with weight decay (classic Adam's L2 is not
+/// AdamW's decoupled decay).
+pub fn fused_rule(spec: &OptimizerSpec) -> ApiResult<FusedRule> {
+    if !FUSED_KINDS.contains(&spec.kind.as_str()) {
+        return Err(ApiError::type_(format!(
+            "only {} are fused into the graph; '{}' runs on the host",
+            FUSED_KINDS.join(", "),
+            spec.kind
+        )));
+    }
+    let o = Opts::new("optimizer", &spec.options)?;
+    let rule = match spec.kind.as_str() {
+        "muon" => {
+            let d = Muon::new(spec.lr);
+            Some(FusedRule::Muon(MuonSpec {
+                lr: spec.lr,
+                momentum: o.f32("momentum", d.momentum)?,
+                nesterov: o.bool("nesterov", d.nesterov)?,
+                weight_decay: o.f32("weight_decay", d.weight_decay)?,
+                ns_steps: d.ns_steps,
+                ns_coeffs: d.ns_coeffs,
+                adamw: None,
+                muon_scale: 1.0,
+            }))
+        }
+        "muon_adamw" => {
+            let d = MuonAdamW::new(spec.lr);
+            let scale = o.f32("muon_scale", d.muon_scale)?;
+            let adamw = AdamSpec {
+                lr: spec.lr,
+                beta1: o.f32("beta1", d.adamw.beta1)?,
+                beta2: o.f32("beta2", d.adamw.beta2)?,
+                eps: o.f32("eps", d.adamw.eps)?,
+                weight_decay: o.f32("weight_decay", 0.0)?,
+            };
+            Some(FusedRule::Muon(MuonSpec {
+                lr: spec.lr * scale,
+                momentum: o.f32("momentum", d.muon.momentum)?,
+                nesterov: o.bool("nesterov", d.muon.nesterov)?,
+                weight_decay: 0.0,
+                ns_steps: d.muon.ns_steps,
+                ns_coeffs: d.muon.ns_coeffs,
+                adamw: Some(adamw),
+                muon_scale: scale,
+            }))
+        }
+        _ => None,
+    };
+    // Defaults come from the host optimizer this replaces: `AdamW::new`
+    // defaults `weight_decay` to 0.01 (as PyTorch does), and hardcoding 0
+    // here once trained a different objective on the two paths.
+    let (d_beta1, d_beta2, d_eps, d_wd) = if spec.kind == "adam" {
+        let d = Adam::new(spec.lr);
+        (d.beta1, d.beta2, d.eps, d.weight_decay)
+    } else {
+        let d = AdamW::new(spec.lr);
+        (d.beta1, d.beta2, d.eps, d.weight_decay)
+    };
+    let weight_decay = if rule.is_some() {
+        0.0
+    } else {
+        o.f32("weight_decay", d_wd)?
+    };
+    // Classic Adam folds L2 into the gradient; the fused graph implements
+    // AdamW's decoupled decay — different algorithms when decay is nonzero.
+    if spec.kind == "adam" && weight_decay != 0.0 {
+        return Err(ApiError::type_(
+            "'adam' with a nonzero weight_decay / weightDecay: classic Adam folds decay into the \
+             gradient, while the fused update applies AdamW's decoupled decay. Use 'adamw', or \
+             run on the host.",
+        ));
+    }
+    Ok(match rule {
+        Some(r) => r,
+        None => FusedRule::Adam(AdamSpec {
+            lr: spec.lr,
+            beta1: o.f32("beta1", d_beta1)?,
+            beta2: o.f32("beta2", d_beta2)?,
+            eps: o.f32("eps", d_eps)?,
+            weight_decay,
+        }),
+    })
+}
+
 /// The optimizer kinds the resident path fuses into the graph.
 pub const FUSED_KINDS: [&str; 4] = ["adam", "adamw", "muon", "muon_adamw"];
 
@@ -1569,6 +1839,7 @@ impl Trainer {
     /// Where param `name`'s state goes in a checkpoint, as the host optimizer
     /// of this kind names it: the first moment's (or momentum's) slot, and
     /// whether a second moment `v/` exists.
+    #[cfg(feature = "gguf-io")]
     fn state_slots(&self) -> HashMap<String, (&'static str, bool)> {
         self.names
             .iter()

@@ -11,8 +11,28 @@
 //   0 = F16
 //   1 = BF16
 
+// Compiled by NVRTC (CUDA) and by hipRTC (ROCm), which has no `cuda_*.h`.
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#endif
+
+// f32 -> bf16, round to nearest even (NaN stays a quiet NaN).
+__device__ __forceinline__ unsigned short rlx_f32_to_bf16_rn(float v) {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+    unsigned int u = __float_as_uint(v);
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+        return (unsigned short)((u >> 16) | 0x0040u);
+    }
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (unsigned short)(u >> 16);
+#else
+    __nv_bfloat16 h = __float2bfloat16_rn(v);
+    return *reinterpret_cast<const unsigned short*>(&h);
+#endif
+}
 
 extern "C" __global__ void cast_f32_to_half(
     const float* __restrict__ src,
@@ -28,8 +48,7 @@ extern "C" __global__ void cast_f32_to_half(
         __half h = __float2half_rn(v);
         out = *reinterpret_cast<const unsigned short*>(&h);
     } else {
-        __nv_bfloat16 h = __float2bfloat16_rn(v);
-        out = *reinterpret_cast<const unsigned short*>(&h);
+        out = rlx_f32_to_bf16_rn(v);
     }
     dst[i] = out;
 }

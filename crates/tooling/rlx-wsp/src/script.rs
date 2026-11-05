@@ -132,16 +132,26 @@ pub fn audit_code(ws: &WeightSpace, code: &str) -> Result<(), String> {
 /// when it returns nothing).
 pub fn run(ws: &WeightSpace, code: &str) -> Result<Value, String> {
     let spec = ws.spec();
-    let params: serde_json::Map<String, Value> = ws
+    let mut params: serde_json::Map<String, Value> = ws
         .state
         .params
         .iter()
         .map(|(n, t)| (n.clone(), json!({ "rows": t.rows, "cols": t.cols })))
         .collect();
+    // A package's own weights, edited or not.
+    if let Some(store) = ws.store() {
+        for n in store.names() {
+            if let Some((rows, cols)) = store.view_shape(n) {
+                params
+                    .entry(n.clone())
+                    .or_insert_with(|| json!({ "rows": rows, "cols": cols }));
+            }
+        }
+    }
     let spec_js = json!({
         "obs_labels": spec.obs_labels,
         "actions": spec.actions,
-        "widths": ws.state.mlp.widths,
+        "nodes": ws.nodes().unwrap_or_default().iter().filter_map(|n| n["name"].as_str().map(str::to_string)).collect::<Vec<_>>(),
         "params": params,
     });
     let source = format!(
@@ -151,6 +161,29 @@ pub fn run(ws: &WeightSpace, code: &str) -> Result<Value, String> {
     );
     let mut ctx = quickrs_core::context::Context::new();
     ctx.set_instruction_budget(Some(INSTRUCTION_BUDGET));
+    let value = ctx
+        .eval(&source)
+        .map_err(|e| format!("script error: {}", ctx.format_exception(&e)))?;
+    let text = ctx
+        .to_rust_string(&value)
+        .map_err(|e| format!("script error: {}", ctx.format_exception(&e)))?;
+    serde_json::from_str(&text).map_err(|e| format!("script returned non-JSON ({e}): {text}"))
+}
+
+/// Run `code` (a function body) with `globals` (`name` → JSON value) in
+/// scope, under `budget` instructions; its JSON return value. The updater
+/// and analysis programs of an agent-steered training run use this.
+pub fn run_with(code: &str, globals: &[(&str, &Value)], budget: u64) -> Result<Value, String> {
+    let mut decls = String::new();
+    for (name, v) in globals {
+        decls.push_str(&format!("const {name} = {v};\n"));
+    }
+    let source = format!(
+        "{decls}(function () {{ const r = (function () {{\n{code}\n}})(); \
+         return r === undefined ? 'null' : JSON.stringify(r); }})()",
+    );
+    let mut ctx = quickrs_core::context::Context::new();
+    ctx.set_instruction_budget(Some(budget));
     let value = ctx
         .eval(&source)
         .map_err(|e| format!("script error: {}", ctx.format_exception(&e)))?;

@@ -81,11 +81,20 @@ pub mod op_registry;
 pub mod supported_ops;
 pub use supported_ops::SUPPORTED_OPS;
 pub mod pool;
+#[cfg(rlx_cpu_sparse_lu)]
+pub mod sparse_lu;
 pub mod splat;
 pub mod thunk;
 pub mod tile;
 pub mod training_bwd;
 pub mod umap_knn;
 pub mod vmath;
+/// The wasm SIMD intrinsics: `core::arch::wasm32`, or on Memory64 the same
+/// set under `core::arch::wasm64` (nightly `simd_wasm64`, which `build.py
+/// --mem64` turns on for every crate).
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+pub(crate) use core::arch::wasm32 as wasm_arch;
+#[cfg(all(target_arch = "wasm64", target_feature = "simd128"))]
+pub(crate) use core::arch::wasm64 as wasm_arch;
 #[cfg(all(target_family = "wasm", target_feature = "simd128"))]
 mod wasm_gemm;

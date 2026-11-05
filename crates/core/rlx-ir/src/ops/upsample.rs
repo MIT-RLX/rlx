@@ -131,6 +131,32 @@ impl Graph {
         }
         let batch: usize = (0..rank - 1).map(|i| xs.dim(i).unwrap_static()).product();
 
+        // Nearest is a gather along the last axis: O(L_out) indices where the
+        // one-hot matrix below is O(L_in·L_out). For U-Sleep's 61440-sample
+        // input the top decoder level's matrix was 30720 × 61440 floats, a
+        // 7 GiB constant (wgpu refused it, past its 4 GiB buffer cap; in the
+        // browser it never finished). The values are the matmul's, except
+        // that a gather copies -0, ±inf and NaN as they are, which a one-hot
+        // product cannot (0·inf is NaN): a gather is what torch does.
+        if mode == InterpMode::Nearest {
+            assert!(
+                l_in <= 1 << 24,
+                "interpolate1d: {l_in} samples overflow f32 indices"
+            );
+            let idx: Vec<f32> = (0..l_out)
+                .map(|j| {
+                    let pos = if l_out == 1 {
+                        0.0
+                    } else {
+                        j as f32 * (l_in as f32 - 1.0) / (l_out as f32 - 1.0)
+                    };
+                    ((pos + 0.5) as usize).min(l_in - 1) as f32
+                })
+                .collect();
+            let idx = self.const_f32_tensor(idx, &[l_out]);
+            return self.gather_(x, idx, rank - 1);
+        }
+
         // Host-build the [L_in, L_out] interpolation matrix W, so that
         // out[.., j] = Σ_i x[.., i]·W[i, j].
         let mut w = vec![0f32; l_in * l_out];

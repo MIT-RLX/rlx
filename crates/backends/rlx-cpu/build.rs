@@ -10,6 +10,7 @@ fn main() {
     // targets where we deliberately don't set it (aarch64 Linux, wasm).
     println!("cargo:rustc-check-cfg=cfg(rlx_cpu_blas)");
     println!("cargo:rustc-check-cfg=cfg(rlx_cpu_blas_accelerate)");
+    println!("cargo:rustc-check-cfg=cfg(rlx_cpu_sparse_lu)");
     println!("cargo:rustc-check-cfg=cfg(rlx_cpu_blas_openblas)");
     println!("cargo:rustc-check-cfg=cfg(rlx_cpu_blas_mkl)");
 
@@ -85,6 +86,11 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=Accelerate");
         println!("cargo:rustc-cfg=rlx_cpu_blas");
         println!("cargo:rustc-cfg=rlx_cpu_blas_accelerate");
+        // Accelerate's sparse LU (`sparse_lu`, macOS 15.5+) through a C shim:
+        // its API is overloaded inlines
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+            build_sparse_lu_shim();
+        }
         return;
     }
 
@@ -336,4 +342,40 @@ fn find_windows_openblas_lib(
         }
     }
     None
+}
+
+/// `csrc/sparse_lu.c` into a static library (the compiler `$CC`, else
+/// `clang`); on success `rlx_cpu_sparse_lu` for `src/sparse_lu.rs`
+fn build_sparse_lu_shim() {
+    println!("cargo:rerun-if-changed=csrc/sparse_lu.c");
+    println!("cargo:rerun-if-env-changed=CC");
+    let out = std::env::var("OUT_DIR").unwrap();
+    let cc = std::env::var("CC").unwrap_or_else(|_| "clang".into());
+    let obj = format!("{out}/rlx_sparse_lu.o");
+    let ok = std::process::Command::new(&cc)
+        .args([
+            "-O2",
+            "-Wno-unguarded-availability-new",
+            "-c",
+            "csrc/sparse_lu.c",
+            "-o",
+            &obj,
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        && std::process::Command::new("ar")
+            .args(["crs", &format!("{out}/librlx_sparse_lu.a"), &obj])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    if ok {
+        println!("cargo:rustc-link-search=native={out}");
+        println!("cargo:rustc-link-lib=static=rlx_sparse_lu");
+        println!("cargo:rustc-cfg=rlx_cpu_sparse_lu");
+    } else {
+        println!(
+            "cargo:warning=rlx-cpu: the sparse LU shim did not build ({cc}); `sparse_lu` is off"
+        );
+    }
 }

@@ -12,6 +12,7 @@
 //!   `bilinear_zpk`), `zpk2tf`, `zpk2sos`, `lfilter`, `sosfilt`, `lfilter_zi`,
 //!   `sosfilt_zi`, `filtfilt`, `sosfiltfilt`.
 //! * [`fir`] — `firwin` and the cosine-sum windows.
+//! * [`resample`] — `resample_poly`, `upfirdn`, the Kaiser window and Cephes `i0`.
 //! * [`complex`] — NumPy's `complex128` arithmetic as NumPy rounds it.
 //!
 //! **Why the spelling matters.** SciPy's inner loops are C/Cython compiled by
@@ -23,3 +24,4 @@
 pub mod complex;
 pub mod fir;
 pub mod iir;
+pub mod resample;

@@ -833,6 +833,50 @@ impl Plan {
         self.largest_texture().map_or(0, |(_, r, c)| r.max(c))
     }
 
+    /// Precomputed index-table entries (`u32`s) per step kind, largest first,
+    /// with each kind's single largest table: what a plan holds in host
+    /// memory and uploads as index textures, beyond the tensors themselves.
+    pub fn index_table_stats(&self) -> Vec<(&'static str, usize, usize)> {
+        let mut by: std::collections::BTreeMap<&'static str, (usize, usize)> = Default::default();
+        let mut add = |k: &'static str, n: usize| {
+            let e = by.entry(k).or_default();
+            e.0 += n;
+            e.1 = e.1.max(n);
+        };
+        for s in &self.steps {
+            match s {
+                Step::Gather { idx, .. } => add("Gather", idx.len()),
+                Step::Reduce { groups, .. } => add("Reduce", groups.len()),
+                Step::ArgReduce { groups, .. } => add("ArgReduce", groups.len()),
+                Step::GatherRuntime { which, base, .. } => {
+                    add("GatherRuntime", which.len() + base.len())
+                }
+                Step::ScatterRuntime {
+                    ibase, ubase, key, ..
+                } => add("ScatterRuntime", ibase.len() + ubase.len() + key.len()),
+                _ => {}
+            }
+        }
+        let mut v: Vec<_> = by.into_iter().map(|(k, (n, m))| (k, n, m)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+
+    /// Steps per IR op that emitted them (the origin of each step's output
+    /// slot), most first: where a plan's size comes from.
+    pub fn steps_by_origin(&self) -> Vec<(String, usize)> {
+        let mut by: std::collections::HashMap<&str, usize> = Default::default();
+        for s in &self.steps {
+            let o = self.slot_origin.get(s.out()).map_or("?", String::as_str);
+            // the op kind, not its shape, so one op's steps group together
+            *by.entry(o.split(['(', ' ', '[']).next().unwrap_or(o))
+                .or_default() += 1;
+        }
+        let mut v: Vec<_> = by.into_iter().map(|(k, n)| (k.to_string(), n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+
     /// `(origin, rows, cols)` of the slot with the longest texture side.
     pub fn largest_texture(&self) -> Option<(&str, usize, usize)> {
         let (i, &(r, c)) = self
@@ -1374,11 +1418,39 @@ const NATIVE_BACKWARD: &[OpKind] = &[OpKind::ReluBackward, OpKind::ActivationBac
 /// RNN ops and every `*Backward` op down to the small kernel set the WebGL
 /// executor implements. Then each remaining node is lowered to a [`Step`].
 pub fn build_plan(graph: &Graph) -> Result<Plan> {
+    let stats = rlx_ir::env::flag("RLX_WEBGL_PLAN_STATS");
+    let show = |stage: &str, g: &Graph| {
+        if stats {
+            eprintln!(
+                "rlx-webgl legalize {stage}: {} nodes, {}",
+                g.len(),
+                op_histogram(g)
+            );
+        }
+    };
+    show("input", graph);
     let g = fold_conv3d_bias(graph.clone());
     let g = rlx_autodiff::decompose_backward_ops_except(g, NATIVE_BACKWARD);
+    show("decomposed", &g);
     let g = rlx_fusion::unfuse_dit_modulation(g);
     let g = rlx_compile::rewrite_for_backend(g, supported_ops());
+    show("rewritten", &g);
     lower(&g)
+}
+
+/// The most frequent op kinds of `g` (`RLX_WEBGL_PLAN_STATS`).
+fn op_histogram(g: &Graph) -> String {
+    let mut by: std::collections::HashMap<String, usize> = Default::default();
+    for n in g.nodes() {
+        *by.entry(format!("{:?}", n.op.kind())).or_default() += 1;
+    }
+    let mut v: Vec<_> = by.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.iter()
+        .take(12)
+        .map(|(k, n)| format!("{k} {n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Most axes a [`Step::Broadcast`] takes (its shader's uniform arrays).

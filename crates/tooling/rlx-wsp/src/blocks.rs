@@ -7,23 +7,19 @@
 //! Agents writing programs into weights rebuild the same few circuits by hand
 //! every time — relays, thresholds, AND gates, "only when the paddle is
 //! here" gates, comparators. A block writes one of them into chosen units of a
-//! layer, activation-aware (a tanh unit is "off" at −1, a ReLU unit at 0),
-//! replacing those units' incoming column and bias. Inputs are the layer's
-//! row labels (observation labels for layer 0, `l{k-1}.hI` above).
+//! node, activation-aware (a tanh unit is "off" at −1, a ReLU unit at 0),
+//! replacing those units' incoming column and bias, found in the graph.
+//! Inputs are the row labels of that weight (observation labels for the
+//! first layer, unit labels above).
 //!
-//! `insert_layer` adds a hidden layer that relays its input, so the network
-//! computes (almost) the same function and the new layer is free to program:
-//! exact for ReLU (identity on non-negative inputs); for tanh the relay runs
-//! at gain ε and the next layer is scaled by 1/ε (error ≈ ε²/3 ≈ 3·10⁻⁵).
+//! New programmable layers come from `insert_linear`
+//! ([`crate::WeightSpace::insert_linear`]), a graph rewrite that works on
+//! any network.
 
-use crate::mlp::{Act, MlpSpec};
-use crate::space::{RowKey, Tensor, WeightSpace};
+use crate::mlp::Act;
+use crate::space::{RowKey, WeightSpace};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
-
-/// Gain of the tanh relay in [`insert_layer`].
-const TANH_RELAY_GAIN: f32 = 0.01;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "block", rename_all = "snake_case", deny_unknown_fields)]
@@ -92,57 +88,69 @@ fn half() -> f32 {
     0.5
 }
 
-/// The layer `units` live in (`l{k}.hI`, an output label, or indices with
-/// `layer`).
-fn target_layer(ws: &WeightSpace, units: &[RowKey], layer: Option<usize>) -> Result<usize, String> {
-    if let Some(k) = layer {
-        return Ok(k);
-    }
-    for u in units {
-        if let RowKey::Label(l) = u
-            && let Some(k) = l
-                .strip_prefix('l')
-                .and_then(|s| s.split_once(".h"))
-                .and_then(|(k, _)| k.parse().ok())
-        {
-            return Ok(k);
-        }
-    }
-    if units.iter().all(|u| matches!(u, RowKey::Label(_))) {
-        // Output labels (actions / digits) are columns of the last layer.
-        return Ok(ws.state.mlp.n_layers() - 1);
-    }
-    Err("give `layer` when units are indices".into())
-}
-
-/// Apply `block` to `units` of `layer`; returns what was written.
+/// Apply `block` to `units` (all channels of one node); returns what was
+/// written. Units are `node[i]`, MLP aliases (`l0.h3`), channel labels
+/// (action / digit names), or indices with `node`. The weight column and
+/// bias producing each channel are found in the graph, so blocks work on any
+/// node fed by a linear map.
 pub fn inject(
     ws: &mut WeightSpace,
     block: Block,
     units: Vec<RowKey>,
-    layer: Option<usize>,
+    node: Option<String>,
 ) -> Result<Value, String> {
-    if ws.state.graph.is_some() {
-        return Err("blocks address MLP layers".into());
-    }
-    let k = target_layer(ws, &units, layer)?;
-    if k >= ws.state.mlp.n_layers() {
-        return Err(format!("no layer {k}"));
-    }
-    let wname = format!("l{k}.w");
-    let bname = format!("l{k}.b");
-    let cols: Vec<usize> = units
+    let resolved: Vec<crate::graphops::Unit> = units
         .iter()
-        .map(|u| ws.resolve_col(&wname, u))
+        .map(|u| match (u, &node) {
+            (RowKey::Index(i), Some(n)) => Ok(crate::graphops::Unit {
+                node: n.clone(),
+                index: *i,
+            }),
+            (RowKey::Index(_), None) => Err("give `node` when units are indices".to_string()),
+            (RowKey::Label(l), _) => ws.resolve_unit(l),
+        })
         .collect::<Result<_, _>>()?;
+    let target = resolved.first().ok_or("no units")?.node.clone();
+    if resolved.iter().any(|u| u.node != target) {
+        return Err("all units of one block must be channels of the same node".into());
+    }
+    let g = ws.base_graph()?;
+    let id =
+        crate::graphops::find_node(&g, &target).ok_or_else(|| format!("no node `{target}`"))?;
+    let cp = crate::graphops::channel_params(&g, id);
+    let wname = cp
+        .weight
+        .ok_or_else(|| format!("`{target}` is not fed by a linear map with a param weight"))?;
+    let bname = cp.bias;
+    let cols: Vec<usize> = resolved.iter().map(|u| u.index).collect();
+    // An input is a row label of the weight, or a unit `node[i]` of a node
+    // the weight reads (row `i`).
     let rows = |ws: &WeightSpace, keys: &[RowKey]| -> Result<Vec<usize>, String> {
-        keys.iter().map(|r| ws.resolve_row(&wname, r)).collect()
+        keys.iter()
+            .map(|r| {
+                ws.resolve_row(&wname, r).or_else(|e| {
+                    let RowKey::Label(l) = r else { return Err(e) };
+                    let u = ws.resolve_unit(l).map_err(|_| e.clone())?;
+                    let reads = crate::graphops::find_node(&g, &u.node).is_some_and(|n| {
+                        crate::graphops::channel_params(&g, n)
+                            .readers
+                            .contains(&wname)
+                    });
+                    if reads { Ok(u.index) } else { Err(e) }
+                })
+            })
+            .collect()
     };
-    let output_layer = k + 1 == ws.state.mlp.n_layers();
-    let act = ws.state.mlp.act;
-    // Default gains: saturate tanh firmly; ReLU passes values as they are.
+    let output_layer = g.outputs.first() == Some(&id);
+    // The activation the channels go through decides gains and off levels.
+    let act = match &g.node(id).op {
+        rlx_ir::Op::Activation(rlx_ir::op::Activation::Tanh) => Some(Act::Tanh),
+        rlx_ir::Op::Activation(_) => Some(Act::Relu),
+        _ => None,
+    };
+    // Default gains: saturate tanh firmly; ReLU / linear pass values as they are.
     let gain_or =
-        |g: Option<f32>, tanh: f32| g.unwrap_or(if act == Act::Tanh { tanh } else { 1.0 });
+        |g: Option<f32>, tanh: f32| g.unwrap_or(if act == Some(Act::Tanh) { tanh } else { 1.0 });
     // Each target column: (input rows with weights, bias).
     let mut plan: Vec<(usize, Vec<(usize, f32)>, f32)> = Vec::new();
     let kind;
@@ -240,7 +248,7 @@ pub fn inject(
             plan.push((cols[1], lt, -g * margin));
         }
     }
-    write_plan(ws, &wname, &bname, &plan, kind, output_layer)
+    write_plan(ws, &wname, bname.as_deref(), &plan, kind, output_layer)
 }
 
 /// Threshold halfway between the closest input sums on either side of the
@@ -258,7 +266,7 @@ fn logic_theta(and: bool, n: f32, levels: &str) -> Result<f32, String> {
 fn write_plan(
     ws: &mut WeightSpace,
     wname: &str,
-    bname: &str,
+    bname: Option<&str>,
     plan: &[(usize, Vec<(usize, f32)>, f32)],
     kind: &str,
     output_layer: bool,
@@ -276,12 +284,18 @@ fn write_plan(
         }
         Ok(())
     })?;
-    ws.edit(bname, &note, |t| {
-        for (c, _, b) in plan {
-            t.data[*c] = *b;
+    match bname {
+        Some(bname) => ws.edit(bname, &note, |t| {
+            for (c, _, b) in plan {
+                t.data[*c] = *b;
+            }
+            Ok(())
+        })?,
+        None if plan.iter().any(|(_, _, b)| *b != 0.0) => {
+            return Err("this block needs a bias but the node has none".into());
         }
-        Ok(())
-    })?;
+        None => {}
+    }
     Ok(json!({
         "block": kind,
         "output_layer": output_layer,
@@ -291,92 +305,5 @@ fn write_plan(
             "inputs": inputs.iter().map(|(r, w)| json!([rl[*r], w])).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "note": "each unit's incoming column and bias were replaced; its outgoing weights are unchanged",
-    }))
-}
-
-/// Insert a relay layer after hidden layer `after` (0-based); `width`
-/// (default: that layer's width) may add spare units, which start at zero.
-/// Checkpoints are dropped (shapes change).
-pub fn insert_layer(
-    ws: &mut WeightSpace,
-    after: usize,
-    width: Option<usize>,
-) -> Result<Value, String> {
-    if ws.state.graph.is_some() || !ws.state.networks.is_empty() {
-        return Err("insert_layer works on single-MLP spaces".into());
-    }
-    let mlp = ws.state.mlp.clone();
-    let hidden = mlp.n_layers() - 1;
-    if after >= hidden {
-        return Err(format!(
-            "`after` must name a hidden layer 0..{}",
-            hidden.saturating_sub(1)
-        ));
-    }
-    let w0 = mlp.widths[after + 1];
-    let w = width.unwrap_or(w0);
-    if w < w0 {
-        return Err(format!(
-            "width must be at least {w0} to relay layer {after}"
-        ));
-    }
-    let (gain, scale) = match mlp.act {
-        Act::Relu => (1.0, 1.0),
-        Act::Tanh => (TANH_RELAY_GAIN, 1.0 / TANH_RELAY_GAIN),
-    };
-    let old = ws.state.params.clone();
-    let mut params: BTreeMap<String, Tensor> = BTreeMap::new();
-    let n = mlp.n_layers();
-    for l in 0..=n {
-        // New layer index l; the inserted layer is l = after + 1.
-        if l == after + 1 {
-            let mut relay = Tensor::zeros(w0, w);
-            for i in 0..w0 {
-                relay.data[i * w + i] = gain;
-            }
-            params.insert(format!("l{l}.w"), relay);
-            params.insert(format!("l{l}.b"), Tensor::zeros(1, w));
-            continue;
-        }
-        let src = if l > after + 1 { l - 1 } else { l };
-        let mut wt = old[&format!("l{src}.w")].clone();
-        if l == after + 2 {
-            // Reads the relay: undo the tanh gain, pad rows for spare units.
-            let mut t = Tensor::zeros(w, wt.cols);
-            for r in 0..wt.rows {
-                for c in 0..wt.cols {
-                    t.data[r * wt.cols + c] = wt.at(r, c) * scale;
-                }
-            }
-            wt = t;
-        }
-        params.insert(format!("l{l}.w"), wt);
-        params.insert(format!("l{l}.b"), old[&format!("l{src}.b")].clone());
-    }
-    let mut widths = mlp.widths.clone();
-    widths.insert(after + 2, w);
-    let dropped = ws.state.checkpoints.len();
-    ws.state.checkpoints.clear();
-    ws.set_architecture(
-        MlpSpec {
-            widths: widths.clone(),
-            act: mlp.act,
-        },
-        params,
-    );
-    ws.state
-        .log
-        .push(format!("insert_layer after l{after}: widths {widths:?}"));
-    Ok(json!({
-        "widths": widths,
-        "inserted": format!("l{}", after + 1),
-        "renamed": format!("layers after it shift up by one (old l{} is now l{})", after + 1, after + 2),
-        "relay": if mlp.act == Act::Tanh {
-            format!("tanh relay at gain {TANH_RELAY_GAIN}, next layer scaled by {scale}; output changes by ~1e-4")
-        } else {
-            "exact ReLU relay".to_string()
-        },
-        "spare_units": w - w0,
-        "checkpoints_dropped": dropped,
     }))
 }

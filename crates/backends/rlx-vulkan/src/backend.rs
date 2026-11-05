@@ -480,6 +480,59 @@ enum Step {
     },
 }
 
+/// Dispatches one GPU segment records at most (`RLX_VULKAN_SEGMENT_DISPATCHES`,
+/// `0` = no limit).
+///
+/// A segment is one submission, and a driver kills a submission that runs past
+/// its job timeout: amdgpu resets the ring after about 2 s, which a long graph
+/// on an integrated GPU reaches in one command buffer (a 44.1 kHz codec
+/// decode on RADV: the ring reset, the context lost, the output garbage). Runs
+/// longer than this are split into consecutive submissions, each waited on
+/// before the next, so a hazard across the split is ordered by the wait.
+pub(crate) const SEGMENT_DISPATCHES: usize = 256;
+
+/// Workgroups one GPU segment dispatches at most (`RLX_VULKAN_SEGMENT_WORKGROUPS`,
+/// `0` = no limit) — the bound that tracks a segment's running time, since a
+/// dispatch's work grows with its input where the dispatch count does not.
+/// [`SEGMENT_DISPATCHES`] stays as a backstop for many small dispatches.
+pub(crate) const SEGMENT_WORKGROUPS: u64 = 1 << 21;
+
+fn limit(name: &str, default: u64) -> u64 {
+    match rlx_ir::env::var(name).map(|v| v.parse::<u64>()) {
+        Some(Ok(0)) => u64::MAX,
+        Some(Ok(n)) => n,
+        _ => default,
+    }
+}
+
+/// Where the segment starting at `start` ends, within `start..end`: before the
+/// dispatch that would pass either limit, but never empty.
+fn segment_end(schedule: &[Step], start: usize, end: usize) -> usize {
+    let dispatches = limit("RLX_VULKAN_SEGMENT_DISPATCHES", SEGMENT_DISPATCHES as u64);
+    let budget = limit("RLX_VULKAN_SEGMENT_WORKGROUPS", SEGMENT_WORKGROUPS);
+    let mut work = 0u64;
+    let mut j = start;
+    while j < end {
+        let groups = match &schedule[j] {
+            Step::Gpu { groups, .. } => groups.0 as u64 * groups.1 as u64 * groups.2 as u64,
+            _ => 0,
+        };
+        let count = (j - start) as u64;
+        if j > start && (count >= dispatches || work.saturating_add(groups) > budget) {
+            break;
+        }
+        work = work.saturating_add(groups);
+        j += 1;
+    }
+    if rlx_ir::env::flag("RLX_VULKAN_DEBUG") {
+        eprintln!(
+            "rlx-vulkan: segment of {} dispatches, {work} workgroups",
+            j - start
+        );
+    }
+    j
+}
+
 /// A pre-recorded execution segment. The schedule is partitioned into maximal
 /// runs of GPU dispatches (each recorded ONCE into a reusable command buffer at
 /// compile time) separated by CPU host-fallback ops. At run time a GPU segment
@@ -1685,60 +1738,68 @@ impl VulkanExecutable {
                 if gpu.is_empty() {
                     continue;
                 }
-                dev.submit_and_wait(|cmd| unsafe {
-                    let barrier = vk::MemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                        .dst_access_mask(
-                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                        );
-                    for (j, step) in gpu.iter().enumerate() {
-                        if let Step::Gpu {
-                            kernel,
-                            push,
-                            groups,
-                            act_shard,
-                        } = step
-                        {
-                            let desc_set = desc_sets
-                                .get(*act_shard as usize)
-                                .copied()
-                                .unwrap_or(desc_sets[0]);
-                            dev.device.cmd_bind_descriptor_sets(
-                                cmd,
-                                vk::PipelineBindPoint::COMPUTE,
-                                layout,
-                                0,
-                                &[desc_set],
-                                &[],
+                // Bounded submissions, as `record_segments` makes them.
+                let mut bounds = vec![0];
+                while *bounds.last().unwrap() < gpu.len() {
+                    let at = *bounds.last().unwrap();
+                    bounds.push(segment_end(&gpu, at, gpu.len()));
+                }
+                for gpu in bounds.windows(2).map(|w| &gpu[w[0]..w[1]]) {
+                    dev.submit_and_wait(|cmd| unsafe {
+                        let barrier = vk::MemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .dst_access_mask(
+                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
                             );
-                            let pipeline = kern.pipeline(kernel);
-                            dev.device.cmd_bind_pipeline(
-                                cmd,
-                                vk::PipelineBindPoint::COMPUTE,
-                                pipeline,
-                            );
-                            dev.device.cmd_push_constants(
-                                cmd,
-                                layout,
-                                vk::ShaderStageFlags::COMPUTE,
-                                0,
+                        for (j, step) in gpu.iter().enumerate() {
+                            if let Step::Gpu {
+                                kernel,
                                 push,
-                            );
-                            dev.device.cmd_dispatch(cmd, groups.0, groups.1, groups.2);
-                            if j + 1 < gpu.len() {
-                                dev.device.cmd_pipeline_barrier(
+                                groups,
+                                act_shard,
+                            } = step
+                            {
+                                let desc_set = desc_sets
+                                    .get(*act_shard as usize)
+                                    .copied()
+                                    .unwrap_or(desc_sets[0]);
+                                dev.device.cmd_bind_descriptor_sets(
                                     cmd,
-                                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                                    vk::DependencyFlags::empty(),
-                                    &[barrier],
-                                    &[],
+                                    vk::PipelineBindPoint::COMPUTE,
+                                    layout,
+                                    0,
+                                    &[desc_set],
                                     &[],
                                 );
+                                let pipeline = kern.pipeline(kernel);
+                                dev.device.cmd_bind_pipeline(
+                                    cmd,
+                                    vk::PipelineBindPoint::COMPUTE,
+                                    pipeline,
+                                );
+                                dev.device.cmd_push_constants(
+                                    cmd,
+                                    layout,
+                                    vk::ShaderStageFlags::COMPUTE,
+                                    0,
+                                    push,
+                                );
+                                dev.device.cmd_dispatch(cmd, groups.0, groups.1, groups.2);
+                                if j + 1 < gpu.len() {
+                                    dev.device.cmd_pipeline_barrier(
+                                        cmd,
+                                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                                        vk::DependencyFlags::empty(),
+                                        &[barrier],
+                                        &[],
+                                        &[],
+                                    );
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
                 self.arena.sync_host_after_gpu();
             }
             // A copy right after GPU work (`Op::KvAppend` writing a computed
@@ -2037,8 +2098,11 @@ fn record_segments(
         while i < n && matches!(schedule[i], Step::Gpu { .. }) {
             i += 1;
         }
-        if i > start {
-            let run = &schedule[start..i];
+        let mut chunk_start = start;
+        while chunk_start < i {
+            let chunk_end = segment_end(schedule, chunk_start, i);
+            let run = &schedule[chunk_start..chunk_end];
+            chunk_start = chunk_end;
             let run_deps = &deps[dep_i..dep_i + run.len()];
             dep_i += run.len();
             let cmd = dev.alloc_primary_cmd();

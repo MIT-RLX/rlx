@@ -44,6 +44,7 @@ fn run_metal_dequant(scheme_id: u32, block_bytes: &[u8], num_blocks: u32) -> Vec
     enc.set_bytes(3, 4, &scheme_id as *const u32 as *const _);
     enc.set_bytes(4, 4, &num_blocks as *const u32 as *const _);
     enc.set_buffer(5, Some(k.iq_grid_buffer()), 0);
+    enc.set_buffer(6, Some(&arena), 0);
     let grid = MTLSize {
         width: num_blocks as u64,
         height: 1,

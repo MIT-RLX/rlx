@@ -20,8 +20,12 @@ pub(crate) fn promote_scalar(g: &mut Graph, value: Scalar, dtype_hint: DType) ->
                 g.constant(fv, DType::F32)
             }
         }
+        // A float literal against an f64 tensor is an f64 constant (as
+        // `pyrlx/dsl.py` does): an f32 one came out as garbage, `x * 2.0` →
+        // denormals, `x + 1.0` → x. (Python also gives f16/bf16 literals the
+        // tensor's dtype; left as it was here.)
         Scalar::Float(v) => {
-            if dtype_hint.is_integral() {
+            if dtype_hint.is_integral() || dtype_hint == DType::F64 {
                 g.constant(v, dtype_hint)
             } else {
                 g.constant(v, DType::F32)

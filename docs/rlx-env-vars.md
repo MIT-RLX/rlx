@@ -13,8 +13,8 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 809  
-**Unregistered mentions (migration leftovers):** 142
+**Registered names:** 815  
+**Unregistered mentions (migration leftovers):** 144
 
 ## Groups
 
@@ -28,7 +28,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [fft](#fft) — 13
 - [gpu](#gpu) — 8
 - [gpu-host](#gpu-host) — 1
-- [metal](#metal) — 210
+- [metal](#metal) — 213
 - [misc](#misc) — 113
 - [mlx](#mlx) — 30
 - [oneapi](#oneapi) — 5
@@ -38,8 +38,8 @@ semantics. Curated Public list: `just env-catalog`.
 - [rocm](#rocm) — 35
 - [runtime](#runtime) — 29
 - [tpu](#tpu) — 4
-- [vulkan](#vulkan) — 19
-- [webgl](#webgl) — 2
+- [vulkan](#vulkan) — 21
+- [webgl](#webgl) — 3
 - [wgpu](#wgpu) — 111
 - [xdna](#xdna) — 20
 
@@ -333,6 +333,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_METAL_ATTN_BWD_GPU` | Bisect | Bool | Backend(metal) | Run attention backward on the GPU; set 0 to host it |
 | `RLX_METAL_ATTN_TRACE` | Bisect | Bool | Backend(metal) | Trace Metal attention kernel selection |
 | `RLX_METAL_BF16W_DISABLE` | Internal | Bool | Backend(metal) | Decode-sized (M <= 4) BF16-weight matmuls unpack to f32 + GEMM instead of reading bf16 in-kernel |
+| `RLX_METAL_BF16W_ROWS_DISABLE` | Internal | Bool | Backend(metal) | 2-8 row BF16-weight matmuls skip the split-K multi-row GEMV (one thread per column up to 4 rows, f32 unpack + GEMM above) |
 | `RLX_METAL_BMM_MPS` | Bisect | Bool | Backend(metal) | Encode f32 BatchedSgemm as one MPS matmul per matrix instead of one bmm_simd_4x4 dispatch |
 | `RLX_METAL_CMDBUF_TRACE` | Bisect | Bool | Backend(metal) | Trace Metal command-buffer status transitions |
 | `RLX_METAL_CONCAT_HOST` | Bisect | Bool | Backend(metal) | Opt in to the host-staged Metal Concat fallback |
@@ -416,6 +417,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_METAL_NO_CONV3D_FOLDS` | Bisect | Bool | Backend(metal) | Disable every Conv3D epilogue thunk fold at once (bisect the fold path as a whole) |
 | `RLX_METAL_NO_CONV3D_LEAKY_FOLD` | Bisect | Bool | Backend(metal) | Disable folding LeakyReLU into the Conv3D kernel |
 | `RLX_METAL_NO_CONV3D_UPSAMPLE_FOLD` | Bisect | Bool | Backend(metal) | Disable folding a nearest-neighbour Upsample into the Conv3D gather |
+| `RLX_METAL_NO_FUSED_ELEMENTWISE` | Public | Bool | Compile | Keep pure elementwise programs on per-op kernels, not one generated kernel |
 | `RLX_METAL_NO_FUSE_NARROW_CLUSTERS` | Bisect | Bool | Backend(metal) | Disable Metal's Narrow->SplitLastAxis merge; leaves the arena plan byte-identical, so a verdict change under it means a thunk-reordering bug, not a layout one |
 | `RLX_METAL_NO_FUSION` | Bisect | Bool | Backend(metal) | Skip every Metal pattern fusion |
 | `RLX_METAL_NO_SGEMM64` | Bisect | Bool | Backend(metal) | Disable the default 64x64-tile Simd64 sgemm (fall back to Simd4x4) for aligned tall/short-K matmuls. |
@@ -425,6 +427,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_METAL_ONNX_QMATMUL_GPU` | Bisect | Bool | Backend(metal) | Run ONNX quantized matmul on the GPU; set 0 to host it |
 | `RLX_METAL_ONNX_QMATMUL_MIN_FLOPS` | Bisect | U64 | Backend(metal) | FLOP threshold above which ONNX qmatmul goes to the GPU |
 | `RLX_METAL_OUTPUT_TRACE` | Bisect | Bool | Backend(metal) | Trace each graph output read back from Metal |
+| `RLX_METAL_PAD_HOST` | Bisect | Bool | Backend(metal) | Run every Metal Pad on the host, as before zero-fill pads moved to the GPU |
 | `RLX_METAL_PARAMS` | Public | String | Backend(metal) | Apple kernel tuning spec, `k=v,...` (stages/sync/precision/tile/encode) |
 | `RLX_METAL_PARAM_DIAG` | Internal | String | Backend(metal) | Diagnose parameter uploads larger than 1 MB |
 | `RLX_METAL_PIPELINE_CACHE` | Bisect | Path | Backend(metal) | On-disk Metal pipeline-state cache directory |
@@ -820,6 +823,8 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_VULKAN_NOCACHE` | Bisect | Bool | Backend(vulkan) | Disable the command-buffer cache; re-record every run |
 | `RLX_VULKAN_SCAN_ALL` | Bisect | Bool | Backend(vulkan) | Scan every buffer for NaN/Inf after each run |
 | `RLX_VULKAN_SCHEDULE_MATMUL` | Internal | String | Backend(vulkan) | Source for the GLSL matmul kernel: schedule-IR emitted vs handwritten |
+| `RLX_VULKAN_SEGMENT_DISPATCHES` | Internal | U64 | Backend(vulkan) | Dispatches per Vulkan submission before a long run is split (0 = no limit), against driver job timeouts |
+| `RLX_VULKAN_SEGMENT_WORKGROUPS` | Internal | U64 | Backend(vulkan) | Workgroups per Vulkan submission before a long run is split (0 = no limit), against driver job timeouts |
 | `RLX_VULKAN_SHARD_LOG` | Bisect | Bool | Backend(vulkan) | Log Vulkan buffer sharding decisions |
 | `RLX_VULKAN_SHARD_STAGE_MIB` | Internal | String | Backend(vulkan) | Staging-window size in MiB for sharded Vulkan uploads |
 | `RLX_VULKAN_VALIDATION` | Bisect | Bool | Backend(vulkan) | Enable the Khronos validation layer |
@@ -830,6 +835,7 @@ semantics. Curated Public list: `just env-catalog`.
 |------|-----------|------|-------|---------|
 | `RLX_WEBGL_MAX_TEXTURE` | Bisect | U64 | Backend(webgl) | Texture side limit the native WebGL planner enforces (default 16384, desktop browsers) |
 | `RLX_WEBGL_NO_FOLD_ACT` | Bisect | Bool | Backend(webgl) | Run each activation as its own pass instead of in the conv3d / group-norm step writing its input |
+| `RLX_WEBGL_PLAN_STATS` | Internal | Bool | Backend(webgl) | Print each WebGL plan's cost at compile: steps, slots, planning time, index tables, steps per IR op |
 
 ## wgpu
 
@@ -1042,6 +1048,7 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_LOCATEANYTHING_DIR` | `rig.sh` |
 | `RLX_LR` | `docs/benchmarks/coreml-training.md` |
 | `RLX_MAGIC` | `crates/io/rlx-bake/src/format.rs` |
+| `RLX_METAL_FUSED_ELEMENTWISE_MIXED` | `crates/backends/rlx-metal/src/fused_ew.rs` |
 | `RLX_METAL_GDN_NATIVE` | `crates/core/rlx-runtime/tests/cpu_gated_delta_net_parity.rs` |
 | `RLX_METAL_GDN_SG` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_METAL_IQ` | `crates/backends/rlx-metal/README.md` |
@@ -1118,6 +1125,7 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_VERBSE` | `crates/core/rlx-ir/src/env_registry.rs` |
 | `RLX_VERSION` | `crates/core/rlx-ir/src/rlxmodel/mod.rs` |
 | `RLX_WHISPER_DIR` | `rig.sh` |
+| `RLX_WSP_EXE` | `crates/tooling/rlx-wsp/src/jobs.rs` |
 | `RLX_XCFRAMEWORK` | `Justfile` |
 | `RLX_ZZZZZZZZZZZZZZZZZZZZ` | `crates/core/rlx-ir/src/env_registry.rs` |
 

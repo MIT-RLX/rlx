@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The warm/cold codec reads and writes standard zstd frames whichever
-//! implementation is built (`ruzstd`, or libzstd with `zstd-native`): frames
+//! implementation is built (`zstd-rs`, or zstd-pure-rs with `zstd-native`): frames
 //! libzstd wrote decode through the crate, and the crate's frames decode with
 //! both libzstd and ruzstd.
 
@@ -109,4 +109,47 @@ fn an_oversized_block_is_refused() {
     // declare one byte less than the frame holds
     blob[8..16].copy_from_slice(&(raw.len() as u64 - 1).to_le_bytes());
     assert!(decode_zstd_blocks(&blob).is_err());
+}
+
+/// With `zstd-native` the warm tier is libzstd's encoder (zstd-pure-rs, a Rust
+/// translation): the blob is byte-for-byte what `zstd::encode_all` at level 3
+/// produced when rlx-pkg linked libzstd, so earlier bakes reproduce exactly.
+#[cfg(feature = "zstd-native")]
+#[test]
+fn zstd_native_writes_libzstds_bytes() {
+    for (n, block) in [
+        (700_000usize, 1usize << 20),
+        (5, 1 << 20),
+        (300_000, 64 << 10),
+        (0, 1 << 20),
+    ] {
+        let raw = weights(n);
+        let blob = encode_zstd_blocks(&raw, block as u32).unwrap();
+        assert!(
+            blob == zblk_by_libzstd(&raw, block, 3),
+            "{n} f32s in {block}-byte blocks"
+        );
+    }
+    // text-like (long matches) as well as weight-like bytes
+    let text: Vec<u8> = (0..200_000)
+        .flat_map(|i: u32| format!("{{\"k\":{},\"v\":\"abc{}\"}}", i % 97, i % 13).into_bytes())
+        .collect();
+    assert!(encode_zstd_blocks(&text, 1 << 20).unwrap() == zblk_by_libzstd(&text, 1 << 20, 3));
+}
+
+/// A frame cut short is an error, not a short block.
+#[test]
+fn a_truncated_frame_is_refused() {
+    let raw = weights(50_000);
+    let blob = zblk_by_libzstd(&raw, 1 << 20, 3);
+    let one = frames(&blob)[0].to_vec();
+    let mut cut = blob.clone();
+    let l = one.len() as u32 - 5;
+    cut[20..24].copy_from_slice(&l.to_le_bytes());
+    cut.truncate(24 + l as usize);
+    assert!(
+        decode_zstd_blocks(&cut).is_err(),
+        "a truncated frame must not decode"
+    );
+    assert_eq!(decode_zstd_blocks(&blob).unwrap(), raw);
 }

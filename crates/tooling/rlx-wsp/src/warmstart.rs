@@ -98,6 +98,7 @@ fn teacher_data(env: EnvKind, episodes: usize, seed: u64) -> Result<(Vec<f32>, V
         | EnvKind::ReadDigit
         | EnvKind::AuditPair
         | EnvKind::MnistSteer
+        | EnvKind::Qa
         | EnvKind::Graph => {
             return Err("warmstart is for control tasks with a reference controller".into());
         }

@@ -175,7 +175,7 @@ impl Lanes for f32 {
 
 #[cfg(all(target_family = "wasm", target_feature = "simd128"))]
 pub(crate) mod simd {
-    use core::arch::wasm32::*;
+    use crate::wasm_arch::*;
 
     /// Exact `a·b + c` per lane. The product of two floats is exact in a
     /// double, so the double sum `s` is the exact value rounded once, and
@@ -922,7 +922,7 @@ mod simd_tests {
     //! fused multiply-add against [`super::fmaf`] (which `native_fma_tests`
     //! checks against hardware FMA).
     use super::Lanes;
-    use core::arch::wasm32::*;
+    use crate::wasm_arch::*;
 
     fn rng(seed: u64) -> impl FnMut() -> u32 {
         let mut s = seed | 1;
