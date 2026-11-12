@@ -389,6 +389,29 @@ mod capabilities_tests {
 /// See [`crate::ExecutableCapabilities`] for the optional feature bits and a
 /// table of which trait methods belong to which group. Core execution is
 /// `set_param` / `run` (and friends); everything else defaults to unsupported.
+/// Where a compiled executable's device memory went (today: Metal). Lets a
+/// caller check that weights were shared, folded and packed as intended —
+/// e.g. in a test, so a regression that puts a second copy of the weights in
+/// the activation arena fails loudly instead of only costing memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryStats {
+    /// The activation arena (which also holds small params kept inline).
+    pub arena_bytes: usize,
+    /// The separate weight buffer; 0 without one.
+    pub weight_buffer_bytes: usize,
+    /// Params in the weight buffer.
+    pub weight_params: usize,
+    /// Of those, mapped from another executable's copy (a sharing scope).
+    pub shared_weight_params: usize,
+    /// Weights stored as slices of a fused weight pack.
+    pub packed_weights: usize,
+    /// Weight transposes the GEMM reads in place, never allocated.
+    pub folded_weight_transposes: usize,
+    /// Runs as one MPSGraph / as MPSGraph segments between kernels.
+    pub mpsgraph: bool,
+    pub mpsgraph_hybrid: bool,
+}
+
 pub trait ExecutableGraph: Send {
     /// Advisory optional-feature bitmask. Default: all clear. Override when
     /// you implement MoE / GPU handles / typed I/O / etc. Callers must still
@@ -741,6 +764,11 @@ pub trait ExecutableGraph: Send {
     fn param_already_set(&self, name: &str) -> bool {
         let _ = name;
         false
+    }
+
+    /// Where this executable's memory went, on backends that report it.
+    fn memory_stats(&self) -> Option<MemoryStats> {
+        None
     }
 
     /// Downcast hook for [`Self::copy_params_from`]. Backends override when supported.

@@ -59,6 +59,8 @@ pub struct MetalExecutable {
     shared_resident: std::collections::HashSet<NodeId>,
     /// Weights stored as slices of a pack param (`weight_packs`), by name.
     pack_parts: HashMap<String, weight_packs::PackPart>,
+    /// Weight transposes read in place by their GEMM (`fold_weight_transposes`).
+    folded_weight_transposes: usize,
     /// Pre-resolved (name, byte_offset, max_f32_len) per input — for run_slots.
     input_slots: Vec<(String, usize, usize)>,
     output_slots: Vec<(usize, usize)>, // (byte_offset, f32_len)
@@ -479,6 +481,45 @@ impl MetalExecutable {
         unsafe {
             let dst = (buf.contents() as *mut u8).add(slot.offset);
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, len);
+        }
+    }
+}
+
+/// Where an executable's memory went: what a caller checks to see that
+/// weights were shared, folded and packed as intended, without reading logs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryStats {
+    /// The activation arena (also holding small, inline params).
+    pub arena_bytes: usize,
+    /// The separate weight buffer, 0 without one.
+    pub weight_buffer_bytes: usize,
+    /// Params in the weight buffer.
+    pub weight_params: usize,
+    /// Of those, mapped from another executable's copy (sharing scope).
+    pub shared_weight_params: usize,
+    /// Weights stored as slices of a fused pack (`RLX_METAL_NO_WEIGHT_PACKS`).
+    pub packed_weights: usize,
+    /// Weight transposes read in place, never allocated.
+    pub folded_weight_transposes: usize,
+    /// Runs as one MPSGraph, or as MPSGraph segments between thunks.
+    pub mpsgraph: bool,
+    pub mpsgraph_hybrid: bool,
+}
+
+impl MetalExecutable {
+    pub fn memory_stats(&self) -> MemoryStats {
+        MemoryStats {
+            arena_bytes: self.arena.buffer.length() as usize,
+            weight_buffer_bytes: self
+                .weight_buffer
+                .as_ref()
+                .map_or(0, |b| b.length() as usize),
+            weight_params: self.weight_slots.len(),
+            shared_weight_params: self.shared_resident.len(),
+            packed_weights: self.pack_parts.len(),
+            folded_weight_transposes: self.folded_weight_transposes,
+            mpsgraph: self.mps_plan.is_some(),
+            mpsgraph_hybrid: self.mps_hybrid.is_some(),
         }
     }
 }

@@ -54,6 +54,7 @@ const INLINED_HERE: &[OpKind] = &[
 /// Call after fusion / LIR→graph and before `compile_thunks` / memory plan.
 pub fn prepare_graph_for_thunks(graph: Graph) -> Graph {
     let graph = expand_cpu_nop_fused(graph);
+    let graph = fuse_strided_softmax(graph);
     // I32 / U32 stay integers; f32-computing ops get casts around them.
     let graph = crate::int_storage::legalize_int_storage(graph);
     // TransformRegion / BatchElementwiseRegion → ResizeNearest2x + ElementwiseRegion
@@ -332,5 +333,157 @@ mod tests {
                 .any(|n| matches!(n.op, Op::FusedConvBiasAct { .. })),
             "FusedConvBiasAct must expand before thunks"
         );
+    }
+}
+
+/// `perm` swaps `axis` with the last axis and moves nothing else.
+fn swap_with_last(perm: &[usize]) -> Option<usize> {
+    let last = perm.len().checked_sub(1)?;
+    let axis = perm
+        .iter()
+        .enumerate()
+        .find(|&(i, &p)| i != p)
+        .map(|(i, _)| i)?;
+    let ok = axis < last
+        && perm[axis] == last
+        && perm[last] == axis
+        && perm
+            .iter()
+            .enumerate()
+            .all(|(i, &p)| i == axis || i == last || i == p);
+    ok.then_some(axis)
+}
+
+/// Undo `LowerSoftmaxAxis` where the CPU kernel does not need it.
+///
+/// That pass turns a softmax over a non-last axis into `Transpose(axis <-> last)
+/// -> Softmax(last) -> Transpose back`, because most backends only reduce
+/// contiguous runs. The CPU thunk normalises along any axis by stride
+/// (`softmax_strided`), so the two transposes are pure cost: on a segmentation
+/// network's `[1, C, D, H, W]` channel softmax they are two full copies of the
+/// output, which measured larger than every convolution layer combined but one.
+///
+/// Rewritten back to `Softmax { axis }` only for the exact shape that pass emits
+/// (single-use transposes, the same swap both sides, f32), and before memory
+/// planning, so buffer lifetimes are computed for the graph that runs.
+pub fn fuse_strided_softmax(g: Graph) -> Graph {
+    let mut uses: HashMap<NodeId, usize> = HashMap::new();
+    for n in g.nodes() {
+        for &i in &n.inputs {
+            *uses.entry(i).or_insert(0) += 1;
+        }
+    }
+    let outputs: std::collections::HashSet<NodeId> = g.outputs.iter().copied().collect();
+    let single = |id: NodeId| uses.get(&id) == Some(&1) && !outputs.contains(&id);
+    let mut replace: HashMap<NodeId, (NodeId, usize)> = HashMap::new();
+    let mut skip: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    for t2 in g.nodes() {
+        let Op::Transpose { perm } = &t2.op else {
+            continue;
+        };
+        let Some(axis) = swap_with_last(perm) else {
+            continue;
+        };
+        let Some(&s_id) = t2.inputs.first() else {
+            continue;
+        };
+        let s = g.node(s_id);
+        let rank = s.shape.rank() as i32;
+        let Op::Softmax { axis: s_axis } = s.op else {
+            continue;
+        };
+        if !(s_axis == rank - 1 || s_axis == -1) {
+            continue;
+        }
+        let Some(&t1_id) = s.inputs.first() else {
+            continue;
+        };
+        let t1 = g.node(t1_id);
+        let Op::Transpose { perm: p1 } = &t1.op else {
+            continue;
+        };
+        let Some(&x_id) = t1.inputs.first() else {
+            continue;
+        };
+        let x = g.node(x_id);
+        let f32_all = [&x.shape, &t1.shape, &s.shape, &t2.shape]
+            .iter()
+            .all(|sh| sh.dtype() == rlx_ir::DType::F32);
+        if p1 != perm
+            || !single(t1_id)
+            || !single(s_id)
+            || !f32_all
+            || x.shape.dims() != t2.shape.dims()
+        {
+            continue;
+        }
+        replace.insert(t2.id, (x_id, axis));
+        skip.insert(t1_id);
+        skip.insert(s_id);
+    }
+    if replace.is_empty() {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        if skip.contains(&node.id) {
+            continue;
+        }
+        let new_id = match replace.get(&node.id) {
+            Some(&(x, axis)) => out.add_node(
+                Op::Softmax { axis: axis as i32 },
+                vec![id_map[&x]],
+                node.shape.clone(),
+            ),
+            None => {
+                let ins: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+                out.add_node(node.op.clone(), ins, node.shape.clone())
+            }
+        };
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+#[cfg(test)]
+mod strided_softmax_tests {
+    use super::*;
+    use rlx_ir::{DType, Shape};
+
+    #[test]
+    fn the_transpose_sandwich_folds_back_into_one_softmax() {
+        let mut g = Graph::new("t");
+        let x = g.input("x", Shape::new(&[1, 3, 4, 5], DType::F32));
+        let s = g.softmax(x, 1, Shape::new(&[1, 3, 4, 5], DType::F32));
+        g.set_outputs(vec![s]);
+        let lowered = rlx_opt::rlx_fusion::LowerSoftmaxAxis.run(g);
+        assert!(
+            lowered
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::Transpose { .. }))
+        );
+        let fused = fuse_strided_softmax(lowered);
+        assert!(
+            !fused
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::Transpose { .. }))
+        );
+        assert!(
+            fused
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::Softmax { axis: 1 }))
+        );
+    }
+
+    #[test]
+    fn only_a_single_axis_swap_is_recognised() {
+        assert_eq!(swap_with_last(&[0, 4, 2, 3, 1]), Some(1));
+        assert_eq!(swap_with_last(&[0, 1, 2, 3]), None);
+        assert_eq!(swap_with_last(&[1, 2, 0]), None);
     }
 }

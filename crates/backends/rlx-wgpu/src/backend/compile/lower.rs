@@ -1034,7 +1034,10 @@ fn compile_static_with(
         && !rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS")
         && !rlx_ir::env::flag("RLX_WGPU_F16_MIRROR")
         && !crate::device::coop_discrete_backend()
-        && !graph.nodes().iter().any(|n| matches!(n.shape.dtype(), rlx_ir::DType::F16))
+        && !graph
+            .nodes()
+            .iter()
+            .any(|n| matches!(n.shape.dtype(), rlx_ir::DType::F16))
     {
         arena.f16_buffer = None;
     }

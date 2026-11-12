@@ -64,15 +64,31 @@ pub fn run(graph: Graph) -> Graph {
     legalize_custom_attention_mask(run_with_remap(graph).0)
 }
 
+/// As [`run`], for a backend whose binary kernel handles any broadcast between
+/// *static* shapes by strides (rlx-cpu's `BinaryFull`): only operands with a
+/// dynamic dimension, which that kernel indexes by modulo, are materialised.
+///
+/// The `Expand` is a full-size copy of the broadcast operand. For the
+/// conv-bias pattern `[N, C, D, H, W] + [1, C, 1, 1, 1]` that is one extra
+/// write and read of the whole activation per bias, scale and shift — on a
+/// SynthSeg U-Net over a 192×224×224 volume, 53–59% of the CPU forward pass.
+pub fn run_static_strided(graph: Graph) -> Graph {
+    legalize_custom_attention_mask(run_impl(graph, true).0)
+}
+
 /// Run the pass and additionally return a `NodeId` remap from old →
 /// new graph. Useful when callers need to translate references
 /// (inputs, params, outputs) they captured before legalization.
 pub fn run_with_remap(graph: Graph) -> (Graph, HashMap<NodeId, NodeId>) {
+    run_impl(graph, false)
+}
+
+fn run_impl(graph: Graph, keep_static: bool) -> (Graph, HashMap<NodeId, NodeId>) {
     let mut out = Graph::new(&graph.name);
     let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
 
     for node in graph.nodes() {
-        let new_id = legalize_node(node, &graph, &id_map, &mut out);
+        let new_id = legalize_node(node, &graph, &id_map, &mut out, keep_static);
         id_map.insert(node.id, new_id);
     }
 
@@ -86,6 +102,7 @@ fn legalize_node(
     fwd_graph: &Graph,
     id_map: &HashMap<NodeId, NodeId>,
     out: &mut Graph,
+    keep_static: bool,
 ) -> NodeId {
     let new_inputs: Vec<NodeId> = node.inputs.iter().map(|id| id_map[id]).collect();
 
@@ -98,6 +115,13 @@ fn legalize_node(
         let lhs_shape = fwd_graph.node(node.inputs[0]).shape.clone();
         let rhs_shape = fwd_graph.node(node.inputs[1]).shape.clone();
 
+        let static_ok = keep_static
+            && [&lhs_shape, &rhs_shape, out_shape]
+                .iter()
+                .all(|s| is_static(s));
+        if static_ok {
+            return out.add_node(node.op.clone(), new_inputs, node.shape.clone());
+        }
         let lhs_id = maybe_expand(new_inputs[0], &lhs_shape, out_shape, out);
         let rhs_id = maybe_expand(new_inputs[1], &rhs_shape, out_shape, out);
         return out.add_node(node.op.clone(), vec![lhs_id, rhs_id], node.shape.clone());
@@ -229,6 +253,10 @@ fn maybe_expand(id: NodeId, src: &Shape, target: &Shape, out: &mut Graph) -> Nod
         vec![id],
         target.clone(),
     )
+}
+
+fn is_static(s: &Shape) -> bool {
+    s.dims().iter().all(|d| matches!(d, Dim::Static(_)))
 }
 
 fn shape_eq(a: &Shape, b: &Shape) -> bool {

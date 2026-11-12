@@ -151,7 +151,10 @@ fn k333_matches_the_eight_channel_tile() {
         let mut g = Graph::new("k333_stack");
         let mut y = g.input("x", sh(&[1, 1, dims[0], dims[1], dims[2]]));
         for l in 0..3 {
-            let w = g.input(format!("w{l}"), sh(&[c, if l == 0 { 1 } else { c }, 3, 3, 3]));
+            let w = g.input(
+                format!("w{l}"),
+                sh(&[c, if l == 0 { 1 } else { c }, 3, 3, 3]),
+            );
             let b = g.input(format!("b{l}"), sh(&[c]));
             y = conv(&mut g, y, w, b, &vol, Some(Activation::Relu));
         }
@@ -160,10 +163,16 @@ fn k333_matches_the_eight_channel_tile() {
     };
     let mut data: Vec<(String, Vec<f32>)> = vec![("x".into(), ramp(dims.iter().product(), 1))];
     for l in 0..3 {
-        data.push((format!("w{l}"), ramp(c * if l == 0 { 1 } else { c } * 27, 2 + l)));
+        data.push((
+            format!("w{l}"),
+            ramp(c * if l == 0 { 1 } else { c } * 27, 2 + l),
+        ));
         data.push((format!("b{l}"), ramp(c, 7 + l)));
     }
-    let ins: Vec<(&str, &[f32])> = data.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+    let ins: Vec<(&str, &[f32])> = data
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_slice()))
+        .collect();
     let run = || WgpuExecutable::compile(build()).run(&ins).remove(0);
     let k333 = run();
     rlx_ir::env::set("RLX_WGPU_CONV3D_NO_K333", "1");
@@ -183,6 +192,10 @@ fn k333_matches_the_eight_channel_tile() {
     rlx_ir::env::set("RLX_WGPU_HALF_ACTIVATIONS", "0");
     let striped = run();
     rlx_ir::env::clear_overrides();
-    assert_eq!(bits(&striped_half), bits(&half), "striped half-packed = whole half-packed");
+    assert_eq!(
+        bits(&striped_half),
+        bits(&half),
+        "striped half-packed = whole half-packed"
+    );
     assert_eq!(bits(&striped), bits(&k333), "striped = whole");
 }

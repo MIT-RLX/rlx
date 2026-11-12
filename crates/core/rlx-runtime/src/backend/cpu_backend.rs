@@ -135,10 +135,9 @@ impl Backend for CpuBackend {
         // Session path: fusion may leave claimed fused/region ops in LIR;
         // expand before broadcast legalize + arena plan + thunks.
         graph = rlx_cpu::prepare_graph_for_thunks(graph);
-        {
-            use rlx_opt::pass::Pass as _;
-            graph = rlx_opt::LegalizeBroadcast.run(graph);
-        }
+        // `BinaryFull` broadcasts static shapes by strides, so only dynamic
+        // operands need the materialising `Expand` (see `run_static_strided`).
+        graph = rlx_opt::legalize_broadcast::run_static_strided(graph);
         if let Some(p) = options.policy.clone() {
             use rlx_opt::pass::Pass;
             graph = rlx_opt::AutoMixedPrecision::new(p).run(graph);
@@ -158,7 +157,7 @@ impl Backend for CpuBackend {
         } else {
             None
         };
-        // LegalizeBroadcast may insert Expand nodes — must replan; the
+        // Broadcast legalization may insert Expand nodes — must replan; the
         // embedded LIR buffer map is from before legalization. In-order CPU
         // executor → `plan_memory_native_in_order` (unpinned unless host
         // indexing, and no deferred-host dequant pin) for full liveness slot

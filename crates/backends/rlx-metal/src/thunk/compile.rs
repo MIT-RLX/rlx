@@ -275,9 +275,13 @@ impl ThunkSchedule {
                         continue;
                     }
                     let (a_id, b_id) = (node.inputs[0], node.inputs[1]);
+                    // Operands f32 too: the transposed GEMM is f32 MPS, and only a
+                    // weight fold (above) widens a half operand first.
                     if graph.node(a_id).shape.rank() != 2
                         || graph.node(b_id).shape.rank() != 2
                         || node.shape.dtype() != DType::F32
+                        || graph.node(a_id).shape.dtype() != DType::F32
+                        || graph.node(b_id).shape.dtype() != DType::F32
                     {
                         continue;
                     }
@@ -966,8 +970,12 @@ impl ThunkSchedule {
                     let a_shape = &graph.node(node.inputs[0]).shape;
                     let b_shape = &graph.node(node.inputs[1]).shape;
                     let b_f16 = matches!(b_shape.dtype(), rlx_ir::DType::F16);
+                    // A folded weight transpose reads the BF16 param itself.
                     let b_bf16 = matches!(b_shape.dtype(), rlx_ir::DType::BF16)
-                        && matches!(graph.node(node.inputs[1]).op, Op::Param { .. });
+                        && (matches!(graph.node(node.inputs[1]).op, Op::Param { .. })
+                            || matmul_fold.get(&node.id).is_some_and(|f| {
+                                f.3 && matches!(graph.node(f.2).op, Op::Param { .. })
+                            }));
                     let a_f16 = matches!(a_shape.dtype(), rlx_ir::DType::F16);
                     // Any-rank batched matmul: all leading dims (except the
                     // last 2) match between A, B, and output, and the last

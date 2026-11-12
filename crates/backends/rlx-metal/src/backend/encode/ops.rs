@@ -5079,6 +5079,25 @@ pub(crate) fn encode_arena_cast(
 
 pub(crate) fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
     let mut max = 0usize;
+    // A folded transpose of a half-width weight widens the weight into this
+    // scratch before its transposeRight GEMM.
+    if crate::backend::fold_weight_transposes() {
+        let half =
+            |n: &rlx_ir::Node| matches!(n.shape.dtype(), rlx_ir::DType::F16 | rlx_ir::DType::BF16);
+        if graph
+            .nodes()
+            .iter()
+            .any(|n| matches!(n.op, Op::Transpose { .. }) && half(n))
+        {
+            let readers = rlx_opt::memory::ReaderIndex::new(graph);
+            for n in graph.nodes() {
+                if half(n) && rlx_opt::memory::is_foldable_weight_transpose(graph, n, &readers) {
+                    let elems = n.shape.num_elements().unwrap_or(0);
+                    max = max.max(elems * std::mem::size_of::<f32>());
+                }
+            }
+        }
+    }
     for node in graph.nodes() {
         // A plain MatMul over a packed BF16 weight Param unpacks that weight
         // into this same scratch (`Thunk::Sgemm { b_bf16 }`).

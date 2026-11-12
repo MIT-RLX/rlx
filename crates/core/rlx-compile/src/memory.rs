@@ -271,12 +271,21 @@ fn folds_into_matmul(graph: &Graph, mm: &rlx_ir::Node) -> bool {
 /// Requiring the direct reader keeps inference graphs that only ever see
 /// `x·transpose(W)` (HF-layout linears) on their existing path: there the copy
 /// is the only resident form of the weight and is baked once.
-pub fn is_foldable_weight_transpose(graph: &Graph, node: &rlx_ir::Node, readers: &ReaderIndex) -> bool {
-    if !is_matmul_fold_transpose(graph, node) || node.shape.dtype() != rlx_ir::DType::F32 {
+pub fn is_foldable_weight_transpose(
+    graph: &Graph,
+    node: &rlx_ir::Node,
+    readers: &ReaderIndex,
+) -> bool {
+    use rlx_ir::DType::{BF16, F16, F32};
+    // The weight may be half-width (F16 / BF16), read into f32 for the GEMM.
+    if !is_matmul_fold_transpose(graph, node) || !matches!(node.shape.dtype(), F32 | F16 | BF16) {
         return false;
     }
     let w = graph.node(node.inputs[0]);
-    if !matches!(w.op, Op::Param { .. }) || w.shape.rank() != 2 || w.shape.dtype() != rlx_ir::DType::F32 {
+    if !matches!(w.op, Op::Param { .. })
+        || w.shape.rank() != 2
+        || w.shape.dtype() != node.shape.dtype()
+    {
         return false;
     }
     if readers.count(w.id) < 2 {
@@ -285,7 +294,11 @@ pub fn is_foldable_weight_transpose(graph: &Graph, node: &rlx_ir::Node, readers:
     let Some(mm) = readers.sole_reader(node.id).map(|id| graph.node(id)) else {
         return false;
     };
-    if !matches!(mm.op, Op::MatMul) || mm.inputs.len() != 2 || mm.inputs[1] != node.id || mm.inputs[0] == node.id {
+    if !matches!(mm.op, Op::MatMul)
+        || mm.inputs.len() != 2
+        || mm.inputs[1] != node.id
+        || mm.inputs[0] == node.id
+    {
         return false;
     }
     let a = graph.node(mm.inputs[0]);
@@ -2180,8 +2193,8 @@ fn plan_memory_aligned_inner(
     }
 
     let keep_native = native_width_nodes(graph, width);
-    let readers =
-        (opts.elide_bank_transposes || opts.elide_weight_transposes).then(|| ReaderIndex::new(graph));
+    let readers = (opts.elide_bank_transposes || opts.elide_weight_transposes)
+        .then(|| ReaderIndex::new(graph));
     let mut buffers: Vec<BufInfo> = Vec::new();
     for node in graph.nodes() {
         // Skip view nodes — they alias their parent's buffer (handled
@@ -2197,7 +2210,8 @@ fn plan_memory_aligned_inner(
                 && (is_elidable_bank_transpose_gated(graph, node, opts.elide_requires_small_m)
                     || (!opts.elide_requires_small_m
                         && is_elidable_matmul_transpose_indexed(graph, node, readers))))
-                || (opts.elide_weight_transposes && is_foldable_weight_transpose(graph, node, readers)))
+                || (opts.elide_weight_transposes
+                    && is_foldable_weight_transpose(graph, node, readers)))
         {
             continue;
         }

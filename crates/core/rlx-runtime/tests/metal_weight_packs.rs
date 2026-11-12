@@ -34,7 +34,7 @@ fn graph() -> Graph {
         .iter()
         .zip(N)
         .map(|(name, n)| {
-            let w = g.param(name, Shape::new(&[K, n], DType::F32));
+            let w = g.param(*name, Shape::new(&[K, n], DType::F32));
             g.mm(x, w)
         })
         .collect();
@@ -55,7 +55,11 @@ fn compile(device: Device, seed: usize, bind: bool) -> CompiledGraph {
 fn assert_close(got: &[Vec<f32>], want: &[Vec<f32>], what: &str) {
     assert_eq!(got.len(), want.len(), "{what}");
     for (o, (a, b)) in got.iter().zip(want).enumerate() {
-        let d = a.iter().zip(b).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let d = a
+            .iter()
+            .zip(b)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
         assert!(d < 1e-2, "{what}: output {o} off by {d}");
     }
 }
@@ -86,12 +90,27 @@ fn packed_qkv_matches_cpu_and_follows_part_writes() {
         }
         let what = format!("split min {split_min:?}");
         let mut metal = compile(Device::Metal, 1, true);
+        let stats = metal.memory_stats().expect("stats");
+        assert_eq!(
+            stats.packed_weights, 3,
+            "{what}: q, k, v not packed: {stats:?}"
+        );
+        if split_min.is_some() {
+            assert_eq!(
+                stats.weight_params, 1,
+                "{what}: the pack is not one weight: {stats:?}"
+            );
+        }
         let mut cpu = compile(Device::Cpu, 1, true);
         assert_close(&metal.run(&[("x", &x)]), &cpu.run(&[("x", &x)]), &what);
         // One part rewritten after a run: the others keep their values.
         metal.set_param("k", &values(K * N[1], 40));
         cpu.set_param("k", &values(K * N[1], 40));
-        assert_close(&metal.run(&[("x", &x)]), &cpu.run(&[("x", &x)]), &format!("{what}, k rewritten"));
+        assert_close(
+            &metal.run(&[("x", &x)]),
+            &cpu.run(&[("x", &x)]),
+            &format!("{what}, k rewritten"),
+        );
     }
 }
 
@@ -105,7 +124,9 @@ fn pack_and_concat_agree() {
     let x = values(4 * K, 9);
     let packed = compile(Device::Metal, 1, true).run(&[("x", &x)]);
     rlx_ir::env::set("RLX_METAL_NO_WEIGHT_PACKS", "1");
-    let concat = compile(Device::Metal, 1, true).run(&[("x", &x)]);
+    let mut c = compile(Device::Metal, 1, true);
+    assert_eq!(c.memory_stats().expect("stats").packed_weights, 0);
+    let concat = c.run(&[("x", &x)]);
     assert_close(&packed, &concat, "pack vs concat");
 }
 
@@ -121,9 +142,15 @@ fn a_pack_is_shared_across_executables() {
     let want = compile(Device::Cpu, 1, true).run(&[("x", &x)]);
     let scope = format!("packs:{}", std::process::id());
     let (one, mut two) = rlx_runtime::with_param_sharing_scope(&scope, || {
-        (compile(Device::Metal, 1, true), compile(Device::Metal, 1, false))
+        (
+            compile(Device::Metal, 1, true),
+            compile(Device::Metal, 1, false),
+        )
     });
-    assert!(PARTS.iter().all(|p| two.param_already_set(p)), "the pack was not mapped");
+    assert!(
+        PARTS.iter().all(|p| two.param_already_set(p)),
+        "the pack was not mapped"
+    );
     drop(one);
     assert_close(&two.run(&[("x", &x)]), &want, "second executable");
 }

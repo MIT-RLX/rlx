@@ -252,3 +252,15 @@ pub fn hybrid_has_mps(steps: &[HybridStep]) -> bool {
         .iter()
         .any(|s| matches!(s, HybridStep::SubGraph { .. }))
 }
+
+/// True when a sub-graph step writes one of `nodes` back for a later step: a
+/// node with no arena slot (a folded weight transpose) must not be one.
+pub fn hands_off_any(steps: &[HybridStep], nodes: &HashSet<NodeId>) -> bool {
+    !nodes.is_empty()
+        && steps.iter().any(|s| match s {
+            HybridStep::SubGraph {
+                output_parent_ids, ..
+            } => output_parent_ids.iter().any(|(_, p)| nodes.contains(p)),
+            HybridStep::Thunks(_) => false,
+        })
+}

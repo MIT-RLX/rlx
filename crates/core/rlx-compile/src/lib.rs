@@ -76,9 +76,8 @@ pub use memory::{
     WeightSlot, is_elidable_bank_transpose, is_elidable_bank_transpose_gated,
     is_elidable_folded_transpose, is_elidable_folded_transpose_gated, is_elidable_matmul_transpose,
     is_elidable_matmul_transpose_indexed, is_foldable_weight_transpose, is_pure_view,
-    plan_memory_backward,
-    plan_memory_f32_uniform, plan_memory_hybrid, plan_memory_native, plan_memory_native_in_order,
-    plan_memory_native_in_order_params, plan_memory_with_options,
+    plan_memory_backward, plan_memory_f32_uniform, plan_memory_hybrid, plan_memory_native,
+    plan_memory_native_in_order, plan_memory_native_in_order_params, plan_memory_with_options,
 };
 pub use numeric_lint::{NumericLint, lint_numerics};
 pub use param_hoist::{HoistSplit, split_param_invariant};

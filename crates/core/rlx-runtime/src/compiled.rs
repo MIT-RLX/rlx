@@ -1113,6 +1113,13 @@ impl CompiledGraph {
         self.inner.param_already_set(name)
     }
 
+    /// Where this executable's device memory went (arena, weight buffer, how
+    /// many weights shared / packed / with folded transposes), on backends
+    /// that report it (Metal); `None` elsewhere.
+    pub fn memory_stats(&self) -> Option<crate::backend::MemoryStats> {
+        self.inner.memory_stats()
+    }
+
     /// Run, refresh GPU handle from output, return that output vector.
     pub fn run_feed_gpu_handle(
         &mut self,

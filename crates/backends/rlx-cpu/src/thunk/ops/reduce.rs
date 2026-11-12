@@ -666,28 +666,42 @@ pub(crate) fn softmax_strided(data: &mut [f32], outer: usize, cols: usize, inner
     if cols == 0 || inner == 0 {
         return;
     }
+    assert!(
+        data.len() >= outer * cols * inner,
+        "softmax_strided: buffer too short"
+    );
     const CHUNK: usize = 8192;
-    let mut max = vec![0f32; CHUNK.min(inner)];
-    let mut sum = vec![0f32; CHUNK.min(inner)];
-    for o in 0..outer {
-        let plane = o * cols * inner;
-        let mut i0 = 0;
-        while i0 < inner {
+    // Each (plane, chunk of `inner`) is normalised on its own, so the units run in
+    // parallel; within one, every column row is a contiguous run of `len`.
+    let chunks = inner.div_ceil(CHUNK);
+    let ptr = SendPtr(data.as_mut_ptr());
+    crate::pool::par_for(outer * chunks, 1, &|off, cnt| {
+        let mut max = vec![0f32; CHUNK.min(inner)];
+        let mut sum = vec![0f32; CHUNK.min(inner)];
+        for unit in off..off + cnt {
+            let (o, k) = (unit / chunks, unit % chunks);
+            let plane = o * cols * inner;
+            let i0 = k * CHUNK;
             let len = CHUNK.min(inner - i0);
+            // SAFETY: units cover disjoint (plane, i0..i0+len) column ranges.
+            let row = |c: usize| unsafe {
+                std::slice::from_raw_parts_mut(ptr.get().add(plane + c * inner + i0), len)
+            };
             max[..len].fill(f32::NEG_INFINITY);
             sum[..len].fill(0.0);
             for c in 0..cols {
-                let row = &data[plane + c * inner + i0..plane + c * inner + i0 + len];
-                for (m, &v) in max[..len].iter_mut().zip(row) {
+                for (m, &v) in max[..len].iter_mut().zip(row(c).iter()) {
                     if v > *m {
                         *m = v;
                     }
                 }
             }
             for c in 0..cols {
-                let at = plane + c * inner + i0;
-                let row = &mut data[at..at + len];
-                for ((x, &m), s) in row.iter_mut().zip(&max[..len]).zip(sum[..len].iter_mut()) {
+                for ((x, &m), s) in row(c)
+                    .iter_mut()
+                    .zip(&max[..len])
+                    .zip(sum[..len].iter_mut())
+                {
                     // Subtracting the max before exponentiating is what keeps a
                     // large logit from overflowing to inf and taking the whole
                     // normalisation to NaN.
@@ -697,14 +711,22 @@ pub(crate) fn softmax_strided(data: &mut [f32], outer: usize, cols: usize, inner
                 }
             }
             for c in 0..cols {
-                let at = plane + c * inner + i0;
-                let row = &mut data[at..at + len];
-                for (x, &s) in row.iter_mut().zip(&sum[..len]) {
+                for (x, &s) in row(c).iter_mut().zip(&sum[..len]) {
                     *x /= s;
                 }
             }
-            i0 += len;
         }
+    });
+}
+
+#[derive(Clone, Copy)]
+struct SendPtr(*mut f32);
+// SAFETY: only dereferenced on disjoint ranges by `softmax_strided`'s units.
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+impl SendPtr {
+    fn get(self) -> *mut f32 {
+        self.0
     }
 }
 

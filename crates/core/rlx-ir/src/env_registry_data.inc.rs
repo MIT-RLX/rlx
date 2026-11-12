@@ -2100,6 +2100,15 @@
         layer: EnvLayer::Backend("metal"),
     },
     EnvVarEntry {
+        name: "RLX_METAL_MPSGRAPH_PAST_CLIFF",
+        group: "metal",
+        summary: "Allow MPSGraph for executables whose weight buffer is 4 GiB or larger (off: such executables run on thunks)",
+        kind: EnvKind::Bool,
+        stability: EnvStability::Bisect,
+        aliases: &[],
+        layer: EnvLayer::Backend("metal"),
+    },
+    EnvVarEntry {
         name: "RLX_METAL_NO_WEIGHT_PACKS",
         group: "metal",
         summary: "Keep fused QKV / gate-up weights as a per-run Concat instead of a pack param written by set_param",

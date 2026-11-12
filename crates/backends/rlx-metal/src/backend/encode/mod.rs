@@ -1712,6 +1712,35 @@ impl MetalExecutable {
                         );
                         b = self.dequant_scratch_off;
                     }
+                    if b_f16 && tb && matches!(dt, HalfFlag::F32) {
+                        // A folded F16 weight transpose: widen the weight into the
+                        // dequant scratch (sized for it at compile time), then the
+                        // f32 transposeRight GEMM below reads that.
+                        let len = kk * n;
+                        let (src_buf, src_off) = self.resolve_off(b);
+                        let enc = e!();
+                        enc.set_compute_pipeline_state(&k.cast_f16_to_f32);
+                        enc.set_buffer(0, Some(src_buf), src_off as u64);
+                        enc.set_buffer(
+                            1,
+                            Some(&self.arena.buffer),
+                            self.dequant_scratch_off as u64,
+                        );
+                        enc.set_bytes(2, 4, &len as *const u32 as *const _);
+                        enc.dispatch_threads(
+                            crate::mtl::MTLSize {
+                                width: len as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                            crate::mtl::MTLSize {
+                                width: 256u64.min(len as u64).max(1),
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                        b = self.dequant_scratch_off;
+                    }
                     let m_scaled = scale(m);
                     if m_scaled == 0 {
                         continue;

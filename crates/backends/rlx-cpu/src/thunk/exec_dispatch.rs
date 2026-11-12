@@ -2060,8 +2060,25 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 if row_walk {
                                     let row = |(k, out): (usize, &mut [f32])| {
                                         let (l0, r0) = idx(k * n_in);
-                                        for (j, o) in out.iter_mut().enumerate() {
-                                            *o = f(l[l0 + j * ls_in], r[r0 + j * rs_in]);
+                                        // A per-channel operand (`[N, C, D, H, W]
+                                        // op [1, C, 1, 1, 1]`) is constant along the
+                                        // row while the other runs contiguously: the
+                                        // same `f(a, b)` per element, as a plain loop
+                                        // the compiler vectorises.
+                                        if ls_in == 1 && rs_in == 0 {
+                                            let b = r[r0];
+                                            for (o, a) in out.iter_mut().zip(&l[l0..l0 + n_in]) {
+                                                *o = f(*a, b);
+                                            }
+                                        } else if ls_in == 0 && rs_in == 1 {
+                                            let a = l[l0];
+                                            for (o, b) in out.iter_mut().zip(&r[r0..r0 + n_in]) {
+                                                *o = f(a, *b);
+                                            }
+                                        } else {
+                                            for (j, o) in out.iter_mut().enumerate() {
+                                                *o = f(l[l0 + j * ls_in], r[r0 + j * rs_in]);
+                                            }
                                         }
                                     };
                                     if crate::pool::should_parallelize(len) {

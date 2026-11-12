@@ -315,6 +315,20 @@ impl ExecutableGraph for MetalExecutableWrapper {
         self.inner.param_already_set(name)
     }
 
+    fn memory_stats(&self) -> Option<super::MemoryStats> {
+        let s = self.inner.memory_stats();
+        Some(super::MemoryStats {
+            arena_bytes: s.arena_bytes,
+            weight_buffer_bytes: s.weight_buffer_bytes,
+            weight_params: s.weight_params,
+            shared_weight_params: s.shared_weight_params,
+            packed_weights: s.packed_weights,
+            folded_weight_transposes: s.folded_weight_transposes,
+            mpsgraph: s.mpsgraph,
+            mpsgraph_hybrid: s.mpsgraph_hybrid,
+        })
+    }
+
     fn share_params_from(&mut self, src: &dyn ExecutableGraph) -> bool {
         let Some(src_any) = src.executable_as_any() else {
             return false;

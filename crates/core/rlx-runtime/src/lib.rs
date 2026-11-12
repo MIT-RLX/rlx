@@ -268,7 +268,7 @@ pub use arena_budget::{
     WGPU_32BIT_ARENA_LIMIT, arena_budget, device_arena_limit, fit_batch, fit_batch_within,
     plan_arena_bytes,
 };
-pub use backend::{Backend, ExecutableGraph, compile_hir, compile_module};
+pub use backend::{Backend, ExecutableGraph, MemoryStats, compile_hir, compile_module};
 pub use backends_manifest::BackendsManifest;
 pub use browser::{
     BrowserCompiledGraph, BrowserError, BrowserSession, browser_block_reason, init_webgpu,

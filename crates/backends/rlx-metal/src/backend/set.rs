@@ -44,11 +44,25 @@ impl MetalExecutable {
             return true; // the pack itself went unused
         };
         let base = if let Some(slot) = self.weight_slots.get(&id) {
-            let buf = self.weight_buffer.as_ref().expect("weight slot without weight buffer");
-            assert_eq!(slot.dtype, rlx_ir::DType::F32, "weight pack {} stored as {:?}", part.pack, slot.dtype);
+            let buf = self
+                .weight_buffer
+                .as_ref()
+                .expect("weight slot without weight buffer");
+            assert_eq!(
+                slot.dtype,
+                rlx_ir::DType::F32,
+                "weight pack {} stored as {:?}",
+                part.pack,
+                slot.dtype
+            );
             unsafe { (buf.contents() as *mut u8).add(slot.offset) }
         } else if let Some(&off) = self.arena.offsets.get(&id) {
-            assert_eq!(self.arena.dtype(id), rlx_ir::DType::F32, "weight pack {} not f32", part.pack);
+            assert_eq!(
+                self.arena.dtype(id),
+                rlx_ir::DType::F32,
+                "weight pack {} not f32",
+                part.pack
+            );
             unsafe { (self.arena.buffer.contents() as *mut u8).add(off) }
         } else {
             return true;

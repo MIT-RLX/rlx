@@ -214,7 +214,10 @@ impl MetalExecutable {
             HashMap::new()
         };
         if verbose && !pack_parts.is_empty() {
-            eprintln!("[rlx-metal] weight packs: {} weights in packs", pack_parts.len());
+            eprintln!(
+                "[rlx-metal] weight packs: {} weights in packs",
+                pack_parts.len()
+            );
         }
         let fused = {
             use rlx_opt::pass::Pass;
@@ -854,25 +857,39 @@ impl MetalExecutable {
             }
             // `RLX_METAL_DEBUG_ARENA=N`: the N largest (op, slot size) groups by
             // total bytes, to see what fills an arena that barely reuses slots.
-            if let Some(n) = rlx_ir::env::var("RLX_METAL_DEBUG_ARENA").and_then(|v| v.parse::<usize>().ok()) {
+            if let Some(n) =
+                rlx_ir::env::var("RLX_METAL_DEBUG_ARENA").and_then(|v| v.parse::<usize>().ok())
+            {
                 let short = |op: &Op| {
                     let op = format!("{op}");
-                    op.split(|c: char| c == '(' || c == ' ' || c == '{').next().unwrap_or("").to_string()
+                    op.split(|c: char| c == '(' || c == ' ' || c == '{')
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
                 };
                 let mut readers: std::collections::HashMap<NodeId, Vec<String>> =
                     std::collections::HashMap::new();
                 for c in fused.nodes() {
-                    let ranks: Vec<String> =
-                        c.inputs.iter().map(|i| fused.node(*i).shape.rank().to_string()).collect();
+                    let ranks: Vec<String> = c
+                        .inputs
+                        .iter()
+                        .map(|i| fused.node(*i).shape.rank().to_string())
+                        .collect();
                     for &i in &c.inputs {
-                        readers.entry(i).or_default().push(format!("{}[{}]", short(&c.op), ranks.join(",")));
+                        readers.entry(i).or_default().push(format!(
+                            "{}[{}]",
+                            short(&c.op),
+                            ranks.join(",")
+                        ));
                     }
                 }
                 type Group = (usize, usize, std::collections::BTreeMap<String, usize>);
                 let mut groups: std::collections::HashMap<(String, usize), Group> =
                     std::collections::HashMap::new();
                 for (id, slot) in &plan.assignments {
-                    let g = groups.entry((short(&fused.node(*id).op), slot.size)).or_default();
+                    let g = groups
+                        .entry((short(&fused.node(*id).op), slot.size))
+                        .or_default();
                     g.0 += 1;
                     g.1 += slot.size;
                     for r in readers.get(id).into_iter().flatten() {
@@ -882,7 +899,8 @@ impl MetalExecutable {
                 let mut groups: Vec<_> = groups.into_iter().collect();
                 groups.sort_by_key(|(_, (_, bytes, _))| std::cmp::Reverse(*bytes));
                 for ((op, size), (count, bytes, read)) in groups.into_iter().take(n) {
-                    let read: Vec<String> = read.into_iter().map(|(r, k)| format!("{r}x{k}")).collect();
+                    let read: Vec<String> =
+                        read.into_iter().map(|(r, k)| format!("{r}x{k}")).collect();
                     eprintln!(
                         "    {op:<24} {count:5} x {:9.3} MB = {:7.3} GB  <- {}",
                         size as f64 / 1e6,
@@ -1069,17 +1087,31 @@ impl MetalExecutable {
         // Opt out with RLX_DISABLE_MPSGRAPH=1.
         // MPSGraph's no-copy binds fail past 4 GiB into a buffer: a weight
         // buffer that big (shared weights) keeps the executable on thunks.
-        let weights_past_cliff = weight_cursor >= MPS_BIND_CLIFF_BYTES;
-        // A folded weight transpose has no arena slot; MPSGraph would lower the
-        // `Transpose` itself and write to it. Such graphs stay on thunks.
-        let folds_weight_t = fold_weight_transposes() && {
+        // `RLX_METAL_MPSGRAPH_PAST_CLIFF=1` lifts that: on macOS 26 binds at
+        // and across 4 GiB read and write right
+        // (`tests/mps_graph_high_offset_probe.rs`), and activation arenas past
+        // it already take MPSGraph; opt-in until a weight buffer that big has
+        // been checked end to end (`tests/mps_graph_weights_past_cliff.rs`).
+        let weights_past_cliff = weight_cursor >= MPS_BIND_CLIFF_BYTES
+            && !rlx_ir::env::flag("RLX_METAL_MPSGRAPH_PAST_CLIFF");
+        // A folded weight transpose has no arena slot. A whole-graph plan only
+        // writes graph outputs, which such a transpose never is, so it lowers
+        // the transpose inside MPSGraph like any other; a hybrid plan is kept
+        // only if no segment hands one to the next (checked below).
+        let folded_weight_t: std::collections::HashSet<NodeId> = if fold_weight_transposes() {
             let readers = memory::ReaderIndex::new(&fused);
-            fused.nodes().iter().any(|n| memory::is_foldable_weight_transpose(&fused, n, &readers))
+            fused
+                .nodes()
+                .iter()
+                .filter(|n| memory::is_foldable_weight_transpose(&fused, n, &readers))
+                .map(|n| n.id)
+                .collect()
+        } else {
+            Default::default()
         };
         let mps_plan = if disable_mpsgraph
             || amp_active
             || weights_past_cliff
-            || folds_weight_t
             || crate::runtime_config().disable_mpsgraph
         {
             None
@@ -1098,7 +1130,6 @@ impl MetalExecutable {
         let mps_hybrid = if !disable_mpsgraph
             && !amp_active
             && !weights_past_cliff
-            && !folds_weight_t
             && mps_plan.is_none()
             && !crate::runtime_config().disable_mpsgraph
             && !crate::runtime_config().disable_mpsgraph_hybrid
@@ -1110,6 +1141,7 @@ impl MetalExecutable {
         {
             crate::mps_graph_hybrid::build_hybrid_plan(&fused, None, &schedule.node_start)
                 .filter(|steps| crate::mps_graph_hybrid::hybrid_has_mps(steps))
+                .filter(|steps| !crate::mps_graph_hybrid::hands_off_any(steps, &folded_weight_t))
         } else {
             None
         };
@@ -1174,6 +1206,7 @@ impl MetalExecutable {
             weight_pages,
             shared_resident,
             pack_parts,
+            folded_weight_transposes: folded_weight_t.len(),
             input_slots,
             output_slots,
             precision: MetalPrecision::F32,

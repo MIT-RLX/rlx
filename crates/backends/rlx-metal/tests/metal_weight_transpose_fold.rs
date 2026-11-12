@@ -63,8 +63,12 @@ fn graph(lead: &[usize], k: usize, n: usize, direct: bool) -> Graph {
 fn run(device: Device, lead: &[usize], k: usize, n: usize, direct: bool) -> Vec<Vec<f32>> {
     let rows: usize = lead.iter().product();
     let w: Vec<f32> = (0..k * n).map(|i| ((i % 19) as f32 - 9.0) * 0.01).collect();
-    let x: Vec<f32> = (0..rows * k).map(|i| ((i % 23) as f32 - 11.0) * 0.02).collect();
-    let gy: Vec<f32> = (0..rows * n).map(|i| ((i % 13) as f32 - 6.0) * 0.03).collect();
+    let x: Vec<f32> = (0..rows * k)
+        .map(|i| ((i % 23) as f32 - 11.0) * 0.02)
+        .collect();
+    let gy: Vec<f32> = (0..rows * n)
+        .map(|i| ((i % 13) as f32 - 6.0) * 0.03)
+        .collect();
     let mut c = Session::new(device).compile(graph(lead, k, n, direct));
     c.set_param("w", &w);
     if direct {
@@ -98,7 +102,11 @@ fn folded_transpose_matches_cpu_with_weights_inline() {
     rlx_ir::env::set("RLX_METAL_NO_WEIGHT_SPLIT", "1");
     for lead in [&[5usize][..], &[2, 3]] {
         let want = run(Device::Cpu, lead, K, N, true);
-        assert_close(&run(Device::Metal, lead, K, N, true), &want, &format!("inline {lead:?}"));
+        assert_close(
+            &run(Device::Metal, lead, K, N, true),
+            &want,
+            &format!("inline {lead:?}"),
+        );
     }
 }
 
@@ -110,7 +118,11 @@ fn folded_transpose_matches_cpu_with_weights_in_the_weight_buffer() {
     rlx_ir::env::set("RLX_METAL_WEIGHT_SPLIT_MIN", "262144");
     for lead in [&[5usize][..], &[2, 3]] {
         let want = run(Device::Cpu, lead, K, N, true);
-        assert_close(&run(Device::Metal, lead, K, N, true), &want, &format!("split {lead:?}"));
+        assert_close(
+            &run(Device::Metal, lead, K, N, true),
+            &want,
+            &format!("split {lead:?}"),
+        );
     }
 }
 
@@ -131,5 +143,63 @@ fn transpose_only_weight_is_left_alone() {
     let _g = Guard::new();
     rlx_ir::env::set("RLX_METAL_WEIGHT_SPLIT_MIN", "262144");
     let want = run(Device::Cpu, &[5], K, N, false);
-    assert_close(&run(Device::Metal, &[5], K, N, false), &want, "transpose only");
+    assert_close(
+        &run(Device::Metal, &[5], K, N, false),
+        &want,
+        "transpose only",
+    );
+}
+
+/// `y = x·W` and `z = g·Wᵀ` with `W` stored half-width (`dtype`), against the
+/// same products on the host over the half-rounded weight.
+fn half_case(dtype: DType, round: fn(f32) -> f32) {
+    let f = DType::F32;
+    let (rows, k, n) = (6, K, N);
+    let mut g = Graph::new("w_t_fold_half");
+    let w = g.param("w", Shape::new(&[k, n], dtype));
+    let gy = g.input("g", Shape::new(&[rows, n], f));
+    let x = g.input("x", Shape::new(&[rows, k], f));
+    let wt = g.transpose_(w, vec![1, 0]);
+    let z = g.matmul(gy, wt, Shape::new(&[rows, k], f));
+    let y = g.matmul(x, w, Shape::new(&[rows, n], f));
+    g.set_outputs(vec![y, z]);
+
+    let wv: Vec<f32> = (0..k * n).map(|i| ((i % 19) as f32 - 9.0) * 0.01).collect();
+    let xv: Vec<f32> = (0..rows * k)
+        .map(|i| ((i % 23) as f32 - 11.0) * 0.02)
+        .collect();
+    let gv: Vec<f32> = (0..rows * n)
+        .map(|i| ((i % 13) as f32 - 6.0) * 0.03)
+        .collect();
+    let wr: Vec<f32> = wv.iter().map(|&v| round(v)).collect();
+    let mut want_y = vec![0f32; rows * n];
+    let mut want_z = vec![0f32; rows * k];
+    for r in 0..rows {
+        for i in 0..k {
+            for j in 0..n {
+                want_y[r * n + j] += xv[r * k + i] * wr[i * n + j];
+                want_z[r * k + i] += gv[r * n + j] * wr[i * n + j];
+            }
+        }
+    }
+    let mut c = Session::new(Device::Metal).compile(g);
+    c.set_param("w", &wv);
+    let got = c.run(&[("g", &gv), ("x", &xv)]);
+    assert_close(&got, &[want_y, want_z], &format!("{dtype:?} weight"));
+}
+
+#[test]
+fn folded_transpose_of_half_weights_matches_host() {
+    let _g = Guard::new();
+    for split in [false, true] {
+        if split {
+            rlx_ir::env::set("RLX_METAL_WEIGHT_SPLIT_MIN", "1");
+        } else {
+            rlx_ir::env::set("RLX_METAL_NO_WEIGHT_SPLIT", "1");
+        }
+        half_case(DType::F16, |v| half::f16::from_f32(v).to_f32());
+        half_case(DType::BF16, |v| half::bf16::from_f32(v).to_f32());
+        rlx_ir::env::unset("RLX_METAL_WEIGHT_SPLIT_MIN");
+        rlx_ir::env::unset("RLX_METAL_NO_WEIGHT_SPLIT");
+    }
 }
