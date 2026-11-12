@@ -57,6 +57,8 @@ pub struct MetalExecutable {
     /// Weight slots mapped from another executable's copy: their values
     /// are already there.
     shared_resident: std::collections::HashSet<NodeId>,
+    /// Weights stored as slices of a pack param (`weight_packs`), by name.
+    pack_parts: HashMap<String, weight_packs::PackPart>,
     /// Pre-resolved (name, byte_offset, max_f32_len) per input — for run_slots.
     input_slots: Vec<(String, usize, usize)>,
     output_slots: Vec<(usize, usize)>, // (byte_offset, f32_len)
@@ -641,11 +643,13 @@ mod tests {
 
 mod bind;
 mod compile;
+pub(crate) use compile::fold_weight_transposes;
 mod encode;
 mod output;
 mod read;
 mod run;
 mod set;
+mod weight_packs;
 
 pub use encode::has_metal_dequant_kernel;
 pub(crate) use encode::*;
@@ -883,13 +887,23 @@ impl MetalExecutable {
     /// BEFORE uploading this executable's own weights; on success, skip the
     /// upload for every weight-buffer param.
     pub fn share_weights_from(&mut self, other: &Self) -> bool {
+        let why = |reason: &str| {
+            if rlx_ir::env::flag("RLX_METAL_DEBUG") {
+                eprintln!("[rlx-metal] share_weights_from: not shared — {reason}");
+            }
+            false
+        };
         if self.param_ids.len() != other.param_ids.len() {
-            return false;
+            return why(&format!(
+                "{} params here, {} in the source",
+                self.param_ids.len(),
+                other.param_ids.len()
+            ));
         }
         // Verify byte-identical weight-buffer layout for every shared param.
         for (name, &dst_id) in &self.param_ids {
             let Some(&src_id) = other.param_ids.get(name) else {
-                return false;
+                return why(&format!("source has no param {name}"));
             };
             match (
                 self.weight_slots.get(&dst_id).copied(),
@@ -900,12 +914,12 @@ impl MetalExecutable {
                         || dst.nbytes != src.nbytes
                         || dst.dtype != src.dtype
                     {
-                        return false;
+                        return why(&format!("weight slot of {name} differs"));
                     }
                 }
                 // Arena params copied below; both-arena is fine, mixed is not.
                 (None, None) => {}
-                _ => return false,
+                _ => return why(&format!("{name} is a weight slot on one side only")),
             }
         }
         // Retain the same MTLBuffer (crate::mtl::Buffer::clone bumps the refcount —
@@ -925,7 +939,7 @@ impl MetalExecutable {
                 self.weight_buffer = Some(src.clone());
                 self.weight_pages = other.weight_pages.clone();
             }
-            _ => return false,
+            _ => return why("no external weight buffer to share"),
         }
         // Copy the small arena-resident params into our own (activation) arena.
         for (name, &dst_id) in &self.param_ids {

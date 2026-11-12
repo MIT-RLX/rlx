@@ -18,10 +18,16 @@ default = ["cpu"]
 cpu = ["dep:rlx-cpu"]
 # Metal execution: registers the fused MetalKernel (macOS only).
 metal = ["dep:rlx-metal"]
+# e-means trainer (arXiv:2611.09501): host loop + per-step rlx graph.
+emeans = ["dep:rlx-rng"]
+# Device-resident e-means (`emeans::device`): state lives in GPU handles.
+emeans-device = ["emeans", "dep:rlx-runtime"]
 
 [dependencies]
 rlx-ir = { workspace = true }
 rlx-cpu = { workspace = true, optional = true }
+rlx-rng = { workspace = true, optional = true }
+rlx-runtime = { workspace = true, optional = true }
 rayon = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]

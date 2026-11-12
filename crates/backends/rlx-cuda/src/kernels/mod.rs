@@ -630,7 +630,7 @@ kernel_cache!(
     LAYER_NORM_BWD_GAMMA,
     layer_norm_bwd_gamma_kernel,
     LAYER_NORM_BWD_CU,
-    "layer_norm_bwd_gamma"
+    "layer_norm_bwd_gamma_cols"
 );
 kernel_cache!(
     FAKE_QUANTIZE_FIXED,
@@ -808,6 +808,12 @@ kernel_cache!(
     attention_bwd_kernel,
     ATTENTION_BWD_CU,
     "attention_bwd"
+);
+kernel_cache!(
+    ATTENTION_BWD_SMALL,
+    attention_bwd_small_kernel,
+    ATTENTION_BWD_CU,
+    "attention_bwd_small"
 );
 kernel_cache!(ARGMAX, argmax_kernel, ARGMAX_CU, "argmax");
 kernel_cache!(ROPE, rope_kernel, ROPE_CU, "rope");

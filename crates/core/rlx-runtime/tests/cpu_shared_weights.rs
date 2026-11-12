@@ -13,6 +13,10 @@ use rlx_ir::op::BinaryOp;
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 
+/// The sharing scope is process-wide, and tests run on parallel threads: one
+/// test's compile could otherwise land in the other's scope (or in none).
+static SCOPE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const VOCAB: usize = 512;
 const HIDDEN: usize = 256;
 
@@ -52,6 +56,7 @@ fn values(n: usize, salt: usize) -> Vec<f32> {
 
 #[test]
 fn shared_cpu_weights_match_private_ones() {
+    let _scope = SCOPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let params = [
         ("embed", values(VOCAB * HIDDEN, 1)),
         ("w_flat", values(HIDDEN * HIDDEN, 2)),
@@ -101,4 +106,64 @@ fn shared_cpu_weights_match_private_ones() {
         private.set_param(name, data);
     }
     assert_eq!(run(c, *seq), run(&mut private, *seq));
+}
+
+/// Two linears with bias (the second through ReLU), which fusion rewrites to
+/// `FusedMatMulBiasAct` before the executable is built. Their weights used to
+/// stay private under a scope: the fused op was not on the weight-only reader
+/// list, so a model whose linears all fuse (every transformer) shared nothing.
+fn fused_linears(rows: usize) -> Graph {
+    let f = |d: &[usize]| Shape::new(d, DType::F32);
+    let mut g = Graph::new("cpu_shared_fused_linears");
+    let x = g.input("x", f(&[rows, HIDDEN]));
+    let w1 = g.param("w1", f(&[HIDDEN, 4 * HIDDEN]));
+    let b1 = g.param("b1", f(&[4 * HIDDEN]));
+    let w2 = g.param("w2", f(&[4 * HIDDEN, HIDDEN]));
+    let b2 = g.param("b2", f(&[HIDDEN]));
+    let h = g.mm(x, w1);
+    let h = g.add(h, b1);
+    let h = g.relu(h);
+    let y = g.mm(h, w2);
+    let y = g.add(y, b2);
+    g.set_outputs(vec![y]);
+    g
+}
+
+#[test]
+fn fused_linear_weights_are_shared() {
+    let _scope = SCOPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let params = [
+        ("w1", values(HIDDEN * 4 * HIDDEN, 5)),
+        ("b1", values(4 * HIDDEN, 6)),
+        ("w2", values(4 * HIDDEN * HIDDEN, 7)),
+        ("b2", values(HIDDEN, 8)),
+    ];
+    let run = |c: &mut rlx_runtime::CompiledGraph, rows: usize| {
+        c.run(&[("x", &values(rows * HIDDEN, 9))]).pop().unwrap()
+    };
+    let mut shared = Vec::new();
+    for (i, rows) in [4usize, 16].into_iter().enumerate() {
+        let mut c = rlx_runtime::with_param_sharing_scope("cpu-shared-fused-test", || {
+            Session::new(Device::Cpu).compile(fused_linears(rows))
+        });
+        for (name, data) in &params {
+            let present = c.param_already_set(name);
+            assert_eq!(
+                present,
+                i > 0 && name.starts_with('w'),
+                "rows {rows}: param_already_set({name})"
+            );
+            if !present {
+                c.set_param(name, data);
+            }
+        }
+        shared.push((rows, c));
+    }
+    for (rows, c) in &mut shared {
+        let mut private = Session::new(Device::Cpu).compile(fused_linears(*rows));
+        for (name, data) in &params {
+            private.set_param(name, data);
+        }
+        assert_eq!(run(c, *rows), run(&mut private, *rows), "rows {rows}");
+    }
 }

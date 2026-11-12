@@ -5,7 +5,8 @@
 // LayerNorm backward (last-axis rows). Matches CPU `LayerNormBackward*` /
 // Metal `layer_norm_bwd` / wgpu `layer_norm_bwd_*`.
 //   Input: one block per row, shared-memory tree reductions.
-//   Gamma: serial single-thread (same shape as `group_norm_bwd_gamma`).
+//   Gamma: serial single-thread (same shape as `group_norm_bwd_gamma`);
+//   `layer_norm_bwd_gamma_cols` is the parallel version CUDA launches.
 
 #define LNB_BLOCK 256
 
@@ -121,5 +122,70 @@ extern "C" __global__ void layer_norm_bwd_gamma(
             float xh = (arena[x_base + i] - mean) * inv_std;
             arena[out_off + i] += arena[dy_base + i] * xh;
         }
+    }
+}
+
+// Parallel gamma gradient: launch grid (ceil(inner/32), 1, 1), block (1024, 1, 1).
+// Each block owns 32 columns; its 32 warps take rows w, w+32, ... A warp computes
+// the row's mean / inv_std with shuffles (two-pass, like the serial kernel),
+// then lane c accumulates dy * xh for column tile*32 + c. The 32 warp partials
+// are summed in a fixed order, so the result is deterministic.
+#define LNG_WARPS 32
+
+// Width-32 sub-group butterfly, portable to HIP (wave32/64) like
+// `attention_warp.cu`; ROCm compiles this file too (it launches only the
+// serial kernels, but the whole TU must build).
+#if defined(__HIP_DEVICE_COMPILE__)
+#define LNG_SHFL_XOR(v, m) __shfl_xor((v), (m), 32)
+#else
+#define LNG_SHFL_XOR(v, m) __shfl_xor_sync(0xffffffffu, (v), (m), 32)
+#endif
+
+__device__ __forceinline__ float lng_warp_sum(float v) {
+    for (int off = 16; off > 0; off >>= 1) v += LNG_SHFL_XOR(v, off);
+    return v;
+}
+
+extern "C" __global__ void layer_norm_bwd_gamma_cols(
+    float* arena,
+    unsigned int outer,
+    unsigned int inner,
+    unsigned int x_off,
+    unsigned int dy_off,
+    unsigned int out_off,
+    unsigned int eps_bits
+) {
+    if (inner == 0u) return;
+    unsigned int lane = threadIdx.x & 31u;
+    unsigned int warp = threadIdx.x >> 5;
+    unsigned int col = blockIdx.x * 32u + lane;
+    float n_inv = 1.0f / (float)inner;
+    float eps = __int_as_float((int)eps_bits);
+
+    float acc = 0.0f;
+    for (unsigned int row = warp; row < outer; row += LNG_WARPS) {
+        unsigned int x_base = x_off + row * inner;
+        float s = 0.0f;
+        for (unsigned int i = lane; i < inner; i += 32u) s += arena[x_base + i];
+        float mean = lng_warp_sum(s) * n_inv;
+        float v = 0.0f;
+        for (unsigned int i = lane; i < inner; i += 32u) {
+            float d = arena[x_base + i] - mean;
+            v += d * d;
+        }
+        float inv_std = 1.0f / sqrtf(lng_warp_sum(v) * n_inv + eps);
+        if (col < inner) {
+            float xh = (arena[x_base + col] - mean) * inv_std;
+            acc += arena[dy_off + row * inner + col] * xh;
+        }
+    }
+
+    __shared__ float part[LNG_WARPS][32];
+    part[warp][lane] = acc;
+    __syncthreads();
+    if (warp == 0 && col < inner) {
+        float t = 0.0f;
+        for (unsigned int w = 0; w < LNG_WARPS; ++w) t += part[w][lane];
+        arena[out_off + col] = t;
     }
 }

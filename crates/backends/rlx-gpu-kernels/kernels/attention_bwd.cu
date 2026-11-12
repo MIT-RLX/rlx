@@ -307,3 +307,125 @@ extern "C" __global__ void attention_bwd(
         }
     }
 }
+
+// Small-attention backward: one block (256 threads) per (batch, head), for
+// seq_q·seq_k ≤ SMALL_ATTN_ELEMS so the whole score matrix fits in shared
+// memory. P = softmax(scale·QKᵀ + mask) is built once by all threads (warp per
+// row for the softmax), then the requested gradient is a block-wide product:
+//   dV = Pᵀ·dY,  dQ = dS·K,  dK = dSᵀ·Q,  dS = P∘(dY·Vᵀ − δ)·scale,
+//   δ_i = Σ_j P_ij (dY·Vᵀ)_ij.
+// K, then V, is staged through one padded shared tile (row stride head_dim+1,
+// conflict-free) so the S_q×S_k dot products read shared memory, not strided
+// global rows. Same math (and mask/softmax conventions) as `attention_bwd`; the
+// host picks this kernel when seq_q·seq_k ≤ SMALL_ATTN_ELEMS and
+// seq_k·(head_dim+1) ≤ SMALL_ATTN_STAGE, launching grid (batch·heads, 1, 1).
+#define SMALL_ATTN_ELEMS 4096
+#define SMALL_ATTN_STAGE 2560
+
+// Width-32 sub-group butterfly, portable to HIP (wave32/64) like
+// `attention_warp.cu`; ROCm compiles this file too (it launches only
+// `attention_bwd`, but the whole TU must build).
+#if defined(__HIP_DEVICE_COMPILE__)
+#define SMALL_ATTN_SHFL_XOR(v, m) __shfl_xor((v), (m), 32)
+#else
+#define SMALL_ATTN_SHFL_XOR(v, m) __shfl_xor_sync(0xffffffffu, (v), (m), 32)
+#endif
+
+extern "C" __global__ void attention_bwd_small(
+    float* arena,
+    unsigned int batch,
+    unsigned int heads,
+    unsigned int seq_q,
+    unsigned int seq_k,
+    unsigned int head_dim,
+    unsigned int q_off,
+    unsigned int k_off,
+    unsigned int v_off,
+    unsigned int dy_off,
+    unsigned int out_off,
+    unsigned int mask_off,
+    unsigned int mask_kind,
+    unsigned int scale_bits,
+    unsigned int window,
+    unsigned int wrt
+) {
+    if (seq_q * seq_k > SMALL_ATTN_ELEMS || seq_k * (head_dim + 1u) > SMALL_ATTN_STAGE) return;
+    unsigned int bh = blockIdx.x;
+    if (bh >= batch * heads) return;
+    float scale = __int_as_float((int)scale_bits);
+    unsigned int tid = threadIdx.x, bsz = blockDim.x;
+    unsigned int lane = tid & 31u, warp = tid >> 5, n_warps = bsz >> 5;
+    const float* Q = arena + q_off + bh * seq_q * head_dim;
+    const float* K = arena + k_off + bh * seq_k * head_dim;
+    const float* V = arena + v_off + bh * seq_k * head_dim;
+    const float* dY = arena + dy_off + bh * seq_q * head_dim;
+    float* out = arena + out_off + bh * (wrt == 0u ? seq_q : seq_k) * head_dim;
+
+    __shared__ float sP[SMALL_ATTN_ELEMS];
+    __shared__ float sD[SMALL_ATTN_ELEMS];
+    __shared__ float sT[SMALL_ATTN_STAGE];
+    unsigned int n = seq_q * seq_k, ld = head_dim + 1u;
+
+    // scores = mask(scale · Q·Kᵀ), and dP = dY·Vᵀ (dQ/dK only), each through sT.
+    for (unsigned int pass = 0; pass < (wrt == 2u ? 1u : 2u); ++pass) {
+        const float* src = pass == 0u ? K : V;
+        const float* lhs = pass == 0u ? Q : dY;
+        for (unsigned int e = tid; e < seq_k * head_dim; e += bsz)
+            sT[(e / head_dim) * ld + e % head_dim] = src[e];
+        __syncthreads();
+        for (unsigned int e = tid; e < n; e += bsz) {
+            unsigned int i = e / seq_k, j = e % seq_k;
+            float dot = 0.0f;
+            for (unsigned int d = 0; d < head_dim; ++d) dot += lhs[i * head_dim + d] * sT[j * ld + d];
+            if (pass == 0u)
+                sP[e] = mask_score(dot * scale, i, j, bh, seq_q, seq_k, mask_kind, mask_off, window, arena);
+            else
+                sD[e] = dot;
+        }
+        __syncthreads();
+    }
+
+    // Row softmax (and, for dQ/dK, dS in place) — one warp owns each row.
+    for (unsigned int i = warp; i < seq_q; i += n_warps) {
+        float* row = sP + i * seq_k;
+        float m = -3.4e38f;
+        for (unsigned int j = lane; j < seq_k; j += 32u) m = fmaxf(m, row[j]);
+        for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, SMALL_ATTN_SHFL_XOR(m, off));
+        float z = 0.0f;
+        for (unsigned int j = lane; j < seq_k; j += 32u) {
+            float ex = (row[j] <= -1e30f) ? 0.0f : expf(row[j] - m);
+            row[j] = ex;
+            z += ex;
+        }
+        for (int off = 16; off > 0; off >>= 1) z += SMALL_ATTN_SHFL_XOR(z, off);
+        float inv = (z > 0.0f) ? 1.0f / z : 0.0f;
+        float delta = 0.0f;
+        for (unsigned int j = lane; j < seq_k; j += 32u) {
+            row[j] *= inv;
+            if (wrt != 2u) delta += row[j] * sD[i * seq_k + j];
+        }
+        if (wrt != 2u) {
+            for (int off = 16; off > 0; off >>= 1) delta += SMALL_ATTN_SHFL_XOR(delta, off);
+            for (unsigned int j = lane; j < seq_k; j += 32u)
+                row[j] = row[j] * (sD[i * seq_k + j] - delta) * scale;
+        }
+    }
+    __syncthreads();
+
+    if (wrt == 0u) {
+        for (unsigned int e = tid; e < seq_q * head_dim; e += bsz) {
+            unsigned int i = e / head_dim, d = e % head_dim;
+            float acc = 0.0f;
+            for (unsigned int j = 0; j < seq_k; ++j) acc += sP[i * seq_k + j] * K[j * head_dim + d];
+            out[e] = acc;
+        }
+    } else {
+        const float* R = (wrt == 1u) ? Q : dY;
+        for (unsigned int e = tid; e < seq_k * head_dim; e += bsz) {
+            unsigned int j = e / head_dim, d = e % head_dim;
+            float acc = 0.0f;
+            for (unsigned int i = 0; i < seq_q; ++i) acc += sP[i * seq_k + j] * R[i * head_dim + d];
+            out[e] = acc;
+        }
+    }
+}

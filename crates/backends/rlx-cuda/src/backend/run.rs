@@ -13,29 +13,29 @@ use crate::device::{
 use crate::host_staging::F32HostSlot;
 use crate::kernels::{
     activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
-    argmax_kernel, attention_bwd_kernel, attention_kernel, attention_row_kernel,
-    attention_warp_kernel, attention_warp_split_kernel, attention_wmma_d128_kernel,
-    attention_wmma_kernel, axial_rope2d_kernel, batch_elementwise_region_kernel,
-    batch_norm_inference_bwd_beta_kernel, batch_norm_inference_bwd_gamma_kernel,
-    batch_norm_inference_bwd_input_kernel, batch_norm_inference_kernel, binary_broadcast_kernel,
-    binary_c64_kernel, binary_kernel, compare_kernel, complex_cast_kernel,
-    complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel,
-    conv_bias_act_epilogue_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_kernel,
-    conv2d_backward_input_kernel, conv2d_backward_weight_kernel, conv2d_kernel,
-    conv3d_backward_input_kernel, conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel,
-    copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
-    dequant_matmul_kernel, dequant_matmul_mlx_gemm_kernel, dequant_matmul_mlx_gemv_kernel,
-    dequant_matmul_mlx_kernel, dequantize_i8_kernel, dispatch_grid_1d, dispatch_grid_prologue_nchw,
-    elementwise_region_kernel, expand_kernel, fake_quantize_backward_kernel,
-    fake_quantize_ema_kernel, fake_quantize_fixed_kernel, fake_quantize_lsq_bwd_scale_kernel,
-    fake_quantize_lsq_bwd_x_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
-    fma_kernel, fused_attn_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
-    fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
-    gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
-    gather_backward_kernel, gather_elements_kernel, gather_kernel, gather_nd_kernel,
-    group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel, group_norm_bwd_input_kernel,
-    group_norm_kernel, grouped_matmul_kernel, im2col_kernel, interpolate3d_kernel,
-    kimi_delta_chunk_kernel, kv_append_kernel, layer_norm_bwd_gamma_kernel,
+    argmax_kernel, attention_bwd_kernel, attention_bwd_small_kernel, attention_kernel,
+    attention_row_kernel, attention_warp_kernel, attention_warp_split_kernel,
+    attention_wmma_d128_kernel, attention_wmma_kernel, axial_rope2d_kernel,
+    batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
+    batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
+    batch_norm_inference_kernel, binary_broadcast_kernel, binary_c64_kernel, binary_kernel,
+    compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel, complex_norm_sq_kernel,
+    concat_kernel, conjugate_c64_kernel, conv_bias_act_epilogue_kernel, conv_transpose2d_kernel,
+    conv_transpose3d_kernel, conv1d_kernel, conv2d_backward_input_kernel,
+    conv2d_backward_weight_kernel, conv2d_kernel, conv3d_backward_input_kernel,
+    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, copy_sanitize_kernel,
+    cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
+    dequant_matmul_mlx_gemm_kernel, dequant_matmul_mlx_gemv_kernel, dequant_matmul_mlx_kernel,
+    dequantize_i8_kernel, dispatch_grid_1d, dispatch_grid_prologue_nchw, elementwise_region_kernel,
+    expand_kernel, fake_quantize_backward_kernel, fake_quantize_ema_kernel,
+    fake_quantize_fixed_kernel, fake_quantize_lsq_bwd_scale_kernel, fake_quantize_lsq_bwd_x_kernel,
+    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel, fused_attn_kernel,
+    fused_binary_unary_kernel, fused_residual_ln_kernel, fused_residual_rms_norm_kernel,
+    fused_swiglu_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
+    gated_residual_kernel, gather_axis_kernel, gather_backward_kernel, gather_elements_kernel,
+    gather_kernel, gather_nd_kernel, group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel,
+    group_norm_bwd_input_kernel, group_norm_kernel, grouped_matmul_kernel, im2col_kernel,
+    interpolate3d_kernel, kimi_delta_chunk_kernel, kv_append_kernel, layer_norm_bwd_gamma_kernel,
     layer_norm_bwd_input_kernel, layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel,
     matmul_kernel, matmul_kernel_tiled, matmul_tma_kernel, matmul_wmma_kernel,
     maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, pad_kernel, pool1d_kernel,
@@ -2876,9 +2876,16 @@ impl CudaExecutable {
                     window,
                     wrt,
                 } => {
-                    let kernel = attention_bwd_kernel(&self.ctx);
-                    let seq_axis = if *wrt == 0 { *seq_q } else { *seq_k };
-                    let y_blocks = seq_axis.div_ceil(256);
+                    // Small shapes (score matrix fits in shared memory) use the
+                    // block-cooperative kernel; keep these bounds in sync with
+                    // SMALL_ATTN_ELEMS / SMALL_ATTN_STAGE in attention_bwd.cu.
+                    let small = seq_q * seq_k <= 4096 && seq_k * (head_dim + 1) <= 2560;
+                    let (kernel, y_blocks) = if small {
+                        (attention_bwd_small_kernel(&self.ctx), 1)
+                    } else {
+                        let seq_axis = if *wrt == 0 { *seq_q } else { *seq_k };
+                        (attention_bwd_kernel(&self.ctx), seq_axis.div_ceil(256))
+                    };
                     let cfg = LaunchConfig {
                         grid_dim: (batch * heads, y_blocks, 1),
                         block_dim: (256, 1, 1),
@@ -5743,10 +5750,12 @@ impl CudaExecutable {
                     h,
                     eps_bits,
                 } => {
+                    // `layer_norm_bwd_gamma_cols`: one block per 32 columns,
+                    // 32 warps (LNG_WARPS) striding over rows.
                     let kernel = layer_norm_bwd_gamma_kernel(&self.ctx);
                     let cfg = LaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (1, 1, 1),
+                        grid_dim: ((*h).div_ceil(32).max(1), 1, 1),
+                        block_dim: (1024, 1, 1),
                         shared_mem_bytes: 0,
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);

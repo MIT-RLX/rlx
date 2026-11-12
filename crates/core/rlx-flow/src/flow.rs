@@ -24,7 +24,7 @@ pub struct ModelFlow {
     name: String,
     pub(crate) profile: CompileProfile,
     /// Graph inputs declared before block stages (do not participate in tensor flow).
-    inputs: Vec<(String, Shape)>,
+    pub(crate) inputs: Vec<(String, Shape)>,
     pub(crate) stages: Vec<FlowStage>,
     output_names: Vec<String>,
     extra_outputs: Vec<HirNodeId>,

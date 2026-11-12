@@ -6192,6 +6192,7 @@ dependencies = [
  "rlx-cpu",
  "rlx-ir",
  "rlx-metal",
+ "rlx-rng",
  "rlx-runtime",
 ]
 

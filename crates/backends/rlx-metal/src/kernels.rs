@@ -3732,12 +3732,25 @@ kernel void group_norm(
     // E[x^2] - mean^2 cancels on data with a DC offset — over a 96^3 group at
     // offset 50 it gave 7e-4 relative error — the same reason wgpu's
     // group_norm.wgsl and layernorm use the stable form.
+    //
+    // Each pass sums in blocks: a thread's share of a 96^3 group is ~14k
+    // values, and one float32 running sum over them drifts by ~1e-4 of the
+    // statistics (SegResNet's 96^3 sliding-window logits moved 1e-4 relative
+    // from the float64-statistics CPU). Strided blocks of GN_BLOCK first, then
+    // the block totals, keep every running sum short without relying on
+    // IEEE ordering, which this fast-math library does not guarantee.
+    // The group's channels are contiguous: element i is at base + i.
     threadgroup float partial[256];
+    const uint GN_BLOCK = 64;
+    uint base = (n * c + c0) * plane;
     float local_sum = 0.0f;
-    for (uint i = tid; i < count; i += tsize) {
-        uint c_off = i / plane;
-        uint s = i % plane;
-        local_sum += src[((n * c + c0 + c_off) * plane) + s];
+    for (uint start = tid; start < count; start += tsize * GN_BLOCK) {
+        uint end = min(count, start + tsize * GN_BLOCK);
+        float block = 0.0f;
+        for (uint i = start; i < end; i += tsize) {
+            block += src[base + i];
+        }
+        local_sum += block;
     }
     partial[tid] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3751,11 +3764,14 @@ kernel void group_norm(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_sq = 0.0f;
-    for (uint i = tid; i < count; i += tsize) {
-        uint c_off = i / plane;
-        uint s = i % plane;
-        float d = src[((n * c + c0 + c_off) * plane) + s] - mean;
-        local_sq += d * d;
+    for (uint start = tid; start < count; start += tsize * GN_BLOCK) {
+        uint end = min(count, start + tsize * GN_BLOCK);
+        float block = 0.0f;
+        for (uint i = start; i < end; i += tsize) {
+            float d = src[base + i] - mean;
+            block += d * d;
+        }
+        local_sq += block;
     }
     partial[tid] = local_sq;
     threadgroup_barrier(mem_flags::mem_threadgroup);

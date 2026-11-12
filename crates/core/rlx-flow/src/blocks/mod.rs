@@ -62,7 +62,7 @@ pub use embed::EmbedStage;
 pub use embed_scale::EmbedScaleStage;
 pub use gather_decode_rope::GatherDecodeRopeStage;
 pub use gather_from_input::{GatherAddStage, GatherFromInputStage};
-pub use gather_last_token::{GatherLastTokenStage, gather_rows_axis1};
+pub use gather_last_token::{GatherLastTokenStage, gather_rows_axis1, gather_rows_flat};
 pub use gdn_scan::GdnScanStage;
 pub use geglu::GeGluStage;
 pub use gelu_ffn::{FfnActivation, GeluFfnStage};

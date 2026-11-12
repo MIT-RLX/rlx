@@ -492,36 +492,6 @@ pub mod splat {
 // IR enums, quant schemes, and autodiff entry points. Specialty crates
 // (GGUF, FPGA, splat, …) stay behind features / module paths.
 
-/// Star-import target covering everyday graph build → compile → run → train.
-///
-/// ```ignore
-/// use rlx::prelude::*;
-///
-/// // Build
-/// let mut g = Graph::new("ex");
-/// let x = g.input("x", Shape::new(&[1, 4], DType::F32));
-/// let y = g.mul(x, g.constant(2.0, DType::F32));
-/// g.set_outputs(vec![y]);
-/// assert!(verify(&g).is_empty());
-///
-/// // Compile + run (pick a device, or let GraphDevices choose)
-/// let mut runner = GraphDevices::new(g.clone());
-/// let device = runner.fastest();
-/// let out = runner.run(device, &[("x", &[1.0; 4])]).unwrap();
-///
-/// // Or Session + CompileOptions
-/// let opts = CompileOptions::default().precision(Precision::F16);
-/// let mut compiled = Session::new(Device::Cpu).compile_with(g, &opts);
-/// let _ = compiled.run(&[("x", &[1.0; 4])]);
-///
-/// // Packages
-/// let pack: Package = open_rlxp("model.rlxp")?;
-/// let _ = compile_rlxp(&Session::new(Device::Cpu), "model.rlxp")?;
-/// ```
-///
-/// For focused imports without the full star set, prefer
-/// [`crate::ops`], [`crate::autodiff`], [`crate::quant`], [`crate::pkg`],
-/// [`crate::compile`].
 /// The workspace README's Rust examples, compiled and run as doctests:
 /// `cargo test -p rlx --doc --features cpu,tensor,optim`. Keeps the first
 /// code a reader copies from going stale.
@@ -529,6 +499,60 @@ pub mod splat {
 #[doc = include_str!("../../../README.md")]
 pub struct ReadmeDoctests;
 
+/// One `use rlx::prelude::*;` for the everyday path: build a graph, compile
+/// it, run it, train it, ship it as a package.
+///
+/// ```
+/// use rlx::prelude::*;
+///
+/// // Build: `GraphExt` builders infer output shapes.
+/// let mut g = Graph::new("mlp");
+/// let x = g.input("x", Shape::new(&[1, 4], DType::F32));
+/// let w = g.param("w", Shape::new(&[4, 2], DType::F32));
+/// let h = g.mm(x, w);
+/// let y = g.relu(h);
+/// g.set_outputs(vec![y]);
+/// assert!(verify(&g).is_empty());
+///
+/// // `rlx::Result` is `anyhow::Result` and keeps std's two-parameter form.
+/// fn parse(s: &str) -> Result<Device> {
+///     Ok(parse_device(s)?)
+/// }
+/// let _: std::result::Result<(), Box<dyn std::error::Error>> = Ok(());
+/// assert_eq!(parse("cpu")?, Device::Cpu);
+/// # Ok::<(), Error>(())
+/// ```
+///
+/// With a backend feature (`cpu`, `metal`, …) the same graph compiles and
+/// runs; `TensorInfo` describes what a compiled graph takes and returns:
+///
+/// ```no_run
+/// # use rlx::prelude::*;
+/// # let mut g = Graph::new("mlp");
+/// # let x = g.input("x", Shape::new(&[1, 4], DType::F32));
+/// # let w = g.param("w", Shape::new(&[4, 2], DType::F32));
+/// # let y = g.mm(x, w);
+/// # g.set_outputs(vec![y]);
+/// let opts = CompileOptions::default().precision(Precision::F16);
+/// let mut net = Session::new(Device::Cpu).compile_with(g, &opts);
+/// let inputs: Vec<TensorInfo> = net.inputs();
+/// assert_eq!(inputs[0].name, "x");
+/// net.set_param("w", &[0.5; 8]);
+/// let out = net.run(&[("x", &[1.0, 2.0, 3.0, 4.0])]);
+/// assert_eq!(out[0].len(), 2);
+///
+/// // Packages
+/// let pack: Package = open_rlxp("model.rlxp")?;
+/// let _ = compile_rlxp(&Session::new(Device::Cpu), "model.rlxp")?;
+/// # Ok::<(), Error>(())
+/// ```
+///
+/// Settings go through [`env`] (`env::var("RLX_…")`, `env::flag`, …): the
+/// prelude exports the module, not its functions, so names as common as
+/// `var` and `set` never collide with yours or another crate's glob import.
+///
+/// For focused imports without the full star set, prefer [`crate::ops`],
+/// [`crate::autodiff`], [`crate::quant`], [`crate::pkg`], [`crate::compile`].
 pub mod prelude {
     // Tensor DSL (expression-style graph building) — feature `tensor`.
     #[cfg(feature = "tensor")]
@@ -542,7 +566,7 @@ pub mod prelude {
         Device, DeviceBenchResult, DeviceCandidate, DeviceFallbackError, DevicePickStrategy,
         DevicePolicy, DeviceRouter, Dim, Element, Error, FlexibleSession, FusionPolicy, Graph,
         GraphDevices, GraphExt, GraphModule, GraphStage, IoError, Node, NodeId, Op, OpKind,
-        ParseDeviceError, Result, Session, Shape, Tick, VerifyError, WeightLoader,
+        ParseDeviceError, Result, Session, Shape, TensorInfo, Tick, VerifyError, WeightLoader,
         available_devices, benchmark_devices, device_chain_from_env, device_from_env, device_label,
         device_report, devices_for, devices_for_with_policy, fastest_device, fastest_device_for,
         graph_param_names, is_available, parse_device, parse_device_list, pipeline_schedule,
@@ -572,8 +596,12 @@ pub mod prelude {
         weight_names_for_rank,
     };
 
+    // Settings: the module and its types, not `var` / `set` / `flag` /
+    // `unset` themselves — names that generic would collide with the
+    // caller's own and with any other glob import.
+    pub use crate::ir::env::{self, RlxEnv, RuntimeOverrides};
+
     // Optimizer / compile-pass types
-    pub use crate::ir::env::{self, RlxEnv, RuntimeOverrides, flag, set, unset, var};
     pub use crate::{CalibrationRecord, Pass, Precision, PrecisionPolicy};
 
     // Training-step optimizers (feature `optim`)

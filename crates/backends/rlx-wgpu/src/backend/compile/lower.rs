@@ -422,6 +422,50 @@ fn wgpu_prefer_structure_host(arena: &crate::buffer::Arena) -> bool {
     wgpu_prefer_host_fallback(arena) || crate::device::discrete_hosts_ops()
 }
 
+/// Debug: `RLX_WGPU_STAGE_SKIP=a-b,c` keeps those node ids off the staging
+/// stripe (they host).
+fn stage_skipped(id: usize) -> bool {
+    let Ok(s) = std::env::var("RLX_WGPU_STAGE_SKIP") else {
+        return false;
+    };
+    s.split(',').any(|p| match p.split_once('-') {
+        Some((a, b)) => {
+            a.parse().is_ok_and(|a: usize| id >= a) && b.parse().is_ok_and(|b: usize| id <= b)
+        }
+        None => p.parse() == Ok(id),
+    })
+}
+
+/// Bytes an op's operands and output take (each 256-aligned, aliases once)
+/// when they do not all lie in one arena stripe and the op has no
+/// two-window kernel; `None` when it needs no staging.
+fn straddle_footprint(
+    arena: &crate::buffer::Arena,
+    node: &rlx_ir::Node,
+    graph: &Graph,
+) -> Option<usize> {
+    if two_window_ok(arena, node, graph) {
+        return None;
+    }
+    let mut ids: Vec<NodeId> = node.inputs.clone();
+    ids.push(node.id);
+    let mut spans = Vec::new();
+    let mut seen: Vec<usize> = Vec::new();
+    let mut bytes = 0usize;
+    for id in ids {
+        let Some(&off) = arena.offsets.get(&id) else {
+            continue;
+        };
+        let len = arena.len_of(id);
+        spans.push((off, len));
+        if !seen.contains(&off) {
+            seen.push(off);
+            bytes += len.max(1).div_ceil(256) * 256;
+        }
+    }
+    arena.straddles_shards(&spans).map(|_| bytes)
+}
+
 /// Ops routed to packed [`Step::HostOp`] when hosting is required.
 /// Expand / Conv / Transpose / Narrow / Concat / DequantMatMul / Custom keep
 /// dedicated host paths. View-like Gather stays on GPU GatherSplit / axis
@@ -517,13 +561,40 @@ fn two_window_ok(arena: &crate::buffer::Arena, node: &rlx_ir::Node, graph: &Grap
         let end = o + arena.len_of(id).max(1);
         end <= arena.shard_stage_off(o) || o >= arena.shard_stage_end(o)
     };
+    // input and output in different stripes: in one, the windows coincide.
+    // (A weight left in another stripe — the browser keeps f32 params in the
+    // arena — made such a conv not "fit" one window; binding two panicked.)
+    let s = arena.shard_size;
+    let apart = node.inputs.first().is_some_and(|&i| {
+        let o = arena.offset(i);
+        crate::buffer::is_weight_off(o) || o / s != arena.offset(node.id) / s
+    });
     (conv || norm)
+        && apart
         && f32(node.id)
         && one_stripe(node.id)
         && node
             .inputs
             .iter()
             .all(|&i| f32(i) && one_stripe(i) && clear_of_reserve(i))
+}
+
+/// A striped arena's op whose data input and output lie in one stripe (each
+/// whole inside it): one window binds both, its parameters staged beside them.
+fn same_stripe_ok(arena: &crate::buffer::Arena, node: &rlx_ir::Node) -> bool {
+    if !arena.is_sharded() || rlx_ir::env::flag("RLX_WGPU_NO_TWO_WINDOW") {
+        return false;
+    }
+    let Some(&i) = node.inputs.first() else {
+        return false;
+    };
+    let s = arena.shard_size;
+    let stripe = |id: NodeId| {
+        let o = arena.offset(id);
+        let last = o + arena.len_of(id).max(1) - 1;
+        (!crate::buffer::is_weight_off(o) && o / s == last / s).then_some(o / s)
+    };
+    stripe(i).is_some() && stripe(i) == stripe(node.id)
 }
 
 fn should_pack_host_op(
@@ -923,10 +994,11 @@ fn compile_static_with(
     // window (not only when it exceeds max_buffer_size). On Metal we raise
     // max_buffer_size to ~40 GiB so F5 fits in one buffer, but Param→Reshape
     // views still need the split pass or they stay zeroed and DiT collapses.
-    // Weight-buffer offsets start at `WEIGHT_BUF_TAG`: on wasm32 that is
-    // 3 GiB, so an arena crossing it would read its own offsets as weight
-    // offsets. Split before it can — a no-op on 64-bit.
-    let split_at = max_bind.min(crate::buffer::WEIGHT_BUF_TAG as u64);
+    // Weight-buffer offsets start at the weight split: on wasm32 that is
+    // 3 GiB unless an earlier arena moved it, so an arena crossing it would
+    // read its own offsets as weight offsets. Split before it can (the split
+    // path then admits the arena, `tag32::admit_arena`) — a no-op on 64-bit.
+    let split_at = max_bind.min(crate::buffer::weight_buf_tag() as u64);
     // Packed GGUF weights read only by the fused GEMV can also live in the
     // weight buffer when the arena is small: the GEMV binds it in place, and
     // a second executable over the same weights (another decode rung, the
@@ -938,6 +1010,7 @@ fn compile_static_with(
         && gdn_scratch == 0
         && rnn_gru_scratch == 0
         && crate::gguf_gpu::packed_weights_bind_in_place(&graph);
+    let one_buffer = (plan.arena_size + scratch_bytes) as u64 <= split_at && !packed_in_place;
     let mut arena = if (plan.arena_size + scratch_bytes) as u64 > split_at {
         Arena::from_plan_split(&dev.device, &plan, &graph, scratch_bytes)
     } else if packed_in_place {
@@ -946,6 +1019,25 @@ fn compile_static_with(
         Arena::from_plan_with_scratch(&dev.device, &plan, scratch_bytes)
     };
     let _ = max_buf;
+    // The f16 shadow (half the arena again) is read only by Coop16 matmuls
+    // (an f16 operand), Vulkan/DX12's CoopF16Vk, the f16 mirror of weights
+    // spanning more than one binding, and the `RLX_WGPU_F16_WEIGHTS` /
+    // `RLX_WGPU_F16_MIRROR` opt-ins. On a one-buffer arena within one binding
+    // none of those can apply to an f16-free graph: drop it before any
+    // parameter is written. Kept, an f32 model held 1.5x its weights, which
+    // across MLX-Reason-CT's decoder stages ran past Metal's working set; its
+    // command buffers then failed without an error and outputs read zeros.
+    if one_buffer
+        && arena.f16_buffer.is_some()
+        && arena.size as u64 <= max_bind
+        && !arena.is_sharded()
+        && !rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS")
+        && !rlx_ir::env::flag("RLX_WGPU_F16_MIRROR")
+        && !crate::device::coop_discrete_backend()
+        && !graph.nodes().iter().any(|n| matches!(n.shape.dtype(), rlx_ir::DType::F16))
+    {
+        arena.f16_buffer = None;
+    }
     if rlx_ir::env::flag("RLX_WGPU_ARENA_REPORT") {
         eprintln!(
             "[rlx-wgpu] arena build: plan {} + scratch {} vs split_at {} -> size {} sharded {}",
@@ -1417,17 +1509,211 @@ fn compile_static_with(
         })
     };
 
+    // STAGING STRIPE (`RLX_WGPU_STRADDLE_STAGE`). An op whose operands lie in
+    // more than one arena stripe would otherwise run on the host (see
+    // `op_straddles_shards`), which the browser refuses. Instead its operands
+    // are copied, on the GPU (`Step::BufferCopy`, two-window copies), into one
+    // extra stripe kept for this; the op runs there with its offsets pointing
+    // at the copies, and its output is copied back before the next op lowers.
+    // The stripe is one full stripe and keeps its stage reserve (weights an
+    // op stages beside its operands); an op whose operands do not fit the
+    // rest still hosts.
+    let mut staging: Option<(usize, usize)> = None; // (logical base, bytes)
+    // Only with `RLX_WGPU_SHARD_GPU` (ops kept on the GPU): a striped arena
+    // otherwise hosts most ops, and a host step needs no staging (it reads
+    // whole tensors) — reading staged copies it would race the GPU copies.
+    if arena.is_sharded()
+        && !arena.extra_shards.is_empty()
+        && rlx_ir::env::flag("RLX_WGPU_STRADDLE_STAGE")
+        && rlx_ir::env::flag("RLX_WGPU_SHARD_GPU")
+    {
+        let cap = arena.shard_size;
+        // Ops whose operands fit one stripe; a larger one still hosts.
+        let mut need = 0usize;
+        let mut too_large = 0usize;
+        for node in graph.nodes() {
+            if matches!(
+                node.op,
+                Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
+            ) {
+                continue;
+            }
+            match straddle_footprint(&arena, node, &graph) {
+                Some(bytes) if bytes + crate::buffer::shard_stage_reserve() <= cap => {
+                    need = need.max(bytes)
+                }
+                Some(bytes) => {
+                    too_large += 1;
+                    if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+                        eprintln!(
+                            "[rlx-wgpu] staging: {:?} node {} needs {:.2} GiB, out {:?}",
+                            node.op.kind(),
+                            node.id.0,
+                            bytes as f64 / (1u64 << 30) as f64,
+                            node.shape.dims()
+                        );
+                    }
+                }
+                None => {}
+            }
+        }
+        if too_large > 0 && rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+            eprintln!("[rlx-wgpu] staging: {too_large} straddling ops exceed one stripe and host");
+        }
+        if need > 0 {
+            let base = (1 + arena.extra_shards.len()) * cap;
+            // A whole stripe: arena reads split at stripe boundaries and take
+            // every stripe but the last as full.
+            let size = cap;
+            let buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rlx-wgpu staging stripe"),
+                size: size as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            arena.extra_shards.push(buf);
+            arena.staging = Some((base, size));
+            staging = Some((base, size));
+            if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+                eprintln!(
+                    "[rlx-wgpu] staging stripe: {:.3} GiB at {base:#x}",
+                    size as f64 / (1u64 << 30) as f64
+                );
+            }
+        }
+    }
+    // The staged op's real offsets and its output's real offset, restored
+    // (and the output copied back) at the top of the next iteration.
+    let mut pending_stage: Option<(Vec<(NodeId, usize)>, Option<(usize, usize, usize)>)> = None;
+
     // Which node each emitted step belongs to. Recorded at the *top* of the next
     // iteration so the many `continue`s in the match below cannot skip it.
     let mut step_nodes: Vec<NodeId> = Vec::new();
     let mut prev_node: Option<NodeId> = None;
     for node in graph.nodes() {
+        if let Some((saved, out)) = pending_stage.take() {
+            if let Some((staged, real, bytes)) = out {
+                schedule.push(Step::BufferCopy {
+                    src_byte_off: staged as u64,
+                    dst_byte_off: real as u64,
+                    bytes: bytes as u32,
+                });
+            }
+            for (id, off) in saved {
+                arena.offsets.insert(id, off);
+            }
+        }
         if let Some(prev) = prev_node {
             while step_nodes.len() < schedule.len() {
                 step_nodes.push(prev);
             }
         }
         prev_node = Some(node.id);
+        // A straddling concat is a set of GPU copies, however large (no
+        // staging): for each of the `outer` rows before its axis, each input's
+        // row goes to its slice of the output's row. Up to 4096 copies.
+        if staging.is_some()
+            && !rlx_ir::env::flag("RLX_WGPU_NO_CONCAT_COPY")
+            && let Op::Concat { axis } = node.op
+            && arena.offsets.contains_key(&node.id)
+            && node
+                .inputs
+                .iter()
+                .all(|i| arena.offsets.contains_key(i) && arena.len_of(*i) > 0)
+            && straddle_footprint(&arena, node, &graph).is_some()
+        {
+            let dims: Vec<usize> = node
+                .shape
+                .dims()
+                .iter()
+                .map(|d| d.unwrap_static())
+                .collect();
+            let outer: usize = dims[..axis].iter().product();
+            let out_row = arena.len_of(node.id) / outer.max(1);
+            if outer >= 1
+                && outer * node.inputs.len() <= 4096
+                && out_row * outer == arena.len_of(node.id)
+            {
+                let out = arena.offsets[&node.id];
+                let mut col = 0usize;
+                for &i in &node.inputs {
+                    let in_row = arena.len_of(i) / outer;
+                    for r in 0..outer {
+                        schedule.push(Step::BufferCopy {
+                            src_byte_off: (arena.offsets[&i] + r * in_row) as u64,
+                            dst_byte_off: (out + r * out_row + col) as u64,
+                            bytes: in_row as u32,
+                        });
+                    }
+                    col += in_row;
+                }
+                continue;
+            }
+        }
+        if let Some((base, size)) = staging
+            && !matches!(
+                node.op,
+                Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
+            )
+            && straddle_footprint(&arena, node, &graph)
+                .is_some_and(|b| b + crate::buffer::shard_stage_reserve() <= size)
+            && !stage_skipped(node.id.0 as usize)
+        {
+            if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+                eprintln!(
+                    "[rlx-wgpu] staged {:?} node {} inputs {:?} out {:?}",
+                    node.op.kind(),
+                    node.id.0,
+                    node.inputs.iter().map(|i| i.0).collect::<Vec<_>>(),
+                    node.shape.dims()
+                );
+            }
+            // Distinct real offsets (aliases share one copy), inputs then output.
+            let mut placed: Vec<(usize, usize)> = Vec::new(); // (real, staged)
+            let mut cursor = base;
+            let mut saved = Vec::new();
+            let mut ids: Vec<NodeId> = node.inputs.clone();
+            ids.push(node.id);
+            for (k, &id) in ids.iter().enumerate() {
+                if !arena.offsets.contains_key(&id) {
+                    continue;
+                }
+                let real = arena.offsets[&id];
+                let len = arena.len_of(id);
+                let staged = match placed.iter().find(|(r, _)| *r == real) {
+                    Some(&(_, st)) => st,
+                    None => {
+                        let st = cursor;
+                        cursor += len.max(1).div_ceil(256) * 256;
+                        placed.push((real, st));
+                        // Inputs are copied in; the output (the last id) is not.
+                        if k + 1 < ids.len() && len > 0 {
+                            schedule.push(Step::BufferCopy {
+                                src_byte_off: real as u64,
+                                dst_byte_off: st as u64,
+                                bytes: len as u32,
+                            });
+                        }
+                        st
+                    }
+                };
+                saved.push((id, real));
+                arena.offsets.insert(id, staged);
+            }
+            let out = arena.offsets.contains_key(&node.id).then(|| {
+                let real = saved
+                    .iter()
+                    .rev()
+                    .find(|(id, _)| *id == node.id)
+                    .map(|x| x.1)
+                    .unwrap();
+                (arena.offsets[&node.id], real, arena.len_of(node.id))
+            });
+            pending_stage = Some((saved, out));
+        }
+
         // Helpers — capture device + arena into closures isn't
         // ergonomic in the loop, so inline the bind-group build
         // when each step is emitted below.
@@ -1446,6 +1732,8 @@ fn compile_static_with(
         if (absolute_offsets_wrong
             || (lowers_to_u32_offset_host_step(&node.op) && !whole_arena_host_ok(&arena, node)))
             && !two_window_ok(&arena, node, &graph)
+            // a folded group norm in one stripe: the GPU kernel's one window
+            && !(crate::unfuse::group_norm_act(&node.op).is_some() && same_stripe_ok(&arena, node))
         {
             schedule.push(host_op_step(&graph, node, &arena));
             continue;
@@ -8021,7 +8309,9 @@ fn compile_static_with(
             // read it (`fold_norm_activation`), applied in its write-back.
             op @ (Op::GroupNorm { .. } | Op::Custom { .. })
                 if crate::unfuse::group_norm_act(op).is_some()
-                    && (!wgpu_prefer_host_norm(&arena) || two_window_ok(&arena, node, &graph)) =>
+                    && (!wgpu_prefer_host_norm(&arena)
+                        || two_window_ok(&arena, node, &graph)
+                        || same_stripe_ok(&arena, node)) =>
             {
                 let (num_groups, eps, act) = crate::unfuse::group_norm_act(op).unwrap();
                 let (num_groups, eps) = (&num_groups, &eps);
@@ -8173,6 +8463,18 @@ fn compile_static_with(
             {
                 let (num_groups, eps, act) = crate::unfuse::group_norm_act(op).unwrap();
                 let (num_groups, eps) = (&num_groups, &eps);
+                if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+                    let at = |id: NodeId| (arena.offset(id), arena.len_of(id));
+                    eprintln!(
+                        "[rlx-wgpu] host group norm node {}: in {:?} out {:?} gamma {:?} stripe {} reserve {}",
+                        node.id.0,
+                        at(node.inputs[0]),
+                        at(node.id),
+                        at(node.inputs[1]),
+                        arena.shard_size,
+                        crate::buffer::shard_stage_reserve()
+                    );
+                }
                 note_host_reads(&graph, node);
                 // `[N, C, ...]`, gamma/beta [c]. Host step (schedule-only).
                 let (n, c, h, w) = group_norm_nchw_dims(&graph.node(node.inputs[0]).shape);
@@ -12144,6 +12446,19 @@ fn compile_static_with(
         }
     }
 
+    // The last staged op's output copy-back and offsets.
+    if let Some((saved, out)) = pending_stage.take() {
+        if let Some((staged, real, bytes)) = out {
+            schedule.push(Step::BufferCopy {
+                src_byte_off: staged as u64,
+                dst_byte_off: real as u64,
+                bytes: bytes as u32,
+            });
+        }
+        for (id, off) in saved {
+            arena.offsets.insert(id, off);
+        }
+    }
     if let Some(prev) = prev_node {
         while step_nodes.len() < schedule.len() {
             step_nodes.push(prev);

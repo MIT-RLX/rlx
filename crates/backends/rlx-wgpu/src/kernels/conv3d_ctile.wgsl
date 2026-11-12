@@ -5,18 +5,17 @@
 // 3D NCDHW conv, four output channels per thread.
 //
 // `conv3d.wgsl` gives one thread one output element. That reloads the whole
-// input patch once per output channel, and it recomputes the padding bounds
-// test inside the input-channel loop — `c_in` times per tap for a result that
-// depends on neither. This kernel fixes both:
-//
-//   * taps move outside the channel loop, so the bounds test and the input
-//     spatial offset are computed once per tap rather than once per (tap, ci);
-//   * four accumulators per thread, so each loaded input value feeds four
-//     fused multiply-adds instead of one.
+// input patch once per output channel. This kernel keeps four accumulators
+// per thread, so each loaded input value feeds four fused multiply-adds
+// instead of one. (Taps once moved outside the channel loop, to test bounds
+// once per tap; the channel-outer order below keeps rlx-cpu's sums.)
 //
 // WGSL has no cooperative-matrix type, so this is register tiling rather than
-// the implicit-GEMM/MMA design the Metal backend uses. The arithmetic is
-// identical to the scalar kernel's, accumulated in the same order.
+// the implicit-GEMM/MMA design the Metal backend uses. Every output sums its
+// terms as one fused multiply-add chain, input channels outermost and taps
+// inside: the order of rlx-cpu's and rlx-metal's conv3d (bit-identical to
+// them). Summed taps-outer with separate multiplies and adds, SynthSeg's
+// robust cascade drifted past the reference's bounds that both met.
 //
 // Ungrouped only. With groups > 1 the four channels of a tile can straddle a
 // group boundary and then read *different* input channels, which is precisely
@@ -126,9 +125,15 @@ fn conv3d_ctile(
     var a2: f32 = 0.0;
     var a3: f32 = 0.0;
 
-    for (var kd: u32 = 0u; kd < params.kd; kd = kd + 1u) {
-      for (var kh: u32 = 0u; kh < params.kh; kh = kh + 1u) {
-        for (var kw: u32 = 0u; kw < params.kw; kw = kw + 1u) {
+    // input channels outermost, each tap's product fused into the running
+    // sum: the order (and the single rounding per term) of rlx-cpu's and
+    // rlx-metal's conv3d, which the reference's MLX shares closely.
+    for (var ci: u32 = 0u; ci < params.c_in; ci = ci + 1u) {
+      let cin = in_base + ci * dhw;
+      let cw = w_base + ci * ktap;
+      for (var kd: u32 = 0u; kd < params.kd; kd = kd + 1u) {
+        for (var kh: u32 = 0u; kh < params.kh; kh = kh + 1u) {
+          for (var kw: u32 = 0u; kw < params.kw; kw = kw + 1u) {
             let in_d_s = i32(do_ * params.sd + kd * params.dd) - i32(params.pd);
             let in_h_s = i32(ho  * params.sh + kh * params.dh) - i32(params.ph);
             let in_w_s = i32(wo  * params.sw + kw * params.dw) - i32(params.pw);
@@ -140,17 +145,13 @@ fn conv3d_ctile(
             }
             let sp = (u32(in_d_s) * params.h + u32(in_h_s)) * params.w + u32(in_w_s);
             let tap = (kd * params.kh + kh) * params.kw + kw;
-            var src = in_base + sp;
-            var wt = w_base + tap;
-            for (var ci: u32 = 0u; ci < params.c_in; ci = ci + 1u) {
-                let v = arena[src];
-                a0 = a0 + v * arena[wt];
-                a1 = a1 + v * arena[wt + kstride];
-                a2 = a2 + v * arena[wt + 2u * kstride];
-                a3 = a3 + v * arena[wt + 3u * kstride];
-                src = src + dhw;
-                wt = wt + ktap;
-            }
+            let v = arena[cin + sp];
+            let wt = cw + tap;
+            a0 = fma(v, arena[wt], a0);
+            a1 = fma(v, arena[wt + kstride], a1);
+            a2 = fma(v, arena[wt + 2u * kstride], a2);
+            a3 = fma(v, arena[wt + 3u * kstride], a3);
+          }
         }
       }
     }
@@ -173,7 +174,7 @@ fn conv3d_ctile(
 // Four output channels × two neighbouring W positions per thread: each
 // weight load feeds two multiply-adds (positions) and each input load four
 // (channels) — 0.75 loads per multiply-add against `conv3d_ctile`'s 1.25.
-// Same taps-then-channels order per output, so the same sums.
+// The same per-output order as `conv3d_ctile`, so the same sums.
 @compute @workgroup_size(64)
 fn conv3d_ctile_w2(
     @builtin(global_invocation_id) gid: vec3<u32>,
@@ -205,14 +206,18 @@ fn conv3d_ctile_w2(
     var a0: f32 = 0.0; var a1: f32 = 0.0; var a2: f32 = 0.0; var a3: f32 = 0.0;
     var b0: f32 = 0.0; var b1: f32 = 0.0; var b2: f32 = 0.0; var b3: f32 = 0.0;
 
-    for (var kd: u32 = 0u; kd < params.kd; kd = kd + 1u) {
-      let in_d_s = i32(do_ * params.sd + kd * params.dd) - i32(params.pd);
-      if (in_d_s < 0 || in_d_s >= i32(params.d)) { continue; }
-      for (var kh: u32 = 0u; kh < params.kh; kh = kh + 1u) {
-        let in_h_s = i32(ho * params.sh + kh * params.dh) - i32(params.ph);
-        if (in_h_s < 0 || in_h_s >= i32(params.h)) { continue; }
-        let row = (u32(in_d_s) * params.h + u32(in_h_s)) * params.w;
-        for (var kw: u32 = 0u; kw < params.kw; kw = kw + 1u) {
+    // channels outermost, fused products (see `conv3d_ctile`)
+    for (var ci: u32 = 0u; ci < params.c_in; ci = ci + 1u) {
+      let cin = in_base + ci * dhw;
+      let cw = w_base + ci * ktap;
+      for (var kd: u32 = 0u; kd < params.kd; kd = kd + 1u) {
+        let in_d_s = i32(do_ * params.sd + kd * params.dd) - i32(params.pd);
+        if (in_d_s < 0 || in_d_s >= i32(params.d)) { continue; }
+        for (var kh: u32 = 0u; kh < params.kh; kh = kh + 1u) {
+          let in_h_s = i32(ho * params.sh + kh * params.dh) - i32(params.ph);
+          if (in_h_s < 0 || in_h_s >= i32(params.h)) { continue; }
+          let row = (u32(in_d_s) * params.h + u32(in_h_s)) * params.w;
+          for (var kw: u32 = 0u; kw < params.kw; kw = kw + 1u) {
             let wa = i32(wo * params.sw + kw * params.dw) - i32(params.pw);
             let wb = wa + i32(params.sw);
             let ok_a = wa >= 0 && wa < i32(params.w);
@@ -220,26 +225,16 @@ fn conv3d_ctile_w2(
             if (!ok_a && !ok_b) { continue; }
             let tap = (kd * params.kh + kh) * params.kw + kw;
             // an out-of-range position reads its partner's voxel and adds 0
-            let sa = in_base + row + u32(select(wb, wa, ok_a));
-            let sb = in_base + row + u32(select(wa, wb, ok_b));
-            let ma = select(0.0, 1.0, ok_a);
-            let mb = select(0.0, 1.0, ok_b);
-            var src_a = sa;
-            var src_b = sb;
-            var wt = w_base + tap;
-            for (var ci: u32 = 0u; ci < params.c_in; ci = ci + 1u) {
-                let va = arena[src_a] * ma;
-                let vb = arena[src_b] * mb;
-                let w0 = arena[wt];
-                let w1 = arena[wt + kstride];
-                let w2 = arena[wt + 2u * kstride];
-                let w3 = arena[wt + 3u * kstride];
-                a0 = a0 + va * w0; a1 = a1 + va * w1; a2 = a2 + va * w2; a3 = a3 + va * w3;
-                b0 = b0 + vb * w0; b1 = b1 + vb * w1; b2 = b2 + vb * w2; b3 = b3 + vb * w3;
-                src_a = src_a + dhw;
-                src_b = src_b + dhw;
-                wt = wt + ktap;
-            }
+            let va = arena[cin + row + u32(select(wb, wa, ok_a))] * select(0.0, 1.0, ok_a);
+            let vb = arena[cin + row + u32(select(wa, wb, ok_b))] * select(0.0, 1.0, ok_b);
+            let wt = cw + tap;
+            let w0 = arena[wt];
+            let w1 = arena[wt + kstride];
+            let w2 = arena[wt + 2u * kstride];
+            let w3 = arena[wt + 3u * kstride];
+            a0 = fma(va, w0, a0); a1 = fma(va, w1, a1); a2 = fma(va, w2, a2); a3 = fma(va, w3, a3);
+            b0 = fma(vb, w0, b0); b1 = fma(vb, w1, b1); b2 = fma(vb, w2, b2); b3 = fma(vb, w3, b3);
+          }
         }
       }
     }
@@ -264,7 +259,7 @@ fn conv3d_ctile_w2(
 // Four output channels × four neighbouring W positions per thread, the four
 // channels of a position in one vec4: each weight load feeds four
 // multiply-adds and each input load four — 0.5 loads per multiply-add.
-// Same taps-then-channels order per output as `conv3d_ctile`.
+// The same per-output order as `conv3d_ctile`.
 @compute @workgroup_size(64)
 fn conv3d_ctile_w4(
     @builtin(global_invocation_id) gid: vec3<u32>,
@@ -296,14 +291,18 @@ fn conv3d_ctile_w4(
     var a = vec4<f32>(0.0); var b = vec4<f32>(0.0);
     var c = vec4<f32>(0.0); var e = vec4<f32>(0.0);
 
-    for (var kd: u32 = 0u; kd < params.kd; kd = kd + 1u) {
-      let in_d_s = i32(do_ * params.sd + kd * params.dd) - i32(params.pd);
-      if (in_d_s < 0 || in_d_s >= i32(params.d)) { continue; }
-      for (var kh: u32 = 0u; kh < params.kh; kh = kh + 1u) {
-        let in_h_s = i32(ho * params.sh + kh * params.dh) - i32(params.ph);
-        if (in_h_s < 0 || in_h_s >= i32(params.h)) { continue; }
-        let row = in_base + (u32(in_d_s) * params.h + u32(in_h_s)) * params.w;
-        for (var kw: u32 = 0u; kw < params.kw; kw = kw + 1u) {
+    // channels outermost, fused products (see `conv3d_ctile`)
+    for (var ci: u32 = 0u; ci < params.c_in; ci = ci + 1u) {
+      let cin = ci * dhw;
+      let cw = w_base + ci * ktap;
+      for (var kd: u32 = 0u; kd < params.kd; kd = kd + 1u) {
+        let in_d_s = i32(do_ * params.sd + kd * params.dd) - i32(params.pd);
+        if (in_d_s < 0 || in_d_s >= i32(params.d)) { continue; }
+        for (var kh: u32 = 0u; kh < params.kh; kh = kh + 1u) {
+          let in_h_s = i32(ho * params.sh + kh * params.dh) - i32(params.ph);
+          if (in_h_s < 0 || in_h_s >= i32(params.h)) { continue; }
+          let row = in_base + cin + (u32(in_d_s) * params.h + u32(in_h_s)) * params.w;
+          for (var kw: u32 = 0u; kw < params.kw; kw = kw + 1u) {
             let w0 = i32(wo * params.sw + kw * params.dw) - i32(params.pw);
             let s = i32(params.sw);
             let wa = w0; let wb = w0 + s; let wc = w0 + 2 * s; let wd = w0 + 3 * s;
@@ -315,21 +314,14 @@ fn conv3d_ctile_w4(
             let md = select(0.0, 1.0, wo + 3u < params.w_out && wd >= 0 && wd <= wmax);
             if (ma + mb + mc + md == 0.0) { continue; }
             let tap = (kd * params.kh + kh) * params.kw + kw;
-            var sa = row + u32(clamp(wa, 0, wmax));
-            var sb = row + u32(clamp(wb, 0, wmax));
-            var sc = row + u32(clamp(wc, 0, wmax));
-            var sd = row + u32(clamp(wd, 0, wmax));
-            var wt = w_base + tap;
-            for (var ci: u32 = 0u; ci < params.c_in; ci = ci + 1u) {
-                let wv = vec4<f32>(arena[wt], arena[wt + kstride],
-                                   arena[wt + 2u * kstride], arena[wt + 3u * kstride]);
-                a = a + (ld(sa) * ma) * wv;
-                b = b + (ld(sb) * mb) * wv;
-                c = c + (ld(sc) * mc) * wv;
-                e = e + (ld(sd) * md) * wv;
-                sa = sa + dhw; sb = sb + dhw; sc = sc + dhw; sd = sd + dhw;
-                wt = wt + ktap;
-            }
+            let wt = cw + tap;
+            let wv = vec4<f32>(arena[wt], arena[wt + kstride],
+                               arena[wt + 2u * kstride], arena[wt + 3u * kstride]);
+            a = fma(vec4<f32>(ld(row + u32(clamp(wa, 0, wmax))) * ma), wv, a);
+            b = fma(vec4<f32>(ld(row + u32(clamp(wb, 0, wmax))) * mb), wv, b);
+            c = fma(vec4<f32>(ld(row + u32(clamp(wc, 0, wmax))) * mc), wv, c);
+            e = fma(vec4<f32>(ld(row + u32(clamp(wd, 0, wmax))) * md), wv, e);
+          }
         }
       }
     }
@@ -356,8 +348,8 @@ fn conv3d_ctile_w4(
 // Eight output channels × four neighbouring W positions per thread, two
 // vec4s per position: each input load feeds eight multiply-adds — half the
 // input traffic of `conv3d_ctile_w4`, whose four-channel tiles re-read every
-// input voxel once per tile. Same taps-then-channels order per output, so
-// the same sums. Measured on MindGrab (M4 Pro): 1.85 → 1.25 s of convs.
+// input voxel once per tile. The same per-output order as `conv3d_ctile`,
+// so the same sums. Measured on MindGrab (M4 Pro): 1.85 → 1.25 s of convs.
 // Sixteen channels × two positions was no faster, weights staged in
 // workgroup memory ten times slower, and a mask-free path for taps inside
 // the volume made no difference.
@@ -394,14 +386,18 @@ fn conv3d_ctile_w4c8(
     var a2 = vec4<f32>(0.0); var b2 = vec4<f32>(0.0);
     var c2 = vec4<f32>(0.0); var e2 = vec4<f32>(0.0);
 
-    for (var kd: u32 = 0u; kd < params.kd; kd = kd + 1u) {
-      let in_d_s = i32(do_ * params.sd + kd * params.dd) - i32(params.pd);
-      if (in_d_s < 0 || in_d_s >= i32(params.d)) { continue; }
-      for (var kh: u32 = 0u; kh < params.kh; kh = kh + 1u) {
-        let in_h_s = i32(ho * params.sh + kh * params.dh) - i32(params.ph);
-        if (in_h_s < 0 || in_h_s >= i32(params.h)) { continue; }
-        let row = in_base + (u32(in_d_s) * params.h + u32(in_h_s)) * params.w;
-        for (var kw: u32 = 0u; kw < params.kw; kw = kw + 1u) {
+    // channels outermost, fused products (see `conv3d_ctile`)
+    for (var ci: u32 = 0u; ci < params.c_in; ci = ci + 1u) {
+      let cin = ci * dhw;
+      let cw = w_base + ci * ktap;
+      for (var kd: u32 = 0u; kd < params.kd; kd = kd + 1u) {
+        let in_d_s = i32(do_ * params.sd + kd * params.dd) - i32(params.pd);
+        if (in_d_s < 0 || in_d_s >= i32(params.d)) { continue; }
+        for (var kh: u32 = 0u; kh < params.kh; kh = kh + 1u) {
+          let in_h_s = i32(ho * params.sh + kh * params.dh) - i32(params.ph);
+          if (in_h_s < 0 || in_h_s >= i32(params.h)) { continue; }
+          let row = in_base + cin + (u32(in_d_s) * params.h + u32(in_h_s)) * params.w;
+          for (var kw: u32 = 0u; kw < params.kw; kw = kw + 1u) {
             let w0 = i32(wo * params.sw + kw * params.dw) - i32(params.pw);
             let s = i32(params.sw);
             let wa = w0; let wb = w0 + s; let wc = w0 + 2 * s; let wd = w0 + 3 * s;
@@ -411,58 +407,42 @@ fn conv3d_ctile_w4c8(
             let md = select(0.0, 1.0, wo + 3u < params.w_out && wd >= 0 && wd <= wmax);
             if (ma + mb + mc + md == 0.0) { continue; }
             let tap = (kd * params.kh + kh) * params.kw + kw;
-            var wt = w_base + tap;
-            var sa = row + u32(clamp(wa, 0, wmax));
-            var sb = row + u32(clamp(wb, 0, wmax));
-            var sc = row + u32(clamp(wc, 0, wmax));
-            var sd = row + u32(clamp(wd, 0, wmax));
+            let wt = cw + tap;
+            let wv = vec4<f32>(arena[wt], arena[wt + kstride],
+                               arena[wt + 2u * kstride], arena[wt + 3u * kstride]);
+            let wt4 = wt + 4u * kstride;
+            let wv2 = vec4<f32>(arena[wt4], arena[wt4 + kstride],
+                                arena[wt4 + 2u * kstride], arena[wt4 + 3u * kstride]);
+            let sa = row + u32(clamp(wa, 0, wmax));
+            let sb = row + u32(clamp(wb, 0, wmax));
+            let sc = row + u32(clamp(wc, 0, wmax));
+            let sd = row + u32(clamp(wd, 0, wmax));
+            var va: f32; var vb: f32; var vc: f32; var vd: f32;
             if (IN_HALF) {
-                // halves: a channel is `dhw / 2` words on (`dhw` is even —
-                // the producer's `w_out` is), and a position's half is the
-                // same for every channel. Four neighbours inside the volume
-                // are two words, or three when the first is an odd half.
-                let hd = dhw >> 1u;
+                // halves: a position's half is the same for every channel;
+                // four neighbours inside the volume are two words, or three
+                // when the first is an odd half
                 let run = s == 1 && ma * mb * mc * md == 1.0;
-                var qa = hword(sa); var qb = hword(sb); var qc = hword(sc); var qd = hword(sd);
-                let oa = hodd(sa); let ob = hodd(sb); let oc = hodd(sc); let od = hodd(sd);
-                for (var ci: u32 = 0u; ci < params.c_in; ci = ci + 1u) {
-                    let wv = vec4<f32>(arena[wt], arena[wt + kstride],
-                                       arena[wt + 2u * kstride], arena[wt + 3u * kstride]);
-                    let wt4 = wt + 4u * kstride;
-                    let wv2 = vec4<f32>(arena[wt4], arena[wt4 + kstride],
-                                        arena[wt4 + 2u * kstride], arena[wt4 + 3u * kstride]);
-                    var va: f32; var vb: f32; var vc: f32; var vd: f32;
-                    if (run && !oa) {
-                        let p0 = hpair(qa); let p1 = hpair(qa + 1u);
-                        va = p0.x; vb = p0.y; vc = p1.x; vd = p1.y;
-                    } else if (run) {
-                        let p0 = hpair(qa); let p1 = hpair(qa + 1u); let p2 = hpair(qa + 2u);
-                        va = p0.y; vb = p1.x; vc = p1.y; vd = p2.x;
-                    } else {
-                        let pa = hpair(qa); let pb = hpair(qb); let pc = hpair(qc); let pd = hpair(qd);
-                        va = select(pa.x, pa.y, oa) * ma; vb = select(pb.x, pb.y, ob) * mb;
-                        vc = select(pc.x, pc.y, oc) * mc; vd = select(pd.x, pd.y, od) * md;
-                    }
-                    a = a + va * wv; b = b + vb * wv; c = c + vc * wv; e = e + vd * wv;
-                    a2 = a2 + va * wv2; b2 = b2 + vb * wv2; c2 = c2 + vc * wv2; e2 = e2 + vd * wv2;
-                    qa = qa + hd; qb = qb + hd; qc = qc + hd; qd = qd + hd;
-                    wt = wt + ktap;
+                let qa = hword(sa); let oa = hodd(sa);
+                if (run && !oa) {
+                    let p0 = hpair(qa); let p1 = hpair(qa + 1u);
+                    va = p0.x; vb = p0.y; vc = p1.x; vd = p1.y;
+                } else if (run) {
+                    let p0 = hpair(qa); let p1 = hpair(qa + 1u); let p2 = hpair(qa + 2u);
+                    va = p0.y; vb = p1.x; vc = p1.y; vd = p2.x;
+                } else {
+                    let pa = hpair(qa); let pb = hpair(hword(sb)); let pc = hpair(hword(sc)); let pd = hpair(hword(sd));
+                    va = select(pa.x, pa.y, oa) * ma; vb = select(pb.x, pb.y, hodd(sb)) * mb;
+                    vc = select(pc.x, pc.y, hodd(sc)) * mc; vd = select(pd.x, pd.y, hodd(sd)) * md;
                 }
-                continue;
+            } else {
+                va = ld(sa) * ma; vb = ld(sb) * mb; vc = ld(sc) * mc; vd = ld(sd) * md;
             }
-            for (var ci: u32 = 0u; ci < params.c_in; ci = ci + 1u) {
-                let wv = vec4<f32>(arena[wt], arena[wt + kstride],
-                                   arena[wt + 2u * kstride], arena[wt + 3u * kstride]);
-                let wt4 = wt + 4u * kstride;
-                let wv2 = vec4<f32>(arena[wt4], arena[wt4 + kstride],
-                                    arena[wt4 + 2u * kstride], arena[wt4 + 3u * kstride]);
-                let va = ld(sa) * ma; let vb = ld(sb) * mb;
-                let vc = ld(sc) * mc; let vd = ld(sd) * md;
-                a = a + va * wv; b = b + vb * wv; c = c + vc * wv; e = e + vd * wv;
-                a2 = a2 + va * wv2; b2 = b2 + vb * wv2; c2 = c2 + vc * wv2; e2 = e2 + vd * wv2;
-                sa = sa + dhw; sb = sb + dhw; sc = sc + dhw; sd = sd + dhw;
-                wt = wt + ktap;
-            }
+            a = fma(vec4<f32>(va), wv, a); b = fma(vec4<f32>(vb), wv, b);
+            c = fma(vec4<f32>(vc), wv, c); e = fma(vec4<f32>(vd), wv, e);
+            a2 = fma(vec4<f32>(va), wv2, a2); b2 = fma(vec4<f32>(vb), wv2, b2);
+            c2 = fma(vec4<f32>(vc), wv2, c2); e2 = fma(vec4<f32>(vd), wv2, e2);
+          }
         }
       }
     }
@@ -650,6 +630,153 @@ fn conv3d_k3_c8(
             v = max(v, vec4<f32>(arena[r], arena[min(r + 1u, r + nw - 1u)],
                                  arena[min(r + 2u, r + nw - 1u)], arena[min(r + 3u, r + nw - 1u)]));
         }
+        if (OUT_HALF) {
+            // pairs, `w_out` even (`pack_half_activations`)
+            put2(o, conv_act(v.x), conv_act(v.y));
+            if (nw > 2u) { put2(o + 2u, conv_act(v.z), conv_act(v.w)); }
+            continue;
+        }
+        put(o, conv_act(v.x));
+        if (nw > 1u) { put(o + 1u, conv_act(v.y)); }
+        if (nw > 2u) { put(o + 2u, conv_act(v.z)); }
+        if (nw > 3u) { put(o + 3u, conv_act(v.w)); }
+    }
+}
+
+// A 3×3×3 conv — stride 1, padding 1, no dilation, ungrouped. Eight output
+// channels by four W positions a thread, as `conv3d_ctile_w4c8`, with
+// `conv3d_k3_c8`'s reuse: the weights of eight input channels at a time in
+// workgroup memory, and a row's six inputs read once for its three taps
+// (`conv3d_ctile_w4c8` reads four per tap, twelve a row). Each output keeps
+// `conv3d_ctile`'s order — channels outermost, then kd, kh, kw, one fused
+// chain — and a tap no position of the thread reads is skipped as there, so
+// the sums are `conv3d_ctile_w4c8`'s bit for bit.
+var<workgroup> k333_w: array<vec4<f32>, 432>; // [8 channels][27 taps][2 vec4]
+
+@compute @workgroup_size(64)
+fn conv3d_k333_c8(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+    @builtin(num_workgroups) ngs: vec3<u32>,
+) {
+    let co_tiles = (params.c_out + 7u) / 8u;
+    let w_quads = (params.w_out + 3u) / 4u;
+    let wid = wg.x + wg.y * ngs.x;
+    let cot = wid % co_tiles;
+    let i = (wid / co_tiles) * 64u + lid;
+    // no early return: every thread takes part in the barriers
+    let valid = i < params.n * params.d_out * params.h_out * w_quads;
+    let wo = (i % w_quads) * 4u;
+    let q1 = i / w_quads;
+    let ho = q1 % params.h_out;
+    let q2 = q1 / params.h_out;
+    let do_ = q2 % params.d_out;
+    let nn = q2 / params.d_out;
+    let co0 = cot * 8u;
+    let hw = params.h * params.w;
+    let dhw = params.d * hw;
+    let kstride = params.c_in * 27u;
+    let in_base = params.in_off + nn * params.c_in * dhw;
+    let wmax = i32(params.w) - 1;
+    // the columns wo - 1 .. wo + 4: clamped into the row, zero outside it
+    let x = i32(wo);
+    let m0 = select(0.0, 1.0, x >= 1);
+    let m1 = select(0.0, 1.0, x <= wmax);
+    let m2 = select(0.0, 1.0, x + 1 <= wmax);
+    let m3 = select(0.0, 1.0, x + 2 <= wmax);
+    let m4 = select(0.0, 1.0, x + 3 <= wmax);
+    let m5 = select(0.0, 1.0, x + 4 <= wmax);
+    let col0 = u32(clamp(x - 1, 0, wmax)); let col1 = u32(clamp(x, 0, wmax));
+    let col2 = u32(clamp(x + 1, 0, wmax)); let col3 = u32(clamp(x + 2, 0, wmax));
+    let col4 = u32(clamp(x + 3, 0, wmax)); let col5 = u32(clamp(x + 4, 0, wmax));
+    // tap kw is read when a position wo + p (inside the output, w_out = w)
+    // has its column wo + p + kw - 1 inside the row
+    let use0 = m0 + m1 * m2 + m2 * m3 + m3 * m4 > 0.0;
+    let use1 = m1 + m2 * m2 + m3 * m3 + m4 * m4 > 0.0;
+    let use2 = m2 + m3 * m2 + m4 * m3 + m5 * m4 > 0.0;
+
+    // `pN_g`: position wo + N, output channels co0 + 4g .. + 3
+    var p0_0 = vec4<f32>(0.0); var p0_1 = vec4<f32>(0.0);
+    var p1_0 = vec4<f32>(0.0); var p1_1 = vec4<f32>(0.0);
+    var p2_0 = vec4<f32>(0.0); var p2_1 = vec4<f32>(0.0);
+    var p3_0 = vec4<f32>(0.0); var p3_1 = vec4<f32>(0.0);
+
+    for (var c0: u32 = 0u; c0 < params.c_in; c0 = c0 + 8u) {
+        workgroupBarrier();
+        for (var j: u32 = lid; j < 432u; j = j + 64u) {
+            let co = co0 + (j & 1u) * 4u;
+            let ci = c0 + j / 54u;
+            var v = vec4<f32>(0.0);
+            if (ci < params.c_in) {
+                let base = params.w_off + co * kstride + ci * 27u + (j >> 1u) % 27u;
+                v = vec4<f32>(
+                    select(0.0, arena[base], co < params.c_out),
+                    select(0.0, arena[base + kstride], co + 1u < params.c_out),
+                    select(0.0, arena[base + 2u * kstride], co + 2u < params.c_out),
+                    select(0.0, arena[base + 3u * kstride], co + 3u < params.c_out));
+            }
+            k333_w[j] = v;
+        }
+        workgroupBarrier();
+        // an `if`, not a `continue`: the next barrier stays in uniform
+        // control flow
+        if (valid) {
+            let cn = min(8u, params.c_in - c0);
+            for (var ci: u32 = 0u; ci < cn; ci = ci + 1u) {
+                let cin = in_base + (c0 + ci) * dhw;
+                for (var kd: u32 = 0u; kd < 3u; kd = kd + 1u) {
+                    let ds = i32(do_ + kd) - 1;
+                    if (ds < 0 || ds >= i32(params.d)) { continue; }
+                    for (var kh: u32 = 0u; kh < 3u; kh = kh + 1u) {
+                        let hs = i32(ho + kh) - 1;
+                        if (hs < 0 || hs >= i32(params.h)) { continue; }
+                        let row = cin + u32(ds) * hw + u32(hs) * params.w;
+                        let v0 = vec4<f32>(ld(row + col0) * m0); let v1 = vec4<f32>(ld(row + col1) * m1);
+                        let v2 = vec4<f32>(ld(row + col2) * m2); let v3 = vec4<f32>(ld(row + col3) * m3);
+                        let v4 = vec4<f32>(ld(row + col4) * m4); let v5 = vec4<f32>(ld(row + col5) * m5);
+                        let wb = (ci * 27u + (kd * 3u + kh) * 3u) * 2u;
+                        if (use0) {
+                            let w0 = k333_w[wb]; let w1 = k333_w[wb + 1u];
+                            p0_0 = fma(v0, w0, p0_0); p0_1 = fma(v0, w1, p0_1);
+                            p1_0 = fma(v1, w0, p1_0); p1_1 = fma(v1, w1, p1_1);
+                            p2_0 = fma(v2, w0, p2_0); p2_1 = fma(v2, w1, p2_1);
+                            p3_0 = fma(v3, w0, p3_0); p3_1 = fma(v3, w1, p3_1);
+                        }
+                        if (use1) {
+                            let w0 = k333_w[wb + 2u]; let w1 = k333_w[wb + 3u];
+                            p0_0 = fma(v1, w0, p0_0); p0_1 = fma(v1, w1, p0_1);
+                            p1_0 = fma(v2, w0, p1_0); p1_1 = fma(v2, w1, p1_1);
+                            p2_0 = fma(v3, w0, p2_0); p2_1 = fma(v3, w1, p2_1);
+                            p3_0 = fma(v4, w0, p3_0); p3_1 = fma(v4, w1, p3_1);
+                        }
+                        if (use2) {
+                            let w0 = k333_w[wb + 4u]; let w1 = k333_w[wb + 5u];
+                            p0_0 = fma(v2, w0, p0_0); p0_1 = fma(v2, w1, p0_1);
+                            p1_0 = fma(v3, w0, p1_0); p1_1 = fma(v3, w1, p1_1);
+                            p2_0 = fma(v4, w0, p2_0); p2_1 = fma(v4, w1, p2_1);
+                            p3_0 = fma(v5, w0, p3_0); p3_1 = fma(v5, w1, p3_1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!valid) { return; }
+
+    let out_dhw = params.d_out * params.h_out * params.w_out;
+    let o0 = params.out_off + nn * params.c_out * out_dhw + co0 * out_dhw
+        + (do_ * params.h_out + ho) * params.w_out + wo;
+    let nw = min(4u, params.w_out - wo);
+    for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+        let co = co0 + k;
+        if (co >= params.c_out) { break; }
+        var bias = 0.0;
+        if (params.has_bias != 0u) { bias = arena[params.bias_off + co]; }
+        let o = o0 + k * out_dhw;
+        let j = k & 3u;
+        var v: vec4<f32>;
+        if (k < 4u) { v = vec4<f32>(p0_0[j], p1_0[j], p2_0[j], p3_0[j]); } else { v = vec4<f32>(p0_1[j], p1_1[j], p2_1[j], p3_1[j]); }
+        v = v + bias;
         if (OUT_HALF) {
             // pairs, `w_out` even (`pack_half_activations`)
             put2(o, conv_act(v.x), conv_act(v.y));

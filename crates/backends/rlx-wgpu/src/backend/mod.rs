@@ -518,6 +518,7 @@ impl WgpuExecutable {
         let arena = Arena {
             buffer: placeholder,
             extra_shards: Vec::new(),
+            staging: None,
             shard_size: 0,
             f16_buffer: None,
             bf16_weight_buffer: None,

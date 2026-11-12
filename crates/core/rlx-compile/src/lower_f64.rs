@@ -68,6 +68,14 @@ pub fn lower_f64(g: &Graph) -> Result<LoweredF64, String> {
             // A df value leaving F64: only a cast can do that.
             match &n.op {
                 Op::Cast { to: DType::F32 } => (df_to_f32(&mut out, ids[0], &n.shape)?, false),
+                // Indices out of a df tensor are plain f32.
+                Op::ArgMax { axis, keep_dim } | Op::ArgMin { axis, keep_dim } if ins[0].1 => {
+                    let is_max = matches!(n.op, Op::ArgMax { .. });
+                    let src = &g.node(n.inputs[0]).shape;
+                    let idx =
+                        df_arg_reduce(&mut out, ids[0], src, *axis, *keep_dim, is_max, &n.shape)?;
+                    (idx, false)
+                }
                 op => {
                     return Err(format!(
                         "lower_f64: {op} reads F64 into {:?}",
@@ -195,6 +203,28 @@ pub fn lower_f64(g: &Graph) -> Result<LoweredF64, String> {
                 }
                 // Indices stay plain; only the table is df.
                 Op::Gather { .. } if ins[0].1 => out.add_node(n.op.clone(), ids, ps),
+                // Indices promoted to F64 (a whole graph under number format
+                // f64): computed plain, then carried as df like any F64 value.
+                Op::ArgMax { axis, keep_dim } | Op::ArgMin { axis, keep_dim } if ins[0].1 => {
+                    let is_max = matches!(n.op, Op::ArgMax { .. });
+                    let src = &g.node(n.inputs[0]).shape;
+                    let plain = n.shape.clone().with_dtype(DType::F32);
+                    let idx =
+                        df_arg_reduce(&mut out, ids[0], src, *axis, *keep_dim, is_max, &plain)?;
+                    f32_to_df(&mut out, idx, &ps)?
+                }
+                Op::ScatterAdd { axis: 0 } if ins[0].1 => {
+                    let src = &g.node(n.inputs[0]).shape;
+                    let idx_shape = &g.node(n.inputs[1]).shape;
+                    // Indices widened to F64 are small integers: `hi + lo` is exact.
+                    let (idx, idx_dt) = if ins[1].1 {
+                        let plain = idx_shape.clone().with_dtype(DType::F32);
+                        (df_to_f32(&mut out, ids[1], &plain)?, DType::F32)
+                    } else {
+                        (ids[1], idx_shape.dtype())
+                    };
+                    df_scatter_add(&mut out, ids[0], idx, idx_dt, src, &n.shape, &ps)?
+                }
                 op => return Err(format!("lower_f64: no double-single lowering for {op}")),
             };
             (id, true)
@@ -228,6 +258,185 @@ fn require_df(ins: &[(NodeId, bool)], op: &Op) -> Result<(), String> {
         true => Ok(()),
         false => Err(format!("lower_f64: {op} mixes F64 with another dtype")),
     }
+}
+
+fn static_dims(s: &Shape) -> Vec<usize> {
+    s.dims().iter().map(|d| d.unwrap_static()).collect()
+}
+
+fn f32_const(g: &mut Graph, v: f32) -> NodeId {
+    g.add_node(
+        Op::Constant {
+            data: v.to_le_bytes().to_vec(),
+        },
+        vec![],
+        Shape::new(&[1], DType::F32),
+    )
+}
+
+/// The hi or lo half (`which` = 0 / 1) of a df tensor, without the pair axis.
+fn df_half(g: &mut Graph, x: NodeId, dims: &[usize], which: usize) -> NodeId {
+    let mut col = dims.to_vec();
+    col.push(1);
+    let part = g.add_node(
+        Op::Narrow {
+            axis: dims.len(),
+            start: which,
+            len: 1,
+        },
+        vec![x],
+        Shape::new(&col, DType::F32),
+    );
+    g.add_node(
+        Op::Reshape {
+            new_shape: dims.iter().map(|&d| d as i64).collect(),
+        },
+        vec![part],
+        Shape::new(dims, DType::F32),
+    )
+}
+
+/// ArgMin / ArgMax of a df tensor. A normalized pair orders like `(hi, lo)`
+/// lexicographically, so the winner has the extreme `hi` and, among the
+/// positions sharing it, the extreme `lo`: reduce `hi`, then take the arg of
+/// `lo` with every other position pushed out of reach. Ties resolve to the
+/// first index, as the f32 op does.
+fn df_arg_reduce(
+    g: &mut Graph,
+    x: NodeId,
+    src: &Shape,
+    axis: usize,
+    keep_dim: bool,
+    is_max: bool,
+    out: &Shape,
+) -> Result<NodeId, String> {
+    let dims = static_dims(src);
+    let shape = Shape::new(&dims, DType::F32);
+    let hi = df_half(g, x, &dims, 0);
+    let lo = df_half(g, x, &dims, 1);
+    let mut red = dims.clone();
+    red[axis] = 1;
+    let extreme = g.add_node(
+        Op::Reduce {
+            op: if is_max { ReduceOp::Max } else { ReduceOp::Min },
+            axes: vec![axis],
+            keep_dim: true,
+        },
+        vec![hi],
+        Shape::new(&red, DType::F32),
+    );
+    let extreme = g.add_node(
+        Op::Expand {
+            target_shape: dims.iter().map(|&d| d as i64).collect(),
+        },
+        vec![extreme],
+        shape.clone(),
+    );
+    let tie = g.add_node(
+        Op::Compare(rlx_ir::op::CmpOp::Eq),
+        vec![hi, extreme],
+        Shape::new(&dims, DType::Bool),
+    );
+    let tie = g.add_node(Op::Cast { to: DType::F32 }, vec![tie], shape.clone());
+    // lo ± (1 − tie)·1e30: |lo| ≤ ulp(hi)/2, far below the penalty.
+    let one = f32_const(g, 1.0);
+    let off = g.add_node(Op::Binary(BinaryOp::Sub), vec![one, tie], shape.clone());
+    let big = f32_const(g, 1e30);
+    let penalty = g.add_node(Op::Binary(BinaryOp::Mul), vec![off, big], shape.clone());
+    let key = g.add_node(
+        Op::Binary(if is_max { BinaryOp::Sub } else { BinaryOp::Add }),
+        vec![lo, penalty],
+        shape,
+    );
+    let op = if is_max {
+        Op::ArgMax { axis, keep_dim }
+    } else {
+        Op::ArgMin { axis, keep_dim }
+    };
+    Ok(g.add_node(op, vec![key], out.clone().with_dtype(DType::F32)))
+}
+
+/// Axis-0 ScatterAdd of df updates `[n, ..]` into `[k, ..]`, as the df matmul
+/// `onehotᵀ[k, n] · updates[n, ..]`: exact one-hot weights keep the sums in
+/// double-single, where scattering `hi` and `lo` separately would round each
+/// partial sum to f32.
+fn df_scatter_add(
+    g: &mut Graph,
+    upd: NodeId,
+    idx: NodeId,
+    idx_dt: DType,
+    src: &Shape,
+    out: &Shape,
+    pairs: &Shape,
+) -> Result<NodeId, String> {
+    let src_dims = static_dims(src);
+    let out_dims = static_dims(out);
+    let (n, k) = (src_dims[0], out_dims[0]);
+    let rest: usize = src_dims[1..].iter().product();
+    let idx = if idx_dt == DType::F32 {
+        idx
+    } else {
+        g.add_node(
+            Op::Cast { to: DType::F32 },
+            vec![idx],
+            Shape::new(&[n], DType::F32),
+        )
+    };
+    let row = g.add_node(
+        Op::Reshape {
+            new_shape: vec![1, n as i64],
+        },
+        vec![idx],
+        Shape::new(&[1, n], DType::F32),
+    );
+    let kn = Shape::new(&[k, n], DType::F32);
+    let row = g.add_node(
+        Op::Expand {
+            target_shape: vec![k as i64, n as i64],
+        },
+        vec![row],
+        kn.clone(),
+    );
+    let iota: Vec<u8> = (0..k).flat_map(|j| (j as f32).to_le_bytes()).collect();
+    let col = g.add_node(
+        Op::Constant { data: iota },
+        vec![],
+        Shape::new(&[k, 1], DType::F32),
+    );
+    let col = g.add_node(
+        Op::Expand {
+            target_shape: vec![k as i64, n as i64],
+        },
+        vec![col],
+        kn.clone(),
+    );
+    let hit = g.add_node(
+        Op::Compare(rlx_ir::op::CmpOp::Eq),
+        vec![row, col],
+        Shape::new(&[k, n], DType::Bool),
+    );
+    let onehot = g.add_node(Op::Cast { to: DType::F32 }, vec![hit], kn);
+    let onehot = f32_to_df(g, onehot, &Shape::new(&[k, n, 2], DType::F32))?;
+    let flat = g.add_node(
+        Op::Reshape {
+            new_shape: vec![n as i64, rest as i64, 2],
+        },
+        vec![upd],
+        Shape::new(&[n, rest, 2], DType::F32),
+    );
+    let sums = g.add_node(
+        Op::DoubleSingle(DfOp::MatMul),
+        vec![onehot, flat],
+        Shape::new(&[k, rest, 2], DType::F32),
+    );
+    let pair_dims: Vec<i64> = static_dims(pairs).iter().map(|&d| d as i64).collect();
+    Ok(g.add_node(
+        Op::Reshape {
+            new_shape: pair_dims,
+        },
+        vec![sums],
+        pairs.clone(),
+    ))
 }
 
 /// `x` (F32) as df: `(x, 0)`.
@@ -322,6 +531,42 @@ mod tests {
         assert_eq!(
             l.graph.node(l.graph.outputs[1]).shape,
             Shape::new(&[3], DType::F32)
+        );
+    }
+
+    /// ArgMin over F64 and an axis-0 ScatterAdd of F64 rows lower to f32
+    /// primitives and the df matmul: no F64 left, indices plain, sums pairs.
+    #[test]
+    fn argmin_and_scatter_add_lower_to_pairs() {
+        let f = DType::F64;
+        let mut g = Graph::new("t");
+        let x = g.input("x", Shape::new(&[4, 3], f));
+        let idx = g.input("idx", Shape::new(&[4], DType::F32));
+        let am = g.add_node(
+            Op::ArgMin {
+                axis: 1,
+                keep_dim: false,
+            },
+            vec![x],
+            Shape::new(&[4], DType::F32),
+        );
+        let sa = g.add_node(
+            Op::ScatterAdd { axis: 0 },
+            vec![x, idx],
+            Shape::new(&[2, 3], f),
+        );
+        g.set_outputs(vec![am, sa]);
+        let l = lower_f64(&g).unwrap();
+        assert!(!has_f64(&l.graph));
+        assert_eq!(l.df_outputs, [1]);
+        let o = &l.graph.outputs;
+        assert_eq!(l.graph.node(o[0]).shape, Shape::new(&[4], DType::F32));
+        assert_eq!(l.graph.node(o[1]).shape, Shape::new(&[2, 3, 2], DType::F32));
+        assert!(
+            l.graph
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::DoubleSingle(DfOp::MatMul)))
         );
     }
 

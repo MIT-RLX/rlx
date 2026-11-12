@@ -181,8 +181,11 @@ fn infer_output_shape_inner(
             shape::reduce_shape(in_shape(0), axes, *keep_dim).sink(rejected)
         }
         Op::Histogram { bins, .. } => Some(Shape::new(&[*bins], DType::F32)),
+        // Indices are f32-encoded whatever the input dtype (see `Op::ArgMax`).
         Op::ArgMax { axis, keep_dim } | Op::ArgMin { axis, keep_dim } => {
-            shape::reduce_shape(in_shape(0), &[*axis], *keep_dim).sink(rejected)
+            shape::reduce_shape(in_shape(0), &[*axis], *keep_dim)
+                .map(|s| s.with_dtype(DType::F32))
+                .sink(rejected)
         }
         Op::Softmax { .. } => Some(shape::softmax_shape(in_shape(0))),
         Op::Cumsum { .. } | Op::CumProd { .. } | Op::CumMax { .. } => {

@@ -345,7 +345,7 @@ pub use memory_estimate::{
 };
 pub use model_pipeline::ModelCompilePipeline;
 pub use options::{CompileOptions, HalfCasts};
-pub use precision::Precision;
+pub use precision::{Precision, precision_honored};
 pub use reflect::{ModelReflection, load_hir_template_with_extensions, specialize_entry};
 pub use registry::{BackendFactory, backend_for, register_backend, registered_devices};
 /// Native low-precision GEMM config for [`CompileOptions::scaled_quant`].

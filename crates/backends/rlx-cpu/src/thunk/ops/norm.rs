@@ -572,7 +572,10 @@ pub(crate) fn exec_layer_norm(t: &Thunk, base: *mut u8) {
                 let g_ptr = gamma.as_ptr() as usize;
                 let b_ptr = beta.as_ptr() as usize;
                 let e = *eps;
-                crate::pool::par_for(rows, 4, &|off, cnt| {
+                // ~3·h operations per row (mean, variance, normalize): at least
+                // `TASK_WORK_FLOOR` per task, so a decode/short-prompt tensor
+                // (32 × 1024) runs inline instead of forking eight 4-row tasks.
+                crate::pool::par_for(rows, crate::pool::grain_for(3 * h).max(4), &|off, cnt| {
                     let inp =
                         std::slice::from_raw_parts((i_ptr as *const f32).add(off * h), cnt * h);
                     let out =

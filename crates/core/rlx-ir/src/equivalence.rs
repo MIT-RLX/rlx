@@ -118,7 +118,14 @@ const SEP: u8 = 0xff;
 /// Hash one [`Op`] (including any nested bodies) into `h`.
 pub fn hash_op_into<H: Hasher>(op: &Op, cfg: IgnoreConfig, h: &mut H) {
     let bodies = op.subgraphs();
-    if bodies.is_empty() {
+    if let Op::Constant { data } = op {
+        // A constant's payload goes in as raw bytes. Through `Debug` it was formatted
+        // one `u8` at a time, which made every pass's change-detection fingerprint cost
+        // seconds once lowering had materialised a few megabytes of zero padding.
+        h.write(b"Op::Constant#");
+        h.write_usize(data.len());
+        h.write(data);
+    } else if bodies.is_empty() {
         // Fast path — no clone, no allocation, whole payload via Debug.
         let _ = write!(HashWriter(h), "{op:?}");
     } else {
@@ -326,6 +333,33 @@ mod tests {
         b.node_mut(NodeId(3)).op = Op::Activation(Activation::Relu);
         assert_ne!(a.fingerprint(), b.fingerprint());
         assert!(!a.structurally_eq(&b, IgnoreConfig::SEMANTIC));
+    }
+
+    fn with_constant(data: Vec<u8>) -> Graph {
+        let mut g = Graph::new("c");
+        let n = data.len() / 4;
+        let c = g.add_node(Op::Constant { data }, vec![], Shape::new(&[n], DType::F32));
+        g.set_outputs(vec![c]);
+        g
+    }
+
+    #[test]
+    fn constant_payload_is_hashed_as_bytes() {
+        let a = with_constant(vec![0; 64]);
+        assert_eq!(a.fingerprint(), with_constant(vec![0; 64]).fingerprint());
+        let mut flipped = vec![0u8; 64];
+        flipped[63] = 1;
+        assert_ne!(a.fingerprint(), with_constant(flipped).fingerprint());
+        // A 16 MB constant (zero padding a backend lowered) hashes in milliseconds; via
+        // `Debug` it was formatted byte by byte, seconds per fingerprint.
+        let big = with_constant(vec![0; 16 << 20]);
+        let t0 = std::time::Instant::now();
+        let _ = big.fingerprint();
+        assert!(
+            t0.elapsed().as_secs_f64() < 1.0,
+            "fingerprint of 16 MB took {:?}",
+            t0.elapsed()
+        );
     }
 
     #[test]

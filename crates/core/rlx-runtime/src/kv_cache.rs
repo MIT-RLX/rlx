@@ -6,7 +6,38 @@
 
 use crate::compile_cache::pad_rows;
 
-/// Layer-wise past K/V tensors in row-major `[past_len * kv_dim]` layout per layer.
+/// `[batch, past_seq, kv_dim]` + one `[kv_dim]` row per sequence (`rows` is
+/// `[batch, kv_dim]`) → `[batch, past_seq + 1, kv_dim]`.
+///
+/// Each sequence's new row goes after *its own* history. Appending all of the
+/// rows after the whole buffer is right only for `batch == 1`: with two
+/// sequences, from the second step on sequence 0 absorbs sequence 1's rows —
+/// which is how Metal batched decode (beam search) attended to the wrong
+/// history.
+pub fn append_row_per_sequence(
+    past: &[f32],
+    rows: &[f32],
+    past_seq: usize,
+    kv_dim: usize,
+) -> Vec<f32> {
+    let batch = rows.len() / kv_dim.max(1);
+    let per_seq = past_seq * kv_dim;
+    assert_eq!(rows.len(), batch * kv_dim, "rows must be [batch, kv_dim]");
+    assert_eq!(
+        past.len(),
+        batch * per_seq,
+        "past must be [batch={batch}, past_seq={past_seq}, kv_dim={kv_dim}]"
+    );
+    let mut out = Vec::with_capacity(batch * (per_seq + kv_dim));
+    for b in 0..batch {
+        out.extend_from_slice(&past[b * per_seq..(b + 1) * per_seq]);
+        out.extend_from_slice(&rows[b * kv_dim..(b + 1) * kv_dim]);
+    }
+    out
+}
+
+/// Layer-wise past K/V tensors in row-major `[past_len * kv_dim]` layout per
+/// layer — `[batch, past_len, kv_dim]` for a batched decode.
 #[derive(Debug, Clone)]
 pub struct LayerKvCache {
     pub past_len: usize,
@@ -181,13 +212,16 @@ impl LayerKvCache {
         Ok(())
     }
 
-    /// Per-layer variant of [`Self::advance_from_decode_outputs`].
+    /// Per-layer variant of [`Self::advance_from_decode_outputs`]. Each
+    /// layer's K/V output is `[batch, rows, kv_dim]` (`rows ≥ past_len + 1`);
+    /// every sequence keeps its first `past_len + 1` rows.
     pub fn advance_from_decode_outputs_per_layer(
         &mut self,
         outputs: Vec<Vec<f32>>,
-        _batch: usize,
+        batch: usize,
         kv_dims: &[usize],
     ) -> Result<(), String> {
+        let batch = batch.max(1);
         let n = self.layers_k.len();
         if outputs.len() != 1 + 2 * n {
             return Err(format!(
@@ -205,12 +239,33 @@ impl LayerKvCache {
         let new_len = self.past_len + 1;
         let mut iter = outputs.into_iter();
         let _logits = iter.next().ok_or("missing logits")?;
+        // Sequence `b`'s first `new_len` rows of a `[batch, rows, kv_dim]` buffer.
+        let keep = |buf: Vec<f32>, kv_dim: usize| -> Result<Vec<f32>, String> {
+            if batch == 1 {
+                let real_len = new_len * kv_dim;
+                return Ok(buf[..real_len.min(buf.len())].to_vec());
+            }
+            let per_seq = buf.len() / batch;
+            if !buf.len().is_multiple_of(batch) || per_seq < new_len * kv_dim {
+                return Err(format!(
+                    "advance_from_decode_outputs_per_layer: {} values cannot hold \
+                     batch {batch} × {new_len} rows of {kv_dim}",
+                    buf.len()
+                ));
+            }
+            Ok((0..batch)
+                .flat_map(|b| {
+                    buf[b * per_seq..b * per_seq + new_len * kv_dim]
+                        .iter()
+                        .copied()
+                })
+                .collect())
+        };
         for i in 0..n {
             let k = iter.next().ok_or("missing k")?;
             let v = iter.next().ok_or("missing v")?;
-            let real_len = new_len * kv_dims[i];
-            self.layers_k[i] = k[..real_len.min(k.len())].to_vec();
-            self.layers_v[i] = v[..real_len.min(v.len())].to_vec();
+            self.layers_k[i] = keep(k, kv_dims[i])?;
+            self.layers_v[i] = keep(v, kv_dims[i])?;
         }
         self.past_len = new_len;
         Ok(())
@@ -219,6 +274,39 @@ impl LayerKvCache {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn append_row_per_sequence_keeps_each_history() {
+        // batch 2, past 2, kv_dim 3; value = 10·seq + row.
+        let past = [0., 0., 0., 1., 1., 1., 10., 10., 10., 11., 11., 11.];
+        let rows = [2., 2., 2., 12., 12., 12.];
+        let out = append_row_per_sequence(&past, &rows, 2, 3);
+        let want: Vec<f32> = [0., 1., 2., 10., 11., 12.]
+            .iter()
+            .flat_map(|&v| [v; 3])
+            .collect();
+        assert_eq!(out, want);
+        assert_eq!(append_row_per_sequence(&[], &rows, 0, 3), rows.to_vec());
+    }
+
+    #[test]
+    fn advance_keeps_each_sequences_rows() {
+        // batch 2, past 1 → 2 rows kept per sequence out of a 3-row bucket.
+        let mut cache = LayerKvCache {
+            past_len: 1,
+            layers_k: vec![vec![0.0; 2]],
+            layers_v: vec![vec![0.0; 2]],
+            layers_kv_base: vec![0],
+        };
+        let k: Vec<f32> = (0..6).map(|i| i as f32).collect(); // [2 seq, 3 rows, 1]
+        cache
+            .advance_from_decode_outputs(vec![vec![], k.clone(), k], 2, 1)
+            .unwrap();
+        assert_eq!(cache.past_len, 2);
+        assert_eq!(cache.layers_k[0], vec![0.0, 1.0, 3.0, 4.0]);
+        assert_eq!(cache.layers_v[0], vec![0.0, 1.0, 3.0, 4.0]);
+    }
+
     use super::*;
 
     #[test]

@@ -333,6 +333,7 @@ fn build_cpu_executable(
         handles: HashMap::new(),
         arena_handles: std::collections::HashSet::new(),
         kv_row_feeds: Vec::new(),
+        handle_feeds: Vec::new(),
         active_extent: None,
         moe_resident: None,
         moe_resident_layers: None,
@@ -349,9 +350,14 @@ const SHARED_WEIGHT_MIN: usize = 256 * 1024;
 /// Ops that only read their weight operand, so a weight they share across
 /// executables is never written through another's arena.
 fn reads_weight_only(op: &Op) -> bool {
+    // The fused linears matter most: fusion has rewritten every
+    // `MatMul → Add (→ act)` by the time a graph reaches here, and without
+    // them no weight of a fused linear was ever shared.
     matches!(
         op,
         Op::MatMul
+            | Op::FusedMatMulBiasAct { .. }
+            | Op::FusedMatMulResidual
             | Op::DotGeneral { .. }
             | Op::Gather { .. }
             | Op::DequantMatMul { .. }
@@ -521,6 +527,10 @@ struct CpuExecutable {
     /// handle, so a decode step moves the new token's K/V row instead of
     /// round-tripping the whole cache through the host.
     kv_row_feeds: Vec<(String, usize)>,
+    /// Whole-tensor handle feeds (`set_gpu_handle_feed`): after each run,
+    /// output `index` becomes handle `name` (and its resident input slot), so
+    /// a training loop's state stays in the executable between steps.
+    handle_feeds: Vec<(String, usize)>,
     /// Active-extent hint (`Some((actual, upper))`) for L1 bucketed
     /// dispatch. When set AND every thunk in the schedule is in
     /// `Thunk::safe_for_active_extent`, the executor processes only
@@ -788,11 +798,42 @@ impl CpuExecutable {
     /// Read a node's arena bytes back as Vec<f32>, casting from how it is
     /// *stored* (see [`Self::storage_dtype`]), not from what it is declared.
     fn read_output(&self, id: NodeId) -> Vec<f32> {
+        let n_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
+        if let Some(v) = self.read_byte_slot(id, 0, n_elems) {
+            return v;
+        }
         let dtype = self.storage_dtype(id);
         let off = self.arena.byte_offset(id);
         let buf = self.arena.raw_buf();
-        let n_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
         unsafe { read_as_f32(buf.as_ptr().add(off), dtype, n_elems) }
+    }
+
+    /// A Bool / U8 / I8 node whose slot is one byte per element (the kernel
+    /// wrote codes, e.g. `Compare` into its Bool output): `len` elements from
+    /// `start` as numbers. `None` for a widened slot, which the f32 read
+    /// covers. Reading such a slot as f32 strode four elements per value — an
+    /// x86 `Eq` mask of 64 came back with 23 wrong entries, read past its end.
+    fn read_byte_slot(&self, id: NodeId, start: usize, len: usize) -> Option<Vec<f32>> {
+        let dt = self.node_dtypes.get(&id).copied()?;
+        if !matches!(dt, DType::Bool | DType::U8 | DType::I8) {
+            return None;
+        }
+        let n_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
+        if n_elems == 0 || self.arena.byte_size(id) >= n_elems * 4 {
+            return None;
+        }
+        let off = self.arena.byte_offset(id) + start;
+        let bytes = self.arena.raw_buf().get(off..off + len)?;
+        Some(
+            bytes
+                .iter()
+                .map(|&b| match dt {
+                    DType::Bool => f32::from(u8::from(b != 0)),
+                    DType::I8 => b as i8 as f32,
+                    _ => b as f32,
+                })
+                .collect(),
+        )
     }
 
     /// `len` elements of a node's arena buffer starting at element `start`,
@@ -801,6 +842,9 @@ impl CpuExecutable {
         let n_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
         if start.checked_add(len)? > n_elems {
             return None;
+        }
+        if let Some(v) = self.read_byte_slot(id, start, len) {
+            return Some(v);
         }
         let dtype = self.storage_dtype(id);
         let off = self.arena.byte_offset(id) + start * dtype.size_bytes();
@@ -868,6 +912,25 @@ impl CpuExecutable {
                 let v = self.read_output(out_id);
                 self.handles.insert(name, v);
             }
+        }
+        // 4. Fed handles: the whole output becomes the handle and, for a
+        //    resident one, its input slot (the next run reads it in place).
+        //    Read every output first: a fed output may sit in an input slot.
+        let fed: Vec<(String, Vec<f32>)> = self
+            .handle_feeds
+            .iter()
+            .filter_map(|(name, idx)| {
+                let &out_id = self.graph.outputs.get(*idx)?;
+                Some((name.clone(), self.read_output(out_id)))
+            })
+            .collect();
+        for (name, v) in fed {
+            if self.arena_handles.contains(&name)
+                && let Some(&id) = self.input_ids.get(&name)
+            {
+                self.write_input(id, &v);
+            }
+            self.handles.insert(name, v);
         }
     }
 }
@@ -1064,6 +1127,16 @@ impl ExecutableGraph for CpuExecutable {
 
     fn has_gpu_handle(&self, name: &str) -> bool {
         self.handles.contains_key(name)
+    }
+
+    fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+        if output_index >= self.graph.outputs.len() {
+            return false;
+        }
+        self.handle_feeds.retain(|(h, _)| h != handle_name);
+        self.handle_feeds
+            .push((handle_name.to_string(), output_index));
+        true
     }
 
     fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {

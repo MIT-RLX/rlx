@@ -35,7 +35,8 @@
 // on every ROCm version and takes the same trailing `width`. The explicit width
 // is what makes this correct on 64-lane wavefronts — see the header note.
 //
-// NOTE: this is the only shared kernel that uses shuffles. `reduce.cu` avoids
+// NOTE: shuffles also appear in `layer_norm_backward.cu` and `attention_bwd.cu`
+// (same width-32 macro, outside the HIP-CPU TU). `reduce.cu` avoids
 // them deliberately so it stays valid under HIP-CPU, whose wavefront semantics
 // differ; `attention_row.cu` (and therefore this drop-in) is not part of the
 // HIP-CPU validation TU in `rlx-cuda/cpp/cpu_dispatch.cpp`, so the shuffle is

@@ -201,10 +201,28 @@ pub fn transpose_2d(data: &[f32], shape: &[usize], key: &str) -> Result<(Vec<f32
     let &[rows, cols] = shape else {
         return Err(anyhow::anyhow!("transpose requires rank-2 weight: {key}"));
     };
+    if data.len() != rows * cols {
+        return Err(anyhow::anyhow!(
+            "{key}: {} values for shape {shape:?}",
+            data.len()
+        ));
+    }
+    // 64×64 tiles (16 KB a side) keep both the rows read and the columns
+    // written cache-resident. The plain double loop writes one cache line per
+    // element and ran several times slower on 4096×1024 FFN weights, which
+    // made it the bulk of a graph build. Output is identical.
+    const TILE: usize = 64;
     let mut out = vec![0f32; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            out[c * rows + r] = data[r * cols + c];
+    for r0 in (0..rows).step_by(TILE) {
+        let r1 = (r0 + TILE).min(rows);
+        for c0 in (0..cols).step_by(TILE) {
+            let c1 = (c0 + TILE).min(cols);
+            for r in r0..r1 {
+                let src = &data[r * cols + c0..r * cols + c1];
+                for (c, &v) in (c0..c1).zip(src) {
+                    out[c * rows + r] = v;
+                }
+            }
         }
     }
     Ok((out, vec![cols, rows]))
@@ -743,6 +761,26 @@ impl<S: WeightSource> WeightSourceExt for S {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transpose_2d_matches_the_definition() {
+        for (rows, cols) in [(1, 1), (3, 5), (64, 64), (65, 130), (200, 7)] {
+            let data: Vec<f32> = (0..rows * cols).map(|i| i as f32).collect();
+            let (t, shape) = super::transpose_2d(&data, &[rows, cols], "w").unwrap();
+            assert_eq!(shape, vec![cols, rows]);
+            for r in 0..rows {
+                for c in 0..cols {
+                    assert_eq!(
+                        t[c * rows + r],
+                        data[r * cols + c],
+                        "{rows}x{cols} ({r},{c})"
+                    );
+                }
+            }
+        }
+        assert!(super::transpose_2d(&[0.0; 6], &[2, 4], "w").is_err());
+        assert!(super::transpose_2d(&[0.0; 6], &[6], "w").is_err());
+    }
+
     use super::*;
     use rlx_ir::quant::QuantScheme;
 

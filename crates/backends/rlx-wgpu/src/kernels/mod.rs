@@ -2234,6 +2234,17 @@ impl Conv3dParams {
             && self.groups <= 1
             && self.c_out > 4
     }
+
+    /// A 3×3×3 conv — stride 1, padding 1, no dilation, ungrouped, past
+    /// four output channels: `conv3d_k333_c8`'s shape.
+    pub fn is_k333(&self) -> bool {
+        (self.kd, self.kh, self.kw) == (3, 3, 3)
+            && (self.sd, self.sh, self.sw) == (1, 1, 1)
+            && (self.dd, self.dh, self.dw) == (1, 1, 1)
+            && (self.pd, self.ph, self.pw) == (1, 1, 1)
+            && self.groups <= 1
+            && self.c_out > 4
+    }
 }
 
 /// Lazy-init container for a compute pipeline + its bind-group layout.
@@ -2926,6 +2937,7 @@ static CONV3D_CTILE_W2: OnceLock<Kernel> = OnceLock::new();
 static CONV3D_CTILE_W4: OnceLock<Kernel> = OnceLock::new();
 static CONV3D_CTILE_W4C8: OnceLock<Kernel> = OnceLock::new();
 static CONV3D_K3_C8: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_K333_C8: OnceLock<Kernel> = OnceLock::new();
 static CONV3D_ARGMAX: OnceLock<Kernel> = OnceLock::new();
 static CONV3D_TOPK: OnceLock<Kernel> = OnceLock::new();
 static CONV_TRANSPOSE3D: OnceLock<Kernel> = OnceLock::new();
@@ -4569,6 +4581,18 @@ pub fn conv3d_k3_c8_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu conv3d_k3_c8",
             CONV3D_CTILE_WGSL,
             "conv3d_k3_c8",
+        )
+    })
+}
+/// A 3×3×3 conv (stride 1, padding 1), its weights in workgroup memory;
+/// see [`Conv3dParams::is_k333`].
+pub fn conv3d_k333_c8_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_K333_C8.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_k333_c8",
+            CONV3D_CTILE_WGSL,
+            "conv3d_k333_c8",
         )
     })
 }

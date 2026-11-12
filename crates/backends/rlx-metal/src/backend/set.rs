@@ -34,8 +34,35 @@ impl MetalExecutable {
         self.baked_weight_concats.borrow_mut().clear();
     }
 
+    /// Write a weight that lives as a slice of a pack param (`weight_packs`).
+    /// False when `name` is not such a weight.
+    fn write_pack_part(&mut self, name: &str, data: &[f32]) -> bool {
+        let Some(part) = self.pack_parts.get(name) else {
+            return false;
+        };
+        let Some(&id) = self.param_ids.get(&part.pack) else {
+            return true; // the pack itself went unused
+        };
+        let base = if let Some(slot) = self.weight_slots.get(&id) {
+            let buf = self.weight_buffer.as_ref().expect("weight slot without weight buffer");
+            assert_eq!(slot.dtype, rlx_ir::DType::F32, "weight pack {} stored as {:?}", part.pack, slot.dtype);
+            unsafe { (buf.contents() as *mut u8).add(slot.offset) }
+        } else if let Some(&off) = self.arena.offsets.get(&id) {
+            assert_eq!(self.arena.dtype(id), rlx_ir::DType::F32, "weight pack {} not f32", part.pack);
+            unsafe { (self.arena.buffer.contents() as *mut u8).add(off) }
+        } else {
+            return true;
+        };
+        // SAFETY: the pack's storage holds `rows * stride` f32s.
+        unsafe { super::weight_packs::scatter(part, data, base.cast()) };
+        true
+    }
+
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
         self.invalidate_baked_weight_packs();
+        if self.write_pack_part(name, data) {
+            return;
+        }
         if let Some(&id) = self.param_ids.get(name) {
             if let Some(slot) = self.weight_slots.get(&id).copied() {
                 self.write_weight_from_f32(slot, data);
@@ -48,6 +75,12 @@ impl MetalExecutable {
 
     pub fn set_param_bytes(&mut self, name: &str, data: &[u8]) {
         self.invalidate_baked_weight_packs();
+        if self.pack_parts.contains_key(name) {
+            // Packs are f32, so these are f32 values.
+            let values = rlx_ir::bytes::decode_le::<f32>(data);
+            self.write_pack_part(name, values.as_ref());
+            return;
+        }
         if let Some(&id) = self.param_ids.get(name) {
             if let Some(slot) = self.weight_slots.get(&id).copied() {
                 self.write_weight_bytes(slot, data);
@@ -82,6 +115,7 @@ impl MetalExecutable {
     /// Whether param `name`'s weight slot is mapped from another
     /// executable's copy (`crate::shared_weights`): its values are there.
     pub fn param_already_set(&self, name: &str) -> bool {
+        let name = self.pack_parts.get(name).map_or(name, |p| p.pack.as_str());
         self.param_ids
             .get(name)
             .is_some_and(|id| self.shared_resident.contains(id))
@@ -90,6 +124,9 @@ impl MetalExecutable {
     /// The dtype a named param is stored in on the device (weight slot or
     /// arena), if the param exists.
     pub fn param_storage_dtype(&self, name: &str) -> Option<rlx_ir::DType> {
+        if self.pack_parts.contains_key(name) {
+            return Some(rlx_ir::DType::F32);
+        }
         let &id = self.param_ids.get(name)?;
         if let Some(slot) = self.weight_slots.get(&id) {
             return Some(slot.dtype);

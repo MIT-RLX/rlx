@@ -2036,6 +2036,9 @@ pub(crate) fn exec_gather(t: &Thunk, base: *mut u8) {
     }
 }
 
+/// Elements below which a one-instruction activation stays on one thread.
+const CHEAP_ELEMENTWISE_PAR_FLOOR: usize = 1 << 20;
+
 #[inline(always)]
 pub(crate) fn exec_activation_in_place(t: &Thunk, base: *mut u8) {
     let Thunk::ActivationInPlace { data, len, act } = t else {
@@ -2050,13 +2053,24 @@ pub(crate) fn exec_activation_in_place(t: &Thunk, base: *mut u8) {
             // parallel for large tensors (bit-exact — elements independent), mirroring
             // the already-parallel Gelu/Silu kernels. `should_parallelize` guards the
             // small case so tiny activations stay serial (no dispatch overhead).
-            let par = crate::pool::should_parallelize(len);
+            // One-instruction ops (ReLU, negate, abs) are a pure memory pass:
+            // a 32×4096 FFN activation is ~20 µs on one core, where waking
+            // the pool cost ~200 µs on a loaded machine. They split only
+            // past 1 M elements; everything else keeps `should_parallelize`.
+            let cheap = matches!(act, Activation::Relu | Activation::Neg | Activation::Abs);
+            let par = if cheap {
+                len >= CHEAP_ELEMENTWISE_PAR_FLOOR && crate::pool::num_threads() > 1
+            } else {
+                crate::pool::should_parallelize(len)
+            };
             macro_rules! apply {
                 ($f:expr) => {{
                     let f = $f;
                     if par {
+                        // One chunk per worker, not rayon's per-element split.
                         use rayon::prelude::*;
-                        d.par_iter_mut().for_each(|v| *v = f(*v));
+                        d.par_chunks_mut(crate::pool::chunk_floor(len))
+                            .for_each(|c| c.iter_mut().for_each(|v| *v = f(*v)));
                     } else {
                         for v in d.iter_mut() {
                             *v = f(*v);

@@ -260,6 +260,41 @@ fn folds_into_matmul(graph: &Graph, mm: &rlx_ir::Node) -> bool {
         && graph.node(mm.inputs[1]).shape.rank() == 2
 }
 
+/// A transposed weight that is pure duplication: `Transpose[1, 0]` of a rank-2
+/// F32 `Param` that something else also reads directly, consumed only as the
+/// right operand of one F32 `MatMul` whose left operand is a plain matrix (or a
+/// stack of rows flattened to one). A backward graph has one per linear layer —
+/// `W` for the forward and `Wᵀ` for `dX = dY·Wᵀ` — so without the fold every
+/// weight is resident twice. A backend that reads `W` with a transposed GEMM
+/// (`transposeRight`) never needs the copy.
+///
+/// Requiring the direct reader keeps inference graphs that only ever see
+/// `x·transpose(W)` (HF-layout linears) on their existing path: there the copy
+/// is the only resident form of the weight and is baked once.
+pub fn is_foldable_weight_transpose(graph: &Graph, node: &rlx_ir::Node, readers: &ReaderIndex) -> bool {
+    if !is_matmul_fold_transpose(graph, node) || node.shape.dtype() != rlx_ir::DType::F32 {
+        return false;
+    }
+    let w = graph.node(node.inputs[0]);
+    if !matches!(w.op, Op::Param { .. }) || w.shape.rank() != 2 || w.shape.dtype() != rlx_ir::DType::F32 {
+        return false;
+    }
+    if readers.count(w.id) < 2 {
+        return false;
+    }
+    let Some(mm) = readers.sole_reader(node.id).map(|id| graph.node(id)) else {
+        return false;
+    };
+    if !matches!(mm.op, Op::MatMul) || mm.inputs.len() != 2 || mm.inputs[1] != node.id || mm.inputs[0] == node.id {
+        return false;
+    }
+    let a = graph.node(mm.inputs[0]);
+    mm.shape.dtype() == rlx_ir::DType::F32
+        && a.shape.dtype() == rlx_ir::DType::F32
+        && a.shape.rank() >= 2
+        && mm.shape.rank() == a.shape.rank()
+}
+
 /// For every node: how many input slots across the graph read it (a node
 /// reading it twice counts twice) and the first node that does, in graph
 /// order. One pass, for the questions the planner and the CPU backend's
@@ -275,6 +310,11 @@ impl ReaderIndex {
             }
         }
         Self(readers)
+    }
+
+    /// How many input slots across the graph read `id`.
+    pub fn count(&self, id: NodeId) -> usize {
+        self.0.get(&id).map_or(0, |&(n, _)| n)
     }
 
     /// The node that reads `id`, when exactly one input slot does.
@@ -1476,6 +1516,11 @@ pub struct MemoryPlanOptions {
     /// see [`conv3d_epilogue_folds`]. Off by default: a backend that does not
     /// fold gets the tighter, ordinary liveness.
     pub fold_conv3d_epilogue: bool,
+    /// When true, do not reserve arena for the weight transposes a backend
+    /// reads in place with a transposed GEMM — see
+    /// [`is_foldable_weight_transpose`]. Off by default, for the same reason as
+    /// [`Self::elide_bank_transposes`].
+    pub elide_weight_transposes: bool,
     /// Restrict [`Self::elide_bank_transposes`] to transposes whose readers are
     /// all small-`m` grouped matmuls — for a backend (Metal) whose transposed
     /// kernel exists only on the decode path.
@@ -1494,6 +1539,7 @@ impl MemoryPlanOptions {
             pin_static_packs: true,
             dequant_host_fallback: true,
             elide_bank_transposes: false,
+            elide_weight_transposes: false,
             fold_conv3d_epilogue: false,
             elide_requires_small_m: false,
         }
@@ -1511,6 +1557,7 @@ impl MemoryPlanOptions {
             pin_static_packs: true,
             dequant_host_fallback: true,
             elide_bank_transposes: false,
+            elide_weight_transposes: false,
             fold_conv3d_epilogue: false,
             elide_requires_small_m: false,
         }
@@ -2133,7 +2180,8 @@ fn plan_memory_aligned_inner(
     }
 
     let keep_native = native_width_nodes(graph, width);
-    let readers = opts.elide_bank_transposes.then(|| ReaderIndex::new(graph));
+    let readers =
+        (opts.elide_bank_transposes || opts.elide_weight_transposes).then(|| ReaderIndex::new(graph));
     let mut buffers: Vec<BufInfo> = Vec::new();
     for node in graph.nodes() {
         // Skip view nodes — they alias their parent's buffer (handled
@@ -2145,9 +2193,11 @@ fn plan_memory_aligned_inner(
         // same test as `is_elidable_folded_transpose_gated`, with the matmul
         // half answered from the reader index.)
         if let Some(readers) = &readers
-            && (is_elidable_bank_transpose_gated(graph, node, opts.elide_requires_small_m)
-                || (!opts.elide_requires_small_m
-                    && is_elidable_matmul_transpose_indexed(graph, node, readers)))
+            && ((opts.elide_bank_transposes
+                && (is_elidable_bank_transpose_gated(graph, node, opts.elide_requires_small_m)
+                    || (!opts.elide_requires_small_m
+                        && is_elidable_matmul_transpose_indexed(graph, node, readers))))
+                || (opts.elide_weight_transposes && is_foldable_weight_transpose(graph, node, readers)))
         {
             continue;
         }

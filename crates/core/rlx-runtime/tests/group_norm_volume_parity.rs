@@ -11,6 +11,10 @@
 //!   CPU and a single-pass `E[x^2] - mean^2` on Metal gave relative errors of
 //!   1.7e-4 / 2e-3 (CPU, offset 0 / 50) and 7e-4 (Metal, offset 50) over one
 //!   96^3 group.
+//! - long running sums: a group of four 96^3 channels (3.5M values) with a
+//!   large mean against its spread, as positive activations are. Metal's
+//!   threads each summed ~14k values in one f32 accumulator, which moved
+//!   SegResNet's 96^3 logits 1e-4 relative; blocked sums fix it.
 
 mod common;
 
@@ -109,7 +113,13 @@ fn layout(device: Device) {
 fn volume(device: Device) {
     check(device, [1, 2, 96, 96, 96], 2, 0.0, 2e-6);
     check(device, [1, 2, 96, 96, 96], 2, 50.0, 1e-4);
+    check(device, [1, 8, 96, 96, 96], 2, 1000.0, LONG_SUM_TOL);
 }
+
+/// Mean 1000, spread 1, 3.5M values a group: a single running f32 sum per
+/// Metal thread gave 2.5e-4, blocked sums 2.5e-5 (the f64-statistics CPU
+/// 1.5e-5, the float32 inputs' own rounding at that offset).
+const LONG_SUM_TOL: f64 = 1e-4;
 
 #[test]
 fn cpu_rank5_layout() {

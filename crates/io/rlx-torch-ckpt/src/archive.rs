@@ -402,6 +402,42 @@ pub fn read_zip_entry<R: Read + Seek>(file: &mut R, entry: &ZipEntry) -> Result<
     read_exact_bounded(file, entry.size, avail, "zip entry")
 }
 
+/// Bytes `[start, start + len)` of a STORED zip entry, read straight into
+/// `out` (which is `len` bytes). Bounds are checked against both the entry's
+/// declared size and the bytes actually present.
+pub fn read_zip_range_into<R: Read + Seek>(
+    file: &mut R,
+    entry: &ZipEntry,
+    start: u64,
+    out: &mut [u8],
+) -> Result<()> {
+    if entry.method != 0 {
+        bail!(
+            "zip entry {} uses compression method {} (only STORED/0 is supported)",
+            entry.name,
+            entry.method
+        );
+    }
+    let len = out.len() as u64;
+    let end = start
+        .checked_add(len)
+        .filter(|&e| e <= entry.size)
+        .ok_or_else(|| {
+            anyhow!(
+                "zip entry {}: range {start}+{len} exceeds its {} byte(s)",
+                entry.name,
+                entry.size
+            )
+        })?;
+    let total = stream_len(file)?;
+    if entry.data_offset.checked_add(end).is_none_or(|e| e > total) {
+        bail!("zip entry {}: range runs past EOF", entry.name);
+    }
+    file.seek(SeekFrom::Start(entry.data_offset + start))?;
+    file.read_exact(out)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -228,6 +228,22 @@ impl ThunkSchedule {
             // applies, so only large weight-transposed matmuls (LM heads) qualify.
             let fold_weights =
                 rlx_ir::env::var("RLX_METAL_MATMUL_TRANSPOSE_FOLD_WEIGHTS").as_deref() == Some("1");
+            // Always on (unlike the two above): the planner did not reserve
+            // these transposes, so every one it skipped must be folded here,
+            // whatever the cost model prefers. Same predicate, same graph.
+            if crate::backend::fold_weight_transposes() {
+                let readers = rlx_opt::memory::ReaderIndex::new(graph);
+                for node in graph.nodes() {
+                    if !matches!(node.op, Op::MatMul) || node.inputs.len() != 2 {
+                        continue;
+                    }
+                    let t = graph.node(node.inputs[1]);
+                    if rlx_opt::memory::is_foldable_weight_transpose(graph, t, &readers) {
+                        fold.insert(node.id, (node.inputs[0], false, t.inputs[0], true));
+                        folded.insert(t.id);
+                    }
+                }
+            }
             if enabled {
                 let mut uses: std::collections::HashMap<NodeId, u32> =
                     std::collections::HashMap::new();
@@ -255,7 +271,7 @@ impl ThunkSchedule {
                         .then_some(n.inputs[0])
                 };
                 for node in graph.nodes() {
-                    if !matches!(node.op, Op::MatMul) {
+                    if !matches!(node.op, Op::MatMul) || fold.contains_key(&node.id) {
                         continue;
                     }
                     let (a_id, b_id) = (node.inputs[0], node.inputs[1]);

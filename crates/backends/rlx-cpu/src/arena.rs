@@ -13,6 +13,11 @@ use rlx_ir::NodeId;
 use rlx_ir::bytes::AlignedBytes;
 use rlx_opt::memory::MemoryPlan;
 
+/// Arenas at least this large are page mappings (see
+/// [`Arena::from_plan_filled`]); smaller ones stay on the heap, where
+/// allocation is cheaper.
+pub const MAPPED_ARENA_MIN_BYTES: usize = 64 << 20;
+
 /// Pre-allocated memory arena for graph execution.
 ///
 /// The backing store is [`AlignedBytes`], not `Vec<u8>`: slots are handed out
@@ -140,15 +145,35 @@ impl Arena {
     /// The CPU executable re-applies the fill at its per-run scratch reset;
     /// GPU host fallbacks (`rlx-gpu-host`) use their own buffers and are not
     /// covered.
+    ///
+    /// An arena of [`MAPPED_ARENA_MIN_BYTES`] or more is an anonymous mapping
+    /// rather than a heap block: dropping it unmaps it, so the memory goes back
+    /// to the OS at once. A freed heap block of that size stays charged to the
+    /// process on macOS until something reuses it, and the next graph's arena —
+    /// a few rows larger for a longer sequence — rarely fits the hole: a model
+    /// that swaps its graphs between length buckets kept one stranded weight
+    /// copy (~0.7 GB for NLLB-600M) per swap. Pages never touched are also
+    /// never committed. Falls back to the heap where mapping is unavailable.
     pub fn from_plan_filled(plan: MemoryPlan, poison: bool) -> Self {
-        let mut buf = AlignedBytes::zeroed(plan.arena_size);
-        if poison {
-            buf.as_mut_slice().fill(0xFF);
-        }
-        Self {
-            buf: Store::Heap(buf),
-            plan,
-        }
+        let mapped = (plan.arena_size >= MAPPED_ARENA_MIN_BYTES)
+            .then(|| crate::shared_params::MappedArena::new(plan.arena_size))
+            .flatten();
+        let buf = match mapped {
+            Some(mut m) => {
+                if poison {
+                    m.as_mut_slice().fill(0xFF);
+                }
+                Store::Mapped(m)
+            }
+            None => {
+                let mut buf = AlignedBytes::zeroed(plan.arena_size);
+                if poison {
+                    buf.as_mut_slice().fill(0xFF);
+                }
+                Store::Heap(buf)
+            }
+        };
+        Self { buf, plan }
     }
 
     /// [`Self::from_plan`] whose `shared` slots — `(name, dtype tag, bytes,
@@ -316,6 +341,49 @@ mod tests {
     use super::*;
     use rlx_opt::memory::BufferSlot;
     use std::collections::HashMap;
+
+    fn plan_of(bytes: usize) -> MemoryPlan {
+        let mut assignments = HashMap::new();
+        assignments.insert(
+            NodeId(0),
+            BufferSlot {
+                offset: 0,
+                size: bytes,
+            },
+        );
+        MemoryPlan {
+            arena_size: bytes,
+            assignments,
+            schedule: vec![NodeId(0)],
+        }
+    }
+
+    /// A large arena is a mapping (returned to the OS on drop) yet behaves
+    /// exactly like the heap one: zero-filled, poisonable, writable, and a
+    /// clone is a private copy.
+    #[test]
+    fn large_arena_is_mapped_and_behaves_like_heap() {
+        let n = MAPPED_ARENA_MIN_BYTES;
+        let mut a = Arena::from_plan_filled(plan_of(n), false);
+        if cfg!(unix) {
+            assert!(matches!(a.buf, Store::Mapped(_)));
+        }
+        assert!(matches!(
+            Arena::from_plan(plan_of(4096)).buf,
+            Store::Heap(_)
+        ));
+        let s = a.slice_mut(NodeId(0));
+        assert_eq!(s.len(), n / 4);
+        assert!(s.iter().step_by(4099).all(|&v| v == 0.0));
+        s[0] = 1.5;
+        s[n / 4 - 1] = -2.0;
+        let b = a.clone();
+        a.slice_mut(NodeId(0))[0] = 7.0;
+        assert_eq!(b.slice(NodeId(0))[0], 1.5);
+        assert_eq!(b.slice(NodeId(0))[n / 4 - 1], -2.0);
+        let p = Arena::from_plan_filled(plan_of(n), true);
+        assert!(p.slice(NodeId(0))[n / 8].is_nan());
+    }
 
     #[test]
     fn arena_slice_access() {

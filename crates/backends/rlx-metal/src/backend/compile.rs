@@ -205,6 +205,17 @@ impl MetalExecutable {
         let fused = widen_spd_f64_to_f32(fused);
         // A pure elementwise program: its regions as generated kernels, before
         // planning so that the planner sees each as the one node it runs as.
+        let mut fused = fused;
+        // Weight-only concats (fused QKV, gate/up) become params of their own;
+        // their parts drop out with the dead code below (`weight_packs`).
+        let pack_parts = if super::weight_packs::enabled() {
+            super::weight_packs::pack_weight_concats(&mut fused)
+        } else {
+            HashMap::new()
+        };
+        if verbose && !pack_parts.is_empty() {
+            eprintln!("[rlx-metal] weight packs: {} weights in packs", pack_parts.len());
+        }
         let fused = {
             use rlx_opt::pass::Pass;
             rlx_opt::rlx_compile::dce::DeadCodeElimination.run(crate::fused_ew::fuse(fused))
@@ -300,6 +311,9 @@ impl MetalExecutable {
                 // decides which thunks become Nop, so the two cannot disagree.
                 elide_bank_transposes: true,
                 elide_requires_small_m: true,
+                // A backward graph's `Wᵀ` for `dX = dY·Wᵀ`, read in place by a
+                // transposed GEMM instead (see `fold_weight_transposes`).
+                elide_weight_transposes: fold_weight_transposes(),
                 ..Default::default()
             },
             memory::ArenaWidthPolicy::NativeBf16Widened,
@@ -362,6 +376,7 @@ impl MetalExecutable {
                     pin_output_ancestors: false,
                     arena_no_reuse: rlx_ir::env::flag("RLX_ARENA_NO_REUSE"),
                     dequant_host_fallback,
+                    elide_weight_transposes: fold_weight_transposes(),
                     ..Default::default()
                 },
                 memory::ArenaWidthPolicy::NativeBf16Widened,
@@ -477,11 +492,13 @@ impl MetalExecutable {
                     pin_output_ancestors: pin_act,
                     arena_no_reuse: rlx_ir::env::flag("RLX_ARENA_NO_REUSE"),
                     dequant_host_fallback,
+                    elide_weight_transposes: fold_weight_transposes(),
                     ..Default::default()
                 },
                 memory::ArenaWidthPolicy::NativeBf16Widened,
             );
             // Append small params into the activation arena; large ones → weight buf.
+            let weight_readers = memory::ReaderIndex::new(&fused);
             let mut tail = act_plan.arena_size;
             let align = 256usize;
             let mut external: Vec<(rlx_ir::NodeId, usize, usize, rlx_ir::DType)> = Vec::new();
@@ -551,6 +568,12 @@ impl MetalExecutable {
                 // EVERY consumer is tag-aware (else leave it in the arena).
                 let mut has_consumer = false;
                 let mut all_consumers_tag_aware = true;
+                // A folded `Wᵀ` is never run: its matmul reads this weight with
+                // `transposeRight`, through `resolve_off` like any other GEMM.
+                let folded_t = |c: &rlx_ir::Node| {
+                    fold_weight_transposes()
+                        && memory::is_foldable_weight_transpose(&fused, c, &weight_readers)
+                };
                 for c in fused.nodes() {
                     if c.inputs.contains(&node.id) {
                         has_consumer = true;
@@ -560,6 +583,7 @@ impl MetalExecutable {
                         // `is_quant` note above for what happens otherwise.
                         let tag_aware =
                             matches!(c.op, Op::MatMul | Op::DotGeneral { .. } | Op::Gather { .. })
+                                || folded_t(c)
                                 || fp8_weight
                                 || (ext_quant
                                     && match &c.op {
@@ -642,7 +666,13 @@ impl MetalExecutable {
             // thunk path (only MPSGraph binds fail there, so such an executable
             // stays off MPSGraph below); worth it when the weights are then
             // one copy across executables (`crate::shared_weights`).
-            if act_plan.arena_size < MPS_BIND_CLIFF
+            // An activation arena past the cliff is still taken under a sharing
+            // scope when the single-arena plan was past it too: that plan was
+            // thunk-only already, and inlining would give this executable its
+            // own copy of every weight (a backward graph next to its forward).
+            let act_ok = act_plan.arena_size < MPS_BIND_CLIFF
+                || (sharing_weights() && plan.arena_size >= MPS_BIND_CLIFF);
+            if act_ok
                 && (weight_padded < MPS_BIND_CLIFF || sharing_weights())
                 && !external.is_empty()
             {
@@ -821,6 +851,45 @@ impl MetalExecutable {
                     *off as f64 / 1e9,
                     *sz as f64 / 1e9
                 );
+            }
+            // `RLX_METAL_DEBUG_ARENA=N`: the N largest (op, slot size) groups by
+            // total bytes, to see what fills an arena that barely reuses slots.
+            if let Some(n) = rlx_ir::env::var("RLX_METAL_DEBUG_ARENA").and_then(|v| v.parse::<usize>().ok()) {
+                let short = |op: &Op| {
+                    let op = format!("{op}");
+                    op.split(|c: char| c == '(' || c == ' ' || c == '{').next().unwrap_or("").to_string()
+                };
+                let mut readers: std::collections::HashMap<NodeId, Vec<String>> =
+                    std::collections::HashMap::new();
+                for c in fused.nodes() {
+                    let ranks: Vec<String> =
+                        c.inputs.iter().map(|i| fused.node(*i).shape.rank().to_string()).collect();
+                    for &i in &c.inputs {
+                        readers.entry(i).or_default().push(format!("{}[{}]", short(&c.op), ranks.join(",")));
+                    }
+                }
+                type Group = (usize, usize, std::collections::BTreeMap<String, usize>);
+                let mut groups: std::collections::HashMap<(String, usize), Group> =
+                    std::collections::HashMap::new();
+                for (id, slot) in &plan.assignments {
+                    let g = groups.entry((short(&fused.node(*id).op), slot.size)).or_default();
+                    g.0 += 1;
+                    g.1 += slot.size;
+                    for r in readers.get(id).into_iter().flatten() {
+                        *g.2.entry(r.clone()).or_default() += 1;
+                    }
+                }
+                let mut groups: Vec<_> = groups.into_iter().collect();
+                groups.sort_by_key(|(_, (_, bytes, _))| std::cmp::Reverse(*bytes));
+                for ((op, size), (count, bytes, read)) in groups.into_iter().take(n) {
+                    let read: Vec<String> = read.into_iter().map(|(r, k)| format!("{r}x{k}")).collect();
+                    eprintln!(
+                        "    {op:<24} {count:5} x {:9.3} MB = {:7.3} GB  <- {}",
+                        size as f64 / 1e6,
+                        bytes as f64 / 1e9,
+                        read.join(" ")
+                    );
+                }
             }
         }
         // Build precision-aware arena: per-node DType drives buffer sizing
@@ -1001,9 +1070,16 @@ impl MetalExecutable {
         // MPSGraph's no-copy binds fail past 4 GiB into a buffer: a weight
         // buffer that big (shared weights) keeps the executable on thunks.
         let weights_past_cliff = weight_cursor >= MPS_BIND_CLIFF_BYTES;
+        // A folded weight transpose has no arena slot; MPSGraph would lower the
+        // `Transpose` itself and write to it. Such graphs stay on thunks.
+        let folds_weight_t = fold_weight_transposes() && {
+            let readers = memory::ReaderIndex::new(&fused);
+            fused.nodes().iter().any(|n| memory::is_foldable_weight_transpose(&fused, n, &readers))
+        };
         let mps_plan = if disable_mpsgraph
             || amp_active
             || weights_past_cliff
+            || folds_weight_t
             || crate::runtime_config().disable_mpsgraph
         {
             None
@@ -1022,6 +1098,7 @@ impl MetalExecutable {
         let mps_hybrid = if !disable_mpsgraph
             && !amp_active
             && !weights_past_cliff
+            && !folds_weight_t
             && mps_plan.is_none()
             && !crate::runtime_config().disable_mpsgraph
             && !crate::runtime_config().disable_mpsgraph_hybrid
@@ -1096,6 +1173,7 @@ impl MetalExecutable {
             weight_slots,
             weight_pages,
             shared_resident,
+            pack_parts,
             input_slots,
             output_slots,
             precision: MetalPrecision::F32,
@@ -1496,6 +1574,17 @@ fn shared_weight_buffer(
 
 /// Whether weights compiled now are shared across executables
 /// (`crate::shared_weights`).
+/// Fold a backward graph's weight transposes (`dX = dY·Wᵀ`) into their GEMMs —
+/// MPS `transposeRight` on `W` itself — so `Wᵀ` is neither allocated nor
+/// written, and `W` (read only by GEMMs then) can live in the shared weight
+/// buffer. Only transposes of a weight that is also read directly qualify
+/// (`rlx_opt::memory::is_foldable_weight_transpose`); planner and thunk compile
+/// both ask this, so they agree. `RLX_METAL_NO_WEIGHT_TRANSPOSE_FOLD=1` keeps
+/// the copies.
+pub(crate) fn fold_weight_transposes() -> bool {
+    !rlx_ir::env::flag("RLX_METAL_NO_WEIGHT_TRANSPOSE_FOLD")
+}
+
 fn sharing_weights() -> bool {
     #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
     return crate::shared_weights::scope().is_some();

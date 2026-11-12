@@ -3581,6 +3581,18 @@ pub fn sgemm_accumulate_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: u
         sgemm_accumulate(a, b, c, m, k, n);
         return;
     }
+    // One row (a decode step's linear): a single GEMV. With Accelerate it runs
+    // on the AMX unit at ~100 GB/s — the bandwidth ceiling of one call — where
+    // splitting N across the pool hands each worker a skinny strided `sgemm`
+    // and measured ~25% slower on the 1024×1024..4096 projections of a 0.6B
+    // decoder (and slower still under load, from the per-call fork/join).
+    // Other BLAS builds keep the split: with the BLAS pinned to one thread a
+    // single call there uses one core's bandwidth.
+    #[cfg(rlx_cpu_blas_accelerate)]
+    if m == 1 && n >= 16 {
+        sgemv_t(b, a, c, k, n, 1.0, 1.0);
+        return;
+    }
     // Defined below with `par_sgemm`; call via the public name once both are
     // in scope (same module — order-independent). Prefer parallel when large.
     if prefer_par_sgemm(m, k, n) {
@@ -3643,6 +3655,36 @@ pub fn sgemv_at(a: &[f32], x: &[f32], y: &mut [f32], n: usize, alpha: f32, beta:
             ROW_MAJOR,
             TRANS,
             n as i32,
+            n as i32,
+            alpha,
+            a.as_ptr(),
+            n as i32,
+            x.as_ptr(),
+            1,
+            beta,
+            y.as_mut_ptr(),
+            1,
+        );
+    }
+}
+
+/// `y = alpha * A^T @ x + beta * y` with `A` row-major `[k, n]` (`lda = n`):
+/// a one-row `x @ A` for a weight stored `[in, out]`.
+#[inline]
+pub fn sgemv_t(a: &[f32], x: &[f32], y: &mut [f32], k: usize, n: usize, alpha: f32, beta: f32) {
+    assert!(
+        a.len() >= k * n && x.len() >= k && y.len() >= n,
+        "sgemv_t: [k={k}, n={n}]"
+    );
+    if k == 0 || n == 0 {
+        y[..n].iter_mut().for_each(|v| *v *= beta);
+        return;
+    }
+    unsafe {
+        cblas_sgemv(
+            ROW_MAJOR,
+            TRANS,
+            k as i32,
             n as i32,
             alpha,
             a.as_ptr(),
@@ -3938,6 +3980,14 @@ pub fn sgemm_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: us
             return;
         }
     }
+    // Mostly-zero A (one-hot / bag-of-features inputs, embedding lookups
+    // written as a matmul, padded batches): touch only B's rows that a
+    // nonzero selects. See [`sparse_lhs_worth`].
+    #[cfg(not(feature = "parity-gemm"))]
+    if sparse_lhs_worth(a, m, k, n) {
+        sgemm_sparse_lhs(a, b, c, m, k, n);
+        return;
+    }
     // `neon_sgemm_small` has a fixed `acc[8]` accumulator so m must be
     // ≤ 8. The cost model prefers NEON whenever its FLOP rate beats
     // BLAS-plus-overhead, which can fire for m up to thousands at
@@ -3960,6 +4010,88 @@ pub fn sgemm_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: us
         } else {
             sgemm(a, b, c, m, k, n);
         }
+    }
+}
+
+/// Whether `A` (m × k) is sparse enough for [`sgemm_sparse_lhs`]: a strided
+/// sample of 256 entries is at most 1/16 nonzero. A dense GEMM pays only the
+/// sample. A wrong guess stays correct (and cheap: rows found dense go to
+/// BLAS). Off under [`rlx_ir::reproducible`] (the summation order differs
+/// from BLAS).
+#[inline]
+fn sparse_lhs_worth(a: &[f32], m: usize, k: usize, n: usize) -> bool {
+    const SAMPLE: usize = 256;
+    let len = m.saturating_mul(k);
+    if len < 16 * SAMPLE || n < 16 || a.len() < len || rlx_ir::reproducible::reproducible() {
+        return false;
+    }
+    let stride = len / SAMPLE;
+    // Odd offset so a regular one-hot layout cannot alias the stride.
+    let nonzero = (0..SAMPLE)
+        .filter(|&i| a[(i * stride + stride / 2 + 1) % len] != 0.0)
+        .count();
+    nonzero * 16 <= SAMPLE
+}
+
+/// `C = A @ B` for a mostly-zero `A`: each output row is the sum of `B`'s
+/// rows selected by that row's nonzeros, scaled by them. Rows are split
+/// across the pool; a row with more than k/8 nonzeros goes to BLAS instead.
+fn sgemm_sparse_lhs(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    let (a_addr, b_addr, c_addr) = (
+        a.as_ptr() as usize,
+        b.as_ptr() as usize,
+        c.as_mut_ptr() as usize,
+    );
+    let rows = |off: usize, cnt: usize| {
+        let mut picks: Vec<(usize, f32)> = Vec::with_capacity(k / 8 + 1);
+        for i in off..off + cnt {
+            // SAFETY: row `i` of A and C, and all of B, are in bounds
+            // (`len` checks in the caller), and workers write disjoint C rows.
+            let (a_row, b_all, c_row) = unsafe {
+                (
+                    std::slice::from_raw_parts((a_addr as *const f32).add(i * k), k),
+                    std::slice::from_raw_parts(b_addr as *const f32, k * n),
+                    std::slice::from_raw_parts_mut((c_addr as *mut f32).add(i * n), n),
+                )
+            };
+            picks.clear();
+            // Blocks of 16 are tested with one vectorisable OR of the bits
+            // (sign masked, so -0.0 counts as zero); only nonzero blocks are
+            // walked entry by entry.
+            const W: usize = 16;
+            let mut at = 0;
+            while at < k && picks.len() <= k / 8 {
+                let end = (at + W).min(k);
+                let block = &a_row[at..end];
+                if block
+                    .iter()
+                    .fold(0u32, |acc, &v| acc | (v.to_bits() & 0x7fff_ffff))
+                    != 0
+                {
+                    for (j, &v) in block.iter().enumerate() {
+                        if v != 0.0 {
+                            picks.push((at + j, v));
+                        }
+                    }
+                }
+                at = end;
+            }
+            if picks.len() > k / 8 {
+                sgemm(a_row, b_all, c_row, 1, k, n);
+                continue;
+            }
+            c_row.fill(0.0);
+            for &(p, v) in &picks {
+                for (y, &w) in c_row.iter_mut().zip(&b_all[p * n..(p + 1) * n]) {
+                    *y += v * w;
+                }
+            }
+        }
+    };
+    if crate::pool::num_threads() > 1 && m >= 64 {
+        crate::pool::par_for(m, 16, &rows);
+    } else {
+        rows(0, m);
     }
 }
 

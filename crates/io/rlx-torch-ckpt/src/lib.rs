@@ -163,7 +163,127 @@ pub fn read_torch_tensor_from<R: std::io::Read + std::io::Seek>(
             expected
         );
     }
+    if let Some(out) = read_contiguous_view(reader, meta, entry)? {
+        return Ok(out);
+    }
     let raw = read_zip_entry(reader, entry)?;
     let storage_f32 = meta.dtype.decode_f32(&raw);
     storage::gather(meta, &storage_f32)
+}
+
+/// The common case — a contiguous row-major view of a STORED storage — read
+/// as just the view's byte range, in one copy: an f32 view on a little-endian
+/// host is read straight into the output, any other dtype decoded from the
+/// exact range. The general path reads the whole storage, decodes it, then
+/// copies the view out — three full passes and allocations, which dominated
+/// loading multi-GB checkpoints. `None` when the view is strided or the entry
+/// is compressed; the caller falls back to that path.
+fn read_contiguous_view<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    meta: &TensorMeta,
+    entry: &ZipEntry,
+) -> Result<Option<Vec<f32>>> {
+    if entry.method != 0 || meta.shape.len() != meta.stride.len() {
+        return Ok(None);
+    }
+    // Checked before `is_contiguous`, whose running product of an untrusted
+    // shape would otherwise overflow.
+    let w = meta.dtype.size();
+    let span = meta
+        .shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .and_then(|numel| Some((numel, numel.checked_mul(w)?, meta.offset.checked_mul(w)?)));
+    let Some((numel, nbytes, start)) = span else {
+        bail!(
+            "tensor {:?}: shape {:?} at offset {} overflows",
+            meta.storage_key,
+            meta.shape,
+            meta.offset
+        );
+    };
+    if !storage::is_contiguous(&meta.shape, &meta.stride) {
+        return Ok(None);
+    }
+    if cfg!(target_endian = "little") && meta.dtype == DType::F32 {
+        let mut out = vec![0f32; numel];
+        // SAFETY: `out` owns `numel` f32s = `nbytes` initialized bytes, u8
+        // has alignment 1, and every bit pattern is a valid f32.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), nbytes) };
+        archive::read_zip_range_into(reader, entry, start as u64, bytes)?;
+        return Ok(Some(out));
+    }
+    let mut raw = vec![0u8; nbytes];
+    archive::read_zip_range_into(reader, entry, start as u64, &mut raw)?;
+    Ok(Some(meta.dtype.decode_f32(&raw)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// A 3×4 f32 storage at byte 7 of a buffer (a STORED zip entry's data
+    /// need not be aligned) and the reader / entry map for it.
+    fn storage(dtype: DType, values: &[f32]) -> (Vec<u8>, HashMap<String, ZipEntry>) {
+        let mut buf = vec![0xAAu8; 7];
+        for &v in values {
+            match dtype {
+                DType::F32 => buf.extend_from_slice(&v.to_le_bytes()),
+                DType::F16 => buf.extend_from_slice(&half::f16::from_f32(v).to_le_bytes()),
+                _ => unreachable!(),
+            }
+        }
+        let size = (buf.len() - 7) as u64;
+        buf.extend_from_slice(&[0xBB; 5]);
+        let entry = ZipEntry {
+            name: "archive/data/0".into(),
+            data_offset: 7,
+            size,
+            method: 0,
+        };
+        (buf, HashMap::from([("0".to_string(), entry)]))
+    }
+
+    fn meta(dtype: DType, shape: &[usize], stride: &[usize], offset: usize) -> TensorMeta {
+        TensorMeta {
+            storage_key: "0".into(),
+            dtype,
+            shape: shape.to_vec(),
+            stride: stride.to_vec(),
+            offset,
+        }
+    }
+
+    /// The one-copy range read must equal the whole-storage decode + gather
+    /// it short-cuts, for offset views, half dtypes and (falling back) strided
+    /// views alike.
+    #[test]
+    fn contiguous_range_read_matches_gather() {
+        let vals: Vec<f32> = (0..12).map(|i| i as f32 * 0.5 - 2.0).collect();
+        for dtype in [DType::F32, DType::F16] {
+            let (buf, entries) = storage(dtype, &vals);
+            let full = dtype.decode_f32(&buf[7..buf.len() - 5]);
+            let cases = [
+                meta(dtype, &[3, 4], &[4, 1], 0), // whole storage
+                meta(dtype, &[2, 4], &[4, 1], 4), // rows 1..3, offset view
+                meta(dtype, &[1, 3], &[9, 1], 5), // size-1 dim, any stride
+                meta(dtype, &[4, 3], &[1, 4], 0), // transposed: general path
+            ];
+            for m in &cases {
+                let got = read_torch_tensor_from(&mut Cursor::new(&buf), m, &entries).unwrap();
+                assert_eq!(got, storage::gather(m, &full).unwrap(), "{dtype:?} {m:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn contiguous_range_read_rejects_views_past_the_storage() {
+        let (buf, entries) = storage(DType::F32, &[1.0; 12]);
+        let m = meta(DType::F32, &[2, 4], &[4, 1], 6); // needs 14 of 12
+        assert!(read_torch_tensor_from(&mut Cursor::new(&buf), &m, &entries).is_err());
+        let huge = meta(DType::F32, &[usize::MAX, 2], &[2, 1], 0);
+        assert!(read_torch_tensor_from(&mut Cursor::new(&buf), &huge, &entries).is_err());
+    }
 }

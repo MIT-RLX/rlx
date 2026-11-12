@@ -931,34 +931,61 @@ pub(crate) fn exec_arg_reduce(t: &Thunk, base: *mut u8) {
         reduced,
         inner,
         is_max,
+        src_f64,
     } = t
     else {
         unreachable!()
     };
-    {
-        let outer = *outer as usize;
-        let reduced = *reduced as usize;
-        let inner = *inner as usize;
-        let in_total = outer * reduced * inner;
-        let out_total = outer * inner;
-        unsafe {
-            let inp = sl(*src, base, in_total);
-            let out = sl_mut(*dst, base, out_total);
-            for o in 0..outer {
-                for i in 0..inner {
-                    let mut best = inp[o * reduced * inner + i];
-                    let mut best_idx = 0usize;
-                    for r in 1..reduced {
-                        let v = inp[o * reduced * inner + r * inner + i];
-                        let better = if *is_max { v > best } else { v < best };
-                        if better {
-                            best = v;
-                            best_idx = r;
-                        }
-                    }
-                    out[o * inner + i] = best_idx as f32;
+    let outer = *outer as usize;
+    let reduced = *reduced as usize;
+    let inner = *inner as usize;
+    let in_total = outer * reduced * inner;
+    unsafe {
+        let out = sl_mut(*dst, base, outer * inner);
+        if *src_f64 {
+            arg_reduce(
+                sl_f64(*src, base, in_total),
+                out,
+                outer,
+                reduced,
+                inner,
+                *is_max,
+            );
+        } else {
+            arg_reduce(
+                sl(*src, base, in_total),
+                out,
+                outer,
+                reduced,
+                inner,
+                *is_max,
+            );
+        }
+    }
+}
+
+/// First index of the max (`is_max`) or min of each `[outer, ·, inner]` lane.
+fn arg_reduce<T: PartialOrd + Copy>(
+    inp: &[T],
+    out: &mut [f32],
+    outer: usize,
+    reduced: usize,
+    inner: usize,
+    is_max: bool,
+) {
+    for o in 0..outer {
+        for i in 0..inner {
+            let mut best = inp[o * reduced * inner + i];
+            let mut best_idx = 0usize;
+            for r in 1..reduced {
+                let v = inp[o * reduced * inner + r * inner + i];
+                let better = if is_max { v > best } else { v < best };
+                if better {
+                    best = v;
+                    best_idx = r;
                 }
             }
+            out[o * inner + i] = best_idx as f32;
         }
     }
 }

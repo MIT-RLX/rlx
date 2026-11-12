@@ -58,6 +58,7 @@ impl Session {
                 format!("enable the `{}` Cargo feature", feature_name(device))
             }
         );
+        crate::precision::warn_if_ignored(device, precision);
         Self {
             device,
             precision,

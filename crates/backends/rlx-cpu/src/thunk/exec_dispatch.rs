@@ -2549,6 +2549,76 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         continue;
                     }
 
+                    // ── Decode (one query row) on aarch64: a task per head ──
+                    // The x86 path above, for Arm, at any key count. Without
+                    // it a single query row past `sdpa_seq_threshold` keys
+                    // takes the strided path, which packs Kᵀ and V and makes
+                    // per-head BLAS calls — ~130 µs per attention on a 129-key
+                    // decode bucket, more than the layer's matmuls at that
+                    // size. Here each head is one task: NEON dots against the
+                    // live keys only, softmax, then the weighted sum of V.
+                    #[cfg(target_arch = "aarch64")]
+                    if !crate::config::portable()
+                        && b == 1
+                        && q_s == 1
+                        && nh > 1
+                        && *softcap == 0.0
+                        && matches!(
+                            mask_kind,
+                            rlx_ir::op::MaskKind::Custom | rlx_ir::op::MaskKind::None
+                        )
+                    {
+                        let custom = matches!(mask_kind, rlx_ir::op::MaskKind::Custom)
+                            && !mask_data.is_empty();
+                        let (q_d, k_d, v_d) = (q_data, k_data, v_data);
+                        let live: Vec<usize> = (0..k_s)
+                            .filter(|&ki| !custom || mask_data[ki] >= mask_thr)
+                            .collect();
+                        let o_addr = out_data.as_mut_ptr() as usize;
+                        let heads = |off: usize, cnt: usize| {
+                            let mut scores = vec![0f32; k_s];
+                            for hi in off..off + cnt {
+                                let kv_hi = hi / group;
+                                let q = &q_d[hi * dh..(hi + 1) * dh];
+                                scores.fill(mask_neg);
+                                for &ki in &live {
+                                    let k_off = ki * krs + kv_hi * dh;
+                                    scores[ki] =
+                                        crate::gemv::dot(q, &k_d[k_off..k_off + dh]) * scale;
+                                }
+                                crate::kernels::neon_softmax(&mut scores, 1, k_s);
+                                // SAFETY: each head writes only its own
+                                // `dh_v` output columns.
+                                let o = std::slice::from_raw_parts_mut(
+                                    (o_addr as *mut f32).add(hi * dh_v),
+                                    dh_v,
+                                );
+                                o.fill(0.0);
+                                for &ki in &live {
+                                    let sc = scores[ki];
+                                    if sc > score_thr {
+                                        let v_off = ki * vrs + kv_hi * dh_v;
+                                        for (od, &vd) in o.iter_mut().zip(&v_d[v_off..v_off + dh_v])
+                                        {
+                                            *od += sc * vd;
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        // A decode step's attention is tiny next to a fork:
+                        // 16 heads × ~100 keys × 64 is ~0.1 M multiply-adds,
+                        // where waking the pool costs tens of µs (far more on
+                        // a loaded machine). Split only long contexts.
+                        const PAR_MACS: usize = 1 << 20;
+                        if nh * live.len() * (dh + dh_v) >= PAR_MACS {
+                            crate::pool::par_for(nh, 1, &heads);
+                        } else {
+                            heads(0, nh);
+                        }
+                        continue;
+                    }
+
                     // ── Auto-select kernel: NEON dots vs strided BLAS ───
                     // For tiny inputs (batch=1, short seq), per-head BLAS call
                     // overhead (~0.5µs × 2 calls × num_heads × num_layers)

@@ -72,7 +72,9 @@ inline float rtf_fine_rcp(float s) {
 }
 // Squared error of a block at scale 2^e, in index order (`FloatFormat::block_scale`);
 // multiply and add are separate statements so they are not contracted.
-inline float rtf_sq_err(const device float* x, uint start, uint end, int e) {
+// Generic over the pointer: MLX binds small inputs in `constant` space.
+template <typename P>
+inline float rtf_sq_err(P x, uint start, uint end, int e) {
     float acc = 0.0f;
     for (uint i = start; i < end; i++) {
         float d = rtf_scaled(x[i], e) - x[i];
@@ -170,7 +172,9 @@ pub fn round_to_format_ondevice(
         format.max_normal.to_bits()
     )
     .replace('-', "m");
-    let flat = crate::ops::reshape(x, &[n as i32])?;
+    // The kernel reads f32: MLX types a custom kernel's parameters from its
+    // input arrays.
+    let flat = crate::ops::cast(&crate::ops::reshape(x, &[n as i32])?, rlx_ir::DType::F32)?;
 
     let amax = if mode == 1 {
         dispatch(

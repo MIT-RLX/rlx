@@ -92,6 +92,11 @@ pub fn gather_rows_axis1(
     idx: rlx_ir::HirNodeId,
     batch: usize,
 ) -> rlx_ir::HirNodeId {
+    // Same rows, one flat gather: the diagonal form below differentiates to a
+    // zero gradient for every batch item but the first.
+    if batch > 1 && gb.shape(x).rank() == 3 && gb.shape(x).dim(1).is_static() {
+        return gather_rows_flat(gb, x, idx, batch);
+    }
     let c = {
         let sh = gb.shape(x);
         sh.dim(sh.rank() - 1).unwrap_static()
@@ -109,4 +114,57 @@ pub fn gather_rows_axis1(
         })
         .collect();
     gb.concat_(rows, 0)
+}
+
+/// Row `b` of `x` (`[batch, seq, c]`, `seq` static) at positions `idx[b]`
+/// (`[batch, k]`, f32- or i32-encoded), as `[batch, k, c]`.
+///
+/// One gather over the flattened `[batch * seq, c]` rows at `b * seq + idx[b, j]`.
+/// Its reverse pass is a plain scatter-add into those rows, so gradients reach
+/// every batch item (and add up where a position repeats); prefer it over the
+/// gather-then-diagonal form whenever the graph is differentiated.
+pub fn gather_rows_flat(
+    gb: &mut HirMut,
+    x: rlx_ir::HirNodeId,
+    idx: rlx_ir::HirNodeId,
+    batch: usize,
+) -> rlx_ir::HirNodeId {
+    let (seq, c) = {
+        let sh = gb.shape(x);
+        (
+            sh.dim(1).unwrap_static(),
+            sh.dim(sh.rank() - 1).unwrap_static(),
+        )
+    };
+    let k = gb.shape(idx).dim(1).unwrap_static();
+    // Offsets in f32 (exact below 2^24 rows), then I32: gather kernels read
+    // positions as I32 (see `GatherLastTokenStage`).
+    let idx = if gb.shape(idx).dtype() == DType::F32 {
+        idx
+    } else {
+        gb.0.mir(
+            rlx_ir::Op::Cast { to: DType::F32 },
+            vec![idx],
+            Shape::new(&[batch, k], DType::F32),
+        )
+    };
+    let offsets: Vec<u8> = (0..batch)
+        .flat_map(|b| std::iter::repeat_n((b * seq) as f32, k))
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let offsets = gb.add_node(
+        rlx_ir::Op::Constant { data: offsets },
+        vec![],
+        Shape::new(&[batch, k], DType::F32),
+    );
+    let flat = gb.add(idx, offsets);
+    let flat = gb.reshape_(flat, vec![(batch * k) as i64]);
+    let flat = gb.0.mir(
+        rlx_ir::Op::Cast { to: DType::I32 },
+        vec![flat],
+        Shape::new(&[batch * k], DType::I32),
+    );
+    let table = gb.reshape_(x, vec![(batch * seq) as i64, c as i64]);
+    let picked = gb.gather_(table, flat, 0);
+    gb.reshape_(picked, vec![batch as i64, k as i64, c as i64])
 }

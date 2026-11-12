@@ -2008,7 +2008,7 @@ pub enum Thunk {
         max: f32,
     },
     /// Index of the max (`is_max`) or min along the reduced axis; writes the
-    /// winning index as an f32 into `dst`.
+    /// winning index as an f32 into `dst`. `src_f64` reads an F64 input.
     ArgReduce {
         src: usize,
         dst: usize,
@@ -2016,6 +2016,7 @@ pub enum Thunk {
         reduced: u32,
         inner: u32,
         is_max: bool,
+        src_f64: bool,
     },
     /// Top-K **indices** along the last axis. Input shape `[outer, axis_dim]`,
     /// output `[outer, k]` (f32 or i64 per `indices_i64`). Ties broken by

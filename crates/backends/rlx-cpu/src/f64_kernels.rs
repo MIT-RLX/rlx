@@ -46,6 +46,9 @@ pub fn native_f64(op: &Op) -> bool {
                 op: ReduceOp::Sum | ReduceOp::Mean,
                 ..
             }
+            | Op::ArgMax { .. }
+            | Op::ArgMin { .. }
+            | Op::ScatterAdd { axis: 0 }
             | Op::RmsNorm { .. }
             | Op::LayerNorm { .. }
             | Op::Softmax { .. }
@@ -155,6 +158,43 @@ impl CpuKernel for ReluBackwardF64 {
     }
 }
 
+/// `out[idx[i], ..] += upd[i, ..]` along axis 0, from zero, in update order.
+/// Inputs `[updates, indices]` (indices f32-encoded or widened to F64).
+struct ScatterAddF64;
+impl CpuKernel for ScatterAddF64 {
+    fn name(&self) -> &str {
+        "core.scatter_add_f64"
+    }
+    fn execute(
+        &self,
+        inputs: &[CpuTensorRef<'_>],
+        output: CpuTensorMut<'_>,
+        _attrs: &[u8],
+    ) -> Result<(), String> {
+        let upd = inputs[0].expect_f64("scatter updates")?;
+        let idx = labels(&inputs[1])?;
+        let out = output.expect_f64_mut("scatter out")?;
+        out.fill(0.0);
+        if idx.is_empty() {
+            return Ok(());
+        }
+        let row = upd.len() / idx.len();
+        let rows_out = out.len() / row.max(1);
+        for (i, &j) in idx.iter().enumerate() {
+            if j >= rows_out {
+                return Err(format!("scatter_add: index {j} out of range 0..{rows_out}"));
+            }
+            for (o, &u) in out[j * row..(j + 1) * row]
+                .iter_mut()
+                .zip(&upd[i * row..(i + 1) * row])
+            {
+                *o += u;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// An f32 op attribute (eps, scale, softcap) as the f64 it was written as.
 ///
 /// `1e-6_f32 as f64` is 9.9999999747e-7: widening keeps the f32 rounding,
@@ -212,6 +252,7 @@ pub(crate) fn kernel_for(op: &Op, in_shapes: &[&Shape]) -> Option<std::sync::Arc
         Op::SoftmaxCrossEntropyWithLogits => Arc::new(SceF64),
         Op::SoftmaxCrossEntropyBackward => Arc::new(SceBackwardF64),
         Op::ReluBackward => Arc::new(ReluBackwardF64),
+        Op::ScatterAdd { axis: 0 } => Arc::new(ScatterAddF64),
         _ => return None,
     })
 }

@@ -1007,6 +1007,7 @@ pub fn compile_thunks_with_rng(
                     reduced: reduced as u32,
                     inner: inner as u32,
                     is_max: matches!(node.op, Op::ArgMax { .. }),
+                    src_f64: in_shape.dtype() == rlx_ir::DType::F64,
                 }
             }
 

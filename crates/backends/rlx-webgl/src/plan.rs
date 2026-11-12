@@ -858,7 +858,7 @@ impl Plan {
             }
         }
         let mut v: Vec<_> = by.into_iter().map(|(k, (n, m))| (k, n, m)).collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|e| std::cmp::Reverse(e.1));
         v
     }
 
@@ -873,7 +873,7 @@ impl Plan {
                 .or_default() += 1;
         }
         let mut v: Vec<_> = by.into_iter().map(|(k, n)| (k.to_string(), n)).collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|e| std::cmp::Reverse(e.1));
         v
     }
 
@@ -1445,7 +1445,7 @@ fn op_histogram(g: &Graph) -> String {
         *by.entry(format!("{:?}", n.op.kind())).or_default() += 1;
     }
     let mut v: Vec<_> = by.into_iter().collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|e| std::cmp::Reverse(e.1));
     v.iter()
         .take(12)
         .map(|(k, n)| format!("{k} {n}"))

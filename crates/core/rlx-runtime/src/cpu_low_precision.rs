@@ -264,6 +264,25 @@ pub fn prepare_f32_exec_graph_keeping_half_matmul_weights(
         gathers: true,
         // Metal has no BF16 storage: those widen as before.
         only_f16: true,
+        only_bf16: false,
+    };
+    (promote(graph, keep), manifest)
+}
+
+/// [`prepare_f32_exec_graph`] keeping a BF16 `Param` whose every consumer is
+/// a `MatMul`'s weight at half width (Vulkan: its arena is f32-uniform except
+/// for such weights, which `matmul_bf16` reads packed). Everything else —
+/// casts to F16/BF16 included — is promoted, so no kernel sees a half-typed
+/// node over an f32 slot.
+#[cfg(feature = "vulkan")]
+pub fn prepare_f32_exec_graph_keeping_bf16_matmul_weights(
+    graph: Graph,
+) -> (Graph, IoDtypeManifest) {
+    let manifest = IoDtypeManifest::from_graph(&graph);
+    let keep = Keep {
+        weights: true,
+        only_bf16: true,
+        ..Keep::NOTHING
     };
     (promote(graph, keep), manifest)
 }
@@ -281,6 +300,8 @@ struct Keep {
     gathers: bool,
     /// Only F16 params, not BF16.
     only_f16: bool,
+    /// Only BF16 params, not F16.
+    only_bf16: bool,
 }
 
 impl Keep {
@@ -289,6 +310,7 @@ impl Keep {
         tables: false,
         gathers: false,
         only_f16: false,
+        only_bf16: false,
     };
 }
 
@@ -328,6 +350,7 @@ fn promote(graph: Graph, keep: Keep) -> Graph {
     let boundary_stays_lowp = |id: NodeId| -> bool {
         let weight_only = keep.weights
             && (!keep.only_f16 || graph.node(id).shape.dtype() == DType::F16)
+            && (!keep.only_bf16 || graph.node(id).shape.dtype() == DType::BF16)
             && matches!(graph.node(id).op, Op::Param { .. })
             && consumers.get(&id).is_some_and(|cs| {
                 cs.iter().all(|&c| {
@@ -361,13 +384,13 @@ fn promote(graph: Graph, keep: Keep) -> Graph {
         let inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
         let is_boundary =
             matches!(&node.op, Op::Param { .. } | Op::Input { .. }) && boundary_stays_lowp(node.id);
+        // Only inputs that really stayed half here: a half input this pass
+        // promoted (a `Cast` to F16, say) now holds f32, and a layout op kept
+        // half over it would read that buffer as pairs of halves.
         let is_layout_of_lowp = is_lowp_layout_op(&node.op)
             && matches!(node.shape.dtype(), DType::F16 | DType::BF16)
             && !node.inputs.is_empty()
-            && node.inputs.iter().all(|&i| {
-                kept_lowp.contains(&i)
-                    || matches!(graph.node(i).shape.dtype(), DType::F16 | DType::BF16)
-            });
+            && node.inputs.iter().all(|&i| kept_lowp.contains(&i));
         let is_gather_of_lowp = keep.gathers
             && matches!(node.op, Op::Gather { axis: 0 })
             && matches!(node.shape.dtype(), DType::F16 | DType::BF16)
@@ -440,6 +463,29 @@ mod tests {
     /// A half weight read only as a `MatMul`'s right operand stays half on
     /// CPU (its packed GEMM reads it), the matmul's output promotes; one read
     /// by anything else promotes, and other backends promote it too.
+    /// A layout op over a promoted half value is promoted with it. `Cast` to
+    /// F16 then `Transpose` (the operand order of `x @ cast(c)ᵀ`) kept the
+    /// transpose F16 over the cast's now-f32 buffer: Metal's matmul read the
+    /// f32 bits as pairs of halves and returned garbage, with no error.
+    #[test]
+    fn a_layout_op_over_a_promoted_cast_is_promoted() {
+        for dt in [DType::F16, DType::BF16] {
+            let mut g = Graph::new("cast_t");
+            let c = g.input("c", Shape::new(&[3, 4], DType::F32));
+            let h = g.add_node(Op::Cast { to: dt }, vec![c], Shape::new(&[3, 4], dt));
+            let t = g.add_node(
+                Op::Transpose { perm: vec![1, 0] },
+                vec![h],
+                Shape::new(&[4, 3], dt),
+            );
+            g.set_outputs(vec![t]);
+            let p = promote_to_f32(g);
+            for n in p.nodes() {
+                assert_eq!(n.shape.dtype(), DType::F32, "{dt:?}: {} stayed half", n.op);
+            }
+        }
+    }
+
     #[test]
     fn a_half_matmul_weight_stays_half_on_cpu_only() {
         let build = |extra_use: bool| {

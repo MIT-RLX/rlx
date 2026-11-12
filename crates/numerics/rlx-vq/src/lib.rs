@@ -40,6 +40,9 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "emeans")]
+pub mod emeans;
+
 use rlx_ir::{DType, Graph, NodeId, OpExtension, Shape, register_op};
 
 /// Stable registry id, shared by the `OpExtension` and every backend kernel.

@@ -30,6 +30,7 @@ pub mod attention_bwd;
 pub mod autotune;
 mod avx2_mirror;
 pub mod blas;
+pub mod gemv;
 pub mod shared_params;
 /// Accurate vectorized f32 exp / log / tanh (the `rlx-fastmath` crate).
 pub use rlx_fastmath as fastmath;

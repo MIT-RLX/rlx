@@ -52,3 +52,80 @@ impl std::fmt::Display for Precision {
         }
     }
 }
+
+/// Does `Session::new_with_precision(device, precision)` change how `device`
+/// computes? Only these combinations do; every other one compiles through the
+/// backend's f32 path, with the same results as `Precision::F32`:
+///
+/// - `F32` everywhere;
+/// - `F16` on [`Device::Ane`] (CoreML lowers floats to f16 when no
+///   [`PrecisionPolicy`](crate::PrecisionPolicy) is set);
+/// - `BF16` on [`Device::Xdna`] (MatMuls run through the bf16 microkernel).
+///
+/// For the numerics of a reduced format on any backend (rounded, but still
+/// computed in f32), see `RLX_NUMBER_FORMAT` / `CompileOptions::number_format`.
+pub fn precision_honored(device: crate::Device, precision: Precision) -> bool {
+    match precision {
+        Precision::F32 => true,
+        Precision::F16 => device == crate::Device::Ane,
+        Precision::BF16 => device == crate::Device::Xdna,
+    }
+}
+
+/// One stderr line per process for each `(device, precision)` request that
+/// [`precision_honored`] says runs in f32 anyway. Silent before this existed,
+/// which made a timing comparison of F16 against F32 measure noise.
+pub(crate) fn warn_if_ignored(device: crate::Device, precision: Precision) {
+    use std::sync::Mutex;
+    static WARNED: Mutex<Vec<(crate::Device, Precision)>> = Mutex::new(Vec::new());
+    if precision_honored(device, precision) {
+        return;
+    }
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if warned.contains(&(device, precision)) {
+        return;
+    }
+    warned.push((device, precision));
+    eprintln!(
+        "[rlx] {precision} requested on {device}, which compiles in f32: results and \
+         speed match Precision::F32. Set RLX_NUMBER_FORMAT={precision} to emulate \
+         {precision} rounding (still computed in f32)."
+    );
+}
+
+#[cfg(test)]
+mod honored_tests {
+    use super::*;
+    use crate::Device;
+
+    #[test]
+    fn f32_is_always_honored() {
+        for d in [
+            Device::Cpu,
+            Device::Metal,
+            Device::Cuda,
+            Device::Ane,
+            Device::Xdna,
+        ] {
+            assert!(precision_honored(d, Precision::F32));
+        }
+    }
+
+    #[test]
+    fn half_formats_only_where_a_backend_reads_them() {
+        assert!(precision_honored(Device::Ane, Precision::F16));
+        assert!(precision_honored(Device::Xdna, Precision::BF16));
+        for d in [
+            Device::Cpu,
+            Device::Metal,
+            Device::Cuda,
+            Device::Rocm,
+            Device::Mlx,
+        ] {
+            assert!(!precision_honored(d, Precision::F16), "{d}");
+            assert!(!precision_honored(d, Precision::BF16), "{d}");
+        }
+        assert!(!precision_honored(Device::Ane, Precision::BF16));
+        assert!(!precision_honored(Device::Xdna, Precision::F16));
+    }
+}

@@ -612,6 +612,39 @@ impl ModelFlow {
         self
     }
 
+    /// Keep `rows` positions of each batch item, chosen at run time through
+    /// the `[batch, rows]` input `input_name` (positions, f32- or i32-encoded;
+    /// declared here as f32 unless the flow declared it already). The hidden
+    /// `[batch, seq, c]` becomes `[batch, rows, c]`, so stages after it (an
+    /// [`Self::lm_head`], a final norm) run on those rows only: logits for the
+    /// positions a loss or a scorer reads, not for the whole sequence.
+    /// Positions may repeat; gradients flow back to every selected row (see
+    /// [`crate::blocks::gather_rows_flat`]).
+    pub fn gather_rows(mut self, input_name: impl Into<String>, batch: usize, rows: usize) -> Self {
+        let name: String = input_name.into();
+        if !self.inputs.iter().any(|(n, _)| *n == name) {
+            self = self.input(
+                name.clone(),
+                rlx_ir::Shape::new(&[batch, rows], rlx_ir::DType::F32),
+            );
+        }
+        self.plugin_named(format!("gather_rows:{name}"), move |emit, input| {
+            let h = input.ok_or_else(|| anyhow::anyhow!("gather_rows requires an input"))?;
+            let idx = emit.flow_input(&name)?.hir_id();
+            let c = h.shape.dim(h.shape.rank() - 1).unwrap_static();
+            let hir = emit
+                .module
+                .as_hir_mut()
+                .ok_or_else(|| anyhow::anyhow!("gather_rows requires the HIR stage"))?;
+            let mut gb = rlx_ir::hir::HirMut::new(hir);
+            let id = crate::blocks::gather_rows_flat(&mut gb, h.hir_id(), idx, batch);
+            Ok(Some(emit.wrap(
+                id,
+                rlx_ir::Shape::new(&[batch, rows, c], h.shape.dtype()),
+            )))
+        })
+    }
+
     /// Causal LM head — tied or separate weights.
     pub fn lm_head(
         mut self,

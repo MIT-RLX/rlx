@@ -94,7 +94,7 @@ pub fn gather(meta: &TensorMeta, storage_f32: &[f32]) -> Result<Vec<f32>> {
 }
 
 /// Is `(shape, stride)` a standard contiguous row-major layout?
-fn is_contiguous(shape: &[usize], stride: &[usize]) -> bool {
+pub(crate) fn is_contiguous(shape: &[usize], stride: &[usize]) -> bool {
     let mut expected = 1usize;
     for d in (0..shape.len()).rev() {
         // Dimensions of size 1 carry an arbitrary stride; ignore them.

@@ -17,18 +17,25 @@ impl Backend for VulkanBackend {
         // (decomposing DotGeneral / Fma / fused ops / non-last reduce down
         // to the native primitive set) itself, so we can hand it the graph
         // directly — no fusion pre-pass that would emit ops it can't lower.
+        // F16/BF16 compute is promoted first: the arena is f32-uniform, and a
+        // half-typed node sized its slot at 2 B/elem while its kernel wrote 4
+        // (wrong sums on MoltenVK, heap corruption on NVIDIA/AMD).
+        let (graph, io_manifest) =
+            cpu_low_precision::prepare_f32_exec_graph_keeping_bf16_matmul_weights(graph);
         Box::new(VulkanExecutableWrapper {
             inner: VulkanExecutable::compile_rng_with_options(
                 graph,
                 options.rng,
                 options.scan_unroll_max_length,
             ),
+            io_manifest,
         })
     }
 }
 
 struct VulkanExecutableWrapper {
     inner: VulkanExecutable,
+    io_manifest: cpu_low_precision::IoDtypeManifest,
 }
 
 unsafe impl Send for VulkanExecutableWrapper {}
@@ -156,7 +163,7 @@ impl ExecutableGraph for VulkanExecutableWrapper {
             .iter()
             .map(|(n, d)| (n.as_str(), d.as_slice()))
             .collect();
-        let dtypes = self.inner.output_dtypes();
+        let dtypes = super::declared_output_dtypes(&self.io_manifest, self.inner.output_dtypes());
         let outs = self.inner.run(&refs);
         outs.into_iter()
             .zip(
@@ -171,6 +178,7 @@ impl ExecutableGraph for VulkanExecutableWrapper {
     fn clone_box(&self) -> Box<dyn ExecutableGraph> {
         Box::new(VulkanExecutableWrapper {
             inner: self.inner.clone_for_cache(),
+            io_manifest: self.io_manifest.clone(),
         })
     }
 }

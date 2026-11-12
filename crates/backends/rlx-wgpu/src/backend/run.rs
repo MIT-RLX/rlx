@@ -468,6 +468,51 @@ impl WgpuExecutable {
             dev.queue.submit(std::iter::once(enc.finish()));
             return Ok(Vec::new());
         }
+        // Large outputs come back in pieces through one bounded staging
+        // buffer: a mappable buffer as large as SynthSeg's 2.1 GB of encoder
+        // outputs (rounded up to 4 GiB) failed as out of memory in Chrome.
+        const READ_CHUNK: usize = 256 << 20;
+        if layout.total_bytes > READ_CHUNK {
+            dev.queue.submit(std::iter::once(enc.finish()));
+            ReadbackStaging::prepare(&dev.device, &mut self.readback_staging, READ_CHUNK);
+            let staging_buf = self
+                .readback_staging
+                .as_ref()
+                .expect("readback staging")
+                .buffer()
+                .clone();
+            let mut partial = Vec::with_capacity(out_ids.len());
+            for (&id, &(_, len)) in out_ids.iter().zip(layout.regions.iter()) {
+                let mut values: Vec<f32> = Vec::with_capacity(len / 4);
+                let base = self.arena.offset(id);
+                for at in (0..len).step_by(READ_CHUNK) {
+                    let n = READ_CHUNK.min(len - at);
+                    let (src, local) = self.arena.resolve_w(base + at);
+                    let mut enc =
+                        dev.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("rlx-wgpu chunked readback"),
+                            });
+                    enc.copy_buffer_to_buffer(src, local as u64, &staging_buf, 0, n as u64);
+                    dev.queue.submit(std::iter::once(enc.finish()));
+                    if let Err(e) = crate::buffer::wasm_async::map_read_async(&staging_buf, n).await
+                    {
+                        return Err(crate::device::take_gpu_error()
+                            .unwrap_or_else(|| format!("reading the outputs back failed: {e}")));
+                    }
+                    {
+                        let view = staging_buf
+                            .slice(..n as u64)
+                            .get_mapped_range()
+                            .expect("buffer slice mapped");
+                        values.extend_from_slice(bytemuck::cast_slice::<u8, f32>(&view[..]));
+                    }
+                    staging_buf.unmap();
+                }
+                partial.push(values);
+            }
+            return Ok(self.pack_readback_outputs(&plan, partial));
+        }
         ReadbackStaging::prepare(&dev.device, &mut self.readback_staging, layout.total_bytes);
         let staging_buf = self
             .readback_staging
@@ -572,7 +617,42 @@ impl WgpuExecutable {
     /// entirely on the GPU.
     pub fn host_summary(&self) -> Option<String> {
         let plan = self.host_plan();
-        (!plan.is_empty()).then(|| plan.summary())
+        if plan.is_empty() {
+            return None;
+        }
+        // The steps that do block (the plan also counts copies that run on
+        // the GPU), the first few named: in a browser no log says which.
+        let blocking: Vec<String> = self
+            .schedule
+            .iter()
+            .filter(|s| {
+                (super::step_runs_on_host(s)
+                    && !gguf_step_is_gpu_only(s, self.active_extent)
+                    && !self.buffer_copy_is_gpu_only(s))
+                    || super::step_is_tail_host(s)
+            })
+            .map(|s| match *s {
+                Step::BufferCopy {
+                    src_byte_off,
+                    dst_byte_off,
+                    bytes,
+                } => format!("copy {src_byte_off:#x}->{dst_byte_off:#x} ({bytes} B)"),
+                Step::HostOp { ref desc } => format!("host op {:?}", desc.op.kind()),
+                ref other => format!("{:?}", std::mem::discriminant(other)),
+            })
+            .collect();
+        let shown = blocking
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "{}; {} block (stripe {} B): {shown}",
+            plan.summary(),
+            blocking.len(),
+            self.arena.shard_size
+        ))
     }
 
     pub(crate) fn run_tail_host_audio_ops(&self, dev: &crate::device::WgpuDevice) {
@@ -3221,6 +3301,16 @@ impl WgpuExecutable {
                                             && params.act != crate::unfuse::ARGMAX_ACT
                                             && params.act != crate::unfuse::TOPK_ACT
                                             && !rlx_ir::env::flag("RLX_WGPU_CONV3D_NO_K3"));
+                                    // a 3×3×3 (`conv3d_k333_c8`): the same
+                                    // workgroup weights and row reuse, the
+                                    // eight-channel tile's sums.
+                                    // `RLX_WGPU_CONV3D_NO_K333=1` for that tile.
+                                    let k333 = !k3
+                                        && c8
+                                        && params.is_k333()
+                                        && params.act != crate::unfuse::ARGMAX_ACT
+                                        && params.act != crate::unfuse::TOPK_ACT
+                                        && !rlx_ir::env::flag("RLX_WGPU_CONV3D_NO_K333");
                                     let k3_total = || {
                                         params.c_out.div_ceil(8)
                                             * (n_s
@@ -3251,6 +3341,8 @@ impl WgpuExecutable {
                                             (k("conv3d_topk"), n_s * spatial)
                                         } else if k3 {
                                             (k("conv3d_k3_c8"), k3_total())
+                                        } else if k333 {
+                                            (k("conv3d_k333_c8"), k3_total())
                                         } else if params.c_out > 4 {
                                             (k("conv3d_ctile_w4c8"), w4_total(8))
                                         } else {
@@ -3279,6 +3371,8 @@ impl WgpuExecutable {
                                             )
                                         } else if k3 {
                                             (k("conv3d_k3_c8"), k3_total())
+                                        } else if k333 {
+                                            (k("conv3d_k333_c8"), k3_total())
                                         } else if c8 {
                                             (k("conv3d_ctile_w4c8"), w4_total(8))
                                         } else {
@@ -3299,6 +3393,11 @@ impl WgpuExecutable {
                                     } else if tiled && k3 {
                                         (
                                             crate::kernels::conv3d_k3_c8_kernel(&dev.device),
+                                            k3_total(),
+                                        )
+                                    } else if tiled && k333 {
+                                        (
+                                            crate::kernels::conv3d_k333_c8_kernel(&dev.device),
                                             k3_total(),
                                         )
                                     } else if tiled && c8 {
@@ -3969,6 +4068,15 @@ impl WgpuExecutable {
                         self.propagate_gpu_handle_feeds_on_gpu(dev, &mut enc);
                     }
                     let plan = self.readback_plan();
+                    // Nothing to read (`run_read_outputs(_, Some(&[]))`, a step
+                    // whose state stays in fed handles): submit and return.
+                    // Mapping the empty staging range failed the map.
+                    if plan.is_empty() {
+                        crate::step_profile::resolve(&mut enc);
+                        dev.queue.submit(std::iter::once(enc.finish()));
+                        self.arm_static_once();
+                        return self.pack_readback_outputs(&plan, Vec::new());
+                    }
                     let out_ids_all: Vec<_> = self.graph.outputs.clone();
                     let out_ids: Vec<_> = plan.iter().map(|&i| out_ids_all[i]).collect();
                     let layout = ReadbackLayout::for_nodes(&self.arena, &out_ids);
@@ -6110,11 +6218,30 @@ fn buffer_copy_gpu_window(
 ) -> Option<(u64, u64)> {
     if crate::buffer::is_weight_off(src as usize)
         || crate::buffer::is_weight_off(dst as usize)
-        || arena.is_sharded()
         || crate::device::coop_discrete_backend()
         || rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY")
+        || nbytes == 0
     {
         return None;
+    }
+    if arena.is_sharded() {
+        // Both ranges inside one stripe (a parameter staged into its stripe's
+        // reserve, in the browser where f32 params stay in the arena), and
+        // disjoint: the copy kernel runs in parallel. Bound as that stripe's
+        // window; other copies host.
+        let s = arena.shard_size as u64;
+        let stripe = src / s;
+        if (src + nbytes - 1) / s != stripe
+            || dst / s != stripe
+            || (dst + nbytes - 1) / s != stripe
+            || (src < dst + nbytes && dst < src + nbytes)
+        {
+            return None;
+        }
+        let (lo, hi) = (src.min(dst), src.max(dst) + nbytes);
+        let base = lo / 256 * 256;
+        let size = (hi - base).div_ceil(256) * 256;
+        return (size <= max_binding).then_some((base, size.min((stripe + 1) * s - base)));
     }
     let lo = src.min(dst);
     let hi = src.saturating_add(nbytes).max(dst.saturating_add(nbytes));
