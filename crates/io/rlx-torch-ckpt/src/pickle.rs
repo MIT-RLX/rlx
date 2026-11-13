@@ -6,7 +6,8 @@
 //! the opcode subset `torch.save` emits for a state dict. It does not
 //! import modules or call arbitrary code: `GLOBAL`/`STACK_GLOBAL` push a
 //! symbolic `(module, name)` reference, `REDUCE` only knows the handful
-//! of torch reconstructors that build tensors, and `persistent_id`
+//! of torch reconstructors that build tensors (any other callable becomes a
+//! symbolic [`Value::Object`] holding its arguments), and `persistent_id`
 //! resolves the storage tuple into a typed [`StorageRef`].
 //!
 //! The end product is a [`Value`] tree from which the crate's private
@@ -66,7 +67,19 @@ pub enum Value {
     Global(Rc<str>, Rc<str>),
     Storage(StorageRef),
     Tensor(TensorMeta),
-    /// A `REDUCE`/`NEWOBJ` result we don't model — kept so traversal can
+    /// `REDUCE` (or `NEWOBJ`) of a global the VM does not reconstruct, kept
+    /// symbolically:
+    /// the callable's `(module, name)` and its argument tuple. Nothing is
+    /// called. Checkpoints that pickle their hyperparameters wrap plain
+    /// values this way — jsonargparse's `PositiveInt(3)` arrives as
+    /// `Object { name: "PositiveInt", args: [Int(3)] }` — so dropping the
+    /// arguments would lose the value itself.
+    Object {
+        module: Rc<str>,
+        name: Rc<str>,
+        args: Rc<Vec<Value>>,
+    },
+    /// A reduce / `NEWOBJ` of a non-global callable — kept so traversal can
     /// skip it without error.
     Opaque,
     /// Internal stack marker for `MARK`/…/`SETITEMS` framing.
@@ -421,11 +434,24 @@ impl<'a> Machine<'a> {
                     let v = self.reduce(&func, &args)?;
                     self.stack.push(v);
                 }
-                // NEWOBJ: cls.__new__(cls, *args) — we don't model classes
+                // NEWOBJ: cls.__new__(cls, *args) — classes are not modelled,
+                // but a global class keeps its arguments like REDUCE does
+                // (protocol ≥ 2 pickles `int` subclasses this way).
                 0x81 => {
-                    let _args = self.pop()?;
-                    let _cls = self.pop()?;
-                    self.stack.push(Value::Opaque);
+                    let args = self.pop()?;
+                    let cls = self.pop()?;
+                    let v = match cls {
+                        Value::Global(module, name) => Value::Object {
+                            module,
+                            name,
+                            args: Rc::new(match args {
+                                Value::Tuple(t) => t.as_slice().to_vec(),
+                                other => vec![other],
+                            }),
+                        },
+                        _ => Value::Opaque,
+                    };
+                    self.stack.push(v);
                 }
                 // BUILD: apply __setstate__ to the object below
                 b'b' => {
@@ -535,7 +561,11 @@ impl<'a> Machine<'a> {
                     .next()
                     .ok_or_else(|| anyhow!("pickle: _rebuild_parameter with no data"))
             }
-            _ => Ok(Value::Opaque),
+            _ => Ok(Value::Object {
+                module: module.into(),
+                name: name.into(),
+                args: Rc::new(argv),
+            }),
         }
     }
 
@@ -639,5 +669,36 @@ mod tests {
         // All ten bytes are consumed even though only eight are used, or every
         // opcode after this one reads from the wrong offset.
         assert_eq!(m.pos, 10);
+    }
+    /// A reduce of a class the VM does not model keeps its arguments:
+    /// `jsonargparse.typing.PositiveInt(3)` is how PyLaia pickles every
+    /// integer hyperparameter, so `Opaque` here would erase the value.
+    #[test]
+    fn unknown_reduce_keeps_callable_and_args() {
+        let mut p: Vec<u8> = vec![0x80, 0x02, b'c'];
+        p.extend_from_slice(b"jsonargparse.typing\nPositiveInt\n");
+        p.extend_from_slice(&[b'K', 3, 0x85, b'R', b'.']);
+        match unpickle(&p).unwrap() {
+            Value::Object { module, name, args } => {
+                assert_eq!(&*module, "jsonargparse.typing");
+                assert_eq!(&*name, "PositiveInt");
+                assert!(matches!(args.as_slice(), [Value::Int(3)]));
+            }
+            other => panic!("expected Object, got {other:?}"),
+        }
+    }
+    /// Protocol 2 builds `int` subclasses with `NEWOBJ`, not `REDUCE`.
+    #[test]
+    fn newobj_of_a_global_keeps_args() {
+        let mut p: Vec<u8> = vec![0x80, 0x02, b'c'];
+        p.extend_from_slice(b"jsonargparse.typing\nNonNegativeInt\n");
+        p.extend_from_slice(&[b'K', 2, 0x85, 0x81, b'.']);
+        match unpickle(&p).unwrap() {
+            Value::Object { name, args, .. } => {
+                assert_eq!(&*name, "NonNegativeInt");
+                assert!(matches!(args.as_slice(), [Value::Int(2)]));
+            }
+            other => panic!("expected Object, got {other:?}"),
+        }
     }
 }
