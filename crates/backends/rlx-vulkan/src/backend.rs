@@ -907,6 +907,38 @@ fn coop_eligible(m: usize, _k: usize, n: usize) -> bool {
     m.is_multiple_of(16) && n.is_multiple_of(16)
 }
 
+/// Rows (`m`) up to which a matmul runs `matmul_rows` — the decode-step
+/// shape, where the one-output-per-thread kernels leave most threads idle.
+const MATMUL_ROWS_MAX_M: usize = 8;
+
+/// Kernel and workgroup grid for one batched matmul. Packed bf16 weights keep
+/// their own kernel; few-row products take `matmul_rows`, which reads either
+/// arena (weights included); otherwise weight operands take the scalar kernel
+/// and activations [`matmul_kernel`]'s pick. All share one push layout.
+fn matmul_dispatch(
+    bf16_rhs: bool,
+    a_off: u32,
+    b_off: u32,
+    m: usize,
+    k: usize,
+    n: usize,
+    batch: usize,
+) -> (&'static str, (u32, u32, u32)) {
+    let tiles = (ceil_div(n, 16), ceil_div(m, 16), batch.max(1) as u32);
+    if bf16_rhs {
+        // Packed bf16 rhs — unpacked in-shader (b_off is a u32-word base,
+        // tagged when in the weight buffer).
+        return ("matmul_bf16", tiles);
+    }
+    if m <= MATMUL_ROWS_MAX_M && rlx_ir::env::var("RLX_VULKAN_MATMUL").is_none() {
+        return ("matmul_rows", (ceil_div(n, 32), 1, batch.max(1) as u32));
+    }
+    if is_weight_elem(a_off) || is_weight_elem(b_off) {
+        return ("matmul", tiles);
+    }
+    (matmul_kernel(m, k, n), tiles)
+}
+
 /// Which matmul kernel to dispatch:
 /// - default: `matmul_tiled` (shared-memory blocked **fp32**, exact) on native
 ///   drivers; `matmul` (scalar) on portability drivers (MoltenVK), where
@@ -954,6 +986,13 @@ fn matmul_kernel(m: usize, k: usize, n: usize) -> &'static str {
 /// device's `maxComputeWorkGroupCount[0]` is large (true on desktop GPUs;
 /// the Vulkan minimum of 65535 caps ~16M elements/dispatch — a follow-up
 /// would switch to a grid-stride loop).
+/// Attention rows (batch · heads · queries) `attention_coop` takes — one
+/// workgroup per row, so capped by the 65 535-workgroup dispatch limit; past
+/// it the one-thread-per-row `attention` runs. Measured decode: 20× on an
+/// RTX 3080 Ti (DAN, 4 heads × 3.9K keys: 264 s → 13 s for 371 steps), 3.3×
+/// (TrOCR-small) there and 4.6× on a Radeon 780M; a 3.5K-row prefill 1.3×.
+const COOP_ATTENTION_MAX_ROWS: usize = 65535;
+
 fn groups1d(n: usize, local: u32) -> (u32, u32, u32) {
     (ceil_div(n, local).max(1), 1, 1)
 }
@@ -2981,25 +3020,16 @@ fn build_schedule(
                     .u(b_bs as u32)
                     .u((m * n) as u32)
                     .bytes();
-                let kernel = if bf16_weights.contains(&b) {
-                    // Packed bf16 rhs — unpacked in-shader (b_off is a u32-word
-                    // base, tagged when in the weight buffer).
-                    "matmul_bf16"
-                } else if is_weight_elem(binder.off(arena, a))
-                    || is_weight_elem(binder.off(arena, b))
-                {
-                    "matmul"
-                } else {
-                    matmul_kernel(m, k, n)
-                };
-                push_gpu_step(
-                    &mut binder,
-                    &mut steps,
-                    &mut deps,
-                    kernel,
-                    push,
-                    (ceil_div(n, 16), ceil_div(m, 16), batch.max(1) as u32),
+                let (kernel, groups) = matmul_dispatch(
+                    bf16_weights.contains(&b),
+                    binder.off(arena, a),
+                    binder.off(arena, b),
+                    m,
+                    k,
+                    n,
+                    batch,
                 );
+                push_gpu_step(&mut binder, &mut steps, &mut deps, kernel, push, groups);
             }
 
             Op::FusedMatMulBiasAct { activation } => {
@@ -3042,23 +3072,16 @@ fn build_schedule(
                     .u(b_bs as u32)
                     .u((m * n) as u32)
                     .bytes();
-                let kernel = if bf16_weights.contains(&b) {
-                    "matmul_bf16"
-                } else if is_weight_elem(binder.off(arena, a))
-                    || is_weight_elem(binder.off(arena, b))
-                {
-                    "matmul"
-                } else {
-                    matmul_kernel(m, k, n)
-                };
-                push_gpu_step(
-                    &mut binder,
-                    &mut steps,
-                    &mut deps,
-                    kernel,
-                    push,
-                    (ceil_div(n, 16), ceil_div(m, 16), batch.max(1) as u32),
+                let (kernel, groups) = matmul_dispatch(
+                    bf16_weights.contains(&b),
+                    binder.off(arena, a),
+                    binder.off(arena, b),
+                    m,
+                    k,
+                    n,
+                    batch,
                 );
+                push_gpu_step(&mut binder, &mut steps, &mut deps, kernel, push, groups);
                 let total = numel(&od);
                 let bn = numel(&dims(graph, bias));
                 let add = Push::default()
@@ -3268,7 +3291,8 @@ fn build_schedule(
                     &mut deps,
                     "group_norm",
                     push,
-                    groups1d(n * (*num_groups), 64),
+                    // One 256-thread workgroup per (batch, group).
+                    ((n * *num_groups).max(1) as u32, 1, 1),
                 );
             }
 
@@ -4198,14 +4222,15 @@ fn build_schedule(
                     .f(-1.0e30)
                     .f(0.5)
                     .bytes();
-                push_gpu_step(
-                    &mut binder,
-                    &mut steps,
-                    &mut deps,
-                    "attention",
-                    push,
-                    groups1d(batch * nh * q_s, 64),
-                );
+                // A workgroup per row splits the keys (decode has only B·H
+                // rows); beyond the dispatch limit, a thread per row.
+                let rows = batch * nh * q_s;
+                let (kernel, groups) = if rows <= COOP_ATTENTION_MAX_ROWS && dh <= 256 {
+                    ("attention_coop", (rows.max(1) as u32, 1, 1))
+                } else {
+                    ("attention", groups1d(rows, 64))
+                };
+                push_gpu_step(&mut binder, &mut steps, &mut deps, kernel, push, groups);
             }
 
             Op::AttentionBackward {

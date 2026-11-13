@@ -533,8 +533,11 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 {
                     Some(0)
                 } else {
-                    let s = q.max(k);
-                    Some(b * h * s * s)
+                    // One `q × k` score block per (batch, head): the paths
+                    // below slice it as `idx * q_s * k_s`. `max(q, k)²` made
+                    // a one-query decode step over 8192 cached keys zero
+                    // 2 GiB per run.
+                    Some(b * h * q * k)
                 }
             }
             _ => None,
@@ -2482,6 +2485,40 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                             }
                         }
                         continue;
+                    }
+
+                    // ── Decode over a long context: split the keys too ──
+                    // One query row against thousands of keys (a page's
+                    // features under cross-attention, a long KV cache) with
+                    // few heads: a task per head leaves most cores idle, and
+                    // past `sdpa_seq_threshold` the strided path packs Kᵀ and
+                    // V on every call. Split each head's live keys into
+                    // chunks; a task scores its chunk and keeps its own max,
+                    // exp-sum and weighted V (flash-decoding), and the chunks
+                    // merge per head. Plain f32 arithmetic, so the portable
+                    // build keeps its own path.
+                    if !crate::config::portable()
+                        && b == 1
+                        && q_s == 1
+                        && k_s >= SPLIT_K_MIN_KEYS
+                        && *softcap == 0.0
+                        && matches!(
+                            mask_kind,
+                            rlx_ir::op::MaskKind::Custom | rlx_ir::op::MaskKind::None
+                        )
+                    {
+                        let custom = matches!(mask_kind, rlx_ir::op::MaskKind::Custom)
+                            && !mask_data.is_empty();
+                        let live: Vec<usize> = (0..k_s)
+                            .filter(|&ki| !custom || mask_data[ki] >= mask_thr)
+                            .collect();
+                        if !live.is_empty() {
+                            decode_attention_split_k(
+                                q_data, k_data, v_data, out_data, &live, nh, group, dh, dh_v, krs,
+                                vrs, scale,
+                            );
+                            continue;
+                        }
                     }
 
                     // ── Decode (one query row) on x86-64: a task per head ──
@@ -4953,6 +4990,95 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     }
 }
 
+/// Keys at or above which a one-row decode attention splits each head's keys
+/// over the pool ([`decode_attention_split_k`]).
+const SPLIT_K_MIN_KEYS: usize = 1024;
+
+/// Keys per split-K task: a few hundred keys × a 64–128 wide head is tens of
+/// microseconds of work, enough to amortize the fork.
+const SPLIT_K_CHUNK: usize = 256;
+
+/// One query row of attention (`q` `[nh·dh]`, keys/values row-strided, `live`
+/// the unmasked key indices) split over (head, key chunk) tasks. Each task
+/// computes `m = max s`, `l = Σ exp(s − m)` and `o = Σ exp(s − m)·v` over its
+/// chunk; a head's output is `Σ e^{m_c−M} o_c / Σ e^{m_c−M} l_c` with
+/// `M = max m_c` — the softmax over all its keys, without a pass that sees
+/// them all at once.
+#[allow(clippy::too_many_arguments)]
+fn decode_attention_split_k(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    live: &[usize],
+    nh: usize,
+    group: usize,
+    dh: usize,
+    dh_v: usize,
+    krs: usize,
+    vrs: usize,
+    scale: f32,
+) {
+    let chunks = live.len().div_ceil(SPLIT_K_CHUNK);
+    let tasks = nh * chunks;
+    let stride = 2 + dh_v; // m, l, o[dh_v]
+    let mut part = vec![0f32; tasks * stride];
+    let part_addr = part.as_mut_ptr() as usize;
+    crate::pool::par_for(tasks, 1, &|off, cnt| {
+        let mut sc = vec![0f32; SPLIT_K_CHUNK];
+        for task in off..off + cnt {
+            let (hi, c) = (task / chunks, task % chunks);
+            let kv_hi = hi / group;
+            let keys = &live[c * SPLIT_K_CHUNK..((c + 1) * SPLIT_K_CHUNK).min(live.len())];
+            let qh = &q[hi * dh..(hi + 1) * dh];
+            let mut m = f32::NEG_INFINITY;
+            for (j, &ki) in keys.iter().enumerate() {
+                let kr = &k[ki * krs + kv_hi * dh..ki * krs + kv_hi * dh + dh];
+                let s = crate::gemv::dot(qh, kr) * scale;
+                sc[j] = s;
+                m = m.max(s);
+            }
+            // SAFETY: each task owns its `stride` floats of `part`.
+            let p = unsafe {
+                std::slice::from_raw_parts_mut((part_addr as *mut f32).add(task * stride), stride)
+            };
+            let (head, o) = p.split_at_mut(2);
+            let mut l = 0f32;
+            for (j, &ki) in keys.iter().enumerate() {
+                let e = (sc[j] - m).exp();
+                l += e;
+                let vr = &v[ki * vrs + kv_hi * dh_v..ki * vrs + kv_hi * dh_v + dh_v];
+                for (od, &vd) in o.iter_mut().zip(vr) {
+                    *od += e * vd;
+                }
+            }
+            head[0] = m;
+            head[1] = l;
+        }
+    });
+    for hi in 0..nh {
+        let ps = &part[hi * chunks * stride..(hi + 1) * chunks * stride];
+        let mx = ps
+            .chunks_exact(stride)
+            .map(|p| p[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let o = &mut out[hi * dh_v..(hi + 1) * dh_v];
+        o.fill(0.0);
+        let mut l = 0f32;
+        for p in ps.chunks_exact(stride) {
+            let w = (p[0] - mx).exp();
+            l += w * p[1];
+            for (od, &pd) in o.iter_mut().zip(&p[2..]) {
+                *od += w * pd;
+            }
+        }
+        let inv = 1.0 / l;
+        for od in o.iter_mut() {
+            *od *= inv;
+        }
+    }
+}
+
 /// `dots[j] = Σ_d q[d]·k[keys[j]·stride + off + d]`, summed in `d` order with
 /// one multiply and one add per term — exactly the scalar loop
 /// `dot += q[d] * k[d]`, so bit-identical to it. The scalar loop is a serial
@@ -5158,5 +5284,76 @@ mod coalesce_tests {
             coalesce_bcast_axes(&[128, 4, 1], &[4, 1, 0], &[0, 0, 0]).0,
             vec![512]
         );
+    }
+}
+
+#[cfg(test)]
+mod split_k_tests {
+    use super::decode_attention_split_k;
+
+    /// Softmax attention for one query row, directly.
+    #[allow(clippy::too_many_arguments)]
+    fn reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        live: &[usize],
+        nh: usize,
+        group: usize,
+        dh: usize,
+        krs: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let mut out = vec![0f32; nh * dh];
+        for h in 0..nh {
+            let kv = h / group;
+            let s: Vec<f64> = live
+                .iter()
+                .map(|&ki| {
+                    (0..dh)
+                        .map(|d| f64::from(q[h * dh + d]) * f64::from(k[ki * krs + kv * dh + d]))
+                        .sum::<f64>()
+                        * f64::from(scale)
+                })
+                .collect();
+            let m = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+            let z: f64 = e.iter().sum();
+            for d in 0..dh {
+                let acc: f64 = live
+                    .iter()
+                    .zip(&e)
+                    .map(|(&ki, w)| w * f64::from(v[ki * krs + kv * dh + d]))
+                    .sum();
+                out[h * dh + d] = (acc / z) as f32;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn matches_softmax_attention() {
+        // 4 query heads over 2 KV heads (GQA),
+        // 1500 keys (six chunks, the last partial), every fifth one masked.
+        let (nh, nkv, dh, k_s) = (4, 2, 32, 1500);
+        let group = nh / nkv;
+        let krs = nkv * dh + 8; // strided rows with padding
+        let f = |i: usize, s: usize| (((i * 2654435761 + s) % 1999) as f32 / 999.5) - 1.0;
+        let q: Vec<f32> = (0..nh * dh).map(|i| f(i, 1)).collect();
+        let k: Vec<f32> = (0..k_s * krs).map(|i| f(i, 2)).collect();
+        let v: Vec<f32> = (0..k_s * krs).map(|i| f(i, 3)).collect();
+        let live: Vec<usize> = (0..k_s).filter(|i| i % 5 != 2).collect();
+        let scale = (dh as f32).powf(-0.5);
+        let mut got = vec![f32::NAN; nh * dh];
+        decode_attention_split_k(
+            &q, &k, &v, &mut got, &live, nh, group, dh, dh, krs, krs, scale,
+        );
+        let want = reference(&q, &k, &v, &live, nh, group, dh, krs, scale);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 1e-5, "split-K attention off by {worst:e}");
     }
 }

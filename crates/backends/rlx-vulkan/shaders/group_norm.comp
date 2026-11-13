@@ -1,8 +1,12 @@
 #version 450
 // NCHW GroupNorm: normalize each (C/G)×H×W block.
-// One invocation per (batch, group); serial two-pass mean/var (naga-friendly —
-// no shared-memory barriers). Matches CUDA `group_norm.cu` / CPU reference.
-layout(local_size_x = 64) in;
+// One 256-thread workgroup per (batch, group): every pass strides the block
+// across the threads and reduces the partial sums in shared memory, so a
+// large block (InstanceNorm over a full page: one group per channel, ~1M
+// elements each) neither runs as a handful of serial threads — long enough
+// to trip a GPU watchdog — nor loses precision to one long f32 running sum.
+// Stable two-pass variance mean((x-mean)^2). Matches CUDA `group_norm.cu`.
+layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PC {
     uint n;
@@ -17,48 +21,49 @@ layout(push_constant) uniform PC {
     float eps;
 } pc;
 
+shared float red[256];
+
+// Tree-reduce `v` across the workgroup; every thread gets the total.
+float block_sum(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) { red[t] += red[t + s]; }
+        barrier();
+    }
+    float total = red[0];
+    barrier();
+    return total;
+}
+
 void main() {
-    uint ng = gl_GlobalInvocationID.x;
+    uint ng = gl_WorkGroupID.x;
     if (ng >= pc.n * pc.num_groups) { return; }
+    uint t = gl_LocalInvocationID.x;
     uint bn = ng / pc.num_groups;
     uint g = ng % pc.num_groups;
     uint cpg = pc.c / pc.num_groups;
-    uint c0 = g * cpg;
     uint spatial = pc.h * pc.w;
     uint count = cpg * spatial;
+    // The group's channels are contiguous in NCHW: one flat block.
+    uint base = bn * pc.c * spatial + g * cpg * spatial;
     float n_inv = 1.0 / float(count);
-    uint plane = pc.c * spatial;
-    uint b_base = bn * plane;
 
-    float mean = 0.0;
-    for (uint ci = 0u; ci < cpg; ci++) {
-        uint base = pc.src_off + b_base + (c0 + ci) * spatial;
-        for (uint s = 0u; s < spatial; s++) {
-            mean += arena_load(base + s);
-        }
+    float acc = 0.0;
+    for (uint i = t; i < count; i += 256u) { acc += arena_load(pc.src_off + base + i); }
+    float mean = block_sum(acc) * n_inv;
+
+    acc = 0.0;
+    for (uint i = t; i < count; i += 256u) {
+        float d = arena_load(pc.src_off + base + i) - mean;
+        acc += d * d;
     }
-    mean *= n_inv;
+    float inv = inversesqrt(block_sum(acc) * n_inv + pc.eps);
 
-    // Stable two-pass variance mean((x-mean)^2) — not E[x^2]-E[x]^2.
-    float var_ = 0.0;
-    for (uint ci = 0u; ci < cpg; ci++) {
-        uint base = pc.src_off + b_base + (c0 + ci) * spatial;
-        for (uint s = 0u; s < spatial; s++) {
-            float d = arena_load(base + s) - mean;
-            var_ += d * d;
-        }
-    }
-    var_ *= n_inv;
-    float inv = inversesqrt(var_ + pc.eps);
-
-    for (uint ci = 0u; ci < cpg; ci++) {
-        uint ch = c0 + ci;
-        float gamma = arena_load(pc.g_off + ch);
-        float beta = arena_load(pc.b_off + ch);
-        uint base = b_base + ch * spatial;
-        for (uint s = 0u; s < spatial; s++) {
-            float v = (arena_load(pc.src_off + base + s) - mean) * inv;
-            arena_store(pc.dst_off + base + s, v * gamma + beta);
-        }
+    for (uint i = t; i < count; i += 256u) {
+        uint ch = g * cpg + i / spatial;
+        float v = (arena_load(pc.src_off + base + i) - mean) * inv;
+        arena_store(pc.dst_off + base + i, v * arena_load(pc.g_off + ch) + arena_load(pc.b_off + ch));
     }
 }

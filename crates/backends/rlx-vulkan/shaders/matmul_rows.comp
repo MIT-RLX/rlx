@@ -1,0 +1,62 @@
+#version 450
+// Few-row batched matmul C[b,m,n] = sum_k A[b,m,k] * B[b,k,n] for m ≤ 8 —
+// the shape of a decode step's projections (one token, a few beams).
+// `matmul.comp` maps one output per thread in 16×16 workgroups, so a
+// one-row product leaves 15 of every 16 threads idle and a 256-wide output
+// is 16 workgroups. Here a workgroup owns 32 columns: lane `t % 32` is the
+// column (consecutive lanes read consecutive B elements — coalesced), and the
+// 8 lane groups `t / 32` split K; the partials meet in shared memory. Every
+// row of A is applied to each loaded B element, so B — the weight — is read
+// once whatever m is. Same push block as `matmul.comp`; fp32 throughout.
+layout(local_size_x = 256) in;
+
+const uint COLS = 32u;
+const uint KS = 8u;
+const uint MAX_ROWS = 8u;
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint k;
+    uint n;
+    uint a_off;
+    uint b_off;
+    uint c_off;
+    uint batch;
+    uint a_bs;
+    uint b_bs;
+    uint c_bs;
+} pc;
+
+shared float part[MAX_ROWS * 256u];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint lane = t % COLS;
+    uint ks = t / COLS;
+    uint col = gl_WorkGroupID.x * COLS + lane;
+    uint bz = gl_WorkGroupID.z;
+    uint rows = min(pc.m, MAX_ROWS);
+
+    float acc[MAX_ROWS];
+    for (uint r = 0u; r < MAX_ROWS; r++) { acc[r] = 0.0; }
+    if (col < pc.n) {
+        uint a_base = pc.a_off + bz * pc.a_bs;
+        uint b_base = pc.b_off + bz * pc.b_bs + col;
+        for (uint kk = ks; kk < pc.k; kk += KS) {
+            float bv = arena_load(b_base + kk * pc.n);
+            for (uint r = 0u; r < rows; r++) {
+                acc[r] += arena_load(a_base + r * pc.k + kk) * bv;
+            }
+        }
+    }
+    for (uint r = 0u; r < rows; r++) { part[r * 256u + t] = acc[r]; }
+    barrier();
+    // The first lane group sums the K slices of its column.
+    if (ks == 0u && col < pc.n) {
+        for (uint r = 0u; r < rows; r++) {
+            float s = 0.0;
+            for (uint j = 0u; j < KS; j++) { s += part[r * 256u + j * COLS + lane]; }
+            arena_store(pc.c_off + bz * pc.c_bs + r * pc.n + col, s);
+        }
+    }
+}

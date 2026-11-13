@@ -87,9 +87,8 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(not(target_arch = "aarch64"))]
     {
         let mut acc = [0f32; 16];
-        let (ca, cb) = (a.chunks_exact(16), b.chunks_exact(16));
-        let (ra, rb) = (ca.remainder(), cb.remainder());
-        for (x, y) in ca.zip(cb) {
+        let ((ca, ra), (cb, rb)) = (a.as_chunks::<16>(), b.as_chunks::<16>());
+        for (x, y) in ca.iter().zip(cb) {
             for j in 0..16 {
                 acc[j] += x[j] * y[j];
             }

@@ -1828,33 +1828,15 @@ pub fn check_rnn_lens(op: &str, checks: &[(&str, usize, usize)]) -> Result<(), S
     Ok(())
 }
 
-/// `Σ a[j]·b[j]` with four independent accumulators (vectorizes to NEON /
-/// SSE); the recurrent mat-vec of the LSTM cell.
-#[inline]
-fn dot4(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len().min(b.len());
-    let mut acc = [0f32; 4];
-    let (ac, ar) = a[..n].as_chunks::<4>();
-    let (bc, br) = b[..n].as_chunks::<4>();
-    for (x, y) in ac.iter().zip(bc) {
-        for l in 0..4 {
-            acc[l] = x[l].mul_add(y[l], acc[l]);
-        }
-    }
-    let mut s = (acc[0] + acc[1]) + (acc[2] + acc[3]);
-    for (x, y) in ar.iter().zip(br) {
-        s = x.mul_add(*y, s);
-    }
-    s
-}
-
 /// Reference / host-fallback entry for `Op::Lstm` (multi-layer,
 /// optionally bidirectional, optional decode carry). Gate order i, f, g,
 /// o. Shared by the CPU backend and the CUDA / ROCm / wgpu / Metal host
 /// fallbacks. Tensors are `f32` in the arena; weights are packed (see
 /// `Op::Lstm`). `h0`/`c0` are byte offsets when `carry`, else ignored;
 /// the final `hn`/`cn` are written back into them in place. `dst` is
-/// `[batch, seq, D*hidden]`. Batch items run in parallel per direction.
+/// `[batch, seq, D*hidden]`. (direction, batch item) pairs run in
+/// parallel; the recurrent mat-vec is `crate::gemv::dot` (SIMD, no libm
+/// `fma` call on x86 builds without the `fma` target feature).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn execute_lstm_f32(
     x: usize,
@@ -1906,77 +1888,76 @@ pub unsafe fn execute_lstm_f32(
             let li_ref: &[f32] = &layer_in;
             let wih_block = four_h * in_l;
 
-            for dir in 0..dirs {
+            // The input projection has no recurrence: one GEMM over every
+            // (batch, t) row per direction, `zin = x · W_ihᵀ + b`, on the
+            // BLAS / SME path. Only `W_hh · h` stays inside the time loop.
+            let rows = batch * seq;
+            let zins: Vec<Vec<f32>> = (0..dirs)
+                .map(|dir| {
+                    let ld = l * dirs + dir;
+                    let wih = f32s((w_ih / 4 + wih_cursor + dir * wih_block) * 4, wih_block);
+                    let bs = f32s(bias + ld * four_h * 4, four_h);
+                    let mut zin = vec![0f32; rows * four_h];
+                    crate::blas::sgemm_bt(li_ref, wih, &mut zin, rows, in_l, four_h, 1.0);
+                    for row in zin.chunks_exact_mut(four_h) {
+                        for (z, &bv) in row.iter_mut().zip(bs) {
+                            *z += bv;
+                        }
+                    }
+                    zin
+                })
+                .collect();
+            let zins_ref: &[Vec<f32>] = &zins;
+            // Directions are independent given their projections: a
+            // bidirectional layer runs both at once even at batch 1.
+            crate::pool::par_range(dirs * batch, |job| {
+                let (dir, b) = (job / batch, job % batch);
                 let ld = l * dirs + dir;
-                let wih = f32s((w_ih / 4 + wih_cursor + dir * wih_block) * 4, wih_block);
                 let whh = f32s(w_hh + ld * four_h * hidden * 4, four_h * hidden);
-                let bs = f32s(bias + ld * four_h * 4, four_h);
                 let h0p = bptr + h0 + ld * batch * hidden * 4;
                 let c0p = bptr + c0 + ld * batch * hidden * 4;
-
-                // The input projection has no recurrence: one GEMM over every
-                // (batch, t) row, `zin = x · W_ihᵀ + b`, on the BLAS / SME
-                // path. Only `W_hh · h` stays inside the time loop.
-                let rows = batch * seq;
-                let mut zin = vec![0f32; rows * four_h];
-                crate::blas::sgemm_bt(li_ref, wih, &mut zin, rows, in_l, four_h, 1.0);
-                for row in zin.chunks_exact_mut(four_h) {
-                    for (z, &bv) in row.iter_mut().zip(bs) {
-                        *z += bv;
+                let zin_ref: &[f32] = &zins_ref[dir];
+                let lo = lo_ptr as *mut f32;
+                let mut h = vec![0f32; hidden];
+                let mut c = vec![0f32; hidden];
+                if carry {
+                    let hin =
+                        std::slice::from_raw_parts((h0p + b * hidden * 4) as *const f32, hidden);
+                    let cin =
+                        std::slice::from_raw_parts((c0p + b * hidden * 4) as *const f32, hidden);
+                    h.copy_from_slice(hin);
+                    c.copy_from_slice(cin);
+                }
+                let mut z = vec![0f32; four_h];
+                for step in 0..seq {
+                    let t = if dir == 0 { step } else { seq - 1 - step };
+                    let zt = &zin_ref[(b * seq + t) * four_h..(b * seq + t + 1) * four_h];
+                    for r in 0..four_h {
+                        z[r] = zt[r] + crate::gemv::dot(&whh[r * hidden..(r + 1) * hidden], &h);
+                    }
+                    for k in 0..hidden {
+                        let i_g = sigmoid(z[k]);
+                        let f_g = sigmoid(z[hidden + k]);
+                        let g_g = crate::vmath::tanh_poly(z[2 * hidden + k]);
+                        let o_g = sigmoid(z[3 * hidden + k]);
+                        let c_new = f_g * c[k] + i_g * g_g;
+                        c[k] = c_new;
+                        let h_new = o_g * crate::vmath::tanh_poly(c_new);
+                        h[k] = h_new;
+                        // [batch, seq, D*hidden]; this direction owns the
+                        // `dir*hidden .. dir*hidden+hidden` feature slice.
+                        *lo.add((b * seq + t) * out_width + dir * hidden + k) = h_new;
                     }
                 }
-                let zin_ref: &[f32] = &zin;
-                crate::pool::par_range(batch, |b| {
-                    let lo = lo_ptr as *mut f32;
-                    let mut h = vec![0f32; hidden];
-                    let mut c = vec![0f32; hidden];
-                    if carry {
-                        let hin = std::slice::from_raw_parts(
-                            (h0p + b * hidden * 4) as *const f32,
-                            hidden,
-                        );
-                        let cin = std::slice::from_raw_parts(
-                            (c0p + b * hidden * 4) as *const f32,
-                            hidden,
-                        );
-                        h.copy_from_slice(hin);
-                        c.copy_from_slice(cin);
-                    }
-                    let mut z = vec![0f32; four_h];
-                    for step in 0..seq {
-                        let t = if dir == 0 { step } else { seq - 1 - step };
-                        let zt = &zin_ref[(b * seq + t) * four_h..(b * seq + t + 1) * four_h];
-                        for r in 0..four_h {
-                            z[r] = zt[r] + dot4(&whh[r * hidden..(r + 1) * hidden], &h);
-                        }
-                        for k in 0..hidden {
-                            let i_g = sigmoid(z[k]);
-                            let f_g = sigmoid(z[hidden + k]);
-                            let g_g = crate::vmath::tanh_poly(z[2 * hidden + k]);
-                            let o_g = sigmoid(z[3 * hidden + k]);
-                            let c_new = f_g * c[k] + i_g * g_g;
-                            c[k] = c_new;
-                            let h_new = o_g * crate::vmath::tanh_poly(c_new);
-                            h[k] = h_new;
-                            // [batch, seq, D*hidden]; this direction owns the
-                            // `dir*hidden .. dir*hidden+hidden` feature slice.
-                            *lo.add((b * seq + t) * out_width + dir * hidden + k) = h_new;
-                        }
-                    }
-                    if carry {
-                        let hout = std::slice::from_raw_parts_mut(
-                            (h0p + b * hidden * 4) as *mut f32,
-                            hidden,
-                        );
-                        let cout = std::slice::from_raw_parts_mut(
-                            (c0p + b * hidden * 4) as *mut f32,
-                            hidden,
-                        );
-                        hout.copy_from_slice(&h);
-                        cout.copy_from_slice(&c);
-                    }
-                });
-            }
+                if carry {
+                    let hout =
+                        std::slice::from_raw_parts_mut((h0p + b * hidden * 4) as *mut f32, hidden);
+                    let cout =
+                        std::slice::from_raw_parts_mut((c0p + b * hidden * 4) as *mut f32, hidden);
+                    hout.copy_from_slice(&h);
+                    cout.copy_from_slice(&c);
+                }
+            });
 
             wih_cursor += dirs * wih_block;
             layer_in = layer_out;
@@ -2042,64 +2023,63 @@ pub unsafe fn execute_gru_f32(
             let li_ref: &[f32] = &layer_in;
             let wih_block = three_h * in_l;
 
-            for dir in 0..dirs {
+            // `x · W_ihᵀ + b_ih` for every (batch, t) row in one GEMM per
+            // direction; only `h · W_hhᵀ` is recurrent.
+            let rows = batch * seq;
+            let xis: Vec<Vec<f32>> = (0..dirs)
+                .map(|dir| {
+                    let ld = l * dirs + dir;
+                    let wih = f32s((w_ih / 4 + wih_cursor + dir * wih_block) * 4, wih_block);
+                    let bih = f32s(b_ih + ld * three_h * 4, three_h);
+                    let mut xi = vec![0f32; rows * three_h];
+                    crate::blas::sgemm_bt(li_ref, wih, &mut xi, rows, in_l, three_h, 1.0);
+                    for row in xi.chunks_exact_mut(three_h) {
+                        for (z, &bv) in row.iter_mut().zip(bih) {
+                            *z += bv;
+                        }
+                    }
+                    xi
+                })
+                .collect();
+            let xis_ref: &[Vec<f32>] = &xis;
+            crate::pool::par_range(dirs * batch, |job| {
+                let (dir, b) = (job / batch, job % batch);
                 let ld = l * dirs + dir;
-                let wih = f32s((w_ih / 4 + wih_cursor + dir * wih_block) * 4, wih_block);
                 let whh = f32s(w_hh + ld * three_h * hidden * 4, three_h * hidden);
-                let bih = f32s(b_ih + ld * three_h * 4, three_h);
                 let bhh = f32s(b_hh + ld * three_h * 4, three_h);
                 let h0p = bptr + h0 + ld * batch * hidden * 4;
-
-                crate::pool::par_range(batch, |b| {
-                    let lo = lo_ptr as *mut f32;
-                    let mut h = vec![0f32; hidden];
-                    if carry {
-                        let hin = std::slice::from_raw_parts(
-                            (h0p + b * hidden * 4) as *const f32,
-                            hidden,
-                        );
-                        h.copy_from_slice(hin);
+                let xi_all: &[f32] = &xis_ref[dir];
+                let lo = lo_ptr as *mut f32;
+                let mut h = vec![0f32; hidden];
+                if carry {
+                    let hin =
+                        std::slice::from_raw_parts((h0p + b * hidden * 4) as *const f32, hidden);
+                    h.copy_from_slice(hin);
+                }
+                let mut hi = vec![0f32; three_h]; // h·W_hhᵀ + b_hh
+                for step in 0..seq {
+                    let t = if dir == 0 { step } else { seq - 1 - step };
+                    let xi = &xi_all[(b * seq + t) * three_h..(b * seq + t + 1) * three_h];
+                    for r in 0..three_h {
+                        hi[r] = bhh[r] + crate::gemv::dot(&whh[r * hidden..(r + 1) * hidden], &h);
                     }
-                    let mut xi = vec![0f32; three_h]; // x·W_ihᵀ + b_ih
-                    let mut hi = vec![0f32; three_h]; // h·W_hhᵀ + b_hh
-                    for step in 0..seq {
-                        let t = if dir == 0 { step } else { seq - 1 - step };
-                        let x_t = &li_ref[(b * seq + t) * in_l..(b * seq + t + 1) * in_l];
-                        for r in 0..three_h {
-                            let wr = &wih[r * in_l..(r + 1) * in_l];
-                            let mut a = bih[r];
-                            for j in 0..in_l {
-                                a += wr[j] * x_t[j];
-                            }
-                            xi[r] = a;
-                            let hr = &whh[r * hidden..(r + 1) * hidden];
-                            let mut bb = bhh[r];
-                            for (j, &hj) in h.iter().enumerate() {
-                                bb += hr[j] * hj;
-                            }
-                            hi[r] = bb;
-                        }
-                        for k in 0..hidden {
-                            let rg = sigmoid(xi[k] + hi[k]);
-                            let zg = sigmoid(xi[hidden + k] + hi[hidden + k]);
-                            // Reset applied to hidden term after its bias.
-                            let ng = crate::vmath::tanh_poly(
-                                xi[2 * hidden + k] + rg * hi[2 * hidden + k],
-                            );
-                            let h_new = (1.0 - zg) * ng + zg * h[k];
-                            h[k] = h_new;
-                            *lo.add((b * seq + t) * out_width + dir * hidden + k) = h_new;
-                        }
+                    for k in 0..hidden {
+                        let rg = sigmoid(xi[k] + hi[k]);
+                        let zg = sigmoid(xi[hidden + k] + hi[hidden + k]);
+                        // Reset applied to hidden term after its bias.
+                        let ng =
+                            crate::vmath::tanh_poly(xi[2 * hidden + k] + rg * hi[2 * hidden + k]);
+                        let h_new = (1.0 - zg) * ng + zg * h[k];
+                        h[k] = h_new;
+                        *lo.add((b * seq + t) * out_width + dir * hidden + k) = h_new;
                     }
-                    if carry {
-                        let hout = std::slice::from_raw_parts_mut(
-                            (h0p + b * hidden * 4) as *mut f32,
-                            hidden,
-                        );
-                        hout.copy_from_slice(&h);
-                    }
-                });
-            }
+                }
+                if carry {
+                    let hout =
+                        std::slice::from_raw_parts_mut((h0p + b * hidden * 4) as *mut f32, hidden);
+                    hout.copy_from_slice(&h);
+                }
+            });
 
             wih_cursor += dirs * wih_block;
             layer_in = layer_out;
