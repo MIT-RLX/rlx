@@ -125,17 +125,17 @@ fn conv_transpose2d_matches_cpu() {
 fn conv_transpose2d_depthwise_matches_cpu() {
     // Grouped/depthwise transpose-conv: MLX's native grouped CT mixes channels
     // ACROSS groups (kokoro ISTFTNet upsampler g=512 → output ~25× too large →
-    // garbage audio). We host-eval groups>1. This guards both that it's routed
-    // to host AND that the host result matches CPU (the groups=1 test above did
-    // not cover grouped, which is how the regression slipped through).
+    // garbage audio). Grouped layers lower as a forward `conv_general` on the
+    // device instead; this guards that they stay native and channels stay
+    // independent.
     let mut g = Graph::new("ct2d_dw");
     let x = g.input("x", Shape::new(&[1, 2, 1, 2], DType::F32));
     let w = g.input("w", Shape::new(&[2, 1, 1, 2], DType::F32));
     let y = g.conv_transpose2d(x, w, [1, 2], [1, 1], [0, 0], [1, 1], [0, 0], 2);
     g.set_outputs(vec![y]);
     assert!(
-        rlx_mlx::lower::first_host_eval_op(&g).is_some(),
-        "grouped ConvTranspose2d must host-eval (MLX native grouped CT mixes channels)"
+        rlx_mlx::lower::first_host_eval_op(&g).is_none(),
+        "grouped ConvTranspose2d should lower natively (not host-eval)"
     );
     // ch0 x=[1,2] w=[1,0.5]; ch1 x=[3,4] w=[2,3] — channels stay independent.
     let xv: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
@@ -146,6 +146,122 @@ fn conv_transpose2d_depthwise_matches_cpu() {
         close(&got, &want, 1e-4),
         "depthwise ConvTranspose2d mismatch:\n got={got:?}\nwant={want:?}"
     );
+}
+
+/// PyTorch `conv_transpose2d` by its definition: every input sample scatters
+/// its kernel into the output, within its group.
+#[allow(clippy::too_many_arguments)]
+fn ct2d_reference(
+    x: &[f32],
+    w: &[f32],
+    [n, c_in, h, wd]: [usize; 4],
+    [kh, kw]: [usize; 2],
+    c_out_per_g: usize,
+    s: [usize; 2],
+    p: [usize; 2],
+    d: [usize; 2],
+    op: [usize; 2],
+    g: usize,
+) -> (Vec<f32>, [usize; 4]) {
+    let ho = (h - 1) * s[0] + d[0] * (kh - 1) + op[0] + 1 - 2 * p[0];
+    let wo = (wd - 1) * s[1] + d[1] * (kw - 1) + op[1] + 1 - 2 * p[1];
+    let (cig, c_out) = (c_in / g, c_out_per_g * g);
+    let mut y = vec![0f64; n * c_out * ho * wo];
+    for b in 0..n {
+        for ci in 0..c_in {
+            let grp = ci / cig;
+            for i in 0..h {
+                for j in 0..wd {
+                    let xv = x[((b * c_in + ci) * h + i) * wd + j] as f64;
+                    for o in 0..c_out_per_g {
+                        for a in 0..kh {
+                            for e in 0..kw {
+                                let oi = (i * s[0] + a * d[0]) as isize - p[0] as isize;
+                                let oj = (j * s[1] + e * d[1]) as isize - p[1] as isize;
+                                if oi < 0 || oj < 0 || oi >= ho as isize || oj >= wo as isize {
+                                    continue;
+                                }
+                                let co = grp * c_out_per_g + o;
+                                let wv = w[((ci * c_out_per_g + o) * kh + a) * kw + e] as f64;
+                                y[((b * c_out + co) * ho + oi as usize) * wo + oj as usize] +=
+                                    xv * wv;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (
+        y.into_iter().map(|v| v as f32).collect(),
+        [n, c_out, ho, wo],
+    )
+}
+
+#[test]
+fn conv_transpose2d_grouped_matches_reference_compiled() {
+    // (input [n, c_in, h, w], kernel, c_out/g, stride, padding, dilation,
+    // output_padding, groups). The last two crop: padding > d·(k-1).
+    let cases: [(
+        [usize; 4],
+        [usize; 2],
+        usize,
+        [usize; 2],
+        [usize; 2],
+        [usize; 2],
+        [usize; 2],
+        usize,
+    ); 6] = [
+        ([1, 4, 3, 5], [3, 3], 3, [2, 2], [1, 1], [1, 1], [1, 0], 2),
+        ([2, 6, 4, 4], [2, 3], 1, [1, 2], [0, 1], [2, 1], [0, 1], 3),
+        // Kokoro ISTFTNet-style depthwise upsampler (length on W).
+        ([1, 8, 1, 7], [1, 3], 1, [1, 2], [0, 1], [1, 1], [0, 1], 8),
+        ([1, 4, 5, 5], [3, 3], 2, [3, 3], [2, 0], [1, 1], [2, 2], 4),
+        ([1, 2, 6, 6], [2, 2], 2, [2, 2], [2, 2], [1, 1], [1, 1], 2),
+        ([1, 4, 4, 1], [3, 1], 1, [1, 1], [3, 0], [1, 1], [0, 0], 4),
+    ];
+    for (shape, k, cog, s, p, d, op, grp) in cases {
+        let w_shape = [shape[1], cog, k[0], k[1]];
+        let xv: Vec<f32> = (0..shape.iter().product::<usize>())
+            .map(|i| ((i as f32) * 0.37).sin())
+            .collect();
+        let wv: Vec<f32> = (0..w_shape.iter().product::<usize>())
+            .map(|i| ((i as f32) * 0.53).cos())
+            .collect();
+        let (want, out) = ct2d_reference(&xv, &wv, shape, k, cog, s, p, d, op, grp);
+        let mut g = Graph::new("ct2d_grouped");
+        let x = g.input("x", Shape::new(&shape, DType::F32));
+        let w = g.input("w", Shape::new(&w_shape, DType::F32));
+        let y = g.conv_transpose2d(x, w, k, s, p, d, op, grp);
+        g.set_outputs(vec![y]);
+        assert_eq!(
+            g.node(y)
+                .shape
+                .dims()
+                .iter()
+                .map(|d| d.unwrap_static())
+                .collect::<Vec<_>>(),
+            out.to_vec(),
+            "{shape:?} k={k:?}"
+        );
+        assert!(rlx_mlx::lower::first_host_eval_op(&g).is_none());
+        let mut exe = MlxExecutable::compile_with_mode(g, MlxMode::Compiled);
+        let got = exe.run(&[("x", &xv), ("w", &wv)]).swap_remove(0);
+        assert!(
+            exe.compile_disabled_reason().is_none(),
+            "fell back to Lazy: {:?}",
+            exe.compile_disabled_reason()
+        );
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            got.len() == want.len() && worst < 1e-5,
+            "{shape:?} k={k:?} s={s:?} p={p:?} d={d:?} op={op:?} g={grp}: max |d| {worst}"
+        );
+    }
 }
 
 #[test]

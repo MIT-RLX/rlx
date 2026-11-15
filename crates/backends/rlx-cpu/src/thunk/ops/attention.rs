@@ -4,6 +4,25 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::thunk::*;
 
+/// Attention logit soft-cap (Gemma 2): `c · tanh(s / c)` over the scaled
+/// scores, *before* the mask, as the reference implementations apply it — so
+/// a masked key ends at the mask value (weight 0), not at `-c`. A cap of 0 (the
+/// op's `None`) leaves the scores as they are.
+#[inline]
+pub(crate) fn apply_softcap(scores: &mut [f32], cap: f32) {
+    if cap > 0.0 {
+        for s in scores.iter_mut() {
+            *s = cap * (*s / cap).tanh();
+        }
+    }
+}
+
+/// [`apply_softcap`] for one score.
+#[inline(always)]
+pub(crate) fn softcap_one(s: f32, cap: f32) -> f32 {
+    if cap > 0.0 { cap * (s / cap).tanh() } else { s }
+}
+
 /// Apply a synthetic (kernel-generated) attention mask to a `[q_seq, k_seq]`
 /// scores matrix. Custom masks are read from a tensor and not handled here.
 /// `None` is a no-op so callers don't need to special-case it.

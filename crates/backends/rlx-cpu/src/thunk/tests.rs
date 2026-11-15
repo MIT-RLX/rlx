@@ -7593,6 +7593,7 @@ fn batched_sgemm_operand_inside_destination_is_not_clobbered() {
             n: n as u32,
             a_bcast: false,
             b_bcast: false,
+            mat_index: None,
         }],
         moe_resident: None,
         moe_resident_layers: None,

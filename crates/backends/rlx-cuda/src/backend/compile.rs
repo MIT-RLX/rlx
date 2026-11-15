@@ -89,6 +89,10 @@ impl CudaExecutable {
         // The attention kernels read K / V as `num_heads` heads: repeat shared
         // ones (grouped-query attention) first, or they return a wrong tensor.
         let graph = rlx_opt::rlx_fusion::expand_shared_kv::ExpandSharedKvHeads.run(graph);
+        // A matmul operand broadcast along only some batch axes: expand it, the
+        // batched GEMM takes the full batch or one repeated matrix only.
+        let graph =
+            rlx_opt::rlx_fusion::expand_partial_broadcast::ExpandPartialBatchBroadcast.run(graph);
         t = mark("unfuse", t);
 
         let dequant_scratch = crate::gguf_gpu::dequant_gguf_scratch_bytes(&graph);
@@ -5045,6 +5049,7 @@ impl CudaExecutable {
 
         Self {
             ctx,
+            exact_f32_matmul: false,
             blas,
             blas_lt,
             blas_lt_workspace,

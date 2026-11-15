@@ -129,3 +129,68 @@ fn the_full_congruence_that_surfaced_it() {
     );
     assert!(worst < 1e-4, "Wᵀ·X·W diverged: {worst:.3e}");
 }
+
+#[test]
+fn rank4_lhs_times_rank3_rhs() {
+    // `[1,H,M,K] · [H,K,N]`: both operands batched, ranks differ, broadcast
+    // right-aligned (the Gemma 4 audio attention's relative-position term).
+    // Neither the equal-rank nor the rank-2-lhs case took it, and the 2-D
+    // flatten read the right operand as one `[K,N]` matrix: every head used
+    // head 0's matrix.
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_metal::is_available(),
+    ) {
+        return;
+    }
+    let (h, m, k, n) = (8, 24, 16, 13);
+    let a = noise(h * m * k, 5);
+    let b = noise(h * k * n, 6);
+    let worst = compare(
+        || {
+            let mut g = Graph::new("rank4-rank3");
+            let x = g.input("a", Shape::new(&[1, h, m, k], F));
+            let y = g.input("b", Shape::new(&[h, k, n], F));
+            let z = g.mm(x, y);
+            g.set_outputs(vec![z]);
+            g
+        },
+        &[("a", &a), ("b", &b)],
+    );
+    assert!(
+        worst < 1e-4,
+        "rank-4 lhs × rank-3 rhs diverged: {worst:.3e}"
+    );
+}
+
+#[test]
+fn per_axis_broadcast_on_both_sides() {
+    // `[2,1,M,K] · [1,3,K,N] → [2,3,M,N]`: each operand broadcasts along a
+    // different batch axis, so neither is a whole-operand broadcast.
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_metal::is_available(),
+    ) {
+        return;
+    }
+    let (m, k, n) = (5, 7, 4);
+    let a = noise(2 * m * k, 7);
+    let b = noise(3 * k * n, 8);
+    let worst = compare(
+        || {
+            let mut g = Graph::new("per-axis-bcast");
+            let x = g.input("a", Shape::new(&[2, 1, m, k], F));
+            let y = g.input("b", Shape::new(&[1, 3, k, n], F));
+            let z = g.mm(x, y);
+            g.set_outputs(vec![z]);
+            g
+        },
+        &[("a", &a), ("b", &b)],
+    );
+    assert!(
+        worst < 1e-4,
+        "per-axis broadcast matmul diverged: {worst:.3e}"
+    );
+}

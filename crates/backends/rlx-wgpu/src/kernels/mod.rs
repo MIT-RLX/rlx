@@ -1191,7 +1191,9 @@ pub struct AttentionParams {
     /// wide while the Q·K score contracts over `head_dim`. Equals `head_dim`
     /// for ordinary attention; 0 makes the shader fall back to `head_dim`.
     pub v_head_dim: u32,
-    pub _pad_mask_2: u32,
+    /// Logit soft-cap `c` as `f32` bits: scores become `c · tanh(s / c)` before
+    /// masking. 0 means no cap.
+    pub softcap_bits: u32,
 
     // Q stride triple (in f32 elements). For [B, H, S, D]:
     //   q_batch_stride = H·S·D, q_head_stride = S·D, q_seq_stride = D

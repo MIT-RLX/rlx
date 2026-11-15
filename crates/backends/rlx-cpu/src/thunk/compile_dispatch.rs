@@ -2549,6 +2549,16 @@ pub fn compile_thunks_with_rng(
                                         sc[qi * k_s + ki] = dot * scale;
                                     }
                                 }
+                                // Gemma 2 attention logit soft-cap on the raw
+                                // scores, before the mask (the reference order,
+                                // and the Metal kernels'): masked keys stay at
+                                // `mask_neg`. Polynomial tanh, not libm: this
+                                // runs per score inside attention.
+                                if softcap > 0.0 {
+                                    for s in sc.iter_mut() {
+                                        *s = softcap * crate::vmath::tanh_poly(*s / softcap);
+                                    }
+                                }
                                 // Apply mask. Causal/SlidingWindow use absolute
                                 // positions so they handle Lq != Lk (decode mode
                                 // with cached K/V): q_offset = k_s - q_s.
@@ -2589,17 +2599,6 @@ pub fn compile_thunks_with_rng(
                                         for i in 0..per_bh {
                                             sc[i] += m_d[off + i];
                                         }
-                                    }
-                                }
-                                // Gemma 2 attention logit soft-cap (post-mask,
-                                // pre-softmax) — matches rlx-cpu executor.rs and
-                                // rlx-metal / rlx-cuda native attention.
-                                if softcap > 0.0 {
-                                    for s in sc.iter_mut() {
-                                        // Polynomial tanh, not libm: this
-                                        // runs per score inside attention.
-                                        *s = softcap
-                                            * crate::vmath::tanh_poly(*s / softcap);
                                     }
                                 }
                                 crate::naive::softmax(&mut sc, q_s, k_s);

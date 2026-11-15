@@ -85,8 +85,8 @@ pub use layer::LayerStack;
 pub use plugin::{PluginStage, plugin, plugin_named};
 pub use profile::{
     BackendOverrides, CompileProfile, CpuBackendProfile, FusionPolicyKind, FusionProfile,
-    FusionTargetKind, MetalBackendProfile, MixedPrecisionKind, PassProfile, PrecisionKind,
-    PrecisionProfile, ProfileMode,
+    FusionTargetKind, MetalBackendProfile, MixedPrecisionKind, MlxBackendProfile, PassProfile,
+    PrecisionKind, PrecisionProfile, ProfileMode,
 };
 pub use recipe::ModelRecipe;
 pub use rope::{

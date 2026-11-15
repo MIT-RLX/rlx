@@ -4849,14 +4849,15 @@ pub(crate) fn encode_cumsum(
     enc.set_bytes(2, 4, &cols as *const u32 as *const _);
     let ex: u32 = if exclusive { 1 } else { 0 };
     enc.set_bytes(3, 4, &ex as *const u32 as *const _);
-    enc.dispatch_threads(
+    // One threadgroup per row; `CUMSUM_THREADS` (256) threads scan it.
+    enc.dispatch_thread_groups(
         crate::mtl::MTLSize {
             width: rows as u64,
             height: 1,
             depth: 1,
         },
         crate::mtl::MTLSize {
-            width: 1,
+            width: 256,
             height: 1,
             depth: 1,
         },

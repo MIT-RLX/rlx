@@ -669,6 +669,7 @@ pub(crate) fn exec_batched_dgemm_f64(t: &Thunk, base: *mut u8) {
         n,
         a_bcast,
         b_bcast,
+        mat_index,
     } = t
     else {
         unreachable!()
@@ -678,16 +679,24 @@ pub(crate) fn exec_batched_dgemm_f64(t: &Thunk, base: *mut u8) {
         let a_mat = m_ * k_;
         let b_mat = k_ * n_;
         let c_stride = m_ * n_;
-        // A broadcast operand has batch stride 0 — reuse matrix 0 every step.
+        // A broadcast operand has batch stride 0 — reuse matrix 0 every step;
+        // a per-axis broadcast reads its index table.
         let a_stride = if *a_bcast { 0 } else { a_mat };
         let b_stride = if *b_bcast { 0 } else { b_mat };
+        let span = |v: &[u32]| v.iter().max().map_or(1, |&x| x as usize + 1);
+        let (a_count, b_count) = match mat_index {
+            Some(t) => (span(&t.0), span(&t.1)),
+            None => (if *a_bcast { 1 } else { b_ }, if *b_bcast { 1 } else { b_ }),
+        };
         unsafe {
-            let a_full = sl_f64(*a, base, if *a_bcast { a_mat } else { b_ * a_mat });
-            let b_full = sl_f64(*b, base, if *b_bcast { b_mat } else { b_ * b_mat });
+            let a_full = sl_f64(*a, base, a_count * a_mat);
+            let b_full = sl_f64(*b, base, b_count * b_mat);
             let c_full = sl_mut_f64(*c, base, b_ * c_stride);
             for bi in 0..b_ {
-                let ao = bi * a_stride;
-                let bo = bi * b_stride;
+                let (ao, bo) = match mat_index {
+                    Some(t) => (t.0[bi] as usize * a_mat, t.1[bi] as usize * b_mat),
+                    None => (bi * a_stride, bi * b_stride),
+                };
                 let a_slice = &a_full[ao..ao + a_mat];
                 let b_slice = &b_full[bo..bo + b_mat];
                 let c_slice = &mut c_full[bi * c_stride..(bi + 1) * c_stride];

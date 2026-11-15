@@ -1368,10 +1368,10 @@ impl ExecutableGraph for CpuExecutable {
                 // would take half the buffer and call it the answer. They fall
                 // through to the f32 read + `narrow_f32_to_bytes` below, which
                 // emits the declared boundary dtype.
-                if matches!(
-                    exec_dtype,
-                    DType::F64 | DType::I32 | DType::I64 | DType::U32 | DType::C64 | DType::C128
-                ) {
+                // Every other dtype sits in the arena at its own width
+                // (U8 / Bool / I8 / I16 included: read through the f32 view
+                // they came back as f32 bytes labelled U8).
+                if !matches!(exec_dtype, DType::F32 | DType::F16 | DType::BF16) {
                     let n_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
                     let n_bytes = n_elems * exec_dtype.size_bytes();
                     let off = self.arena.byte_offset(id);

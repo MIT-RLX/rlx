@@ -36,6 +36,55 @@ pub(crate) fn compile_fused_mat_mul_bias_act(
     }
 }
 
+/// Per output matrix, the `a` and `b` matrix a batched matmul reads, when
+/// some operand broadcasts along only part of the batch (`[2,1,M,K]·[1,3,K,N]`,
+/// `[2,3,M,K]·[3,K,N]`): its matrix count is then neither the output's nor 1,
+/// and no single stride reaches its matrices. Batch dims right-align with the
+/// output's (`out_batch`); a size-1 dim repeats its matrix. `None` when each
+/// operand is either the full batch or one matrix.
+fn broadcast_mat_index(
+    a: &rlx_ir::Shape,
+    b: &rlx_ir::Shape,
+    out_batch: &[usize],
+) -> Option<std::sync::Arc<(Vec<u32>, Vec<u32>)>> {
+    let total: usize = out_batch.iter().product();
+    let lead = |s: &rlx_ir::Shape| -> usize {
+        (0..s.rank().saturating_sub(2))
+            .map(|d| s.dim(d).unwrap_static())
+            .product()
+    };
+    let linear = |n: usize| n == total || n == 1;
+    if linear(lead(a)) && linear(lead(b)) {
+        return None;
+    }
+    let r = out_batch.len();
+    let index_of = |s: &rlx_ir::Shape| -> Vec<u32> {
+        let own = s.rank().saturating_sub(2);
+        let off = r - own;
+        let mut stride = vec![0usize; own];
+        let mut acc = 1usize;
+        for d in (0..own).rev() {
+            let n = s.dim(d).unwrap_static();
+            stride[d] = if n == 1 { 0 } else { acc };
+            acc *= n;
+        }
+        (0..total)
+            .map(|o| {
+                let (mut rem, mut idx) = (o, 0usize);
+                for d in (0..r).rev() {
+                    let c = rem % out_batch[d];
+                    rem /= out_batch[d];
+                    if d >= off {
+                        idx += c * stride[d - off];
+                    }
+                }
+                idx as u32
+            })
+            .collect()
+    };
+    Some(std::sync::Arc::new((index_of(a), index_of(b))))
+}
+
 #[allow(unused_variables)]
 pub(crate) fn compile_mat_mul(
     node: &rlx_ir::Node,
@@ -107,6 +156,9 @@ pub(crate) fn compile_mat_mul(
                     batch_prod *= eff.dim(d).unwrap_static();
                 }
                 let m_dim = eff.dim(rank - 2).unwrap_static();
+                let out_batch: Vec<usize> =
+                    (0..rank - 2).map(|d| eff.dim(d).unwrap_static()).collect();
+                let mat_index = broadcast_mat_index(a_shape, b_shape, &out_batch);
                 Thunk::BatchedDgemmF64 {
                     a: node_offset(arena, node.inputs[0]),
                     b: node_offset(arena, node.inputs[1]),
@@ -117,6 +169,7 @@ pub(crate) fn compile_mat_mul(
                     n: n as u32,
                     a_bcast: a_batch == 1 && batch_prod > 1,
                     b_bcast: b_batch == 1 && batch_prod > 1,
+                    mat_index,
                 }
             } else if batched_3d && shape.dtype() == rlx_ir::DType::F32 {
                 let mut batch_prod = 1usize;
@@ -124,6 +177,9 @@ pub(crate) fn compile_mat_mul(
                     batch_prod *= eff.dim(d).unwrap_static();
                 }
                 let m_dim = eff.dim(rank - 2).unwrap_static();
+                let out_batch: Vec<usize> =
+                    (0..rank - 2).map(|d| eff.dim(d).unwrap_static()).collect();
+                let mat_index = broadcast_mat_index(a_shape, b_shape, &out_batch);
                 Thunk::BatchedSgemm {
                     a: node_offset(arena, node.inputs[0]),
                     b: node_offset(arena, node.inputs[1]),
@@ -134,6 +190,7 @@ pub(crate) fn compile_mat_mul(
                     n: n as u32,
                     a_bcast: a_batch == 1 && batch_prod > 1,
                     b_bcast: b_batch == 1 && batch_prod > 1,
+                    mat_index,
                 }
             } else {
                 let m = if a_shape.rank() >= 3 && b_shape.rank() <= 2 {

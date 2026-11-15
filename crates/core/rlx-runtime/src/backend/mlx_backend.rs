@@ -28,18 +28,21 @@ impl Backend for MlxBackend {
         graph = rlx_opt::LowerControlFlow.run(graph);
         graph = rlx_opt::rlx_autodiff::decompose_backward_ops_except(graph, rlx_mlx::SUPPORTED_OPS);
         let graph = prepare_fused_graph(graph, options, rlx_mlx::SUPPORTED_OPS, "mlx");
-        Box::new(build_mlx_executable(graph, options.rng))
+        Box::new(build_mlx_executable(graph, options))
     }
 }
 
-fn build_mlx_executable(graph: Graph, rng: rlx_ir::RngOptions) -> MlxExecutableWrapper {
+fn build_mlx_executable(graph: Graph, options: &CompileOptions) -> MlxExecutableWrapper {
     let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
     // Integer control params (Kitten duration carry, masks) must live as F32
     // so `set_param_typed` can widen values — raw i64 bytes are read as
     // denormals by f32 Where/Expand and break alignment (same as Metal).
     let graph = cpu_low_precision::widen_integer_control_params_to_f32(graph);
     let mode = mlx_mode_from_env();
-    let mut exe = MlxExecutable::compile_from_fused_with_rng(graph, mode, rng);
+    let mut exe = MlxExecutable::compile_from_fused_with_rng(graph, mode, options.rng);
+    if let Some(limit) = options.mlx_compile_max_nodes {
+        exe.set_compile_max_nodes((limit > 0).then_some(limit));
+    }
     if mode == rlx_mlx::lower::MlxMode::Compiled {
         if let Err(e) = exe.warm_compile() {
             eprintln!(

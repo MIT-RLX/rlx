@@ -1619,10 +1619,12 @@ pub fn lower_with_env_writeback(
                 // host-eval — same im2col ceiling as forward Conv.
                 // MLX's native grouped/depthwise transpose-conv mixes channels
                 // across groups (kokoro ISTFTNet upsampler g=512 → output ~25×
-                // too large → garbage audio; same class as the CT3d groups>1
-                // host fallback). Host-eval for groups>1 (correct; the layers
-                // are small) and keep the native GPU path only for groups==1.
-                if *groups > 1 || mlx_conv_im2col_too_large(graph, node, kernel_size, *groups) {
+                // too large → garbage audio). Grouped layers run as the
+                // equivalent forward conv instead — `conv_general` with the
+                // input dilated by the stride and the kernel flipped — whose
+                // grouping is right, so they stay on the device and inside
+                // `mlx::compile`.
+                if mlx_conv_im2col_too_large(graph, node, kernel_size, *groups) {
                     host_eval_op_f32(graph, node, &env)?
                 } else {
                     let in_shape = node_input_shape(graph, node.inputs[0]);
@@ -1656,15 +1658,47 @@ pub fn lower_with_env_writeback(
                         let perm = ops::transpose(&split, &[0, 2, 3, 4, 1])?;
                         ops::reshape(&perm, &[c_out, kh, kw, c_in_per_g])?
                     };
-                    let y_nhwc = ops::conv_transpose2d(
-                        &x_nhwc,
-                        &w_mlx,
-                        (s(0), s(1)),
-                        (p(0), p(1)),
-                        (d(0), d(1)),
-                        (op(0), op(1)),
-                        g,
-                    )?;
+                    let y_nhwc = if g == 1 {
+                        ops::conv_transpose2d(
+                            &x_nhwc,
+                            &w_mlx,
+                            (s(0), s(1)),
+                            (p(0), p(1)),
+                            (d(0), d(1)),
+                            (op(0), op(1)),
+                            g,
+                        )?
+                    } else {
+                        // Transposed conv = forward conv over the input with
+                        // `s - 1` zeros between samples, padded by
+                        // `d·(k-1) - p` (plus `output_padding` at the end),
+                        // kernel flipped. Padding below zero is cropped after.
+                        let k = [kh, kw];
+                        let lo: Vec<i32> = (0..2).map(|i| d(i) * (k[i] - 1) - p(i)).collect();
+                        let hi: Vec<i32> = (0..2).map(|i| lo[i] + op(i)).collect();
+                        let y = ops::conv_general(
+                            &x_nhwc,
+                            &w_mlx,
+                            &[1, 1],
+                            &[lo[0].max(0), lo[1].max(0)],
+                            &[hi[0].max(0), hi[1].max(0)],
+                            &[d(0), d(1)],
+                            &[s(0), s(1)],
+                            g,
+                            true,
+                        )?;
+                        if lo.iter().chain(&hi).any(|&v| v < 0) {
+                            let sh = y.shape().unwrap_or_default();
+                            let (h, w) = (sh[1] as i32, sh[2] as i32);
+                            ops::slice(
+                                &y,
+                                &[0, (-lo[0]).max(0), (-lo[1]).max(0), 0],
+                                &[sh[0] as i32, h - (-hi[0]).max(0), w - (-hi[1]).max(0), sh[3] as i32],
+                            )?
+                        } else {
+                            y
+                        }
+                    };
                     ops::transpose(&y_nhwc, &[0, 3, 1, 2])?
                 }
             }

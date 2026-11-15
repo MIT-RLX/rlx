@@ -121,6 +121,13 @@ fn hash_op(h: &mut DefaultHasher, op: &rlx_ir::Op) {
     }
 }
 
+/// Options whose rewrites only `Session::compile_with` applies.
+fn needs_session_rewrites(o: &CompileOptions) -> bool {
+    !matches!(o.number_format, None | Some(rlx_ir::NumberFormat::F32))
+        || o.half_casts == crate::HalfCasts::Round
+        || o.scaled_quant.is_some()
+}
+
 fn hash_compile_context(h: &mut DefaultHasher, device: Device, o: &CompileOptions) {
     format!("{device:?}").hash(h);
     // Every field except the parameter bindings, whose maps hold weights
@@ -268,6 +275,10 @@ impl AotCache {
         graph: Graph,
         options: &CompileOptions,
     ) -> Result<CompiledGraph, AotCacheError> {
+        // See `compile_hir_cached`.
+        if needs_session_rewrites(options) {
+            return Ok(crate::Session::new(device).compile_with(graph, options));
+        }
         let input = InputFingerprint::of_graph(device, options, &graph);
         if self.fresh(key, input) {
             match self.get_lir(key) {
@@ -293,6 +304,13 @@ impl AotCache {
         hir: HirModule,
         options: &CompileOptions,
     ) -> Result<CompiledGraph, AotCacheError> {
+        // Number formats, half-cast rounding and scaled matmuls are graph
+        // rewrites `Session::compile_with` applies before lowering; the cached
+        // LIR path below skips them, so such a compile would silently run f32.
+        if needs_session_rewrites(options) {
+            let graph = rlx_opt::CompilePipeline::lower_hir(hir)?.into_graph();
+            return Ok(crate::Session::new(device).compile_with(graph, options));
+        }
         let input = InputFingerprint::of_hir(device, options, &hir);
         if self.fresh(key, input) {
             match self.get_lir(key) {

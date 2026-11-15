@@ -277,6 +277,9 @@ impl Default for PassProfile {
 pub struct PrecisionProfile {
     pub compute: PrecisionKind,
     pub mixed: MixedPrecisionKind,
+    /// f32 matmuls in strict FP32 where a backend would otherwise use a
+    /// reduced-precision mode (CUDA TF32).
+    pub exact_f32_matmul: bool,
 }
 
 impl Default for PrecisionProfile {
@@ -284,6 +287,7 @@ impl Default for PrecisionProfile {
         Self {
             compute: PrecisionKind::F32,
             mixed: MixedPrecisionKind::None,
+            exact_f32_matmul: false,
         }
     }
 }
@@ -312,12 +316,22 @@ pub struct BackendOverrides {
     pub metal: MetalBackendProfile,
     #[serde(default)]
     pub cpu: CpuBackendProfile,
+    #[serde(default)]
+    pub mlx: MlxBackendProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct MetalBackendProfile {
     pub skip_fusion: bool,
     pub unfuse_regions: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct MlxBackendProfile {
+    /// Largest graph (in nodes) run under `mlx::compile`; `None` keeps the
+    /// process default, `Some(0)` lifts the limit for this graph.
+    #[serde(default)]
+    pub compile_max_nodes: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]

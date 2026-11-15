@@ -2971,7 +2971,7 @@
     EnvVarEntry {
         name: "RLX_MLX_COMPILE_MAX_NODES",
         group: "mlx",
-        summary: "Max graph nodes MLX will compile as one Compiled unit (default 1536)",
+        summary: "Max graph nodes MLX will compile as one Compiled unit (default 5000; 0 = no limit)",
         kind: EnvKind::U64,
         stability: EnvStability::Bisect,
         aliases: &[],

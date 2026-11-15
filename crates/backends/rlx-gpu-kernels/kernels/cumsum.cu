@@ -17,14 +17,16 @@ extern "C" __global__ void cumsum(
     if (row >= outer) return;
     unsigned int in_base  = in_off  + row * inner;
     unsigned int out_base = out_off + row * inner;
-    float acc = 0.0f;
+    // f64 accumulator: a long f32 scan (a vocoder's phase over 80k samples)
+    // adds small steps to a large sum and drifts by ~1e-2.
+    double acc = 0.0;
     for (unsigned int i = 0; i < inner; ++i) {
         if (exclusive != 0) {
-            arena[out_base + i] = acc;
-            acc += arena[in_base + i];
+            arena[out_base + i] = (float)acc;
+            acc += (double)arena[in_base + i];
         } else {
-            acc += arena[in_base + i];
-            arena[out_base + i] = acc;
+            acc += (double)arena[in_base + i];
+            arena[out_base + i] = (float)acc;
         }
     }
 }

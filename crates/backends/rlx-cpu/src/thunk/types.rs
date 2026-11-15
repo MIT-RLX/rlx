@@ -315,6 +315,8 @@ pub enum Thunk {
         /// operand for `bi > 0`.
         a_bcast: bool,
         b_bcast: bool,
+        /// Per-axis broadcast index tables, as on [`Thunk::BatchedSgemm`].
+        mat_index: Option<std::sync::Arc<(Vec<u32>, Vec<u32>)>>,
     },
     /// Batched f32 matmul — same loop-per-batch shape as
     /// `BatchedDgemmF64` but calling `sgemm`. Needed for attention
@@ -335,6 +337,10 @@ pub enum Thunk {
         /// Without this the loop over-reads a batch-1 operand for `bi>0`.
         a_bcast: bool,
         b_bcast: bool,
+        /// For broadcasts no single stride expresses (`[2,1,M,K]·[1,3,K,N]`,
+        /// `[2,3,M,K]·[3,K,N]`): per output matrix, the index of the `a` and the
+        /// `b` matrix it reads. `None` when `a_bcast`/`b_bcast` say it all.
+        mat_index: Option<std::sync::Arc<(Vec<u32>, Vec<u32>)>>,
     },
     /// C = A @ B via Accelerate cblas_dgemm. Mirror of `Sgemm` at f64.
     Dgemm {

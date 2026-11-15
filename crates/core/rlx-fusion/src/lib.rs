@@ -11,6 +11,7 @@ pub mod analysis;
 #[cfg(feature = "assoc-scan")]
 pub mod assoc_scan;
 pub mod control_flow;
+pub mod expand_partial_broadcast;
 pub mod expand_shared_kv;
 pub mod fk_fusion;
 pub mod fk_graphs;

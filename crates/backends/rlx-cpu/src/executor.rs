@@ -687,6 +687,15 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                                 scale,
                             );
                         }
+                        // Logit soft-cap before the mask, as the reference
+                        // implementations apply it: masked keys stay at -1e9.
+                        if let Some(cap) = attn_logit_softcap {
+                            if *cap > 0.0 {
+                                for s in scores.iter_mut() {
+                                    *s = cap * (*s / cap).tanh();
+                                }
+                            }
+                        }
                         // Mask: branch on kind so None / Causal skip the
                         // mask load entirely. Causal/SlidingWindow use
                         // absolute positions so they handle Lq != Lk
@@ -736,13 +745,6 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                                     for i in 0..per_bh {
                                         scores[i] += b[i];
                                     }
-                                }
-                            }
-                        }
-                        if let Some(cap) = attn_logit_softcap {
-                            if *cap > 0.0 {
-                                for s in scores.iter_mut() {
-                                    *s = cap * (*s / cap).tanh();
                                 }
                             }
                         }

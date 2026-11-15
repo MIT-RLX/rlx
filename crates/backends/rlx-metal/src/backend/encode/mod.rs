@@ -2797,6 +2797,7 @@ impl MetalExecutable {
                     dt,
                     a_bcast,
                     b_bcast,
+                    mat_index,
                 } => {
                     use crate::thunk::HalfFlag;
                     let m_scaled = scale(*m);
@@ -2810,6 +2811,66 @@ impl MetalExecutable {
                         *batch as usize,
                     );
                     let elem = if matches!(dt, HalfFlag::F16) { 2 } else { 4 };
+                    // Per-axis broadcast: each output matrix reads the `a` and
+                    // `b` matrices its index table names. f32 runs the indexed
+                    // batched kernel, which keeps every buffer bound at its
+                    // (aligned) base: offsetting buffers by a whole matrix is
+                    // not 16-byte aligned for odd sizes, and the sgemm kernels'
+                    // vector loads then read the wrong elements. Tables go in
+                    // as constant bytes, 1024 matrices per dispatch.
+                    if let Some(idx) = mat_index {
+                        let (ai, bi_) = (&idx.0, &idx.1);
+                        if !matches!(dt, HalfFlag::F16) {
+                            const CHUNK: usize = 1024;
+                            let enc = e!();
+                            enc.set_compute_pipeline_state(&k.bmm_simd_4x4_indexed);
+                            enc.set_buffer(0, Some(&self.arena.buffer), *a as u64);
+                            enc.set_buffer(1, Some(&self.arena.buffer), *b as u64);
+                            enc.set_buffer(2, Some(&self.arena.buffer), *c as u64);
+                            let dims = [mu as u32, ku as u32, nu as u32];
+                            for (slot, v) in dims.iter().enumerate() {
+                                enc.set_bytes(3 + slot as u64, 4, v as *const u32 as *const _);
+                            }
+                            let strides: [u32; 4] =
+                                [(mu * ku) as u32, (ku * nu) as u32, (mu * nu) as u32, 0];
+                            enc.set_bytes(6, 16, strides.as_ptr() as *const _);
+                            for z0 in (0..b_).step_by(CHUNK) {
+                                let len = CHUNK.min(b_ - z0);
+                                enc.set_bytes(7, (len * 4) as u64, ai[z0..].as_ptr() as *const _);
+                                enc.set_bytes(8, (len * 4) as u64, bi_[z0..].as_ptr() as *const _);
+                                let z0u = z0 as u32;
+                                enc.set_bytes(9, 4, &z0u as *const u32 as *const _);
+                                enc.dispatch_thread_groups(
+                                    crate::mtl::MTLSize {
+                                        width: nu.div_ceil(32) as u64,
+                                        height: mu.div_ceil(32) as u64,
+                                        depth: len as u64,
+                                    },
+                                    crate::mtl::MTLSize {
+                                        width: 512,
+                                        height: 1,
+                                        depth: 1,
+                                    },
+                                );
+                            }
+                        } else {
+                            // f16 has only the MPS path, which takes byte offsets.
+                            end_msl!();
+                            for o in 0..b_ {
+                                crate::mps_blas::encode_mps_hgemm(
+                                    &cmd_buf,
+                                    &self.arena.buffer,
+                                    *a + ai[o] as usize * mu * ku * elem,
+                                    *b + bi_[o] as usize * ku * nu * elem,
+                                    *c + o * mu * nu * elem,
+                                    mu,
+                                    ku,
+                                    nu,
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     // A broadcast operand (batch dim 1) reuses matrix 0 for every
                     // output batch → per-matrix stride 0.
                     let a_stride = if *a_bcast { 0 } else { mu * ku * elem };

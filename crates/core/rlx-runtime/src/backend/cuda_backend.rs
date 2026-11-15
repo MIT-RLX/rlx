@@ -38,10 +38,9 @@ impl Backend for CudaBackend {
             None => graph,
         };
         let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
-        Box::new(CudaExecutableWrapper {
-            inner: CudaExecutable::compile_rng(graph, options.rng),
-            io_manifest,
-        })
+        let mut inner = CudaExecutable::compile_rng(graph, options.rng);
+        inner.set_exact_f32_matmul(options.exact_f32_matmul);
+        Box::new(CudaExecutableWrapper { inner, io_manifest })
     }
 
     fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
@@ -53,10 +52,9 @@ impl Backend for CudaBackend {
             rlx_cuda::SUPPORTED_OPS,
             "cuda",
         ));
-        Box::new(CudaExecutableWrapper {
-            inner: CudaExecutable::compile_rng(graph, options.rng),
-            io_manifest,
-        })
+        let mut inner = CudaExecutable::compile_rng(graph, options.rng);
+        inner.set_exact_f32_matmul(options.exact_f32_matmul);
+        Box::new(CudaExecutableWrapper { inner, io_manifest })
     }
 }
 

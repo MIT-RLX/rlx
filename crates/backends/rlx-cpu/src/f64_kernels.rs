@@ -465,6 +465,10 @@ impl CpuKernel for AttentionF64 {
                     for (ki, sc) in scores.iter_mut().enumerate() {
                         let kr = &k[at(bi, kh, ki, nkv, dh, ks)..][..dh];
                         let mut s = qr.iter().zip(kr).map(|(a, b)| a * b).sum::<f64>() * self.scale;
+                        // Soft-cap the raw score, then mask (reference order).
+                        if self.softcap > 0.0 {
+                            s = self.softcap * (s / self.softcap).tanh();
+                        }
                         match self.mask_kind {
                             MaskKind::Custom if mask[bi * ks + ki] < thr => s = neg,
                             MaskKind::Bias => s += mask[((bi * nh + h) * qs + qi) * ks + ki],
@@ -475,9 +479,6 @@ impl CpuKernel for AttentionF64 {
                                 s = neg
                             }
                             _ => {}
-                        }
-                        if self.softcap > 0.0 {
-                            s = self.softcap * (s / self.softcap).tanh();
                         }
                         *sc = s;
                     }

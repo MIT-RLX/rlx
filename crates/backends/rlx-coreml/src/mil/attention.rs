@@ -506,11 +506,9 @@ impl<'a> LowerCtx<'a> {
             vec![("x", bind_name(&raw)), ("y", bind_value(scalar_f32(scale)))],
         )?;
 
-        // mask (factored so the native attention backward recomputes P identically)
-        let mut cur =
-            self.apply_score_mask(&cur, &scores_shape, s_q, s_k, mask_kind, mask_in, out_name)?;
-
-        // softcap: cap * tanh(scores / cap)
+        // softcap: cap * tanh(scores / cap), on the raw scores before the mask
+        // (the models' own order: a masked key keeps its -inf-like value).
+        let mut cur = cur;
         if let Some(cap) = softcap {
             if cap > 0.0 {
                 let div = format!("{out_name}_cap_div");
@@ -535,6 +533,10 @@ impl<'a> LowerCtx<'a> {
                 cur = capped;
             }
         }
+
+        // mask (factored so the native attention backward recomputes P identically)
+        let cur =
+            self.apply_score_mask(&cur, &scores_shape, s_q, s_k, mask_kind, mask_in, out_name)?;
 
         // probs = softmax(cur, axis=-1)
         let probs = format!("{out_name}_p");

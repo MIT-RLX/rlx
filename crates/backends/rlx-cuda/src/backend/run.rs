@@ -1134,7 +1134,7 @@ impl CudaExecutable {
                         }
                     }
 
-                    if matmul_parity_mode() {
+                    if self.exact_f32_matmul || matmul_parity_mode() {
                         // Parity mode pins the DEFAULT tile on purpose: it is
                         // the fixed reference schedule other paths are compared
                         // against, so it must not follow the tuning table.
@@ -1276,6 +1276,7 @@ impl CudaExecutable {
                                 *b_batch_stride,
                                 *c_batch_stride,
                                 cu_stream,
+                                self.exact_f32_matmul,
                             )
                         };
                         if let Err(ref e) = r {

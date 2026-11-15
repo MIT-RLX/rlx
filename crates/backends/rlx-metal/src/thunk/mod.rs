@@ -237,6 +237,11 @@ pub enum Thunk {
         /// batch (its per-matrix stride is 0 — reuse matrix 0).
         a_bcast: bool,
         b_bcast: bool,
+        /// For broadcasts no single stride expresses (`[2,1,M,K]·[2,3,K,N]`,
+        /// `[2,3,M,K]·[3,K,N]`): per output matrix, the index of the `a` and
+        /// the `b` matrix it reads. `None` when both follow from
+        /// `a_bcast`/`b_bcast` (stride `M·K` / `K·N`, or 0).
+        mat_index: Option<std::sync::Arc<(Vec<u32>, Vec<u32>)>>,
     },
     FusedMmBiasAct {
         a: usize,

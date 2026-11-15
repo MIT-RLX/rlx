@@ -85,6 +85,11 @@ pub struct MlxExecutable {
     /// detected). Subsequent `run` calls take the Lazy path instead of
     /// re-attempting compile every step.
     compile_disabled: Option<String>,
+    /// Largest graph (in nodes) run as Compiled; `None` = no limit. Starts
+    /// at the process default ([`compile_max_nodes_from_env`]); a caller
+    /// that knows its graph compiles quickly lifts it with
+    /// [`Self::set_compile_max_nodes`].
+    compile_max_nodes: Option<usize>,
     /// Runtime-mutable RNG policy for in-graph random ops.
     rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
 }
@@ -198,7 +203,10 @@ impl MlxExecutable {
         // ones first.
         let graph = {
             use rlx_opt::pass::Pass as _;
-            rlx_opt::rlx_fusion::expand_shared_kv::ExpandSharedKvHeads.run(graph)
+            let graph = rlx_opt::rlx_fusion::expand_shared_kv::ExpandSharedKvHeads.run(graph);
+            // MLX's fused SDPA has no logit soft-cap: attention that carries
+            // one (Gemma 2) runs as matmul / tanh / softmax instead.
+            rlx_opt::rlx_fusion::lower_attention::LowerSoftcappedAttention.run(graph)
         };
         let output_names = graph.outputs.clone();
 
@@ -254,6 +262,7 @@ impl MlxExecutable {
             output_dtypes,
             active_extent: None,
             compile_disabled: None,
+            compile_max_nodes: compile_max_nodes_from_env(),
             rng: std::sync::Arc::new(std::sync::RwLock::new(rng)),
         }
     }
@@ -291,14 +300,22 @@ impl MlxExecutable {
         }
     }
 
+    /// Override the node limit above which this graph runs Lazy instead of
+    /// Compiled: `None` = no limit. Call before the first run or
+    /// [`Self::warm_compile`]; a graph already moved to Lazy stays there.
+    pub fn set_compile_max_nodes(&mut self, limit: Option<usize>) {
+        self.compile_max_nodes = limit;
+    }
+
     /// Skip `mlx::compile` for oversized graphs. First `invoke` runs
-    /// `compile_simplify`, which can hang unboundedly on large TTS/vocoder
-    /// IR (Kokoro decoder ~2400 nodes). Lazy finishes in seconds.
+    /// `compile_simplify`, which has hung on large TTS/vocoder IR (the
+    /// Kokoro decoder, ~2400 nodes, before it gained a host-evaluated op
+    /// that keeps it Lazy anyway). Lazy finishes in seconds.
     fn maybe_disable_compile_for_graph_size(&mut self) {
         if self.mode != MlxMode::Compiled || self.compile_disabled.is_some() {
             return;
         }
-        let Some(limit) = compile_max_nodes_from_env() else {
+        let Some(limit) = self.compile_max_nodes else {
             return;
         };
         let n = self.graph.nodes().len();
@@ -1254,6 +1271,7 @@ impl MlxExecutable {
             .collect();
         let mut exe =
             Self::compile_from_fused_with_rng(self.graph.clone(), self.mode, self.current_rng());
+        exe.compile_max_nodes = self.compile_max_nodes;
         for (k, v) in &self.params {
             exe.set_param(k, v);
         }
@@ -1289,7 +1307,8 @@ fn mode_from_env() -> MlxMode {
     crate::config::runtime_config().mode
 }
 
-/// `RLX_MLX_COMPILE_MAX_NODES`: max nodes for Compiled (default 1536).
+/// `RLX_MLX_COMPILE_MAX_NODES`: max nodes for Compiled (default
+/// [`crate::config::DEFAULT_COMPILE_MAX_NODES`]).
 /// `0` disables the limit (force Compiled even on huge graphs).
 fn compile_max_nodes_from_env() -> Option<usize> {
     crate::config::runtime_config().compile_max_nodes

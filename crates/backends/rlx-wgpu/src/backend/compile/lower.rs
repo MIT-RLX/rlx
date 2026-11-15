@@ -4551,7 +4551,7 @@ fn compile_static_with(
                 v_head_dim,
                 mask_kind,
                 score_scale,
-                attn_logit_softcap: _,
+                attn_logit_softcap,
             } => {
                 // Asymmetric SDPA (DeepSeek/Kimi MLA): V rows + output are
                 // `v_head_dim` wide while Q·K scores still contract over
@@ -4959,7 +4959,10 @@ fn compile_static_with(
                     mask_head_stride: mask_strides.h,
                     kv_heads: nkv,
                     v_head_dim: hd_v,
-                    _pad_mask_2: 0,
+                    softcap_bits: attn_logit_softcap
+                        .filter(|c| *c > 0.0)
+                        .unwrap_or(0.0)
+                        .to_bits(),
                     q_batch_stride: q_b,
                     q_head_stride: q_h,
                     q_seq_stride: q_s,
@@ -7923,6 +7926,102 @@ fn compile_static_with(
                 output_padding: _,
                 groups,
             } => {
+                let host =
+                    wgpu_prefer_structure_host(&arena) || rlx_ir::env::flag("RLX_WGPU_CONV_HOST");
+                if !host {
+                    // Native: the `conv_transpose3d` gather kernel at depth 1.
+                    // A host step mirrors the whole arena both ways per layer
+                    // (Kokoro's decoder: ~6 s a run in host transposed convs
+                    // and the copies around them, against ~10 ms of GPU work).
+                    let in_id = node.inputs[0];
+                    let w_id = node.inputs[1];
+                    let in_shape = &graph.node(in_id).shape;
+                    let out_shape = &node.shape;
+                    let ct_win = vec![node.id, in_id, w_id];
+                    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                    let ct_fits = arena_span_bytes(&arena, &ct_win) <= max_binding;
+                    let mut scratch = arena.scratch_off as u64;
+                    let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &mut scratch,
+                        &ct_win,
+                    );
+                    if !ct_fits && !param_anchor {
+                        base = arena_bind_window_covering_scratch_if_needed(
+                            &arena, base, size, scratch,
+                        );
+                    }
+                    let in_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        in_id,
+                        &mut base,
+                        &mut size,
+                    );
+                    let w_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        w_id,
+                        &mut base,
+                        &mut size,
+                    );
+                    let p3 = Conv3dParams {
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c_in: in_shape.dim(1).unwrap_static() as u32,
+                        c_out: out_shape.dim(1).unwrap_static() as u32,
+                        d: 1,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w: in_shape.dim(3).unwrap_static() as u32,
+                        d_out: 1,
+                        h_out: out_shape.dim(2).unwrap_static() as u32,
+                        w_out: out_shape.dim(3).unwrap_static() as u32,
+                        kd: 1,
+                        kh: kernel_size[0] as u32,
+                        kw: kernel_size[1] as u32,
+                        sd: 1,
+                        sh: stride[0] as u32,
+                        sw: stride[1] as u32,
+                        pd: 0,
+                        ph: padding[0] as u32,
+                        pw: padding[1] as u32,
+                        dd: 1,
+                        dh: dilation[0] as u32,
+                        dw: dilation[1] as u32,
+                        groups: (*groups).max(1) as u32,
+                        in_off,
+                        w_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        bias_off: 0,
+                        has_bias: 0,
+                        act: 0,
+                        alpha: 0,
+                        split: 0,
+                        half: 0,
+                        in_prelu: 0,
+                        in_alpha: 0,
+                        res_max: 0,
+                        res_off: 0,
+                    };
+                    schedule.push(Step::ConvTranspose3d { params: p3 });
+                    let sk = conv_transpose3d_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<Conv3dParams>());
+                    let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                    continue;
+                }
                 if !whole_arena_host_ok(&arena, node) {
                     schedule.push(Step::HostOp {
                         desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),

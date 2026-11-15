@@ -418,6 +418,7 @@ pub(crate) unsafe fn cublaslt_matmul_fused(
     b_batch_stride: u32,
     c_batch_stride: u32,
     cu_stream: cudarc::driver::sys::CUstream,
+    exact_f32: bool,
 ) -> Result<(), cublaslt_result::CublasError> {
     use core::ffi::c_void;
     use core::mem;
@@ -466,7 +467,7 @@ pub(crate) unsafe fn cublaslt_matmul_fused(
     }
 
     let cfg = crate::runtime_config();
-    let compute_type = if cfg.no_tf32 || cfg.parity {
+    let compute_type = if exact_f32 || cfg.no_tf32 || cfg.parity {
         cublaslt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
     } else {
         cublaslt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32

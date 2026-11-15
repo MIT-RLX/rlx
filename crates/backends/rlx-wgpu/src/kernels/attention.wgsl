@@ -67,7 +67,9 @@ struct Params {
     // wide while Q/K scores still use `head_dim`. Equals `head_dim` for
     // ordinary symmetric attention; 0 (zero-init) falls back to `head_dim`.
     v_head_dim: u32,
-    _pad_mask_2: u32,
+    // Logit soft-cap `c` (bitcast f32): scores become `c · tanh(s / c)` before
+    // masking. 0 (zero-init) means no cap.
+    softcap_bits: u32,
 
     // Per-tensor strides (in f32 elements). Q/K/V/out can be in either
     // [B, H, S, D] or [B, S, H, D] layout — caller sets the strides.
@@ -79,6 +81,18 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1) var<uniform>              params: Params;
+
+// `c · tanh(s / c)` when `c > 0`, on the scaled score before the mask (the
+// order the reference implementations use: a masked key keeps its -1e9 /
+// -3.4e38 and weight 0). The argument is clamped first: fast-math `tanh` on
+// Metal returns NaN far outside its saturation range (tanh(±15) is ±1 in f32).
+fn softcap(score: f32) -> f32 {
+    let c = bitcast<f32>(params.softcap_bits);
+    if (c > 0.0) {
+        return c * tanh(clamp(score / c, -15.0, 15.0));
+    }
+    return score;
+}
 
 @compute @workgroup_size(64)
 fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ngs: vec3<u32>) {
@@ -150,7 +164,7 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         for (var d: u32 = 0u; d < hd; d = d + 1u) {
             score = score + q_reg[d] * arena[k_base + d];
         }
-        score = score * scale;
+        score = softcap(score * scale);
         if (params.mask_kind == 1u) {
             if (s > q_abs) { score = -3.4e38; }
         } else if (params.mask_kind == 2u) {
@@ -263,7 +277,7 @@ fn attention_coop(
             for (var d: u32 = 0u; d < hd; d = d + 1u) {
                 acc = acc + q_sh[d] * arena[k_base + d];
             }
-            score = acc * scale;
+            score = softcap(acc * scale);
             if (params.mask_kind == 1u) {
                 if (s > q_abs) { score = -3.4e38; }
             } else if (params.mask_kind == 2u) {

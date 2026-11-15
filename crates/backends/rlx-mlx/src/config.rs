@@ -40,7 +40,11 @@ pub fn reset_compile_output_cap() {
 }
 
 /// Default IR node count above which Compiled is skipped for Lazy.
-pub const DEFAULT_COMPILE_MAX_NODES: usize = 1536;
+///
+/// Was 1536. Compiling the Gemma 4 audio tower (1,780–4,708 nodes) takes
+/// no longer than a Lazy run's setup and runs 1.7–5× faster, and the graph
+/// the limit was set for (Kokoro's decoder) no longer compiles at all.
+pub const DEFAULT_COMPILE_MAX_NODES: usize = 5000;
 
 /// Typed MLX runtime options loaded once from the `RLX_*` registry.
 #[derive(Debug, Clone)]

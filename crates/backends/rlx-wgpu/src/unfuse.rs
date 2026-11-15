@@ -77,7 +77,13 @@ pub fn unfuse_with(graph: Graph, folds: bool) -> Graph {
         graph
     };
     let g = fold_conv_bias_into_conv3d(expand_unsupported_fusions(g, folds));
-    rlx_unfuse::unfuse(g, &WgpuPolicy)
+    // A matmul operand broadcast along only some batch axes: the batched
+    // matmul takes the full batch or one repeated matrix, so expand it.
+    {
+        use rlx_opt::pass::Pass as _;
+        rlx_opt::rlx_fusion::expand_partial_broadcast::ExpandPartialBatchBroadcast
+            .run(rlx_unfuse::unfuse(g, &WgpuPolicy))
+    }
 }
 
 /// Whether [`pack_half_activations`] runs (`RLX_WGPU_HALF_ACTIVATIONS=1`):

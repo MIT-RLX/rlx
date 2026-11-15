@@ -95,6 +95,10 @@ impl RocmExecutable {
         // The attention kernels read K / V as `num_heads` heads: repeat shared
         // ones (grouped-query attention) first, or they return a wrong tensor.
         let graph = rlx_opt::rlx_fusion::expand_shared_kv::ExpandSharedKvHeads.run(graph);
+        // A matmul operand broadcast along only some batch axes: expand it, the
+        // batched GEMM takes the full batch or one repeated matrix only.
+        let graph =
+            rlx_opt::rlx_fusion::expand_partial_broadcast::ExpandPartialBatchBroadcast.run(graph);
 
         let dequant_scratch = crate::gguf_gpu::dequant_gguf_scratch_bytes(&graph);
         let mut plan = plan_f32_uniform(&graph, 16);
@@ -1506,7 +1510,7 @@ impl RocmExecutable {
                     head_dim,
                     v_head_dim,
                     mask_kind,
-                    score_scale: _,
+                    score_scale,
                     attn_logit_softcap,
                 } => {
                     assert!(
@@ -1529,7 +1533,10 @@ impl RocmExecutable {
                     let seq_q = geom.seq_q as u32;
                     let seq_k = geom.seq_k as u32;
                     let hd = *head_dim as u32;
-                    let scale = 1.0_f32 / (hd as f32).sqrt();
+                    // The op's own score scale: Gemma 4 sets 1.0 (Q is RMS-normed
+                    // per head), and the 1/sqrt(head_dim) default would crush its
+                    // scores. rlx-cuda reads it the same way.
+                    let scale = score_scale.unwrap_or(1.0_f32 / (hd as f32).sqrt());
                     // Gemma 2 attention logit soft-cap (0 = disabled). Applied
                     // pre-mask in the kernel; matches rlx-cpu executor.rs and rlx-cuda.
                     let softcap_bits = attn_logit_softcap.unwrap_or(0.0).to_bits();

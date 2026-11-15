@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// Cumulative sum along the last axis. Sequential per-row scan;
+// Cumulative sum along the last axis. Sequential per-row scan in chunks;
 // `exclusive` shifts the result so out[..., 0] = 0.
 
 struct Params {
@@ -23,14 +23,26 @@ fn cumsum(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
     if (row >= params.outer) { return; }
     let in_base  = params.in_off  + row * params.inner;
     let out_base = params.out_off + row * params.inner;
-    var acc: f32 = 0.0;
-    for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-        if (params.exclusive != 0u) {
-            arena[out_base + i] = acc;
-            acc = acc + arena[in_base + i];
-        } else {
-            acc = acc + arena[in_base + i];
-            arena[out_base + i] = acc;
+    // Chunks of 256 scanned from zero, each output = chunk offset + local
+    // sum. One running f32 sum over a long row (a vocoder's phase, 80k
+    // samples) adds tiny steps to a large total and drifts by ~1e-2; this
+    // rounds against the large offset once per chunk instead of per element.
+    var offset: f32 = 0.0;
+    var start: u32 = 0u;
+    loop {
+        if (start >= params.inner) { break; }
+        let end = min(start + 256u, params.inner);
+        var local: f32 = 0.0;
+        for (var i: u32 = start; i < end; i = i + 1u) {
+            if (params.exclusive != 0u) {
+                arena[out_base + i] = offset + local;
+                local = local + arena[in_base + i];
+            } else {
+                local = local + arena[in_base + i];
+                arena[out_base + i] = offset + local;
+            }
         }
+        offset = offset + local;
+        start = end;
     }
 }

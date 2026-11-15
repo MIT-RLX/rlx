@@ -15,7 +15,8 @@
 //! 4. `Causal` / `SlidingWindow(w)` — query `i` sits at absolute position
 //!    `k_seq − q_seq + i` (a decode step's query is the newest row), and keys
 //!    past it (or more than `w` before it) get `-1e9`;
-//! 5. logit soft-cap `c · tanh(s / c)` when set — after masking, as there;
+//! 5. logit soft-cap `c · tanh(s / c)` when set — on the scaled scores, before
+//!    the masks of steps 2–4 (the order the models' own code uses);
 //! 6. softmax over keys, `· v`.
 //!
 //! Layouts: rank-3 `[B, S, H·D]`, rank-2 `[S, H·D]`, and rank-4 either
@@ -49,13 +50,40 @@ impl Pass for LowerAttention {
     }
 
     fn run(&self, graph: Graph) -> Graph {
-        if !graph
-            .nodes()
-            .iter()
-            .any(|n| matches!(n.op, Op::Attention { .. }))
-        {
-            return graph;
-        }
+        lower_matching(graph, |_| true)
+    }
+}
+
+/// [`LowerAttention`] for the `Op::Attention` nodes that carry a logit
+/// soft-cap only, for backends whose fused attention has no soft-cap parameter
+/// (MLX's `scaled_dot_product_attention`). The rest stay fused.
+pub struct LowerSoftcappedAttention;
+
+impl Pass for LowerSoftcappedAttention {
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::Attention]
+    }
+
+    fn name(&self) -> &str {
+        "lower_softcapped_attention"
+    }
+
+    fn run(&self, graph: Graph) -> Graph {
+        lower_matching(graph, |cap| cap.is_some_and(|c| c > 0.0))
+    }
+}
+
+/// Lower each `Op::Attention` whose soft-cap satisfies `pick`; keep the rest.
+fn lower_matching(graph: Graph, pick: impl Fn(Option<f32>) -> bool) -> Graph {
+    if !graph.nodes().iter().any(|n| match &n.op {
+        Op::Attention {
+            attn_logit_softcap, ..
+        } => pick(*attn_logit_softcap),
+        _ => false,
+    }) {
+        return graph;
+    }
+    {
         let mut out = Graph::new(&graph.name);
         let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
         for node in graph.nodes() {
@@ -68,7 +96,7 @@ impl Pass for LowerAttention {
                     mask_kind,
                     score_scale,
                     attn_logit_softcap,
-                } => lower_one(
+                } if pick(*attn_logit_softcap) => lower_one(
                     &mut out,
                     &inputs,
                     &node.shape,
@@ -275,6 +303,15 @@ fn lower_one(g: &mut Graph, inputs: &[NodeId], out_shape: &Shape, spec: Spec) ->
     let mut s = g.mm(q4, kt); // [B, H, Sq, Sk]
     let scale = scalar(g, spec.scale, s);
     s = g.mul(s, scale);
+    // Logit soft-cap on the raw scores, before the mask (the models' own
+    // order): a masked key keeps its -1e9 and gets weight 0.
+    if let Some(c) = spec.softcap {
+        let inv = scalar(g, 1.0 / c, s);
+        let t = g.mul(s, inv);
+        let t = g.tanh(t);
+        let cap = scalar(g, c, t);
+        s = g.mul(t, cap);
+    }
 
     match spec.mask {
         MaskKind::Custom if inputs.len() > 3 => {
@@ -296,13 +333,6 @@ fn lower_one(g: &mut Graph, inputs: &[NodeId], out_shape: &Shape, spec: Spec) ->
     }
     if let Some(drop) = positional_drop(g, q_seq, k_seq, spec.mask) {
         s = replace_masked(g, s, drop);
-    }
-    if let Some(c) = spec.softcap {
-        let inv = scalar(g, 1.0 / c, s);
-        let t = g.mul(s, inv);
-        let t = g.tanh(t);
-        let cap = scalar(g, c, t);
-        s = g.mul(t, cap);
     }
     let p = g.sm(s, -1);
     let o = g.mm(p, v4); // [B, H, Sq, Dv]

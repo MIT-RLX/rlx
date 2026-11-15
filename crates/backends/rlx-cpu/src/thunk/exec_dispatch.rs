@@ -896,6 +896,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 n,
                 a_bcast,
                 b_bcast,
+                mat_index,
             } => {
                 let (b_, m_, k_, n_) = (*batch as usize, *m as usize, *k as usize, *n as usize);
                 if trace_thunks {
@@ -911,12 +912,25 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 // matrix 0 for every output batch; else stride by its matrix size.
                 let a_bstride = if *a_bcast { 0 } else { a_mat };
                 let b_bstride = if *b_bcast { 0 } else { b_mat };
+                // Element offset of output matrix `bi`'s operands: the index
+                // table for a per-axis broadcast, else the stride.
+                let a_at = |bi: usize| match mat_index {
+                    Some(t) => t.0[bi] as usize * a_mat,
+                    None => bi * a_bstride,
+                };
+                let b_at = |bi: usize| match mat_index {
+                    Some(t) => t.1[bi] as usize * b_mat,
+                    None => bi * b_bstride,
+                };
                 let arena_len = arena_buf.len();
                 let a_cap = (arena_len.saturating_sub(*a)) / 4;
                 let b_cap = (arena_len.saturating_sub(*b)) / 4;
                 let c_cap = (arena_len.saturating_sub(*c)) / 4;
-                let a_count = if *a_bcast { 1 } else { b_ };
-                let b_count = if *b_bcast { 1 } else { b_ };
+                let span = |v: &[u32]| v.iter().max().map_or(1, |&x| x as usize + 1);
+                let (a_count, b_count) = match mat_index {
+                    Some(t) => (span(&t.0), span(&t.1)),
+                    None => (if *a_bcast { 1 } else { b_ }, if *b_bcast { 1 } else { b_ }),
+                };
                 let a_elems = (a_count * a_mat).min(a_cap);
                 let b_elems = (b_count * b_mat).min(b_cap);
                 let c_elems = (b_ * c_mat).min(c_cap);
@@ -940,7 +954,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         let b_full = sl(*b, base, b_elems).to_vec();
                         let mut out = vec![0f32; c_elems];
                         for bi in 0..b_ {
-                            let (a0, b0, c0) = (bi * a_bstride, bi * b_bstride, bi * c_mat);
+                            let (a0, b0, c0) = (a_at(bi), b_at(bi), bi * c_mat);
                             if a0 + a_mat > a_full.len()
                                 || b0 + b_mat > b_full.len()
                                 || c0 + c_mat > out.len()
@@ -978,8 +992,8 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         let c_len = c_full.len();
                         crate::pool::par_for(b_, grain, &|off, cnt| {
                             for bi in off..off + cnt {
-                                let a0 = bi * a_bstride;
-                                let b0 = bi * b_bstride;
+                                let a0 = a_at(bi);
+                                let b0 = b_at(bi);
                                 let c0 = bi * c_mat;
                                 if a0 + a_mat > a_len || b0 + b_mat > b_len || c0 + c_mat > c_len {
                                     break;
@@ -1011,8 +1025,8 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         });
                     } else {
                         for bi in 0..b_ {
-                            let a0 = bi * a_bstride;
-                            let b0 = bi * b_bstride;
+                            let a0 = a_at(bi);
+                            let b0 = b_at(bi);
                             let c0 = bi * c_mat;
                             if a0 + a_mat > a_full.len()
                                 || b0 + b_mat > b_full.len()
@@ -2374,6 +2388,8 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     )
                 };
                 let bhsd = *bhsd;
+                // By value, for the parallel closures below.
+                let cap = *softcap;
                 let _ = (q_row_stride, k_row_stride, v_row_stride);
                 let scale = *scale;
                 let ss = q_s * k_s;
@@ -2441,7 +2457,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                         for d in 0..dh {
                                             dot += q_data[q_base + d] * k_data[k_base + d];
                                         }
-                                        scores[qi * k_s + ki] = dot * scale;
+                                        scores[qi * k_s + ki] = softcap_one(dot * scale, cap);
                                         if matches!(mask_kind, rlx_ir::op::MaskKind::Custom)
                                             && !mask_data.is_empty()
                                             && mask_data[bi * k_s + ki] < mask_thr
@@ -2457,12 +2473,6 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     }
                                 }
                                 apply_synthetic_mask(scores, q_s, k_s, *mask_kind);
-                                // Gemma 2 attention logit soft-cap (post-mask, pre-softmax).
-                                if *softcap > 0.0 {
-                                    for s in scores.iter_mut() {
-                                        *s = *softcap * (*s / *softcap).tanh();
-                                    }
-                                }
                                 crate::kernels::neon_softmax(scores, q_s, k_s);
                                 // score @ V — V and output are dh_v-wide per head.
                                 let o_head_base = bi * nh * q_s * dh_v + hi * q_s * dh_v;
@@ -2720,7 +2730,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                                 }
                                             }
                                         );
-                                        scores[qi * k_s + ki] = dot * scale;
+                                        scores[qi * k_s + ki] = softcap_one(dot * scale, cap);
                                         // Inner-loop Custom mask check —
                                         // Causal / SlidingWindow / None
                                         // apply outside the loop below.
@@ -2881,6 +2891,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                         scale,
                                         0.0,
                                     );
+                                    apply_softcap(sc, cap);
                                     match mask_kind {
                                         rlx_ir::op::MaskKind::Custom => {
                                             let mask_bi = std::slice::from_raw_parts(
@@ -2970,6 +2981,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     false,
                                     true,
                                 );
+                                apply_softcap(sc, cap);
 
                                 match mask_kind {
                                     rlx_ir::op::MaskKind::Custom => {
@@ -2997,7 +3009,6 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     }
                                     _ => apply_synthetic_mask(sc, q_s, k_s, *mask_kind),
                                 }
-
                                 crate::kernels::neon_softmax(sc, q_s, k_s);
 
                                 // score@V: N = dh_v (output/V width), LDB = vrs

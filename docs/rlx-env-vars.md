@@ -658,7 +658,7 @@ semantics. Curated Public list: `just env-catalog`.
 |------|-----------|------|-------|---------|
 | `RLX_MLX_CACHE_LIMIT` | Bisect | U64 | Backend(mlx) | Cap MLX's allocator cache of freed buffers (bytes; default = memory limit) |
 | `RLX_MLX_CCACHE` | Bisect | String | Backend(mlx) | Compiler cache for the MLX build: sccache, ccache, a path, or off; default: sccache, else ccache |
-| `RLX_MLX_COMPILE_MAX_NODES` | Bisect | U64 | Backend(mlx) | Max graph nodes MLX will compile as one Compiled unit (default 1536) |
+| `RLX_MLX_COMPILE_MAX_NODES` | Bisect | U64 | Backend(mlx) | Max graph nodes MLX will compile as one Compiled unit (default 5000; 0 = no limit) |
 | `RLX_MLX_CUDA` | Internal | Bool | Tooling | Build vendored MLX with CUDA (build time; default follows the `cuda` feature) |
 | `RLX_MLX_CUDA_ARCH` | Bisect | String | Backend(mlx) | CUDA arch to build MLX for |
 | `RLX_MLX_CUDA_ROOT` | Bisect | Path | Backend(mlx) | CUDA toolkit dir (with bin/nvcc) to build MLX against; default: auto-select |

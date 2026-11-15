@@ -769,28 +769,32 @@ pub(crate) unsafe fn cumsum_typed(
     exclusive: bool,
     dtype: rlx_ir::DType,
 ) {
+    // `$acc` is the accumulator type: f32 rows accumulate in f64. A long f32
+    // scan (a vocoder's phase over 80k samples) adds small steps to a large
+    // sum and loses ~1e-3 relative per thousand steps; f64 keeps every output
+    // within one f32 rounding of the exact prefix.
     macro_rules! scan {
-        ($sl:expr, $slm:expr, $zero:expr) => {{
+        ($sl:expr, $slm:expr, $zero:expr, $acc:ty, $out:ty) => {{
             let s = $sl(src, base, rows * cols);
             let d = $slm(dst, base, rows * cols);
             for r in 0..rows {
-                let mut acc = $zero;
+                let mut acc: $acc = $zero;
                 for c in 0..cols {
                     if exclusive {
-                        d[r * cols + c] = acc;
-                        acc += s[r * cols + c];
+                        d[r * cols + c] = acc as $out;
+                        acc += s[r * cols + c] as $acc;
                     } else {
-                        acc += s[r * cols + c];
-                        d[r * cols + c] = acc;
+                        acc += s[r * cols + c] as $acc;
+                        d[r * cols + c] = acc as $out;
                     }
                 }
             }
         }};
     }
     match dtype {
-        rlx_ir::DType::I64 => scan!(sl_i64, sl_mut_i64, 0i64),
-        rlx_ir::DType::I32 => scan!(sl_i32, sl_mut_i32, 0i32),
-        _ => scan!(sl, sl_mut, 0.0f32),
+        rlx_ir::DType::I64 => scan!(sl_i64, sl_mut_i64, 0i64, i64, i64),
+        rlx_ir::DType::I32 => scan!(sl_i32, sl_mut_i32, 0i32, i32, i32),
+        _ => scan!(sl, sl_mut, 0.0f64, f64, f32),
     }
 }
 

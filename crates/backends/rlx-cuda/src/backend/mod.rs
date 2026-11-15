@@ -102,6 +102,10 @@ pub enum ExecMode {
 
 pub struct CudaExecutable {
     ctx: Arc<CudaContext>,
+    /// Matmuls in strict FP32 (no TF32) for this graph, as the process-wide
+    /// `RLX_CUDA_NO_TF32` does for every graph. See
+    /// [`Self::set_exact_f32_matmul`].
+    exact_f32_matmul: bool,
     /// cuBLAS handle bound to the same default stream as `ctx`. Used for
     /// plain matmul (no fused bias/activation); falls back to the custom
     /// kernel when cuBLAS isn't available (e.g., on Mac via the panic-
@@ -684,6 +688,13 @@ impl CudaExecutable {
     }
 
     /// Clone into an independent executable (recompiles from the stored graph).
+    /// Run this graph's matmuls in strict FP32 instead of TF32 (10-bit
+    /// mantissa inputs, ~1e-3 relative error per product). Call before the
+    /// first run: a captured CUDA graph keeps the kernels it was captured with.
+    pub fn set_exact_f32_matmul(&mut self, on: bool) {
+        self.exact_f32_matmul = on;
+    }
+
     pub fn clone_for_cache(&self) -> Self {
         let mut exe = Self::compile_with_rng(
             self.graph.clone(),
@@ -691,6 +702,7 @@ impl CudaExecutable {
             exec_mode_from_env(),
             self.rng(),
         );
+        exe.exact_f32_matmul = self.exact_f32_matmul;
         for (k, v) in &self.gpu_handles {
             exe.bind_gpu_handle(k, v);
         }

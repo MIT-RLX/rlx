@@ -16,14 +16,22 @@ void main() {
     uint row = gl_GlobalInvocationID.x;
     if (row >= pc.rows) { return; }
     uint base = row * pc.cols;
-    float acc = 0.0;
-    for (uint j = 0u; j < pc.cols; j++) {
-        if (pc.exclusive != 0u) {
-            arena_store(pc.out_off + base + j, acc);
-            acc += arena_load(pc.in_off + base + j);
-        } else {
-            acc += arena_load(pc.in_off + base + j);
-            arena_store(pc.out_off + base + j, acc);
+    // Chunks of 256 scanned from zero, each output = chunk offset + local
+    // sum: one running f32 sum over a long row (a vocoder's phase, 80k
+    // samples) adds tiny steps to a large total and drifts by ~1e-2.
+    float offset = 0.0;
+    for (uint start = 0u; start < pc.cols; start += 256u) {
+        uint end = min(start + 256u, pc.cols);
+        float local = 0.0;
+        for (uint j = start; j < end; j++) {
+            if (pc.exclusive != 0u) {
+                arena_store(pc.out_off + base + j, offset + local);
+                local += arena_load(pc.in_off + base + j);
+            } else {
+                local += arena_load(pc.in_off + base + j);
+                arena_store(pc.out_off + base + j, offset + local);
+            }
         }
+        offset += local;
     }
 }

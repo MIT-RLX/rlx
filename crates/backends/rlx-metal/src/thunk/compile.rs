@@ -1030,8 +1030,8 @@ impl ThunkSchedule {
                     // Neither case above takes it, and the 2-D flatten below
                     // reads B as one `[K,N]` matrix, so all but the first of
                     // its matrices were silently dropped. Each operand's batch
-                    // must be the output's or a single matrix, which is all
-                    // `BatchedSgemm`'s per-operand stride can express.
+                    // that is neither the output's nor one matrix gets an
+                    // explicit per-matrix index (`mat_index`).
                     let rank_bcast = !batched
                         && !lhs_bcast
                         && a_shape.rank() >= 3
@@ -1048,7 +1048,6 @@ impl ThunkSchedule {
                                     s.dim(d - off).unwrap_static()
                                 }
                             };
-                            let (mut out_b, mut a_b, mut b_b) = (1usize, 1usize, 1usize);
                             let mut ok = true;
                             for d in 0..r - 2 {
                                 let (ad, bd, od) = (
@@ -1059,11 +1058,8 @@ impl ThunkSchedule {
                                 ok &= (ad == od || ad == 1)
                                     && (bd == od || bd == 1)
                                     && od == ad.max(bd);
-                                out_b *= od;
-                                a_b *= ad;
-                                b_b *= bd;
                             }
-                            ok && (a_b == out_b || a_b == 1) && (b_b == out_b || b_b == 1)
+                            ok
                         };
                     if batched || lhs_bcast || rank_bcast {
                         let r = shape.rank();
@@ -1079,6 +1075,42 @@ impl ThunkSchedule {
                                 .product()
                         };
                         let (a_batch, b_batch) = (lead(a_shape), lead(b_shape));
+                        // An operand whose matrix count is neither the
+                        // output's nor 1 broadcasts along some batch axes
+                        // only: no stride reaches its matrices, so list them.
+                        // Batch dims right-align with the output's; a size-1
+                        // dim repeats its matrix.
+                        let linear = |nb: usize| nb == batch_prod || nb == 1;
+                        let mat_index = (!linear(a_batch) || !linear(b_batch)).then(|| {
+                            let out_dims: Vec<usize> =
+                                (0..r - 2).map(|d| shape.dim(d).unwrap_static()).collect();
+                            let index_of = |s: &rlx_ir::Shape| -> Vec<u32> {
+                                let lead_r = s.rank() - 2;
+                                let off = (r - 2) - lead_r;
+                                // Matrix strides of the operand's own batch dims.
+                                let mut st = vec![0usize; lead_r];
+                                let mut acc = 1usize;
+                                for d in (0..lead_r).rev() {
+                                    let n = s.dim(d).unwrap_static();
+                                    st[d] = if n == 1 { 0 } else { acc };
+                                    acc *= n;
+                                }
+                                (0..batch_prod)
+                                    .map(|bi| {
+                                        let (mut rem, mut idx) = (bi, 0usize);
+                                        for d in (0..r - 2).rev() {
+                                            let c = rem % out_dims[d];
+                                            rem /= out_dims[d];
+                                            if d >= off {
+                                                idx += c * st[d - off];
+                                            }
+                                        }
+                                        idx as u32
+                                    })
+                                    .collect()
+                            };
+                            std::sync::Arc::new((index_of(a_shape), index_of(b_shape)))
+                        });
                         let m_dim = shape.dim(r - 2).unwrap_static();
                         // K is A's own last dim — A may be rank-2 while the
                         // output is rank-3 (the broadcast-left case).
@@ -1095,6 +1127,7 @@ impl ThunkSchedule {
                             dt: shape.dtype().into(),
                             a_bcast: a_batch == 1 && batch_prod > 1,
                             b_bcast: b_batch == 1 && batch_prod > 1,
+                            mat_index,
                         }
                     } else {
                         let n = shape.dim(shape.rank() - 1).unwrap_static();

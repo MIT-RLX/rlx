@@ -664,6 +664,13 @@ impl B {
             _ => (dh as f64).powf(-0.5),
         };
         let mut s = self.mul_s(scores, scale)?;
+        // Logit soft-cap before the mask, as the CPU kernel applies it.
+        if let Some(c) = softcap.filter(|&c| c > 0.0) {
+            let c = attr(c);
+            let z = self.mul_s(s, 1.0 / c)?;
+            let t = self.tanh(z)?;
+            s = self.mul_s(t, c)?;
+        }
         let cfg_neg = -1e30;
         let q_off = ks.saturating_sub(qs);
         match mask {
@@ -721,12 +728,6 @@ impl B {
                 let bias = self.reshape(bias, &[b, 1, 1, ks]);
                 s = self.add(s, bias)?;
             }
-        }
-        if let Some(c) = softcap.filter(|&c| c > 0.0) {
-            let c = attr(c);
-            let z = self.mul_s(s, 1.0 / c)?;
-            let t = self.tanh(z)?;
-            s = self.mul_s(t, c)?;
         }
         let p = self.softmax(s, 3)?;
         let o = self.matmul(p, vh)?;

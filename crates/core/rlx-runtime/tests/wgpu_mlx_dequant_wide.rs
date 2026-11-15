@@ -15,7 +15,7 @@ mod common;
 
 use common::skip_unless_available;
 use rlx_ir::quant::QuantScheme;
-use rlx_ir::{DType, Graph, GraphExt, Shape};
+use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
 fn run(

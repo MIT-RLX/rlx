@@ -862,10 +862,7 @@ impl MetalExecutable {
             {
                 let short = |op: &Op| {
                     let op = format!("{op}");
-                    op.split(|c: char| c == '(' || c == ' ' || c == '{')
-                        .next()
-                        .unwrap_or("")
-                        .to_string()
+                    op.split(['(', ' ', '{']).next().unwrap_or("").to_string()
                 };
                 let mut readers: std::collections::HashMap<NodeId, Vec<String>> =
                     std::collections::HashMap::new();

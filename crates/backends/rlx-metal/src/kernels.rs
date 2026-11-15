@@ -1547,29 +1547,19 @@ kernel void sgemm_simd_4x4(
 // grid z. `strides` = per-matrix element strides of (A, B, C); 0 broadcasts
 // matrix 0. Same tile math as `sgemm_simd_4x4` — replaces `batch` separate MPS
 // encodes, which dominated many-head attention (B*H tiny matmuls per call).
-kernel void bmm_simd_4x4(
-    device const float* A0 [[buffer(0)]],
-    device const float* B0 [[buffer(1)]],
-    device float* C0       [[buffer(2)]],
-    constant uint& M      [[buffer(3)]],
-    constant uint& K      [[buffer(4)]],
-    constant uint& N      [[buffer(5)]],
-    constant uint3& strides [[buffer(6)]],
-    uint3 tgid [[threadgroup_position_in_grid]],
-    uint sgid  [[simdgroup_index_in_threadgroup]],
-    uint slid  [[thread_index_in_simdgroup]]
+inline void bmm_simd_4x4_tile(
+    device const float* A,
+    device const float* B,
+    device float* C,
+    uint M, uint K, uint N,
+    uint3 tgid, uint sgid, uint slid,
+    threadgroup float* A_tg,
+    threadgroup float* B_tg
 ) {
-    device const float* A = A0 + (ulong)tgid.z * strides.x;
-    device const float* B = B0 + (ulong)tgid.z * strides.y;
-    device float* C = C0 + (ulong)tgid.z * strides.z;
-
     uint sg_row = sgid / 4;
     uint sg_col = sgid % 4;
     uint tg_row_base = tgid.y * 32;
     uint tg_col_base = tgid.x * 32;
-
-    threadgroup float A_tg[32 * 32];
-    threadgroup float B_tg[32 * 32];
 
     simdgroup_float8x8 a, b, c;
     c = simdgroup_float8x8(0.0f);
@@ -1615,6 +1605,50 @@ kernel void bmm_simd_4x4(
             }
         }
     }
+}
+
+kernel void bmm_simd_4x4(
+    device const float* A0 [[buffer(0)]],
+    device const float* B0 [[buffer(1)]],
+    device float* C0       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& K      [[buffer(4)]],
+    constant uint& N      [[buffer(5)]],
+    constant uint3& strides [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint slid  [[thread_index_in_simdgroup]]
+) {
+    threadgroup float A_tg[32 * 32];
+    threadgroup float B_tg[32 * 32];
+    bmm_simd_4x4_tile(A0 + (ulong)tgid.z * strides.x, B0 + (ulong)tgid.z * strides.y,
+                      C0 + (ulong)tgid.z * strides.z, M, K, N, tgid, sgid, slid, A_tg, B_tg);
+}
+
+// `bmm_simd_4x4` for broadcasts no single stride expresses (`[2,1,M,K]·[2,3,K,N]`):
+// output matrix `z0 + z` reads A matrix `a_index[z]` and B matrix `b_index[z]`.
+// `strides` are whole-matrix sizes. The buffers stay bound at their base, so an
+// unaligned matrix offset never reaches a `set_buffer` offset.
+kernel void bmm_simd_4x4_indexed(
+    device const float* A0 [[buffer(0)]],
+    device const float* B0 [[buffer(1)]],
+    device float* C0       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& K      [[buffer(4)]],
+    constant uint& N      [[buffer(5)]],
+    constant uint3& strides [[buffer(6)]],
+    constant uint* a_index [[buffer(7)]],
+    constant uint* b_index [[buffer(8)]],
+    constant uint& z0     [[buffer(9)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint slid  [[thread_index_in_simdgroup]]
+) {
+    threadgroup float A_tg[32 * 32];
+    threadgroup float B_tg[32 * 32];
+    bmm_simd_4x4_tile(A0 + (ulong)a_index[tgid.z] * strides.x,
+                      B0 + (ulong)b_index[tgid.z] * strides.y,
+                      C0 + (ulong)(z0 + tgid.z) * strides.z, M, K, N, tgid, sgid, slid, A_tg, B_tg);
 }
 
 // Register-blocked simdgroup GEMM family (plain + split-K) — generated per tile
@@ -11211,21 +11245,54 @@ kernel void rope_bwd(
     }
 }
 
+// Threads per row in `cumsum_fwd` (and its dispatch in `encode_cumsum`).
+constant uint CUMSUM_THREADS = 256u;
+
 kernel void cumsum_fwd(
     device const float* src [[buffer(0)]],
     device float* dst [[buffer(1)]],
     constant uint& inner [[buffer(2)]],
     constant uint& exclusive [[buffer(3)]],
-    uint row [[threadgroup_position_in_grid]]
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]]
 ) {
-    float acc = 0.0f;
-    for (uint i = 0; i < inner; ++i) {
+    // Blocked scan, one threadgroup per row: each thread sums a contiguous
+    // chunk, thread 0 turns the chunk sums into offsets, then each thread
+    // scans its chunk from zero and adds its offset once per element. A
+    // single running f32 sum over a long row (a vocoder's phase, 80k samples)
+    // adds tiny steps to a large total and drifts by ~1e-2; here every output
+    // is one offset rounding plus a short local scan.
+    threadgroup float part[CUMSUM_THREADS];
+    uint chunk = (inner + nt - 1u) / nt;
+    uint lo = min(tid * chunk, inner);
+    uint hi = min(lo + chunk, inner);
+    device const float* s = src + row * inner;
+    device float* d = dst + row * inner;
+    float sum = 0.0f;
+    for (uint i = lo; i < hi; ++i) {
+        sum += s[i];
+    }
+    part[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float run = 0.0f;
+        for (uint t = 0u; t < nt; ++t) {
+            float v = part[t];
+            part[t] = run;
+            run += v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float offset = part[tid];
+    float local = 0.0f;
+    for (uint i = lo; i < hi; ++i) {
         if (exclusive != 0u) {
-            dst[row * inner + i] = acc;
-            acc += src[row * inner + i];
+            d[i] = offset + local;
+            local += s[i];
         } else {
-            acc += src[row * inner + i];
-            dst[row * inner + i] = acc;
+            local += s[i];
+            d[i] = offset + local;
         }
     }
 }
@@ -14616,6 +14683,7 @@ pub struct Kernels {
     pub sgemm_simd_bias: ComputePipelineState,
     pub sgemm_simd_4x4: ComputePipelineState,
     pub bmm_simd_4x4: ComputePipelineState,
+    pub bmm_simd_4x4_indexed: ComputePipelineState,
     pub sgemm_simd64: ComputePipelineState,
     pub sgemm_simd64_splitk: ComputePipelineState,
     pub zero_f32: ComputePipelineState,
@@ -15428,6 +15496,7 @@ impl Kernels {
             sgemm_simd_bias: pipeline("sgemm_simd_bias"),
             sgemm_simd_4x4: pipeline("sgemm_simd_4x4"),
             bmm_simd_4x4: pipeline("bmm_simd_4x4"),
+            bmm_simd_4x4_indexed: pipeline("bmm_simd_4x4_indexed"),
             sgemm_simd64: pipeline("sgemm_simd64"),
             sgemm_simd64_splitk: pipeline("sgemm_simd64_splitk"),
             zero_f32: pipeline("zero_f32"),

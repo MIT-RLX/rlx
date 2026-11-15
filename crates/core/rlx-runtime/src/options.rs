@@ -80,6 +80,15 @@ pub struct CompileOptions {
     /// This keeps the regular Metal thunk schedule while retaining all other
     /// compile options. Off by default.
     pub disable_mpsgraph: bool,
+    /// MLX: largest graph (in nodes) run under `mlx::compile`; bigger ones run
+    /// Lazy. `None` keeps the process default (`RLX_MLX_COMPILE_MAX_NODES`,
+    /// else `rlx_mlx::config::DEFAULT_COMPILE_MAX_NODES`); `Some(0)` lifts the
+    /// limit for this graph. For callers that know their graph compiles fast.
+    pub mlx_compile_max_nodes: Option<usize>,
+    /// f32 matmuls in strict FP32 for this graph where the backend would use
+    /// a reduced-precision mode: CUDA TF32 (10-bit mantissa inputs), which
+    /// `RLX_CUDA_NO_TF32` turns off for every graph. Off by default.
+    pub exact_f32_matmul: bool,
     /// On backends that list `OpKind::Scan` (host-fallback), Scans with
     /// `length <= scan_unroll_max_length` are IR-unrolled into body replicas so
     /// they run as ordinary device ops. Longer Scans keep `ScanHost`.
@@ -167,6 +176,8 @@ impl CompileOptions {
             quant_param_bindings: None,
             kernel_dispatch: KernelDispatchConfig::default(),
             disable_mpsgraph: false,
+            mlx_compile_max_nodes: None,
+            exact_f32_matmul: false,
             scan_unroll_max_length: 64,
             cache_param_invariant: false,
             lint_numerics: false,
@@ -386,6 +397,18 @@ impl CompileOptions {
 
     pub fn with_disable_mpsgraph(mut self, on: bool) -> Self {
         self.disable_mpsgraph = on;
+        self
+    }
+
+    /// See [`Self::mlx_compile_max_nodes`].
+    pub fn with_mlx_compile_max_nodes(mut self, limit: Option<usize>) -> Self {
+        self.mlx_compile_max_nodes = limit;
+        self
+    }
+
+    /// See [`Self::exact_f32_matmul`].
+    pub fn with_exact_f32_matmul(mut self, on: bool) -> Self {
+        self.exact_f32_matmul = on;
         self
     }
 

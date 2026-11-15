@@ -1190,8 +1190,16 @@ pub fn try_lower_with_constants(
                 v_head_dim,
                 mask_kind,
                 score_scale,
-                attn_logit_softcap: _,
+                attn_logit_softcap,
             } => {
+                // MPSGraph's SDPA has no logit soft-cap; the thunk kernels apply
+                // it (before the mask). Lowering here would drop it.
+                if attn_logit_softcap.is_some_and(|c| c > 0.0) {
+                    if trace {
+                        eprintln!("[mpsgraph] bail attention with soft-cap: node {}", node.id);
+                    }
+                    return None;
+                }
                 // Asymmetric MLA (v_head_dim != head_dim): the MPSGraph SDPA
                 // reshapes assume a square per-head width. Bail to the thunk
                 // path, which handles v_head_dim natively.
