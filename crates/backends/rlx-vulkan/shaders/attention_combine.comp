@@ -1,0 +1,56 @@
+#version 450
+// Combine pass of split-K decode attention (see `attention_split.comp`): one
+// workgroup per row merges its `splits` slices — global max M, then
+// out[d] = Σ e^{m_i − M}·acc_i[d] / Σ e^{m_i − M}·l_i — and writes the row
+// where `attention_coop.comp` would. Same push block as the split pass.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint b;
+    uint nh;
+    uint q_s;
+    uint k_s;
+    uint dh;
+    uint q_off;
+    uint k_off;
+    uint v_off;
+    uint o_off;
+    uint qrs;
+    uint krs;
+    uint vrs;
+    uint bhsd;
+    uint mask_kind;
+    uint mask_off;
+    uint window;
+    float scale;
+    float neg;
+    float thr;
+    uint scratch_off;
+    uint kps;
+    uint splits;
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    if (row >= pc.b * pc.nh * pc.q_s || t >= pc.dh) { return; }
+    uint qi = row % pc.q_s;
+    uint hi = (row / pc.q_s) % pc.nh;
+    uint bi = row / (pc.q_s * pc.nh);
+    uint o_base = (pc.bhsd != 0u)
+        ? pc.o_off + bi * pc.nh * pc.q_s * pc.dh + hi * pc.q_s * pc.dh + qi * pc.dh
+        : pc.o_off + bi * pc.q_s * (pc.nh * pc.dh) + qi * (pc.nh * pc.dh) + hi * pc.dh;
+    uint stride = pc.dh + 2u;
+    uint base = pc.scratch_off + row * pc.splits * stride;
+    float mx = -3.402823466e38;
+    for (uint i = 0u; i < pc.splits; i++) { mx = max(mx, arena_load(base + i * stride)); }
+    float l = 0.0;
+    float o = 0.0;
+    for (uint i = 0u; i < pc.splits; i++) {
+        uint b = base + i * stride;
+        float w = exp(arena_load(b) - mx);
+        l += w * arena_load(b + 1u);
+        o += w * arena_load(b + 2u + t);
+    }
+    arena_store(o_base + t, (l > 0.0) ? o / l : 0.0);
+}

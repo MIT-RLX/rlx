@@ -1,0 +1,79 @@
+#version 450
+// Tiled direct 2-D convolution on NCHW for groups = 1, kernels up to 7×7,
+// stride and dilation up to 2. `conv2d.comp` gives each output element one
+// thread that reads every input and weight value it uses from global memory —
+// two loads per multiply-add. Here a 16×16 workgroup owns a 16×16 output
+// tile for COB = 8 output channels: for each input channel the threads stage
+// the input patch the tile needs (zero-padded) in shared memory once, then
+// every thread reads it from there for all kh·kw taps and all 8 channels;
+// the weights a step needs are the same for the whole workgroup. Same push
+// block, bounds and bias semantics as `conv2d.comp`. fp32 throughout.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const uint T = 16u;
+const uint COB = 8u;
+const uint MAX_IT = 43u;   // (T − 1)·2 + (7 − 1)·2 + 1
+
+layout(push_constant) uniform PC {
+    uint nn; uint cin; uint hh; uint ww;
+    uint cout; uint kh; uint kw;
+    uint oh; uint ow;
+    uint sh; uint sw; uint ph; uint pw; uint dh; uint dw;
+    uint groups; uint has_bias;
+    uint x_off; uint w_off; uint b_off; uint out_off;
+} pc;
+
+shared float xs[MAX_IT * MAX_IT];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint t = ty * T + tx;
+    uint ox = gl_WorkGroupID.x * T + tx;
+    uint oy = gl_WorkGroupID.y * T + ty;
+    uint cblocks = (pc.cout + COB - 1u) / COB;
+    uint n = gl_WorkGroupID.z / cblocks;
+    uint co0 = (gl_WorkGroupID.z % cblocks) * COB;
+
+    // Input patch of the tile: rows iy0 .. iy0 + ith, columns ix0 .. ix0 + itw.
+    uint ith = (T - 1u) * pc.sh + (pc.kh - 1u) * pc.dh + 1u;
+    uint itw = (T - 1u) * pc.sw + (pc.kw - 1u) * pc.dw + 1u;
+    int iy0 = int(gl_WorkGroupID.y * T * pc.sh) - int(pc.ph);
+    int ix0 = int(gl_WorkGroupID.x * T * pc.sw) - int(pc.pw);
+
+    float acc[COB];
+    for (uint c = 0u; c < COB; c++) { acc[c] = 0.0; }
+
+    for (uint ci = 0u; ci < pc.cin; ci++) {
+        uint xbase = pc.x_off + (n * pc.cin + ci) * pc.hh * pc.ww;
+        for (uint i = t; i < ith * itw; i += T * T) {
+            int y = iy0 + int(i / itw);
+            int x = ix0 + int(i % itw);
+            bool inside = y >= 0 && y < int(pc.hh) && x >= 0 && x < int(pc.ww);
+            xs[i] = inside ? arena_load(xbase + uint(y) * pc.ww + uint(x)) : 0.0;
+        }
+        barrier();
+        for (uint i = 0u; i < pc.kh; i++) {
+            for (uint j = 0u; j < pc.kw; j++) {
+                float xv = xs[(ty * pc.sh + i * pc.dh) * itw + tx * pc.sw + j * pc.dw];
+                uint wbase = pc.w_off + (ci * pc.kh + i) * pc.kw + j;
+                uint wstride = pc.cin * pc.kh * pc.kw;
+                for (uint c = 0u; c < COB; c++) {
+                    uint co = co0 + c;
+                    if (co < pc.cout) { acc[c] += xv * arena_load(wbase + co * wstride); }
+                }
+            }
+        }
+        barrier();
+    }
+
+    if (ox < pc.ow && oy < pc.oh) {
+        for (uint c = 0u; c < COB; c++) {
+            uint co = co0 + c;
+            if (co >= pc.cout) { break; }
+            float v = acc[c];
+            if (pc.has_bias != 0u) { v += arena_load(pc.b_off + co); }
+            arena_store(pc.out_off + ((n * pc.cout + co) * pc.oh + oy) * pc.ow + ox, v);
+        }
+    }
+}

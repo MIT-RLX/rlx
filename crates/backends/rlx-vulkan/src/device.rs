@@ -36,6 +36,10 @@ pub struct VulkanDevice {
     /// needs were enabled. Gates the `matmul_coop` fast path. Always false on
     /// portability drivers (MoltenVK doesn't expose `VK_KHR_cooperative_matrix`).
     pub coop_matmul: bool,
+    /// A discrete GPU: its own VRAM, reached from the host over PCIe. The
+    /// arena then prefers device-local host-visible memory (resizable BAR)
+    /// over system RAM — see `Arena::alloc_buffer`.
+    pub discrete: bool,
     cmd_pool: vk::CommandPool,
     /// Vulkan queues require external synchronization; serialize submits.
     submit_lock: Mutex<()>,
@@ -318,6 +322,7 @@ impl VulkanDevice {
             name,
             portability: is_portability,
             coop_matmul,
+            discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
             cmd_pool,
             submit_lock: Mutex::new(()),
         })
@@ -359,6 +364,25 @@ impl VulkanDevice {
                         .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)) as u8;
                 (fits, host, heap.size)
             })
+    }
+
+    /// The memory type with all of `flags` whose heap holds `size` bytes —
+    /// the largest such heap — or `None`.
+    pub fn find_memory_type_for_size_where(
+        &self,
+        type_bits: u32,
+        flags: vk::MemoryPropertyFlags,
+        size: u64,
+    ) -> Option<u32> {
+        let mp = &self.mem_props;
+        (0..mp.memory_type_count)
+            .filter(|&i| {
+                let ty = mp.memory_types[i as usize];
+                (type_bits & (1 << i)) != 0
+                    && ty.property_flags.contains(flags)
+                    && mp.memory_heaps[ty.heap_index as usize].size >= size
+            })
+            .max_by_key(|&i| mp.memory_heaps[mp.memory_types[i as usize].heap_index as usize].size)
     }
 
     /// Record `record` into a one-shot primary command buffer, submit it to
@@ -450,6 +474,21 @@ impl VulkanDevice {
     /// recorded WITHOUT `ONE_TIME_SUBMIT` so it can be resubmitted; since we
     /// wait here it is never pending at the next submit. Serialized via
     /// `submit_lock` (queue submission needs external synchronization).
+    /// [`Self::submit_recorded_wait`] for several pre-recorded command buffers
+    /// in one submit, executed in order.
+    pub fn submit_recorded_wait_many(&self, cmds: &[vk::CommandBuffer], fence: vk::Fence) {
+        let _guard = self.submit_lock.lock().unwrap();
+        let dev = &self.device;
+        unsafe {
+            let submit = vk::SubmitInfo::default().command_buffers(cmds);
+            dev.queue_submit(self.queue, &[submit], fence)
+                .expect("vk submit");
+            dev.wait_for_fences(&[fence], true, u64::MAX)
+                .expect("vk wait");
+            dev.reset_fences(&[fence]).expect("vk reset fence");
+        }
+    }
+
     pub fn submit_recorded_wait(&self, cmd: vk::CommandBuffer, fence: vk::Fence) {
         let _guard = self.submit_lock.lock().unwrap();
         let dev = &self.device;

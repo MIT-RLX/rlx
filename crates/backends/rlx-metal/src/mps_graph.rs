@@ -23,7 +23,7 @@
 //! callers opt in via `RLX_USE_MPS_GRAPH=1` for now.
 
 use crate::mtl::Buffer;
-use objc::runtime::{BOOL, Class, NO, Object};
+use objc::runtime::{BOOL, Class, NO, Object, YES};
 use objc::{class, msg_send, sel, sel_impl};
 use std::sync::OnceLock;
 
@@ -501,6 +501,11 @@ impl MpsGraph {
         }
     }
     /// Nearest-neighbor resize on NCHW spatial dims to `[out_h, out_w]`.
+    ///
+    /// For an integer upscale this is `out[o] = in[floor(o / s)]`, as the CPU kernel, the
+    /// native Metal kernel and ONNX (`asymmetric`, `floor`) do. MPSGraph's uncentred mapping
+    /// (`o / s`, ties rounded up) would read `in[1]` for `out[1]` at 2×; centred, it samples
+    /// `(o + 0.5) / s - 0.5`, which is never a tie and rounds to `floor(o / s)`.
     pub fn resize_nearest_nchw(&self, x: &MpsTensor, out_h: usize, out_w: usize) -> MpsTensor {
         unsafe {
             let size = [out_h, out_w];
@@ -511,7 +516,7 @@ impl MpsGraph {
                 resizeTensor: x.obj
                 size: nssize
                 mode: mode
-                centerResult: NO
+                centerResult: YES
                 alignCorners: NO
                 layout: layout
                 name: ns_string("resize_nn")];

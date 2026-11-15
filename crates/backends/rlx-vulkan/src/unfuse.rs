@@ -165,3 +165,48 @@ fn inline_compose(
     }
     map[&expanded.outputs[0]]
 }
+
+/// Fold an activation into the `FusedMatMulBiasAct` it reads when that is its
+/// only reader: `FusedMatMulBiasAct{None} → Activation(a)` becomes
+/// `FusedMatMulBiasAct{Some(a)}`, and the activation node a same-shape
+/// `Reshape` (a pure view, no dispatch). Both lowerings of the fused linear
+/// apply any activation, so this saves a dispatch per linear+activation —
+/// TrOCR's decoder ran its fc1 GELU as a separate kernel in every layer.
+pub fn fold_activation_into_linear(mut g: Graph) -> Graph {
+    let outputs: std::collections::HashSet<NodeId> = g.outputs.iter().copied().collect();
+    let ids: Vec<NodeId> = g.nodes().iter().map(|n| n.id).collect();
+    for id in ids {
+        let node = g.node(id);
+        let Op::Activation(act) = node.op else {
+            continue;
+        };
+        let Some(&src) = node.inputs.first() else {
+            continue;
+        };
+        let shape = node.shape.clone();
+        let fused = g.node(src);
+        if !matches!(fused.op, Op::FusedMatMulBiasAct { activation: None })
+            || fused.shape != shape
+            || outputs.contains(&src)
+            || g.use_count(src) != 1
+        {
+            continue;
+        }
+        let Some(dims) = shape
+            .dims()
+            .iter()
+            .map(|d| match d {
+                rlx_ir::Dim::Static(v) => Some(*v as i64),
+                _ => None,
+            })
+            .collect::<Option<Vec<i64>>>()
+        else {
+            continue;
+        };
+        g.node_mut(src).op = Op::FusedMatMulBiasAct {
+            activation: Some(act),
+        };
+        g.node_mut(id).op = Op::Reshape { new_shape: dims };
+    }
+    g
+}

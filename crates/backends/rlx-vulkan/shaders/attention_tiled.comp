@@ -1,0 +1,170 @@
+#version 450
+// Attention for many query rows (a prefill / an encoder), tiled: workgroup
+// (query tile, batch·head) owns QT = 16 queries of one head and walks the
+// keys in tiles of KT = 32, staging each K tile and then V tile in shared
+// memory once for all 16 queries. `attention_coop.comp` gives every row its
+// own workgroup, so each row reread its head's whole K and V — a 577-token
+// ViT encoder moved ~1 GB per attention. Thread (q = t / 16, lane = t % 16)
+// scores keys lane, lane + 16 of its query and accumulates output dims
+// lane + 16·i. Same push block, masks (neg-filled, so a fully masked row
+// averages its values) and online softmax as `attention_coop.comp`.
+// dh ≤ 128.
+layout(local_size_x = 256) in;
+
+const uint QT = 16u;
+const uint KT = 32u;
+const uint MAX_DH = 128u;
+const uint DPT = MAX_DH / 16u;   // output dims per thread
+
+layout(push_constant) uniform PC {
+    uint b;
+    uint nh;
+    uint q_s;
+    uint k_s;
+    uint dh;
+    uint q_off;
+    uint k_off;
+    uint v_off;
+    uint o_off;
+    uint qrs;
+    uint krs;
+    uint vrs;
+    uint bhsd;
+    uint mask_kind;
+    uint mask_off;
+    uint window;
+    float scale;
+    float neg;
+    float thr;
+} pc;
+
+shared float qs[QT * MAX_DH];
+shared float kv[KT * (MAX_DH + 1u)];   // padded rows: no bank conflicts
+shared float s[QT * KT];
+shared float red[QT * 16u];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint q = t / 16u;
+    uint lane = t % 16u;
+    uint bh = gl_WorkGroupID.y;
+    uint hi = bh % pc.nh;
+    uint bi = bh / pc.nh;
+    uint qi = gl_WorkGroupID.x * QT + q;
+    bool qvalid = qi < pc.q_s;
+    uint dh = pc.dh;
+    uint ks = dh + 1u;
+
+    // Stage this tile's queries.
+    for (uint i = t; i < QT * dh; i += 256u) {
+        uint qq = i / dh;
+        uint d = i % dh;
+        uint qx = gl_WorkGroupID.x * QT + qq;
+        float v = 0.0;
+        if (qx < pc.q_s) {
+            uint base = (pc.bhsd != 0u)
+                ? pc.q_off + ((bi * pc.nh + hi) * pc.q_s + qx) * dh
+                : pc.q_off + bi * pc.q_s * pc.qrs + qx * pc.qrs + hi * dh;
+            v = arena_load(base + d);
+        }
+        qs[qq * MAX_DH + d] = v;
+    }
+
+    uint q_offset = (pc.k_s > pc.q_s) ? (pc.k_s - pc.q_s) : 0u;
+    uint abs_q = q_offset + qi;
+    float m = -3.402823466e38;
+    float l = 0.0;
+    float acc[DPT];
+    for (uint i = 0u; i < DPT; i++) { acc[i] = 0.0; }
+
+    for (uint k0 = 0u; k0 < pc.k_s; k0 += KT) {
+        uint n = min(KT, pc.k_s - k0);
+        barrier();   // qs staged / previous V tile consumed
+        for (uint i = t; i < n * dh; i += 256u) {
+            uint j = i / dh;
+            uint d = i % dh;
+            uint ki = k0 + j;
+            uint base = (pc.bhsd != 0u)
+                ? pc.k_off + ((bi * pc.nh + hi) * pc.k_s + ki) * dh
+                : pc.k_off + bi * pc.k_s * pc.krs + ki * pc.krs + hi * dh;
+            kv[j * ks + d] = arena_load(base + d);
+        }
+        barrier();
+        float tmax = -3.402823466e38;
+        for (uint j = lane; j < KT; j += 16u) {
+            float score = -3.402823466e38;
+            if (j < n) {
+                uint ki = k0 + j;
+                bool masked = false;
+                float bias = 0.0;
+                if (pc.mask_kind == 1u) {
+                    masked = (ki > abs_q);
+                } else if (pc.mask_kind == 2u) {
+                    uint lo = (abs_q > pc.window) ? (abs_q - pc.window) : 0u;
+                    masked = (ki < lo) || (ki > abs_q);
+                } else if (pc.mask_kind == 3u) {
+                    masked = arena_load(pc.mask_off + bi * pc.k_s + ki) < pc.thr;
+                } else if (pc.mask_kind == 4u && qvalid) {
+                    bias = arena_load(pc.mask_off + ((bi * pc.nh + hi) * pc.q_s + qi) * pc.k_s + ki);
+                }
+                if (masked) {
+                    score = pc.neg;
+                } else {
+                    float dot = 0.0;
+                    for (uint d = 0u; d < dh; d++) { dot += qs[q * MAX_DH + d] * kv[j * ks + d]; }
+                    score = dot * pc.scale + bias;
+                }
+                tmax = max(tmax, score);
+            }
+            s[q * KT + j] = score;
+        }
+        // Row max over the 16 lanes of this query.
+        red[t] = tmax;
+        barrier();
+        float rmax = -3.402823466e38;
+        for (uint i = 0u; i < 16u; i++) { rmax = max(rmax, red[q * 16u + i]); }
+        float m_new = max(m, rmax);
+        float corr = exp(m - m_new);
+        float ps = 0.0;
+        for (uint j = lane; j < n; j += 16u) {
+            float p = exp(s[q * KT + j] - m_new);
+            s[q * KT + j] = p;
+            ps += p;
+        }
+        barrier();   // red read; s rewritten
+        red[t] = ps;
+        // Stage the V tile over the K tile (every score is in s now).
+        for (uint i = t; i < n * dh; i += 256u) {
+            uint j = i / dh;
+            uint d = i % dh;
+            uint ki = k0 + j;
+            uint base = (pc.bhsd != 0u)
+                ? pc.v_off + ((bi * pc.nh + hi) * pc.k_s + ki) * dh
+                : pc.v_off + bi * pc.k_s * pc.vrs + ki * pc.vrs + hi * dh;
+            kv[j * ks + d] = arena_load(base + d);
+        }
+        barrier();
+        float rsum = 0.0;
+        for (uint i = 0u; i < 16u; i++) { rsum += red[q * 16u + i]; }
+        l = l * corr + rsum;
+        for (uint i = 0u; i < DPT; i++) {
+            uint d = lane + 16u * i;
+            if (d < dh) {
+                float a = acc[i] * corr;
+                for (uint j = 0u; j < n; j++) { a += s[q * KT + j] * kv[j * ks + d]; }
+                acc[i] = a;
+            }
+        }
+        m = m_new;
+    }
+
+    if (qvalid) {
+        uint o_base = (pc.bhsd != 0u)
+            ? pc.o_off + ((bi * pc.nh + hi) * pc.q_s + qi) * dh
+            : pc.o_off + bi * pc.q_s * (pc.nh * dh) + qi * (pc.nh * dh) + hi * dh;
+        for (uint i = 0u; i < DPT; i++) {
+            uint d = lane + 16u * i;
+            if (d < dh) { arena_store(o_base + d, (l > 0.0) ? acc[i] / l : 0.0); }
+        }
+    }
+}

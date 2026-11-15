@@ -77,6 +77,28 @@ fn main() {
         entries.push("unary".to_string());
     }
 
+    // `matmul_rows` (few-row matmul with a bias + activation epilogue) takes
+    // the forward activation dispatch the same way `unary` does.
+    {
+        println!("cargo:rerun-if-changed=shaders/templates/matmul_rows_main.comp");
+        let main_src = fs::read_to_string(shader_dir.join("templates/matmul_rows_main.comp"))
+            .expect("rlx-vulkan: read shaders/templates/matmul_rows_main.comp");
+        let activation = rlxsl::glsl_activation_module(rlxsl::OpcodeScheme::GeluFirst);
+        let combined = main_src.replacen(
+            "#version 450\n",
+            &format!("#version 450\n{activation}\n"),
+            1,
+        );
+        let words = compile_glsl_to_spirv("matmul_rows", &combined, &shader_dir);
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for w in &words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        fs::write(Path::new(&out_dir).join("matmul_rows.spv"), &bytes)
+            .expect("rlx-vulkan: write matmul_rows.spv");
+        entries.push("matmul_rows".to_string());
+    }
+
     // Same assembly for the activation-backward kernel: `rlx_activation_backward`
     // (op 0..17, always relu-first) is auto-differentiated from the forward
     // manifest and prepended to `templates/activation_backward_main.comp`.

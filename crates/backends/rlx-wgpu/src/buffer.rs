@@ -923,7 +923,11 @@ impl Arena {
                 reserve = (reserve / 2).max(1024 * 1024);
             }
         }
-        let mut size = plan.arena_size.max(1); // wgpu hates zero-sized allocs
+        // wgpu hates zero-sized allocs, and a storage binding must be a
+        // multiple of 4 bytes: a half param with an odd element count, last
+        // in the plan, ends the arena on a 2-byte boundary.
+        plan.arena_size = plan.arena_size.max(1).next_multiple_of(4);
+        let mut size = plan.arena_size;
         // Bind-stripe snap can still leave size > max_buf when size_hint was
         // already over the cap; re-pack onto physical shard boundaries.
         // Guard: never prefer an inflated multi-shard layout when the compact
@@ -1913,7 +1917,7 @@ impl Arena {
     pub fn register_bf16_packed(&mut self, device: &wgpu::Device, id: NodeId) {
         if self.bf16_weight_buffer.is_none() {
             // Spans the arena: packed bytes sit at the param's arena byte offset.
-            let bytes = self.size.max(256);
+            let bytes = self.size.max(256).next_multiple_of(4);
             self.bf16_weight_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rlx-wgpu arena bf16 packed weights"),
                 size: bytes as u64,

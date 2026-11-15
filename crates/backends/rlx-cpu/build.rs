@@ -121,7 +121,7 @@ fn main() {
     //      `RLX_BLAS_LINK="blis lapack"`; searched in `RLX_BLAS_SEARCH` /
     //      `OPENBLAS_LIB_DIR` then the system paths. The caller asserts the set
     //      provides both interfaces. Only the umbrella `rlx_cpu_blas` cfg is
-    //      set (not the OpenBLAS sub-cfg), so no vendor-specific thread-control
+    //      set (not the OpenBLAS sub-cfg, unless the spec names openblas), so no vendor-specific thread-control
     //      symbol is referenced — the alt BLAS self-manages threads.
     //   2. `OPENBLAS_LIB_DIR` / `OPENBLAS_DIR` pins.
     //   3. Auto-probe for a distro OpenBLAS on a NATIVE build.
@@ -155,6 +155,17 @@ fn main() {
             println!("cargo:rustc-link-lib={name}");
         }
         println!("cargo:rustc-cfg=rlx_cpu_blas"); // generic cblas+lapack ABI
+        // A spec naming OpenBLAS itself (`openblas`, `static=openblas`, …), e.g. a static
+        // link for a cross build, is OpenBLAS: enable its thread control, or its pthread
+        // pool (all cores by default) runs under Rayon's. Measured on a Raspberry Pi CM4
+        // (Whisper-small encoder): 29.5 s oversubscribed, 20.9 s with OpenBLAS at 1 thread.
+        let is_openblas = |name: &str| {
+            let lib = name.rsplit('=').next().unwrap_or(name);
+            lib == "openblas" || lib.starts_with("openblasp") || lib.starts_with("openblas64")
+        };
+        if spec.split_whitespace().any(is_openblas) {
+            println!("cargo:rustc-cfg=rlx_cpu_blas_openblas");
+        }
         return;
     }
 

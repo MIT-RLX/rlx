@@ -7,7 +7,12 @@
 // column (consecutive lanes read consecutive B elements — coalesced), and the
 // 8 lane groups `t / 32` split K; the partials meet in shared memory. Every
 // row of A is applied to each loaded B element, so B — the weight — is read
-// once whatever m is. Same push block as `matmul.comp`; fp32 throughout.
+// once whatever m is. The push block is `matmul.comp`'s plus an epilogue —
+// a bias (`bias_len` > 0, indexed `out_index % bias_len`: per column or
+// full) and an activation (`act` < 100, the `unary` op ids; `NO_ACT` none) —
+// so a fused linear is one dispatch, not three. fp32 throughout.
+//
+// A template: `build.rs` prepends the generated `rlx_activation_apply`.
 layout(local_size_x = 256) in;
 
 const uint COLS = 32u;
@@ -25,7 +30,12 @@ layout(push_constant) uniform PC {
     uint a_bs;
     uint b_bs;
     uint c_bs;
+    uint bias_off;
+    uint bias_len;
+    uint act;
 } pc;
+
+const uint NO_ACT = 0xFFFFFFFFu;
 
 shared float part[MAX_ROWS * 256u];
 
@@ -56,6 +66,9 @@ void main() {
         for (uint r = 0u; r < rows; r++) {
             float s = 0.0;
             for (uint j = 0u; j < KS; j++) { s += part[r * 256u + j * COLS + lane]; }
+            uint oi = bz * pc.m * pc.n + r * pc.n + col;
+            if (pc.bias_len > 0u) { s += arena_load(pc.bias_off + oi % pc.bias_len); }
+            if (pc.act < 100u) { s = rlx_activation_apply(pc.act, s); }
             arena_store(pc.c_off + bz * pc.c_bs + r * pc.n + col, s);
         }
     }

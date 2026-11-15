@@ -1,0 +1,95 @@
+#version 450
+// Recurrence of one LSTM layer (gate order i, f, g, o; h0 = c0 = 0): one
+// 1024-thread workgroup per (batch item, direction). Each step the threads
+// split the 4h gate rows — z = zin + W_hh · h, with h in shared memory —
+// then the h units. The reverse direction walks t = seq−1 … 0. Writes
+// out[(b·seq + t)·out_w + dir·h + k], the `[batch, seq, D·h]` layout of
+// `Op::Lstm`. W_hh comes transposed (`lstm_whh_t.comp`) so the gate-row loop
+// reads coalesced. `lstm.comp` ran a whole batch item on one thread.
+// h ≤ 512.
+layout(local_size_x = 1024) in;
+
+const uint MAX_H = 512u;
+
+layout(push_constant) uniform PC {
+    uint batch;
+    uint seq;
+    uint hidden;
+    uint zin_off;   // [dirs, batch·seq, 4h] from lstm_proj
+    uint wt_off;    // this layer's W_hhᵀ [dirs, h, 4h]
+    uint out_off;
+    uint out_w;     // D · h
+} pc;
+
+shared float hs[MAX_H];
+shared float cs[MAX_H];
+shared float z[4u * MAX_H];
+
+float sigm(float v) { return 1.0 / (1.0 + exp(-v)); }
+float tanh_safe(float v) {
+    float e = exp(-2.0 * abs(v));
+    float t = (1.0 - e) / (1.0 + e);
+    return v < 0.0 ? -t : t;
+}
+
+void main() {
+    uint b = gl_WorkGroupID.x;
+    uint dir = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    uint h = pc.hidden;
+    if (b >= pc.batch || h > MAX_H) { return; }
+    uint four_h = 4u * h;
+    uint rows = pc.batch * pc.seq;
+    uint wt = pc.wt_off + dir * four_h * h;
+    for (uint k = t; k < h; k += 1024u) { hs[k] = 0.0; cs[k] = 0.0; }
+    barrier();
+    for (uint step = 0u; step < pc.seq; step++) {
+        uint tt = (dir == 0u) ? step : pc.seq - 1u - step;
+        uint zrow = pc.zin_off + (dir * rows + b * pc.seq + tt) * four_h;
+        // Thread t owns gate rows t + 1024·i (i < 2; rows past 4h clamp to
+        // the last and are dropped). W_hhᵀ lives in the scratch tail of the
+        // activation buffer, so the loop reads `act_data` directly: no tag
+        // branch and no per-row guard, so every load of a pass is in flight —
+        // behind branches only ~4 were, and a step ran at ~11 GB/s.
+        uint r0 = min(t + 0u, four_h - 1u);
+        float a0 = arena_load(zrow + r0);
+        uint r1 = min(t + 1024u, four_h - 1u);
+        float a1 = arena_load(zrow + r1);
+        uint j = 0u;
+        for (; j + 4u <= h; j += 4u) {
+            float h0 = hs[j];
+            float h1 = hs[j + 1u];
+            float h2 = hs[j + 2u];
+            float h3 = hs[j + 3u];
+            uint c0 = wt + j * four_h;
+            uint c1 = c0 + four_h;
+            uint c2 = c1 + four_h;
+            uint c3 = c2 + four_h;
+            a0 += act_data[c0 + r0] * h0 + act_data[c1 + r0] * h1
+                + act_data[c2 + r0] * h2 + act_data[c3 + r0] * h3;
+            a1 += act_data[c0 + r1] * h0 + act_data[c1 + r1] * h1
+                + act_data[c2 + r1] * h2 + act_data[c3 + r1] * h3;
+        }
+        for (; j < h; j++) {
+            uint c = wt + j * four_h;
+            float hj = hs[j];
+            a0 += act_data[c + r0] * hj;
+            a1 += act_data[c + r1] * hj;
+        }
+        if (t + 0u < four_h) { z[t + 0u] = a0; }
+        if (t + 1024u < four_h) { z[t + 1024u] = a1; }
+        barrier();
+        for (uint k = t; k < h; k += 1024u) {
+            float ig = sigm(z[k]);
+            float fg = sigm(z[h + k]);
+            float gg = tanh_safe(z[2u * h + k]);
+            float og = sigm(z[3u * h + k]);
+            float c = fg * cs[k] + ig * gg;
+            cs[k] = c;
+            float hn = og * tanh_safe(c);
+            hs[k] = hn;
+            arena_store(pc.out_off + (b * pc.seq + tt) * pc.out_w + dir * h + k, hn);
+        }
+        barrier();
+    }
+}

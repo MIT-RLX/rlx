@@ -35,7 +35,7 @@ fn build(batch: usize, m: usize, k: usize, n: usize, weight_param: bool) -> Grap
     } else {
         g.input("w", Shape::new(&[k, n], f))
     };
-    let y = g.matmul(a, w);
+    let y = g.matmul(a, w, Shape::new(&[batch, m, n], f));
     g.set_outputs(vec![y]);
     g
 }
@@ -90,4 +90,56 @@ fn few_rows_activations_and_batch() {
     }
     check(1, 1, 64, 33, false);
     check(3, 4, 129, 70, false);
+}
+
+/// `FusedMatMulBiasAct` with `matmul_rows`' epilogue (bias + activation in
+/// the same dispatch) vs the CPU backend running the same graph.
+fn check_fused(m: usize, k: usize, n: usize, act: Option<rlx_ir::op::Activation>) {
+    let f = DType::F32;
+    let build = || {
+        let mut g = Graph::new("linear");
+        let a = g.input("a", Shape::new(&[1, m, k], f));
+        let w = g.param("w", Shape::new(&[k, n], f));
+        let b = g.param("b", Shape::new(&[n], f));
+        let y = g.add_node(
+            rlx_ir::op::Op::FusedMatMulBiasAct { activation: act },
+            vec![a, w, b],
+            Shape::new(&[1, m, n], f),
+        );
+        g.set_outputs(vec![y]);
+        g
+    };
+    let (a, w, b) = (data(m * k, 4), data(k * n, 5), data(n, 6));
+    let want = {
+        use rlx::prelude::*;
+        let mut exe = Session::new(Device::Cpu).compile(build());
+        exe.set_param("w", &w);
+        exe.set_param("b", &b);
+        exe.run(&[("a", &a)]).remove(0)
+    };
+    let mut exe = VulkanExecutable::compile(build());
+    exe.set_param("w", &w);
+    exe.set_param("b", &b);
+    let got = exe.run(&[("a", &a)]).remove(0);
+    let worst = got
+        .iter()
+        .zip(&want)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        worst < 1e-4,
+        "fused linear m={m} k={k} n={n} {act:?}: max |vk − cpu| = {worst:e}"
+    );
+}
+
+#[test]
+fn fused_linear_epilogue() {
+    let _gpu = common::serialize_gpu();
+    if skip() {
+        return;
+    }
+    use rlx_ir::op::Activation;
+    check_fused(1, 256, 256, Some(Activation::Relu));
+    check_fused(5, 96, 70, Some(Activation::Gelu));
+    check_fused(1, 64, 300, None);
 }

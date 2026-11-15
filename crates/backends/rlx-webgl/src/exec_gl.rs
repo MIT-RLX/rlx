@@ -933,6 +933,15 @@ fn red_code(r: Red) -> i32 {
 }
 
 /// A compiled WebGL2 backend (programs + framebuffer). Reusable across runs.
+/// One plan's textures: its weights and its index tables.
+#[derive(Default)]
+struct PlanCache {
+    leaves: HashMap<usize, WebGlTexture>,
+    param_slots: HashMap<String, usize>,
+    idx: HashMap<(usize, u8), WebGlTexture>,
+    idx_cols: HashMap<(usize, u8), usize>,
+}
+
 pub struct GlBackend {
     gl: GL,
     /// `MAX_TEXTURE_SIZE`: every tensor is one 2-D texture, so no tensor may
@@ -952,6 +961,11 @@ pub struct GlBackend {
     /// Which plan the caches above hold ([`GlBackend::use_plan`]): one
     /// backend (one context, its programs compiled once) serves many.
     plan: std::cell::Cell<u64>,
+    /// The caches of the other plans, set aside while another runs: a model
+    /// made of graphs taking turns (a decode step, then an audio decoder)
+    /// uploaded every weight of each again at each turn.
+    /// [`GlBackend::drop_plan`] frees a plan's.
+    parked: std::cell::RefCell<HashMap<u64, PlanCache>>,
     /// `getUniformLocation` answers by uniform name, then program: in
     /// Safari it is a synchronous trip to the GPU process, and it was asked
     /// for every uniform of every draw.
@@ -1096,6 +1110,7 @@ impl GlBackend {
             idx_cache: Default::default(),
             idx_cols: Default::default(),
             plan: Default::default(),
+            parked: Default::default(),
             uniforms: Default::default(),
             complete: Default::default(),
             read_red: Default::default(),
@@ -1604,35 +1619,108 @@ impl GlBackend {
     /// compiled programs — share one rather than make one a plan (a model
     /// run a layer at a time is a plan a layer).
     pub fn use_plan(&self, plan: u64) {
-        if self.plan.replace(plan) == plan {
+        let was = self.plan.replace(plan);
+        if was == plan {
             return;
         }
-        // another plan: its weights and the sizes it asked for go
-        let leaves: Vec<_> = self
-            .leaf_cache
-            .borrow_mut()
-            .drain()
-            .map(|(_, t)| t)
-            .collect();
-        for t in leaves {
+        // another plan: this one's textures are set aside (not deleted) and
+        // that one's, if it ran before, come back
+        let mine = self.take_cache();
+        self.parked.borrow_mut().insert(was, mine);
+        if let Some(c) = self.parked.borrow_mut().remove(&plan) {
+            *self.leaf_cache.borrow_mut() = c.leaves;
+            *self.param_slots.borrow_mut() = c.param_slots;
+            *self.idx_cache.borrow_mut() = c.idx;
+            *self.idx_cols.borrow_mut() = c.idx_cols;
+        }
+    }
+
+    /// The current plan's caches, leaving them empty.
+    fn take_cache(&self) -> PlanCache {
+        PlanCache {
+            leaves: std::mem::take(&mut *self.leaf_cache.borrow_mut()),
+            param_slots: std::mem::take(&mut *self.param_slots.borrow_mut()),
+            idx: std::mem::take(&mut *self.idx_cache.borrow_mut()),
+            idx_cols: std::mem::take(&mut *self.idx_cols.borrow_mut()),
+        }
+    }
+
+    /// Free `plan`'s textures (its executable is gone).
+    pub fn drop_plan(&self, plan: u64) {
+        let cache = if self.plan.get() == plan {
+            self.take_cache()
+        } else {
+            match self.parked.borrow_mut().remove(&plan) {
+                Some(c) => c,
+                None => return,
+            }
+        };
+        for t in cache.leaves.into_values().chain(cache.idx.into_values()) {
             self.sized.borrow_mut().retain(|(s, _)| *s != t);
             self.gl.delete_texture(Some(&t));
         }
         self.drain_free();
-        for (b, _) in self.free_pbos.borrow_mut().drain(..) {
-            self.gl.delete_buffer(Some(&b));
+    }
+
+    /// Upload param `name` of the current plan ([`Self::use_plan`]) as its
+    /// leaf's texture now, ahead of a run: a caller holding a param narrower
+    /// than f32 widens one at a time, rather than every one for the run.
+    pub fn upload_param(&self, plan: &Plan, name: &str, data: &[f32]) -> Result<()> {
+        for st in &plan.steps {
+            if let Step::Leaf {
+                out,
+                src: LeafSource::Param(n),
+            } = st
+                && n == name
+                && !self.leaf_cache.borrow().contains_key(out)
+            {
+                let (r, c) = plan.slot_dims[*out];
+                let t = self.data_texture(c, r, data)?;
+                self.leaf_cache.borrow_mut().insert(*out, t);
+                self.param_slots.borrow_mut().insert(name.to_string(), *out);
+            }
         }
-        for (_, t) in self.idx_cache.borrow_mut().drain() {
-            self.gl.delete_texture(Some(&t));
-        }
-        self.param_slots.borrow_mut().clear();
-        self.idx_cols.borrow_mut().clear();
+        Ok(())
+    }
+
+    /// The params `plan` reads that it has not uploaded yet: only those need
+    /// their values on the next run (the rest are cached textures).
+    pub fn params_to_upload<'p>(&self, plan_id: u64, plan: &'p Plan) -> Vec<&'p str> {
+        let cached = |name: &str| {
+            if self.plan.get() == plan_id {
+                self.param_slots.borrow().contains_key(name)
+            } else {
+                self.parked
+                    .borrow()
+                    .get(&plan_id)
+                    .is_some_and(|c| c.param_slots.contains_key(name))
+            }
+        };
+        plan.steps
+            .iter()
+            .filter_map(|st| match st {
+                Step::Leaf {
+                    src: LeafSource::Param(name),
+                    ..
+                } if !cached(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// [`Self::forget_param`] when `plan` is the one cached.
     pub fn forget_param_of(&self, plan: u64, name: &str) {
         if self.plan.get() == plan {
             self.forget_param(name);
+            return;
+        }
+        // a parked plan's (its turn comes again)
+        let t = self.parked.borrow_mut().get_mut(&plan).and_then(|c| {
+            let slot = c.param_slots.remove(name)?;
+            c.leaves.remove(&slot)
+        });
+        if let Some(t) = t {
+            self.release(t);
         }
     }
 

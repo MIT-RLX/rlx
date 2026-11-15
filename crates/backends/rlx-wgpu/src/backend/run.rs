@@ -1814,12 +1814,22 @@ impl WgpuExecutable {
                                         // Packed-BF16 weight, unpacked in-shader.
                                         // Same 32×32-tile grid as the plain matmul.
                                         crate::backend::bf16_packed_dispatch_inc();
-                                        pass.set_pipeline(&mm_bf16w.pipeline);
-                                        pass.dispatch_workgroups(
-                                            n.div_ceil(32),
-                                            m_s.div_ceil(32),
-                                            *batch,
-                                        );
+                                        if m_s <= 4 && !no_gemv {
+                                            // Decode: one thread per column
+                                            // (bit-identical, no padding rows).
+                                            let g = crate::kernels::matmul_gemv_bf16w_kernel(
+                                                &dev.device,
+                                            );
+                                            pass.set_pipeline(&g.pipeline);
+                                            pass.dispatch_workgroups(n.div_ceil(128), 1, *batch);
+                                        } else {
+                                            pass.set_pipeline(&mm_bf16w.pipeline);
+                                            pass.dispatch_workgroups(
+                                                n.div_ceil(32),
+                                                m_s.div_ceil(32),
+                                                *batch,
+                                            );
+                                        }
                                     } else if let Some(coop) = mm_coop.as_ref()
                                         && *b_is_param
                                         && *compute_precision == MatmulCompute::Coop16

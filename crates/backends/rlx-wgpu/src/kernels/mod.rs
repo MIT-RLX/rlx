@@ -15,6 +15,7 @@ use bytemuck::{Pod, Zeroable};
 
 pub const MATMUL_WGSL: &str = include_str!("matmul.wgsl");
 pub const MATMUL_BF16W_WGSL: &str = include_str!("matmul_bf16w.wgsl");
+pub const MATMUL_GEMV_BF16W_WGSL: &str = include_str!("matmul_gemv_bf16w.wgsl");
 pub const MATMUL_GEMV_WGSL: &str = include_str!("matmul_gemv.wgsl");
 pub const MATMUL_WIDE_WGSL: &str = include_str!("matmul_wide.wgsl");
 pub const MATMUL_WIDE_NV_WGSL: &str = include_str!("matmul_wide_nv.wgsl");
@@ -3121,6 +3122,20 @@ pub fn matmul_bf16w_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu matmul_bf16w",
             MATMUL_BF16W_WGSL,
             "matmul_bf16w",
+        )
+    })
+}
+/// `m ≤ 4` (decode) form of [`matmul_bf16w_kernel`]: one thread per output
+/// column, K in order, so bit-identical to it; same bindings — see
+/// `matmul_gemv_bf16w.wgsl`.
+pub fn matmul_gemv_bf16w_kernel(device: &wgpu::Device) -> &'static Kernel {
+    static MATMUL_GEMV_BF16W: OnceLock<Kernel> = OnceLock::new();
+    MATMUL_GEMV_BF16W.get_or_init(|| {
+        build_kernel_3(
+            device,
+            "rlx-wgpu matmul_gemv_bf16w",
+            MATMUL_GEMV_BF16W_WGSL,
+            "matmul_gemv_bf16w",
         )
     })
 }

@@ -10,10 +10,84 @@ pub struct WebglBackend;
 
 struct WebglExecutable {
     plan: Plan,
-    params: HashMap<String, Vec<f32>>,
+    params: HashMap<String, HostParam>,
     /// this executable's plan, to the shared backend's caches
     #[cfg(target_family = "wasm")]
     id: u64,
+}
+
+/// A param's value as kept here: the GL side computes in f32, but holds a
+/// param as a texture once uploaded, so a half one stays half (2 B a value
+/// in the tab's memory, not 4) and is widened only when it must be uploaded
+/// (its first run, a lost context).
+#[derive(Clone)]
+enum HostParam {
+    F32(Vec<f32>),
+    /// F16 or BF16 bytes.
+    Half(Vec<u8>, rlx_ir::DType),
+}
+
+impl WebglExecutable {
+    /// The params for a run: each f32 one as it is, and each half one
+    /// widened — of those, only the ones in `upload` when given (the others
+    /// are textures already, and are not read).
+    fn run_params(&self, upload: Option<&[&str]>) -> Vec<(&str, std::borrow::Cow<'_, [f32]>)> {
+        let upload: Option<std::collections::HashSet<&str>> =
+            upload.map(|u| u.iter().copied().collect());
+        self.params
+            .iter()
+            .filter_map(|(name, p)| match p {
+                HostParam::F32(v) => Some((name.as_str(), std::borrow::Cow::Borrowed(&v[..]))),
+                HostParam::Half(_, _)
+                    if upload.as_ref().is_some_and(|u| !u.contains(name.as_str())) =>
+                {
+                    None
+                }
+                HostParam::Half(b, dtype) => Some((
+                    name.as_str(),
+                    std::borrow::Cow::Owned(super::widen_bytes_to_f32(b, *dtype)),
+                )),
+            })
+            .collect()
+    }
+
+    /// The GL side caches param textures across runs; a new value must be
+    /// uploaded again.
+    fn forget_uploaded(&self, name: &str) {
+        #[cfg(target_family = "wasm")]
+        if let Some(gl) = shared::existing() {
+            gl.forget_param_of(self.id, name);
+        }
+        let _ = name;
+    }
+
+    /// The params for the shared backend's next run of this plan: each half
+    /// one it has still to upload is widened and uploaded now, one at a time
+    /// (widening them all for the run held the whole model in f32 at once,
+    /// and a tab's memory never shrinks back); the f32 ones as they are.
+    #[cfg(target_family = "wasm")]
+    fn gl_params(
+        &self,
+        gl: &rlx_webgl::exec_gl::GlBackend,
+    ) -> Result<Vec<(&str, std::borrow::Cow<'_, [f32]>)>, String> {
+        for name in gl.params_to_upload(self.id, &self.plan) {
+            if let Some(HostParam::Half(b, dtype)) = self.params.get(name) {
+                gl.upload_param(&self.plan, name, &super::widen_bytes_to_f32(b, *dtype))
+                    .map_err(|e| format!("rlx-webgl upload of {name} failed: {}", e.0))?;
+            }
+        }
+        Ok(self.run_params(Some(&[])))
+    }
+}
+
+/// Its plan's textures go with it.
+#[cfg(target_family = "wasm")]
+impl Drop for WebglExecutable {
+    fn drop(&mut self) {
+        if let Some(gl) = shared::existing() {
+            gl.drop_plan(self.id);
+        }
+    }
 }
 
 /// One WebGL2 backend a thread (a context, its programs compiled once),
@@ -152,14 +226,28 @@ impl ExecutableGraph for WebglExecutable {
         }
     }
 
-    fn set_param(&mut self, name: &str, data: &[f32]) {
-        self.params.insert(name.to_string(), data.to_vec());
-        // The GL side caches param textures across runs; a new value must
-        // be uploaded again.
-        #[cfg(target_family = "wasm")]
-        if let Some(gl) = shared::existing() {
-            gl.forget_param_of(self.id, name);
+    /// Half-precision (F16 / BF16) weights kept half ([`HostParam`]), and
+    /// widened to the f32 the GL side computes in only to be uploaded; other
+    /// float types widened now (the default panics for anything but F32).
+    fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
+        match dtype {
+            rlx_ir::DType::F32 => {
+                let f = rlx_ir::bytes::decode_le::<f32>(data);
+                self.set_param(name, f.as_ref());
+            }
+            rlx_ir::DType::F16 | rlx_ir::DType::BF16 => {
+                self.params
+                    .insert(name.to_string(), HostParam::Half(data.to_vec(), dtype));
+                self.forget_uploaded(name);
+            }
+            _ => self.set_param(name, &super::widen_bytes_to_f32(data, dtype)),
         }
+    }
+
+    fn set_param(&mut self, name: &str, data: &[f32]) {
+        self.params
+            .insert(name.to_string(), HostParam::F32(data.to_vec()));
+        self.forget_uploaded(name);
     }
 
     fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
@@ -168,13 +256,12 @@ impl ExecutableGraph for WebglExecutable {
 
     fn try_run(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>, String> {
         let mut named: Vec<(&str, &[f32])> = inputs.to_vec();
-        for (name, data) in &self.params {
-            named.push((name.as_str(), data.as_slice()));
-        }
         #[cfg(target_family = "wasm")]
         {
             let gl = shared::backend()?;
             gl.use_plan(self.id);
+            let params = self.gl_params(&gl)?;
+            named.extend(params.iter().map(|(n, d)| (*n, &d[..])));
             let r = gl.run(&self.plan, &named);
             // a lost context stays lost: a new one next run
             if r.is_err() && gl.context_lost() {
@@ -184,6 +271,8 @@ impl ExecutableGraph for WebglExecutable {
         }
         #[cfg(not(target_family = "wasm"))]
         {
+            let params = self.run_params(None);
+            named.extend(params.iter().map(|(n, d)| (*n, &d[..])));
             rlx_webgl::run_cpu(&self.plan, &named)
                 .map_err(|e| format!("rlx-webgl run_cpu failed: {}", e.0))
         }
@@ -191,13 +280,12 @@ impl ExecutableGraph for WebglExecutable {
 
     #[cfg(target_family = "wasm")]
     fn try_submit(&mut self, inputs: &[(&str, &[f32])]) -> Option<Result<(), String>> {
-        let mut named: Vec<(&str, &[f32])> = inputs.to_vec();
-        for (name, data) in &self.params {
-            named.push((name.as_str(), data.as_slice()));
-        }
         Some((|| {
             let gl = shared::backend()?;
             gl.use_plan(self.id);
+            let params = self.gl_params(&gl)?;
+            let mut named: Vec<(&str, &[f32])> = inputs.to_vec();
+            named.extend(params.iter().map(|(n, d)| (*n, &d[..])));
             let r = gl.submit(self.id, &self.plan, &named);
             if r.is_err() && gl.context_lost() {
                 shared::drop_backend();
@@ -211,14 +299,11 @@ impl ExecutableGraph for WebglExecutable {
         &mut self,
         inputs: Vec<(String, Vec<u16>)>,
     ) -> Option<Result<Vec<(String, Vec<u16>)>, String>> {
-        let named: Vec<(&str, &[f32])> = self
-            .params
-            .iter()
-            .map(|(n, d)| (n.as_str(), d.as_slice()))
-            .collect();
         Some((|| {
             let gl = shared::backend()?;
             gl.use_plan(self.id);
+            let params = self.gl_params(&gl)?;
+            let named: Vec<(&str, &[f32])> = params.iter().map(|(n, d)| (*n, &d[..])).collect();
             let r = gl.submit_half(self.id, &self.plan, &named, inputs);
             if r.is_err() && gl.context_lost() {
                 shared::drop_backend();

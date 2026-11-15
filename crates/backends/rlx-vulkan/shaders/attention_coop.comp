@@ -34,6 +34,12 @@ layout(push_constant) uniform PC {
     float scale;
     float neg;
     float thr;
+    // Keys split across two buffers (`k_split` > 0): keys [0, k_split) at
+    // k_off / v_off, keys [k_split, k_s) at k2_off / v2_off — a decode step's
+    // `concat(past, new)` read in place instead of copied first.
+    uint k2_off;
+    uint v2_off;
+    uint k_split;
 } pc;
 
 shared float s[CHUNK];
@@ -67,6 +73,23 @@ float block_sum(float v) {
     float r = red[0];
     barrier();
     return r;
+}
+
+// Arena offset of key / value row `ki` of head `hi` in batch `bi`.
+uint kv_base(uint off, uint off2, uint rs, uint bi, uint hi, uint ki) {
+    uint len = pc.k_s;
+    if (pc.k_split != 0u) {
+        if (ki < pc.k_split) {
+            len = pc.k_split;
+        } else {
+            off = off2;
+            ki -= pc.k_split;
+            len = pc.k_s - pc.k_split;
+        }
+    }
+    return (pc.bhsd != 0u)
+        ? off + bi * pc.nh * len * pc.dh + hi * len * pc.dh + ki * pc.dh
+        : off + bi * len * rs + ki * rs + hi * pc.dh;
 }
 
 void main() {
@@ -121,9 +144,7 @@ void main() {
             if (masked) {
                 score = pc.neg;
             } else {
-                uint k_base = (pc.bhsd != 0u)
-                    ? pc.k_off + bi * pc.nh * pc.k_s * pc.dh + hi * pc.k_s * pc.dh + ki * pc.dh
-                    : pc.k_off + bi * pc.k_s * pc.krs + ki * pc.krs + hi * pc.dh;
+                uint k_base = kv_base(pc.k_off, pc.k2_off, pc.krs, bi, hi, ki);
                 float dot = 0.0;
                 for (uint d = 0u; d < pc.dh; d++) { dot += qs[d] * arena_load(k_base + d); }
                 score = dot * pc.scale + bias;
@@ -144,9 +165,7 @@ void main() {
             float a = acc * corr;
             for (uint j = slice; j < n; j += slices) {
                 uint ki = c0 + j;
-                uint v_base = (pc.bhsd != 0u)
-                    ? pc.v_off + bi * pc.nh * pc.k_s * pc.dh + hi * pc.k_s * pc.dh + ki * pc.dh
-                    : pc.v_off + bi * pc.k_s * pc.vrs + ki * pc.vrs + hi * pc.dh;
+                uint v_base = kv_base(pc.v_off, pc.v2_off, pc.vrs, bi, hi, ki);
                 a += s[j] * arena_load(v_base + dim);
             }
             acc = a;

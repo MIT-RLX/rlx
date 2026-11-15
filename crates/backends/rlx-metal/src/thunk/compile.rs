@@ -1024,20 +1024,61 @@ impl ThunkSchedule {
                         && (0..shape.rank() - 2).all(|d| {
                             b_shape.dim(d).unwrap_static() == shape.dim(d).unwrap_static()
                         });
-                    if batched || lhs_bcast {
+                    // Operands of different rank, both batched, broadcast
+                    // numpy-style (right-aligned): `[1,H,M,K] · [H,K,N]`, the
+                    // relative-position term of the Gemma 4 audio attention.
+                    // Neither case above takes it, and the 2-D flatten below
+                    // reads B as one `[K,N]` matrix, so all but the first of
+                    // its matrices were silently dropped. Each operand's batch
+                    // must be the output's or a single matrix, which is all
+                    // `BatchedSgemm`'s per-operand stride can express.
+                    let rank_bcast = !batched
+                        && !lhs_bcast
+                        && a_shape.rank() >= 3
+                        && b_shape.rank() >= 3
+                        && a_shape.rank() != b_shape.rank()
+                        && shape.rank() == a_shape.rank().max(b_shape.rank())
+                        && {
+                            let r = shape.rank();
+                            let aligned = |s: &rlx_ir::Shape, d: usize| -> usize {
+                                let off = r - s.rank();
+                                if d < off {
+                                    1
+                                } else {
+                                    s.dim(d - off).unwrap_static()
+                                }
+                            };
+                            let (mut out_b, mut a_b, mut b_b) = (1usize, 1usize, 1usize);
+                            let mut ok = true;
+                            for d in 0..r - 2 {
+                                let (ad, bd, od) = (
+                                    aligned(a_shape, d),
+                                    aligned(b_shape, d),
+                                    shape.dim(d).unwrap_static(),
+                                );
+                                ok &= (ad == od || ad == 1)
+                                    && (bd == od || bd == 1)
+                                    && od == ad.max(bd);
+                                out_b *= od;
+                                a_b *= ad;
+                                b_b *= bd;
+                            }
+                            ok && (a_b == out_b || a_b == 1) && (b_b == out_b || b_b == 1)
+                        };
+                    if batched || lhs_bcast || rank_bcast {
                         let r = shape.rank();
                         let mut batch_prod = 1usize;
-                        let mut a_batch = 1usize;
-                        let mut b_batch = 1usize;
                         for d in 0..r - 2 {
                             batch_prod *= shape.dim(d).unwrap_static();
-                            if a_shape.rank() == r {
-                                a_batch *= a_shape.dim(d).unwrap_static();
-                            }
-                            if b_shape.rank() == r {
-                                b_batch *= b_shape.dim(d).unwrap_static();
-                            }
                         }
+                        // Matrices per operand: the product of its own leading
+                        // dims (1 for a rank-2 operand), whatever its rank.
+                        let lead = |s: &rlx_ir::Shape| -> usize {
+                            (0..s.rank() - 2)
+                                .map(|d| s.dim(d).unwrap_static())
+                                .product()
+                        };
+                        let (a_batch, b_batch) = (lead(a_shape), lead(b_shape));
                         let m_dim = shape.dim(r - 2).unwrap_static();
                         // K is A's own last dim — A may be rank-2 while the
                         // output is rank-3 (the broadcast-left case).

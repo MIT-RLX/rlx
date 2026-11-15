@@ -196,6 +196,8 @@ struct BufferMem {
     memory: vk::DeviceMemory,
     mapped: *mut u8,
     size: usize,
+    /// Allocated in device-local memory.
+    vram: bool,
 }
 
 /// Re-place unique buffer slots so no slot crosses a shard boundary.
@@ -268,6 +270,10 @@ fn snap_plan_to_shards_ex(plan: &mut MemoryPlan, shard_cap: usize, stage_reserve
     plan.arena_size = cursor.max(1);
 }
 
+/// Reads of at least this many bytes off a VRAM arena go through
+/// [`Arena::read_f32_staged`]; smaller ones read the mapping directly.
+const STAGED_READ_BYTES: usize = 16 << 10;
+
 pub struct Arena {
     dev: &'static VulkanDevice,
     /// Shard 0 (or the only buffer when unsharded).
@@ -292,13 +298,24 @@ pub struct Arena {
     lens: HashMap<NodeId, usize>,
     /// Per-node byte offset into the weight buffer (un-tagged).
     weight_offsets: HashMap<NodeId, usize>,
+    /// The activation buffer landed in VRAM (see [`Self::in_vram`]).
+    vram: bool,
+    /// System-RAM staging for reads off a VRAM arena (see [`Self::read_f32`]);
+    /// grown on demand.
+    staging: std::sync::Mutex<Option<BufferMem>>,
+    /// Persistent host-cached target of a pre-recorded output readback (see
+    /// [`Self::out_staging`]).
+    out_staging: Option<BufferMem>,
 }
 
 unsafe impl Send for Arena {}
 
 impl Arena {
     /// Build from a full memory plan (single activation buffer + dummy weight bind).
-    pub fn from_plan(plan: &MemoryPlan) -> Self {
+    ///
+    /// `vram`: on a discrete GPU, place the buffers in host-mapped VRAM
+    /// (resizable BAR) when it fits — see [`Self::in_vram`].
+    pub fn from_plan(plan: &MemoryPlan, vram: bool) -> Self {
         let dev = vulkan_device().expect("rlx-vulkan: no device for arena");
         let size = plan.arena_size.max(4);
         let max_range = dev.limits.max_storage_buffer_range as usize;
@@ -311,12 +328,12 @@ impl Arena {
                 dev.name,
             );
         }
-        Self::from_plan_inner(dev, plan, None, max_range, 0)
+        Self::from_plan_inner(dev, plan, None, max_range, 0, vram)
     }
 
     /// Split params into a dedicated weight buffer. When activations still exceed
     /// `maxStorageBufferRange`, stripe the logical arena across multiple buffers.
-    pub fn from_plan_split(graph: &Graph) -> Self {
+    pub fn from_plan_split(graph: &Graph, vram: bool) -> Self {
         let dev = vulkan_device().expect("rlx-vulkan: no device for arena");
         let max_range = dev.limits.max_storage_buffer_range as usize;
         let shard_cap = (max_range / 256) * 256;
@@ -485,7 +502,7 @@ impl Arena {
         }
 
         let weight_buf = if weight_cursor > 0 {
-            Some(Self::alloc_buffer(dev, weight_cursor.max(4)))
+            Some(Self::alloc_buffer(dev, vram, weight_cursor.max(4)))
         } else {
             None
         };
@@ -495,6 +512,7 @@ impl Arena {
             weight_buf.map(|w| (w, weight_offsets, weight_lens)),
             max_range,
             weight_bind_bytes.min(weight_cursor.max(4)),
+            vram,
         )
     }
 
@@ -504,12 +522,13 @@ impl Arena {
         weight: Option<(BufferMem, HashMap<NodeId, usize>, HashMap<NodeId, usize>)>,
         max_range: usize,
         weight_bind_bytes: usize,
+        vram: bool,
     ) -> Self {
         let size = plan.arena_size.max(4);
         let shard_cap = (max_range / 256) * 256;
 
         let (primary, extra_shards, shard_size) = if size <= max_range {
-            (Self::alloc_buffer(dev, size), Vec::new(), 0usize)
+            (Self::alloc_buffer(dev, vram, size), Vec::new(), 0usize)
         } else {
             for (id, a) in &plan.assignments {
                 if a.size > shard_cap {
@@ -541,7 +560,7 @@ impl Arena {
             for i in 0..n_shards {
                 let begin = i * shard_cap;
                 let this = (size - begin).min(shard_cap).max(256);
-                shards.push(Self::alloc_buffer(dev, this));
+                shards.push(Self::alloc_buffer(dev, vram, this));
             }
             let primary = shards.remove(0);
             (primary, shards, shard_cap)
@@ -559,7 +578,7 @@ impl Arena {
         let (weight_mem, weight_offsets, extra_lens) = match weight {
             Some((w, offs, lens)) => (Some(w), offs, lens),
             None => (
-                Some(Self::alloc_buffer(dev, 4)),
+                Some(Self::alloc_buffer(dev, vram, 4)),
                 HashMap::new(),
                 HashMap::new(),
             ),
@@ -588,10 +607,27 @@ impl Arena {
             offsets,
             lens,
             weight_offsets,
+            vram: primary.vram,
+            staging: std::sync::Mutex::new(None),
+            out_staging: None,
         }
     }
 
-    fn alloc_buffer(dev: &VulkanDevice, size: usize) -> BufferMem {
+    /// Whether the activation buffer is host-mapped VRAM. The GPU reads it at
+    /// VRAM speed; the host reads it uncached, so a schedule with host steps
+    /// on the arena wants system RAM instead.
+    pub fn in_vram(&self) -> bool {
+        self.vram
+    }
+
+    fn alloc_buffer(dev: &VulkanDevice, vram: bool, size: usize) -> BufferMem {
+        Self::alloc_buffer_in(dev, vram, false, size)
+    }
+
+    /// [`Self::alloc_buffer`]; `cached` asks for HOST_CACHED memory first — the
+    /// readback staging, which the host *reads*: uncached (write-combined)
+    /// system RAM read at ~0.3 GB/s, a TrOCR step's 260 KB of outputs 0.9 ms.
+    fn alloc_buffer_in(dev: &VulkanDevice, vram: bool, cached: bool, size: usize) -> BufferMem {
         let info = vk::BufferCreateInfo::default()
             .size(size as u64)
             .usage(
@@ -603,24 +639,56 @@ impl Arena {
         let buffer = unsafe { dev.device.create_buffer(&info, None) }.expect("vk create_buffer");
 
         let req = unsafe { dev.device.get_buffer_memory_requirements(buffer) };
-        // Size-aware: for a big arena, land in a heap that fits (GTT/system RAM on
-        // an APU), not the first HOST_VISIBLE type (a small VRAM BAR → OOM).
-        let mem_type = dev
-            .find_memory_type_for_size(
-                req.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                req.size,
-            )
-            .expect("rlx-vulkan: no HOST_VISIBLE|HOST_COHERENT memory type");
-        let memory = unsafe {
+        let host_visible =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let allocate = |mem_type: u32| unsafe {
             dev.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(req.size)
                     .memory_type_index(mem_type),
                 None,
             )
-        }
-        .expect("vk allocate_memory");
+        };
+        // A discrete GPU reads system RAM over PCIe — a page-encoder conv or a
+        // decode attention over a long memory ran 10-20× below VRAM speed — so
+        // the arena goes to VRAM the host can map (resizable BAR) when a heap
+        // that size exists and the allocation succeeds. `RLX_VULKAN_ARENA=host`
+        // keeps it in system RAM, as does `vram = false` (host steps).
+        let in_vram = (vram
+            && dev.discrete
+            && rlx_ir::env::var("RLX_VULKAN_ARENA").as_deref() != Some("host"))
+        .then(|| {
+            dev.find_memory_type_for_size_where(
+                req.memory_type_bits,
+                host_visible | vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                req.size,
+            )
+        })
+        .flatten()
+        .and_then(|t| allocate(t).ok());
+        let on_vram = in_vram.is_some();
+        let memory = match in_vram {
+            Some(m) => m,
+            None => {
+                // Size-aware: for a big arena, land in a heap that fits
+                // (GTT/system RAM on an APU), not the first HOST_VISIBLE type
+                // (a small VRAM BAR → OOM).
+                let mem_type = cached
+                    .then(|| {
+                        dev.find_memory_type_for_size_where(
+                            req.memory_type_bits,
+                            host_visible | vk::MemoryPropertyFlags::HOST_CACHED,
+                            req.size,
+                        )
+                    })
+                    .flatten()
+                    .or_else(|| {
+                        dev.find_memory_type_for_size(req.memory_type_bits, host_visible, req.size)
+                    })
+                    .expect("rlx-vulkan: no HOST_VISIBLE|HOST_COHERENT memory type");
+                allocate(mem_type).expect("vk allocate_memory")
+            }
+        };
         unsafe { dev.device.bind_buffer_memory(buffer, memory, 0) }.expect("vk bind_buffer_memory");
 
         let mapped = unsafe {
@@ -635,6 +703,7 @@ impl Arena {
             memory,
             mapped,
             size,
+            vram: on_vram,
         }
     }
 
@@ -845,6 +914,9 @@ impl Arena {
         };
         let cap = self.lens.get(&id).copied().unwrap_or(0) / 4;
         let n = n.min(cap);
+        if !w && self.vram && !self.is_sharded() && n * 4 >= STAGED_READ_BYTES {
+            return self.read_f32_staged(off, n);
+        }
         let mut out = vec![0.0f32; n];
         unsafe {
             let src = if w {
@@ -853,6 +925,134 @@ impl Arena {
                 self.act_ptr(off) as *const f32
             };
             std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
+        }
+        out
+    }
+
+    /// Byte offset of `id`'s slot in the activation buffer, or `None` for a
+    /// weight-buffer node or one without a slot.
+    pub fn act_byte_offset(&self, id: NodeId) -> Option<usize> {
+        match self.byte_off_raw(id)? {
+            (false, off) => Some(off),
+            (true, _) => None,
+        }
+    }
+
+    /// A persistent host-cached buffer of at least `bytes` for a pre-recorded
+    /// output readback; replaces any earlier one. Returns its handle and
+    /// mapping.
+    pub fn out_staging(&mut self, bytes: usize) -> (vk::Buffer, *const u8) {
+        if let Some(old) = self.out_staging.take() {
+            unsafe {
+                self.dev.device.unmap_memory(old.memory);
+                self.dev.device.destroy_buffer(old.buffer, None);
+                self.dev.device.free_memory(old.memory, None);
+            }
+        }
+        let b = Self::alloc_buffer_in(self.dev, false, true, bytes.max(16));
+        let out = (b.buffer, b.mapped as *const u8);
+        self.out_staging = Some(b);
+        out
+    }
+
+    /// Several activation reads — `(node, f32 count)` — as one staged GPU
+    /// copy and one submit when the arena is in VRAM (a decode step's logits
+    /// plus a K/V row per layer paid a submit, or an uncached BAR read, each:
+    /// 1.3 ms of TrOCR's 3.3 ms step). Otherwise, or for any weight-buffer
+    /// node, the same as [`Self::read_f32`] per entry.
+    pub fn read_f32_many(&self, reads: &[(NodeId, usize)]) -> Vec<Vec<f32>> {
+        let slots: Option<Vec<(usize, usize)>> = reads
+            .iter()
+            .map(|&(id, n)| {
+                let (w, off) = self.byte_off_raw(id)?;
+                let cap = self.lens.get(&id).copied().unwrap_or(0) / 4;
+                (!w).then_some((off, n.min(cap)))
+            })
+            .collect();
+        let Some(slots) = slots.filter(|_| self.vram && !self.is_sharded() && !reads.is_empty())
+        else {
+            return reads.iter().map(|&(id, n)| self.read_f32(id, n)).collect();
+        };
+        let mut regions = Vec::with_capacity(slots.len());
+        let mut cursor = 0usize;
+        for &(off, n) in &slots {
+            let bytes = (n * 4).max(4);
+            regions.push(vk::BufferCopy {
+                src_offset: off as u64,
+                dst_offset: cursor as u64,
+                size: bytes as u64,
+            });
+            cursor += bytes.div_ceil(16) * 16;
+        }
+        let mut guard = self.staging.lock().unwrap();
+        self.grow_staging(&mut guard, cursor);
+        let st = guard.as_ref().unwrap();
+        let (src, dst) = (self.buffer, st.buffer);
+        self.dev.submit_and_wait(|cmd| unsafe {
+            self.dev.device.cmd_copy_buffer(cmd, src, dst, &regions);
+        });
+        slots
+            .iter()
+            .zip(&regions)
+            .map(|(&(_, n), r)| {
+                let mut out = vec![0.0f32; n];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        st.mapped.add(r.dst_offset as usize) as *const f32,
+                        out.as_mut_ptr(),
+                        n,
+                    );
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// Make the staging buffer hold at least `bytes`.
+    fn grow_staging(&self, guard: &mut Option<BufferMem>, bytes: usize) {
+        if guard.as_ref().is_none_or(|b| b.size < bytes) {
+            if let Some(old) = guard.take() {
+                unsafe {
+                    self.dev.device.unmap_memory(old.memory);
+                    self.dev.device.destroy_buffer(old.buffer, None);
+                    self.dev.device.free_memory(old.memory, None);
+                }
+            }
+            *guard = Some(Self::alloc_buffer_in(
+                self.dev,
+                false,
+                true,
+                bytes.next_power_of_two(),
+            ));
+        }
+    }
+
+    /// `n` f32 at activation byte `off`, copied by the GPU into system-RAM
+    /// staging and read from there. The host reads host-mapped VRAM uncached:
+    /// TrOCR's 7.7 MB of encoder outputs took ~190 ms straight off the BAR.
+    /// The queue is idle here (every run waits on its fence), so the copy
+    /// sees the finished writes.
+    fn read_f32_staged(&self, off: usize, n: usize) -> Vec<f32> {
+        let bytes = n * 4;
+        let mut guard = self.staging.lock().unwrap();
+        self.grow_staging(&mut guard, bytes);
+        let st = guard.as_ref().unwrap();
+        let (src, dst) = (self.buffer, st.buffer);
+        self.dev.submit_and_wait(|cmd| unsafe {
+            self.dev.device.cmd_copy_buffer(
+                cmd,
+                src,
+                dst,
+                &[vk::BufferCopy {
+                    src_offset: off as u64,
+                    dst_offset: 0,
+                    size: bytes as u64,
+                }],
+            );
+        });
+        let mut out = vec![0.0f32; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(st.mapped as *const f32, out.as_mut_ptr(), n);
         }
         out
     }
@@ -1081,6 +1281,16 @@ impl Drop for Arena {
                 self.dev.device.unmap_memory(w.memory);
                 self.dev.device.destroy_buffer(w.buffer, None);
                 self.dev.device.free_memory(w.memory, None);
+            }
+            if let Some(st) = self.out_staging.take() {
+                self.dev.device.unmap_memory(st.memory);
+                self.dev.device.destroy_buffer(st.buffer, None);
+                self.dev.device.free_memory(st.memory, None);
+            }
+            if let Some(st) = self.staging.get_mut().unwrap().take() {
+                self.dev.device.unmap_memory(st.memory);
+                self.dev.device.destroy_buffer(st.buffer, None);
+                self.dev.device.free_memory(st.memory, None);
             }
         }
     }

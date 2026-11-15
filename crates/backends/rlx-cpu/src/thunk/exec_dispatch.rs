@@ -4239,12 +4239,30 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     let windows_fit = h_out.saturating_sub(1) * sh + kh <= h
                         && w_out.saturating_sub(1) * sw + kw <= w;
                     let nopad = ph == 0 && pw == 0 && windows_fit;
+                    // 2×2 stride-2 max pooling (every conv-net downsample): two input rows
+                    // per output row, no window loops or bounds checks.
+                    let max_2x2 = nopad && is_max && kh == 2 && kw == 2 && sh == 2 && sw == 2;
                     let pool_plane = |nc: usize| {
                         let ni = nc / c;
                         let ci = nc % c;
                         let in_chan = ni * c * h * w + ci * h * w;
                         let out_chan = ni * c * h_out * w_out + ci * h_out * w_out;
                         let op = out_addr as *mut f32;
+                        if max_2x2 {
+                            let o = std::slice::from_raw_parts_mut(op.add(out_chan), h_out * w_out);
+                            for (ho, orow) in o.chunks_exact_mut(w_out).enumerate() {
+                                let r0 = &inp[in_chan + 2 * ho * w..][..2 * w_out];
+                                let r1 = &inp[in_chan + (2 * ho + 1) * w..][..2 * w_out];
+                                for ((o, a), b) in orow
+                                    .iter_mut()
+                                    .zip(r0.as_chunks::<2>().0)
+                                    .zip(r1.as_chunks::<2>().0)
+                                {
+                                    *o = a[0].max(a[1]).max(b[0].max(b[1]));
+                                }
+                            }
+                            return;
+                        }
                         for ho in 0..h_out {
                             for wo in 0..w_out {
                                 let mut valid = 0.0f32;
@@ -4304,7 +4322,13 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                             }
                         }
                     };
-                    if fast_conv_enabled() && crate::pool::should_parallelize(n * c * h_out * w_out)
+                    // Pooling is a single pass over memory: fan out only for large layers (a
+                    // fan-out costs tens of µs, more on a loaded machine).
+                    const POOL_PAR_WORK: usize = 1 << 22;
+                    if fast_conv_enabled()
+                        && crate::pool::num_threads() > 1
+                        && n * c > 1
+                        && n * c * h_out * w_out * kh * kw >= POOL_PAR_WORK
                     {
                         crate::pool::par_for(
                             n * c,

@@ -508,7 +508,11 @@ fn limit(name: &str, default: u64) -> u64 {
 /// Where the segment starting at `start` ends, within `start..end`: before the
 /// dispatch that would pass either limit, but never empty.
 fn segment_end(schedule: &[Step], start: usize, end: usize) -> usize {
-    let dispatches = limit("RLX_VULKAN_SEGMENT_DISPATCHES", SEGMENT_DISPATCHES as u64);
+    let dispatches = if rlx_ir::env::flag("RLX_VULKAN_PROFILE") {
+        1
+    } else {
+        limit("RLX_VULKAN_SEGMENT_DISPATCHES", SEGMENT_DISPATCHES as u64)
+    };
     let budget = limit("RLX_VULKAN_SEGMENT_WORKGROUPS", SEGMENT_WORKGROUPS);
     let mut work = 0u64;
     let mut j = start;
@@ -539,8 +543,10 @@ fn segment_end(schedule: &[Step], start: usize, end: usize) -> usize {
 /// is a single `queue_submit` of its prebuilt command buffer — no per-step
 /// allocation, recording, or fence churn. See [`record_segments`].
 enum Segment {
-    /// A prebuilt command buffer covering a run of consecutive GPU dispatches.
-    Gpu(vk::CommandBuffer),
+    /// A prebuilt command buffer covering a run of consecutive GPU dispatches,
+    /// and the kernel of its first dispatch (the whole segment's under
+    /// `RLX_VULKAN_PROFILE`, which records one dispatch per segment).
+    Gpu(vk::CommandBuffer, &'static str),
     /// Cross-shard staging copy on the host-visible arena mapping.
     ActCopy {
         src_byte: usize,
@@ -573,6 +579,21 @@ enum Segment {
     },
 }
 
+/// A pre-recorded copy of every graph output into host-cached staging,
+/// submitted in the same `vkQueueSubmit` as the last GPU segment. The host
+/// reads host-mapped VRAM uncached, and a separate staged copy cost a
+/// submit-and-wait: on a TrOCR decode step the logits and 12 K/V rows took
+/// ~0.9 ms to read either way, against ~1.9 ms of GPU work.
+struct Readback {
+    cmd: vk::CommandBuffer,
+    /// Mapping of the staging buffer (owned by the arena).
+    base: usize,
+    /// Per graph output: byte offset in staging and f32 count.
+    slots: Vec<(usize, usize)>,
+    /// The last run's submit included the copy (cleared once read).
+    fresh: bool,
+}
+
 pub struct VulkanExecutable {
     /// Post-legalize, f32-uniform graph (kept for `clone_for_cache`).
     graph: Graph,
@@ -592,6 +613,9 @@ pub struct VulkanExecutable {
     segments: Vec<Segment>,
     /// Reusable fence for the cached submit path (reset after each wait).
     fence: vk::Fence,
+    /// Outputs copied to host-cached staging by a command buffer submitted
+    /// with the last segment (VRAM arenas; see [`Readback`]).
+    readback: Option<Readback>,
     /// Whether the cached pre-recorded path is active.
     cached: bool,
     input_ids: HashMap<String, NodeId>,
@@ -907,6 +931,52 @@ fn coop_eligible(m: usize, _k: usize, n: usize) -> bool {
     m.is_multiple_of(16) && n.is_multiple_of(16)
 }
 
+/// Kernel and grid for a 2-D conv: `conv2d_tiled` (16×16 output tiles × 8
+/// channels, input patch in shared memory) for the dense case it covers —
+/// groups 1, kernels ≤ 7×7, stride and dilation ≤ 2 — else the direct
+/// one-thread-per-output `conv2d` (depthwise and the rest). Same push block.
+#[allow(clippy::too_many_arguments)]
+fn conv_dispatch(
+    groups: usize,
+    k: [usize; 2],
+    stride: [usize; 2],
+    dilation: [usize; 2],
+    nn: usize,
+    cout: usize,
+    oh: usize,
+    ow: usize,
+) -> (&'static str, (u32, u32, u32)) {
+    let tiled = groups == 1
+        && k.iter().all(|&v| (1..=7).contains(&v))
+        && stride.iter().all(|&v| (1..=2).contains(&v))
+        && dilation.iter().all(|&v| (1..=2).contains(&v))
+        && rlx_ir::env::var("RLX_VULKAN_CONV").as_deref() != Some("direct");
+    if tiled {
+        let z = nn * cout.div_ceil(8);
+        if let Ok(z) = u32::try_from(z)
+            && z <= 65535
+        {
+            return ("conv2d_tiled", (ceil_div(ow, 16), ceil_div(oh, 16), z));
+        }
+    }
+    ("conv2d", groups1d(nn * cout * oh * ow, 64))
+}
+
+/// `matmul_rows`' push block: the matmul fields plus its epilogue — bias
+/// offset, bias length (`0` = no bias; indexed `out % len`) and an activation
+/// op id (`None` = identity).
+fn matmul_rows_epilogue(
+    mut push: Vec<u8>,
+    bias_off: u32,
+    bias_len: u32,
+    act: Option<u32>,
+) -> Vec<u8> {
+    for v in [bias_off, bias_len, act.unwrap_or(u32::MAX)] {
+        push.extend_from_slice(&v.to_le_bytes());
+    }
+    push
+}
+
 /// Rows (`m`) up to which a matmul runs `matmul_rows` — the decode-step
 /// shape, where the one-output-per-thread kernels leave most threads idle.
 const MATMUL_ROWS_MAX_M: usize = 8;
@@ -992,6 +1062,196 @@ fn matmul_kernel(m: usize, k: usize, n: usize) -> &'static str {
 /// RTX 3080 Ti (DAN, 4 heads × 3.9K keys: 264 s → 13 s for 371 steps), 3.3×
 /// (TrOCR-small) there and 4.6× on a Radeon 780M; a 3.5K-row prefill 1.3×.
 const COOP_ATTENTION_MAX_ROWS: usize = 65535;
+
+/// Hidden units up to which `Op::Lstm` (no carried state) runs as
+/// `lstm_proj` + `lstm_rec` per layer.
+const GPU_LSTM_MAX_HIDDEN: usize = 512;
+
+/// Scratch an `Op::Lstm` node needs on the GPU path, or `None` if it takes
+/// another path: the gate projections of both directions
+/// (`dirs · rows · 4h`), two layer buffers (`rows · dirs · h` each) that
+/// alternate between layers, and one layer's transposed `W_hh`
+/// (`dirs · h · 4h`).
+fn lstm_scratch_elems(graph: &Graph, node: &rlx_ir::Node) -> Option<usize> {
+    let Op::Lstm {
+        hidden_size,
+        bidirectional,
+        carry,
+        ..
+    } = &node.op
+    else {
+        return None;
+    };
+    // `lstm_rec` is a 1024-thread workgroup; Vulkan only guarantees 128.
+    let wide_groups = vulkan_device().is_some_and(|d| {
+        d.limits.max_compute_work_group_invocations >= 1024
+            && d.limits.max_compute_work_group_size[0] >= 1024
+    });
+    if *carry
+        || *hidden_size > GPU_LSTM_MAX_HIDDEN
+        || !wide_groups
+        || rlx_ir::env::var("RLX_VULKAN_LSTM").as_deref() == Some("host")
+    {
+        return None;
+    }
+    let xd = dims(graph, node.inputs[0]);
+    let rows = xd[0] * xd[1];
+    let dirs = if *bidirectional { 2 } else { 1 };
+    Some(
+        dirs * rows * 4 * hidden_size
+            + 2 * rows * dirs * hidden_size
+            + dirs * 4 * hidden_size * hidden_size,
+    )
+}
+
+/// Keys per split-K slice of decode attention (≤ the kernels' 2048 chunk).
+const SPLIT_ATTENTION_KEYS: usize = 256;
+
+/// Attention nodes that read their K and V `concat(past, new)` in place:
+/// attention → `[past_k, new_k, past_v, new_v]`. A decode step builds each
+/// layer's keys as a 2-input concat along the sequence axis and then copies
+/// both inputs into it (TrOCR: 4 of a layer's ~18 dispatches); when that
+/// concat feeds only the attention and the attention runs `attention_coop`
+/// (fewer than 16 queries, no split-K), the kernel reads keys `[0, split)`
+/// from `past` and the rest from `new`, and the concat emits nothing.
+/// `RLX_VULKAN_KV_FOLD=0` keeps the copies.
+fn kv_concat_folds(graph: &Graph, arena: &Arena) -> HashMap<NodeId, [NodeId; 4]> {
+    let mut folds = HashMap::new();
+    if arena.is_sharded() || rlx_ir::env::var("RLX_VULKAN_KV_FOLD").as_deref() == Some("0") {
+        return folds;
+    }
+    let outputs: std::collections::HashSet<NodeId> = graph.outputs.iter().copied().collect();
+    for node in graph.nodes() {
+        let Op::Attention {
+            num_heads,
+            head_dim,
+            v_head_dim,
+            ..
+        } = &node.op
+        else {
+            continue;
+        };
+        if v_head_dim.is_some_and(|v| v != *head_dim) {
+            continue;
+        }
+        let qd = dims(graph, node.inputs[0]);
+        let kd = dims(graph, node.inputs[1]);
+        let nh = *num_heads;
+        let (batch, q_s, k_s, seq_axis) = if qd.len() == 4 {
+            if qd[1] == nh {
+                (qd[0], qd[2], kd[2], 2)
+            } else {
+                (qd[0], qd[1], kd[1], 1)
+            }
+        } else if qd.len() >= 3 {
+            (qd[0], qd[1], kd[1], 1)
+        } else {
+            (1, qd[0], kd[0], 0)
+        };
+        let rows = batch * nh * q_s;
+        if q_s >= 16
+            || rows > COOP_ATTENTION_MAX_ROWS
+            || *head_dim > 256
+            || attention_split(rows, k_s, *head_dim).is_some()
+        {
+            continue;
+        }
+        let parts = |id: NodeId| -> Option<(NodeId, NodeId, usize)> {
+            let c = graph.node(id);
+            match &c.op {
+                Op::Concat { axis }
+                    if *axis == seq_axis
+                        && c.inputs.len() == 2
+                        && graph.use_count(id) == 1
+                        && !outputs.contains(&id)
+                        && c.inputs
+                            .iter()
+                            .all(|&i| arena.has(i) && !arena.is_weight_node(i)) =>
+                {
+                    Some((c.inputs[0], c.inputs[1], dims(graph, c.inputs[0])[seq_axis]))
+                }
+                _ => None,
+            }
+        };
+        if let (Some((pk, nk, sk)), Some((pv, nv, sv))) =
+            (parts(node.inputs[1]), parts(node.inputs[2]))
+            && sk == sv
+            && sk > 0
+            && sk < k_s
+        {
+            folds.insert(node.id, [pk, nk, pv, nv]);
+        }
+    }
+    folds
+}
+
+/// `(keys per slice, slices)` when a decode attention of `rows` (batch ·
+/// heads · queries) rows over `k_s` keys should split its keys across
+/// workgroups: few rows (≤ 64) and at least four slices. `RLX_VULKAN_ATTN_SPLIT=0`
+/// keeps every row on `attention_coop`.
+fn attention_split(rows: usize, k_s: usize, dh: usize) -> Option<(usize, usize)> {
+    if rows == 0
+        || rows > 64
+        || dh > 256
+        || rlx_ir::env::var("RLX_VULKAN_ATTN_SPLIT").as_deref() == Some("0")
+    {
+        return None;
+    }
+    let splits = k_s
+        .div_ceil(SPLIT_ATTENTION_KEYS)
+        .min(65535 / rows.max(1))
+        .min(1024);
+    // Below four slices the extra combine dispatch costs what the split
+    // saves: TrOCR's 577-key cross-attention (3 slices) timed the same on
+    // `attention_coop` on an RTX 3080 Ti and on MoltenVK, one dispatch fewer.
+    if splits < 4 {
+        return None;
+    }
+    // Every slice non-empty: the combine pass reads all of them.
+    let kps = k_s.div_ceil(splits);
+    Some((kps, k_s.div_ceil(kps)))
+}
+
+/// Scratch (f32 elements) `graph`'s kernels need: the largest split-K
+/// attention (`[m, l, acc[dh]]` per (row, slice)) or GPU LSTM (see
+/// [`lstm_scratch_elems`]). One region serves all of them — each step's
+/// footprint names it, so barriers order the users.
+fn scratch_elems(graph: &Graph) -> usize {
+    let mut need = 0usize;
+    for node in graph.nodes() {
+        if let Some(n) = lstm_scratch_elems(graph, node) {
+            need = need.max(n);
+            continue;
+        }
+        let Op::Attention {
+            num_heads,
+            head_dim,
+            ..
+        } = &node.op
+        else {
+            continue;
+        };
+        let qd = dims(graph, node.inputs[0]);
+        let kd = dims(graph, node.inputs[1]);
+        let nh = *num_heads;
+        let (batch, q_s, k_s) = if qd.len() == 4 {
+            if qd[1] == nh {
+                (qd[0], qd[2], kd[2])
+            } else {
+                (qd[0], qd[1], kd[1])
+            }
+        } else if qd.len() >= 3 {
+            (qd[0], qd[1], kd[1])
+        } else {
+            (1, qd[0], kd[0])
+        };
+        let rows = batch * nh * q_s;
+        if let Some((_, splits)) = attention_split(rows, k_s, *head_dim) {
+            need = need.max(rows * splits * (head_dim + 2));
+        }
+    }
+    need
+}
 
 fn groups1d(n: usize, local: u32) -> (u32, u32, u32) {
     (ceil_div(n, local).max(1), 1, 1)
@@ -1115,6 +1375,7 @@ impl VulkanExecutable {
         // Materialize mid-axis broadcasts so Binary operands are equal-shaped
         // or trailing-broadcast (our kernels only do trailing modulus).
         let graph = rlx_opt::LegalizeBroadcast.run(graph);
+        let graph = crate::unfuse::fold_activation_into_linear(graph);
 
         Self::build(graph, rng)
     }
@@ -1126,11 +1387,44 @@ impl VulkanExecutable {
         let mut plan = plan_f32_uniform(&graph, 16);
         crate::buffer::pack_i8_u8_slot_sizes(&graph, &mut plan);
         let max_range = dev.limits.max_storage_buffer_range as usize;
-        let arena = if plan.arena_size > max_range {
-            Arena::from_plan_split(&graph)
-        } else {
-            Arena::from_plan(&plan)
+        // Kernel scratch (split-K decode attention, the LSTM's projections and
+        // layer hand-off): a tail after the planned slots, on single-buffer
+        // arenas only (a sharded arena binds one shard per op, and the tail
+        // need not share it).
+        let mut attn_scratch = None;
+        if plan.arena_size <= max_range {
+            let elems = scratch_elems(&graph);
+            let start = plan.arena_size.div_ceil(256) * 256;
+            if elems > 0 && start + elems * 4 <= max_range {
+                plan.arena_size = start + elems * 4;
+                attn_scratch = Some(SlotSpan {
+                    start: (start / 4) as u32,
+                    len: elems as u32,
+                });
+            }
+        }
+        let make_arena = |vram: bool| {
+            if plan.arena_size > max_range {
+                Arena::from_plan_split(&graph, vram)
+            } else {
+                Arena::from_plan(&plan, vram)
+            }
         };
+        let mut arena = make_arena(true);
+        // Host steps read and write the mapped arena, and the host reads VRAM
+        // uncached (PyLaia's LSTM ran 6× slower there): any host step keeps
+        // the arena in system RAM. Offsets come from the plan, not the memory,
+        // so the same plan serves either buffer.
+        if arena.in_vram() {
+            let (probe, _, _) = build_schedule(&graph, &arena, rng, attn_scratch);
+            if probe
+                .iter()
+                .any(|st| !matches!(st, Step::Gpu { .. } | Step::ActCopy { .. }))
+            {
+                drop(arena);
+                arena = make_arena(false);
+            }
+        }
 
         // Upload constants. U8/I8 stay packed bytes (Quantize codes / QMatMul
         // weights); every other dtype widens to f32 for the f32-uniform arena.
@@ -1174,7 +1468,7 @@ impl VulkanExecutable {
             .map(|&id| graph.node(id).shape.dtype())
             .collect();
 
-        let (schedule, deps, static_once_steps) = build_schedule(&graph, &arena, rng);
+        let (schedule, deps, static_once_steps) = build_schedule(&graph, &arena, rng, attn_scratch);
         if rlx_ir::env::var("RLX_VULKAN_CHECK_CAST").as_deref() == Some("1") {
             let mut bad = 0usize;
             let mut ok = 0usize;
@@ -1285,6 +1579,16 @@ impl VulkanExecutable {
         } else {
             (Vec::new(), vk::Fence::null())
         };
+        let readback = if cached
+            && arena.in_vram()
+            && !arena.is_sharded()
+            && !segments.is_empty()
+            && segments.iter().all(|sg| matches!(sg, Segment::Gpu(..)))
+        {
+            record_readback(dev, &mut arena, &graph)
+        } else {
+            None
+        };
 
         if rlx_ir::env::var_os("RLX_VULKAN_DEBUG").is_some() {
             let gpu = schedule
@@ -1294,7 +1598,7 @@ impl VulkanExecutable {
             let host = schedule.len() - gpu;
             let gpu_segs = segments
                 .iter()
-                .filter(|s| matches!(s, Segment::Gpu(_)))
+                .filter(|s| matches!(s, Segment::Gpu(..)))
                 .count();
             let mut hist: HashMap<&'static str, usize> = HashMap::new();
             for s in &schedule {
@@ -1309,6 +1613,24 @@ impl VulkanExecutable {
                  cached={cached} ({gpu_segs} gpu submit(s)/run)"
             );
             eprintln!("[rlx-vulkan] dispatch histogram: {by_count:?}");
+            let host_steps: Vec<String> = schedule
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Gpu { .. } => None,
+                    Step::ActCopy { .. } => Some("ActCopy".to_string()),
+                    Step::Host { op, .. } | Step::SpdHost { op, .. } => {
+                        Some(format!("{:?}", op.kind()))
+                    }
+                    Step::ScanHost { .. } => Some("ScanHost".to_string()),
+                    Step::HostOp { .. } => Some("HostOp".to_string()),
+                    Step::CpuIndexing { .. } => Some("CpuIndexing".to_string()),
+                    #[allow(unreachable_patterns)]
+                    _ => Some("other".to_string()),
+                })
+                .collect();
+            if !host_steps.is_empty() {
+                eprintln!("[rlx-vulkan] host steps: {host_steps:?}");
+            }
         }
 
         Self {
@@ -1319,6 +1641,7 @@ impl VulkanExecutable {
             static_once_done: false,
             segments,
             fence,
+            readback,
             cached,
             input_ids,
             param_ids,
@@ -1643,11 +1966,32 @@ impl VulkanExecutable {
             // reads/writes are `&self` (interior mutability via the mapped ptr),
             // so the whole loop borrows `self` immutably.
             let nseg = self.segments.len();
+            let mut readback_ran = false;
+            // `RLX_VULKAN_PROFILE=1`: wall time per kernel (one dispatch per
+            // segment, so each submit-and-wait times exactly one kernel).
+            let mut profile: Option<HashMap<&'static str, (f64, usize)>> =
+                rlx_ir::env::flag("RLX_VULKAN_PROFILE").then(HashMap::new);
             for si in 0..nseg {
                 match &self.segments[si] {
-                    Segment::Gpu(cmd) => {
+                    Segment::Gpu(cmd, label) => {
                         let cmd = *cmd;
-                        dev.submit_recorded_wait(cmd, self.fence);
+                        let t0 = profile.as_ref().map(|_| std::time::Instant::now());
+                        match self.readback.as_ref().filter(|_| {
+                            si + 1 == nseg
+                                && self.gpu_handle_feeds.is_empty()
+                                && self.kv_row_feeds.is_empty()
+                        }) {
+                            Some(rb) => {
+                                dev.submit_recorded_wait_many(&[cmd, rb.cmd], self.fence);
+                                readback_ran = true;
+                            }
+                            None => dev.submit_recorded_wait(cmd, self.fence),
+                        }
+                        if let (Some(p), Some(t0)) = (profile.as_mut(), t0) {
+                            let e = p.entry(*label).or_insert((0.0, 0));
+                            e.0 += t0.elapsed().as_secs_f64();
+                            e.1 += 1;
+                        }
                         // Discrete GPUs + host ConvTranspose: make shader
                         // writes visible before the CPU reads the arena.
                         self.arena.sync_host_after_gpu();
@@ -1738,7 +2082,19 @@ impl VulkanExecutable {
                     }
                 }
             }
+            if let Some(p) = profile {
+                let mut rows: Vec<_> = p.into_iter().collect();
+                rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+                let total: f64 = rows.iter().map(|r| r.1.0).sum();
+                eprintln!("[vulkan-profile] {:.1} ms across kernels:", total * 1e3);
+                for (k, (t, n)) in rows.iter().take(12) {
+                    eprintln!("  {k:<28} {:8.1} ms  ({n} dispatches)", t * 1e3);
+                }
+            }
             // Fall through to the feed/readback tail below.
+            if let Some(rb) = self.readback.as_mut() {
+                rb.fresh = readback_ran;
+            }
             return self.finish_run(read_indices);
         }
 
@@ -2019,22 +2375,55 @@ impl VulkanExecutable {
                 }
             }
         }
-        want.into_iter()
+        // Lane count, not element count: a complex output occupies 2 (C64)
+        // / 4 (C128) f32 lanes per element, so reading `num_elements`
+        // would truncate the readback to the real parts (and a slot-sizing
+        // regression would surface here as a short buffer). Every other
+        // dtype is one lane per element, so this is `num_elements` there.
+        let want_idx: Vec<usize> = want
+            .iter()
+            .copied()
+            .filter(|&i| i < self.output_ids.len())
+            .collect();
+        let reads: Vec<(NodeId, usize)> = want
+            .into_iter()
             .filter_map(|i| {
                 let id = *self.output_ids.get(i)?;
-                // Lane count, not element count: a complex output occupies 2 (C64)
-                // / 4 (C128) f32 lanes per element, so reading `num_elements`
-                // would truncate the readback to the real parts (and a slot-sizing
-                // regression would surface here as a short buffer). Every other
-                // dtype is one lane per element, so this is `num_elements` there.
-                let n = arena_lane_count(&self.graph.node(id).shape);
-                let buf = self.arena.read_f32(id, n);
-                if scanner.enabled() {
-                    scanner.check(&self.graph, id, &buf, &[]);
-                }
-                Some(buf)
+                Some((id, arena_lane_count(&self.graph.node(id).shape)))
             })
-            .collect()
+            .collect();
+        // Copied with the last segment's submit, or one staged copy for all
+        // of them (see `Arena::read_f32_many`).
+        let pre = self.readback.as_mut().filter(|rb| rb.fresh).map(|rb| {
+            rb.fresh = false;
+            (rb.base, &rb.slots)
+        });
+        let bufs = match pre {
+            Some((base, slots)) => want_idx
+                .iter()
+                .map(|&i| {
+                    let (off, n) = slots[i];
+                    let mut out = vec![0.0f32; n];
+                    // SAFETY: staging holds every output at `slots`, written by
+                    // the readback that ran with this run's last submit.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            (base + off) as *const f32,
+                            out.as_mut_ptr(),
+                            n,
+                        );
+                    }
+                    out
+                })
+                .collect(),
+            None => self.arena.read_f32_many(&reads),
+        };
+        if scanner.enabled() {
+            for (&(id, _), buf) in reads.iter().zip(&bufs) {
+                scanner.check(&self.graph, id, buf, &[]);
+            }
+        }
+        bufs
     }
 
     /// Deep copy for `clone_box`: fresh arena/descriptors with the same params
@@ -2063,7 +2452,7 @@ impl Drop for VulkanExecutable {
                 .segments
                 .iter()
                 .filter_map(|s| match s {
-                    Segment::Gpu(cmd) => Some(*cmd),
+                    Segment::Gpu(cmd, _) => Some(*cmd),
                     Segment::Host { .. }
                     | Segment::SpdHost { .. }
                     | Segment::ScanHost { .. }
@@ -2074,6 +2463,9 @@ impl Drop for VulkanExecutable {
                 .collect();
             if !cmds.is_empty() {
                 dev.free_cmds(&cmds);
+            }
+            if let Some(rb) = self.readback.take() {
+                dev.free_cmds(&[rb.cmd]);
             }
             if self.fence != vk::Fence::null() {
                 dev.destroy_fence(self.fence);
@@ -2101,6 +2493,71 @@ impl Drop for VulkanExecutable {
 /// glue). `RLX_VULKAN_FULLBARRIER=1` restores a barrier between every pair
 /// (conservative fallback); `RLX_VULKAN_NOBARRIER=1` drops them all (unsafe —
 /// diagnostic only).
+/// Record [`Readback`]: wait for compute, copy every graph output's slot into
+/// a host-cached staging buffer, make it visible to the host. `None` when an
+/// output has no activation slot (a weight-buffer node, a view).
+fn record_readback(
+    dev: &crate::device::VulkanDevice,
+    arena: &mut Arena,
+    graph: &Graph,
+) -> Option<Readback> {
+    let mut slots = Vec::with_capacity(graph.outputs.len());
+    let mut regions = Vec::with_capacity(graph.outputs.len());
+    let mut cursor = 0usize;
+    for &id in &graph.outputs {
+        let src = arena.act_byte_offset(id)?;
+        let n = arena_lane_count(&graph.node(id).shape).min(arena.slot_elems(id));
+        let bytes = (n * 4).max(4);
+        regions.push(vk::BufferCopy {
+            src_offset: src as u64,
+            dst_offset: cursor as u64,
+            size: bytes as u64,
+        });
+        slots.push((cursor, n));
+        cursor += bytes.div_ceil(16) * 16;
+    }
+    let (dst, base) = arena.out_staging(cursor);
+    let src = arena.buffer;
+    let cmd = dev.alloc_primary_cmd();
+    unsafe {
+        dev.device
+            .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
+            .expect("vk begin cmd");
+        let before = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        dev.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[before],
+            &[],
+            &[],
+        );
+        dev.device.cmd_copy_buffer(cmd, src, dst, &regions);
+        let after = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+        dev.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[after],
+            &[],
+            &[],
+        );
+        dev.device.end_command_buffer(cmd).expect("vk end cmd");
+    }
+    Some(Readback {
+        cmd,
+        base: base as usize,
+        slots,
+        fresh: false,
+    })
+}
+
 fn record_segments(
     dev: &crate::device::VulkanDevice,
     kern: &crate::kernels::Kernels,
@@ -2141,6 +2598,10 @@ fn record_segments(
         while chunk_start < i {
             let chunk_end = segment_end(schedule, chunk_start, i);
             let run = &schedule[chunk_start..chunk_end];
+            let label = match run.first() {
+                Some(Step::Gpu { kernel, .. }) => *kernel,
+                _ => "",
+            };
             chunk_start = chunk_end;
             let run_deps = &deps[dep_i..dep_i + run.len()];
             dep_i += run.len();
@@ -2219,7 +2680,7 @@ fn record_segments(
                 }
                 dev.device.end_command_buffer(cmd).expect("vk end cmd");
             }
-            segments.push(Segment::Gpu(cmd));
+            segments.push(Segment::Gpu(cmd, label));
         }
         // A copy right after GPU work is the loop head's (its segment and its
         // dep): consuming it here dropped `Op::KvAppend`'s row write and set
@@ -2525,6 +2986,7 @@ fn build_schedule(
     graph: &Graph,
     arena: &Arena,
     rng: RngOptions,
+    attn_scratch: Option<SlotSpan>,
 ) -> (Vec<Step>, Vec<StepDep>, std::collections::HashSet<usize>) {
     let mut steps = Vec::new();
     let mut deps: Vec<StepDep> = Vec::new();
@@ -2548,6 +3010,11 @@ fn build_schedule(
     };
     let mut static_once_steps: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut binder = ActBinder::new();
+    let kv_folds = kv_concat_folds(graph, arena);
+    let folded_concats: std::collections::HashSet<NodeId> = kv_folds
+        .keys()
+        .flat_map(|&a| [graph.node(a).inputs[1], graph.node(a).inputs[2]])
+        .collect();
     // BF16 matmul weights stored packed (2 bytes/elem) → `matmul_bf16` kernel.
     let bf16_weights = crate::buffer::bf16_packed_matmul_weights(graph);
     if rlx_ir::env::var("RLX_VULKAN_DUMP_OPS").as_deref() == Some("1") {
@@ -3029,12 +3496,18 @@ fn build_schedule(
                     n,
                     batch,
                 );
+                let push = if kernel == "matmul_rows" {
+                    matmul_rows_epilogue(push, 0, 0, None)
+                } else {
+                    push
+                };
                 push_gpu_step(&mut binder, &mut steps, &mut deps, kernel, push, groups);
             }
 
             Op::FusedMatMulBiasAct { activation } => {
-                // Compose existing matmul + Binary(Add) + optional Activation
-                // into `out` (no dedicated matmul epilogue shader yet).
+                // `matmul_rows` (few rows) folds bias + activation into its
+                // epilogue; the other kernels compose matmul + Binary(Add) +
+                // optional Activation into `out`.
                 let a = node.inputs[0];
                 let b = node.inputs[1];
                 let bias = node.inputs[2];
@@ -3081,41 +3554,53 @@ fn build_schedule(
                     n,
                     batch,
                 );
-                push_gpu_step(&mut binder, &mut steps, &mut deps, kernel, push, groups);
                 let total = numel(&od);
                 let bn = numel(&dims(graph, bias));
-                let add = Push::default()
-                    .u(total as u32)
-                    .u(binder.off(arena, out))
-                    .u(binder.off(arena, bias))
-                    .u(binder.off(arena, out))
-                    .u(0) // a contiguous (matmul result)
-                    .u(if bn == total { 0 } else { bn as u32 })
-                    .u(binop_id(BinaryOp::Add))
-                    .bytes();
-                push_gpu_step(
-                    &mut binder,
-                    &mut steps,
-                    &mut deps,
-                    "binary",
-                    add,
-                    groups1d(total, 256),
-                );
-                if let Some(act) = activation {
-                    let act_push = Push::default()
+                if kernel == "matmul_rows" {
+                    // Bias and activation in the kernel's epilogue: one
+                    // dispatch for the whole linear.
+                    let push = matmul_rows_epilogue(
+                        push,
+                        binder.off(arena, bias),
+                        bn as u32,
+                        activation.map(act_id),
+                    );
+                    push_gpu_step(&mut binder, &mut steps, &mut deps, kernel, push, groups);
+                } else {
+                    push_gpu_step(&mut binder, &mut steps, &mut deps, kernel, push, groups);
+                    let add = Push::default()
                         .u(total as u32)
                         .u(binder.off(arena, out))
+                        .u(binder.off(arena, bias))
                         .u(binder.off(arena, out))
-                        .u(act_id(*act))
+                        .u(0) // a contiguous (matmul result)
+                        .u(if bn == total { 0 } else { bn as u32 })
+                        .u(binop_id(BinaryOp::Add))
                         .bytes();
                     push_gpu_step(
                         &mut binder,
                         &mut steps,
                         &mut deps,
-                        "unary",
-                        act_push,
+                        "binary",
+                        add,
                         groups1d(total, 256),
                     );
+                    if let Some(act) = activation {
+                        let act_push = Push::default()
+                            .u(total as u32)
+                            .u(binder.off(arena, out))
+                            .u(binder.off(arena, out))
+                            .u(act_id(*act))
+                            .bytes();
+                        push_gpu_step(
+                            &mut binder,
+                            &mut steps,
+                            &mut deps,
+                            "unary",
+                            act_push,
+                            groups1d(total, 256),
+                        );
+                    }
                 }
             }
 
@@ -3412,20 +3897,21 @@ fn build_schedule(
                     .u(binder.off(arena, beta))
                     .u(binder.off(arena, out))
                     .u(if *has_bias { 1 } else { 0 })
-                    .f(*eps)
-                    .bytes();
-                push_gpu_step(
-                    &mut binder,
-                    &mut steps,
-                    &mut deps,
-                    if is_rms {
-                        "fused_residual_rms_norm"
-                    } else {
-                        "fused_residual_ln"
-                    },
-                    push,
-                    groups1d(outer, 64),
-                );
+                    .f(*eps);
+                // A workgroup per row (decode has one row); past the dispatch
+                // limit, the thread-per-row kernels.
+                let (kernel, push, groups) = if outer <= 65535 {
+                    (
+                        "fused_residual_norm_row",
+                        push.u(u32::from(is_rms)).bytes(),
+                        (outer.max(1) as u32, 1, 1),
+                    )
+                } else if is_rms {
+                    ("fused_residual_rms_norm", push.bytes(), groups1d(outer, 64))
+                } else {
+                    ("fused_residual_ln", push.bytes(), groups1d(outer, 64))
+                };
+                push_gpu_step(&mut binder, &mut steps, &mut deps, kernel, push, groups);
             }
 
             Op::FusedSwiGLU {
@@ -4177,6 +4663,7 @@ fn build_schedule(
                 let q = node.inputs[0];
                 let k = node.inputs[1];
                 let v = node.inputs[2];
+                let fold = kv_folds.get(&node.id).copied();
                 let qd = dims(graph, q);
                 let kd = dims(graph, k);
                 let nh = *num_heads;
@@ -4208,8 +4695,8 @@ fn build_schedule(
                     .u(k_s as u32)
                     .u(dh as u32)
                     .u(binder.off(arena, q))
-                    .u(binder.off(arena, k))
-                    .u(binder.off(arena, v))
+                    .u(binder.off(arena, fold.map_or(k, |f| f[0])))
+                    .u(binder.off(arena, fold.map_or(v, |f| f[2])))
                     .u(binder.off(arena, out))
                     .u(hs)
                     .u(hs)
@@ -4223,14 +4710,115 @@ fn build_schedule(
                     .f(0.5)
                     .bytes();
                 // A workgroup per row splits the keys (decode has only B·H
-                // rows); beyond the dispatch limit, a thread per row.
+                // rows); few rows over many keys also split the keys across
+                // workgroups; beyond the dispatch limit, a thread per row.
                 let rows = batch * nh * q_s;
-                let (kernel, groups) = if rows <= COOP_ATTENTION_MAX_ROWS && dh <= 256 {
-                    ("attention_coop", (rows.max(1) as u32, 1, 1))
+                let split = attention_split(rows, k_s, dh)
+                    .zip(attn_scratch)
+                    .filter(|&((_, splits), scr)| rows * splits * (dh + 2) <= scr.len as usize);
+                if let Some(((kps, splits), scr)) = split {
+                    let mut push = push;
+                    for v in [scr.start, kps as u32, splits as u32] {
+                        push.extend_from_slice(&v.to_le_bytes());
+                    }
+                    let used = SlotSpan {
+                        start: scr.start,
+                        len: (rows * splits * (dh + 2)) as u32,
+                    };
+                    let span = |id: NodeId| SlotSpan {
+                        start: crate::buffer::raw_elem_off(arena.elem_offset(id)),
+                        len: arena.slot_elems(id) as u32,
+                    };
+                    let reads: Vec<SlotSpan> = node
+                        .inputs
+                        .iter()
+                        .filter(|&&id| arena.has(id))
+                        .map(|&id| span(id))
+                        .collect();
+                    // Each pass carries its own footprint (the scratch is no
+                    // node's slot): split writes the scratch, combine reads
+                    // it and writes the output.
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "attention_split",
+                        push.clone(),
+                        (rows as u32, splits as u32, 1),
+                    );
+                    deps.push(StepDep { reads, write: used });
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "attention_combine",
+                        push,
+                        (rows as u32, 1, 1),
+                    );
+                    deps.push(StepDep {
+                        reads: vec![used],
+                        write: span(out),
+                    });
                 } else {
-                    ("attention", groups1d(rows, 64))
-                };
-                push_gpu_step(&mut binder, &mut steps, &mut deps, kernel, push, groups);
+                    // 16 queries of a head per workgroup share each K/V tile.
+                    let tiled = q_s >= 16
+                        && dh <= 128
+                        && batch * nh <= 65535
+                        && q_s.div_ceil(16) <= 65535
+                        && rlx_ir::env::var("RLX_VULKAN_ATTN_TILED").as_deref() != Some("0");
+                    let (kernel, groups) = if tiled {
+                        (
+                            "attention_tiled",
+                            (q_s.div_ceil(16) as u32, (batch * nh) as u32, 1),
+                        )
+                    } else if rows <= COOP_ATTENTION_MAX_ROWS && dh <= 256 {
+                        ("attention_coop", (rows.max(1) as u32, 1, 1))
+                    } else {
+                        ("attention", groups1d(rows, 64))
+                    };
+                    let mut push = push;
+                    if kernel == "attention_coop" {
+                        // Second K/V buffer for a folded concat; `k_split` 0 = none.
+                        let seq_axis = if bhsd != 0 {
+                            2
+                        } else if qd.len() >= 3 {
+                            1
+                        } else {
+                            0
+                        };
+                        let (k2, v2, split) = match fold {
+                            Some(f) => (
+                                binder.off(arena, f[1]),
+                                binder.off(arena, f[3]),
+                                dims(graph, f[0])[seq_axis] as u32,
+                            ),
+                            None => (0, 0, 0),
+                        };
+                        for w in [k2, v2, split] {
+                            push.extend_from_slice(&w.to_le_bytes());
+                        }
+                    }
+                    debug_assert!(fold.is_none() || kernel == "attention_coop");
+                    push_gpu_step(&mut binder, &mut steps, &mut deps, kernel, push, groups);
+                    if let Some(f) = fold {
+                        // The concat slots are never written: read the parts.
+                        let span = |id: NodeId| SlotSpan {
+                            start: crate::buffer::raw_elem_off(arena.elem_offset(id)),
+                            len: arena.slot_elems(id) as u32,
+                        };
+                        let mut reads: Vec<SlotSpan> = f.iter().map(|&id| span(id)).collect();
+                        reads.push(span(q));
+                        for &extra in node.inputs.iter().skip(3) {
+                            if arena.has(extra) {
+                                reads.push(span(extra));
+                            }
+                        }
+                        deps.push(StepDep {
+                            reads,
+                            write: span(out),
+                        });
+                    }
+                }
             }
 
             Op::AttentionBackward {
@@ -4589,6 +5177,9 @@ fn build_schedule(
                     bytes: inner_bytes,
                 });
             }
+            // Read in place by its attention (`kv_concat_folds`).
+            Op::Concat { .. } if folded_concats.contains(&node.id) => {}
+
             Op::Concat { axis } => {
                 let sched_before = steps.len();
                 // Complex packs `lanes` contiguous f32 per element; the `reindex`
@@ -4615,6 +5206,11 @@ fn build_schedule(
                 let out_str = contig_strides(&od);
                 let rank = od.len();
                 let mut axis_cursor = 0usize;
+                let contiguous_parts = !arena.is_sharded()
+                    && arena.has(out)
+                    && !arena.is_weight_node(out)
+                    && od[..*axis].iter().product::<usize>() == 1
+                    && node.inputs.iter().all(|&i| arena.has(i));
                 for &inp in &node.inputs {
                     let mut id_dims = dims(graph, inp);
                     if lanes > 1 {
@@ -4648,6 +5244,25 @@ fn build_schedule(
                         push,
                         groups1d(n, 256),
                     );
+                    // A copy whose part of `out` is one contiguous range (no
+                    // axis outside the concat one) carries that range, not the
+                    // whole output: the copies are disjoint, and the shared
+                    // footprint made each wait on the last (a TrOCR decode
+                    // step had a barrier inside each of its 12 KV concats).
+                    if contiguous_parts && arena.has(inp) {
+                        let start = raw_elem_off(arena.elem_offset(out))
+                            + (axis_cursor * out_str[*axis]) as u32;
+                        deps.push(StepDep {
+                            reads: vec![SlotSpan {
+                                start: raw_elem_off(arena.elem_offset(inp)),
+                                len: arena.slot_elems(inp) as u32,
+                            }],
+                            write: SlotSpan {
+                                start,
+                                len: n as u32,
+                            },
+                        });
+                    }
                     axis_cursor += *id_dims.get(*axis).unwrap_or(&1);
                 }
                 if rlx_opt::memory::is_static_weight_tensor(graph, node.id, &mut static_weight_memo)
@@ -5063,14 +5678,9 @@ fn build_schedule(
                         .u(binder.off(arena, bias))
                         .u(binder.off(arena, out))
                         .bytes();
-                    push_gpu_step(
-                        &mut binder,
-                        &mut steps,
-                        &mut deps,
-                        "conv2d",
-                        push,
-                        groups1d(nn * cout * oh * ow, 64),
-                    );
+                    let (kernel, grid) =
+                        conv_dispatch(*groups, [kh, kw], [sh, sw], [dh, dw], nn, cout, oh, ow);
+                    push_gpu_step(&mut binder, &mut steps, &mut deps, kernel, push, grid);
                 }
             }
 
@@ -5334,14 +5944,17 @@ fn build_schedule(
                     .u(binder.off(arena, bias))
                     .u(binder.off(arena, out))
                     .bytes();
-                push_gpu_step(
-                    &mut binder,
-                    &mut steps,
-                    &mut deps,
-                    "conv2d",
-                    push,
-                    groups1d(nn * cout * oh * ow, 64),
+                let (kernel, grid) = conv_dispatch(
+                    *groups,
+                    [kh, kw],
+                    [stride[0], stride[1]],
+                    [dilation[0], dilation[1]],
+                    nn,
+                    cout,
+                    oh,
+                    ow,
                 );
+                push_gpu_step(&mut binder, &mut steps, &mut deps, kernel, push, grid);
                 let act = match activation {
                     None => 0xFFFFu32,
                     Some(a) => act_id(*a),
@@ -5588,7 +6201,122 @@ fn build_schedule(
                 let (batch, seq, input_size) = (xd[0], xd[1], xd[2]);
                 let hidden = *hidden_size;
                 let simple = *num_layers == 1 && !*bidirectional && !*carry && hidden <= 256;
-                if simple {
+                let gpu = lstm_scratch_elems(graph, node)
+                    .zip(attn_scratch)
+                    .filter(|&(need, scr)| need <= scr.len as usize);
+                if let Some((_, scr)) = gpu {
+                    // Per layer: the input projection of every (batch, t) row
+                    // for both directions, then the recurrence, as the CPU
+                    // reference splits it; W_hh is transposed first so the
+                    // recurrence reads it coalesced. Scratch:
+                    // [zin | layer A | layer B | W_hhᵀ].
+                    let dirs = if *bidirectional { 2 } else { 1 };
+                    let rows = batch * seq;
+                    let four_h = 4 * hidden;
+                    let out_w = dirs * hidden;
+                    let zin = scr.start;
+                    let layer_buf = [
+                        zin + (dirs * rows * four_h) as u32,
+                        zin + (dirs * rows * four_h + rows * out_w) as u32,
+                    ];
+                    let wt = zin + (dirs * rows * four_h + 2 * rows * out_w) as u32;
+                    let used = SlotSpan {
+                        start: scr.start,
+                        len: (dirs * rows * four_h + 2 * rows * out_w + dirs * four_h * hidden)
+                            as u32,
+                    };
+                    let span = |id: NodeId| SlotSpan {
+                        start: crate::buffer::raw_elem_off(arena.elem_offset(id)),
+                        len: arena.slot_elems(id) as u32,
+                    };
+                    let mut reads: Vec<SlotSpan> = node
+                        .inputs
+                        .iter()
+                        .filter(|&&id| arena.has(id))
+                        .map(|&id| span(id))
+                        .collect();
+                    reads.push(used);
+                    let (w_ih, w_hh, bias) = (
+                        binder.off(arena, node.inputs[1]),
+                        binder.off(arena, node.inputs[2]),
+                        binder.off(arena, node.inputs[3]),
+                    );
+                    let x_off = binder.off(arena, x);
+                    let out_off = binder.off(arena, out);
+                    let mut wih_cursor = 0u32;
+                    let mut in_l = input_size;
+                    for l in 0..*num_layers {
+                        let last = l + 1 == *num_layers;
+                        let src = if l == 0 {
+                            x_off
+                        } else {
+                            layer_buf[(l - 1) % 2]
+                        };
+                        let dst = if last { out_off } else { layer_buf[l % 2] };
+                        let proj = Push::default()
+                            .u(rows as u32)
+                            .u(in_l as u32)
+                            .u(four_h as u32)
+                            .u(src)
+                            .u(w_ih + wih_cursor)
+                            .u(bias + (l * dirs * four_h) as u32)
+                            .u(zin)
+                            .bytes();
+                        push_gpu_step(
+                            &mut binder,
+                            &mut steps,
+                            &mut deps,
+                            "lstm_proj",
+                            proj,
+                            (ceil_div(four_h, 16), ceil_div(rows, 16), dirs as u32),
+                        );
+                        deps.push(StepDep {
+                            reads: reads.clone(),
+                            write: used,
+                        });
+                        let tr = Push::default()
+                            .u(four_h as u32)
+                            .u(hidden as u32)
+                            .u(w_hh + (l * dirs * four_h * hidden) as u32)
+                            .u(wt)
+                            .bytes();
+                        push_gpu_step(
+                            &mut binder,
+                            &mut steps,
+                            &mut deps,
+                            "lstm_whh_t",
+                            tr,
+                            (ceil_div(hidden, 16), ceil_div(four_h, 16), dirs as u32),
+                        );
+                        deps.push(StepDep {
+                            reads: reads.clone(),
+                            write: used,
+                        });
+                        let rec = Push::default()
+                            .u(batch as u32)
+                            .u(seq as u32)
+                            .u(hidden as u32)
+                            .u(zin)
+                            .u(wt)
+                            .u(dst)
+                            .u(out_w as u32)
+                            .bytes();
+                        push_gpu_step(
+                            &mut binder,
+                            &mut steps,
+                            &mut deps,
+                            "lstm_rec",
+                            rec,
+                            (batch as u32, dirs as u32, 1),
+                        );
+                        deps.push(StepDep {
+                            reads: reads.clone(),
+                            write: if last { span(out) } else { used },
+                        });
+                        wih_cursor += (dirs * four_h * in_l) as u32;
+                        in_l = out_w;
+                    }
+                } else if simple {
                     let push = Push::default()
                         .u(batch as u32)
                         .u(seq as u32)

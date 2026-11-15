@@ -1,0 +1,34 @@
+#version 450
+// W_hh of one LSTM layer, transposed per direction: wt[dir][j][r] =
+// whh[dir][r][j] ([4h, h] → [h, 4h]). In `lstm_rec.comp` thread r then
+// reads wt[j·4h + r], so a warp's lanes read consecutive words for each j;
+// reading whh[r·h + j] row by row put every lane on its own row and the
+// recurrence spent ~250 µs a step on uncoalesced loads. 16×16 shared tiles.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform PC {
+    uint four_h;
+    uint hidden;
+    uint whh_off;   // this layer's W_hh; + dir · 4h · h
+    uint wt_off;    // [dirs, h, 4h]
+} pc;
+
+shared float tile[16][17];
+
+void main() {
+    uint dir = gl_WorkGroupID.z;
+    uint base = dir * pc.four_h * pc.hidden;
+    // Read rows r0 + ty, columns j0 + tx of whh.
+    uint r = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    uint j = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    if (r < pc.four_h && j < pc.hidden) {
+        tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = arena_load(pc.whh_off + base + r * pc.hidden + j);
+    }
+    barrier();
+    // Write rows j0 + ty, columns r0 + tx of wt.
+    uint jo = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.y;
+    uint ro = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.x;
+    if (jo < pc.hidden && ro < pc.four_h) {
+        arena_store(pc.wt_off + base + jo * pc.four_h + ro, tile[gl_LocalInvocationID.x][gl_LocalInvocationID.y]);
+    }
+}

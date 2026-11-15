@@ -82,7 +82,7 @@ fn every_epilogue_divides_exactly_and_fuses_its_polynomials() {
             "{name}: calls the builtin `exp` (its rounding depends on the math mode)"
         );
     }
-    assert_eq!(seen, 18, "the epilogue shaders moved; update this test");
+    assert_eq!(seen, 19, "the epilogue shaders moved; update this test");
 }
 
 /// The normalization, softmax and attention kernels (forward and backward) take

@@ -1,0 +1,45 @@
+#version 450
+// Input projection of one LSTM layer, both directions: for every (batch, t)
+// row, zin[dir][row][r] = bias[dir][r] + Σ_j in[row][j] · W_ih[dir][r][j]
+// (W_ih row-major [4h, in] per direction, as `Op::Lstm` packs it). The
+// recurrence (`lstm_rec.comp`) then adds only W_hh · h per step, which is
+// how the CPU reference splits it. 16×16 output tiles, 16-wide shared K
+// tiles. fp32.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform PC {
+    uint rows;      // batch · seq
+    uint in_l;      // input width of this layer
+    uint four_h;
+    uint in_off;    // [rows, in_l]
+    uint w_off;     // this layer's W_ih block; + dir · four_h · in_l
+    uint bias_off;  // this layer's bias block; + dir · four_h
+    uint zin_off;   // [dirs, rows, four_h]
+} pc;
+
+shared float xa[16][17];
+shared float wb[16][17];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;   // gate row within tile
+    uint ty = gl_LocalInvocationID.y;   // input row within tile
+    uint r = gl_WorkGroupID.x * 16u + tx;
+    uint row = gl_WorkGroupID.y * 16u + ty;
+    uint dir = gl_WorkGroupID.z;
+    uint w_base = pc.w_off + dir * pc.four_h * pc.in_l;
+    float acc = 0.0;
+    for (uint k0 = 0u; k0 < pc.in_l; k0 += 16u) {
+        // xa[ty][tx] = in[row][k0 + tx]; wb[ty][tx] = W[gate row tile + ty][k0 + tx]
+        uint k = k0 + tx;
+        xa[ty][tx] = (row < pc.rows && k < pc.in_l) ? arena_load(pc.in_off + row * pc.in_l + k) : 0.0;
+        uint wr = gl_WorkGroupID.x * 16u + ty;
+        wb[ty][tx] = (wr < pc.four_h && k < pc.in_l) ? arena_load(w_base + wr * pc.in_l + k) : 0.0;
+        barrier();
+        for (uint j = 0u; j < 16u; j++) { acc += xa[ty][j] * wb[tx][j]; }
+        barrier();
+    }
+    if (row < pc.rows && r < pc.four_h) {
+        acc += arena_load(pc.bias_off + dir * pc.four_h + r);
+        arena_store(pc.zin_off + (dir * pc.rows + row) * pc.four_h + r, acc);
+    }
+}

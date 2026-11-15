@@ -1318,7 +1318,13 @@ pub(crate) fn exec_conv2_d(t: &Thunk, base: *mut u8) {
             // shapes take the (constant-memory) naive kernel instead.
             const IM2COL_MAX_COL_ELEMS: usize = 512 * 1024 * 1024; // 2 GB f32 scratch
             let col_elems = (c_in_per_g * kh * kw).saturating_mul(h_out * w_out);
-            if fast_conv_enabled() && winograd_enabled() && winograd_ok {
+            if fast_conv_enabled() && groups == c_in && c_out == c_in && kh * kw > 1 {
+                // Depthwise (MobileNet / YuNet blocks): im2col would build a patch matrix and
+                // run one single-row GEMM per channel; a direct per-plane pass needs neither.
+                conv2d_forward_depthwise(
+                    inp, wt, out, n, c_in, h, w, h_out, w_out, kh, kw, sh, sw, ph, pw, dh, dw,
+                );
+            } else if fast_conv_enabled() && winograd_enabled() && winograd_ok {
                 conv2d_forward_winograd(inp, wt, out, n, c_in, h, w, c_out, h_out, w_out);
             } else if fast_conv_enabled()
                 && (direct_conv_enabled() || im2col_gemm_is_degenerate(c_out, groups, kh, kw))
@@ -2361,6 +2367,153 @@ pub(crate) fn fast_conv_enabled() -> bool {
     })
 }
 
+/// Depthwise forward convolution (`groups == c_in == c_out`): each output plane is its input
+/// plane convolved with its own `kh × kw` kernel. Per kernel tap, the output rows are walked
+/// over the columns whose input lies inside the image (padding clips the range instead of
+/// branching per element, so the stride-1 inner loop vectorizes); no scratch. Planes are
+/// independent, so they fan out over the pool when the layer is large enough.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conv2d_forward_depthwise(
+    inp: &[f32],
+    wt: &[f32],
+    out: &mut [f32],
+    n: usize,
+    c: usize,
+    h: usize,
+    w: usize,
+    h_out: usize,
+    w_out: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+    dh: usize,
+    dw: usize,
+) {
+    let work = n * c * h_out * w_out * kh * kw;
+    depthwise_planes(
+        inp,
+        wt,
+        out,
+        n,
+        c,
+        h,
+        w,
+        h_out,
+        w_out,
+        kh,
+        kw,
+        sh,
+        sw,
+        ph,
+        pw,
+        dh,
+        dw,
+        work >= DEPTHWISE_PAR_WORK,
+    );
+}
+
+/// Multiply-adds below which a depthwise layer runs on the calling thread. A depthwise layer is
+/// memory-bound and short (YuNet's largest, 16×96×160, is ~0.2 ms on one core); a fan-out
+/// costs more than it saves until layers are far bigger, more so on a loaded machine.
+const DEPTHWISE_PAR_WORK: usize = 1 << 24;
+
+#[allow(clippy::too_many_arguments)]
+fn depthwise_planes(
+    inp: &[f32],
+    wt: &[f32],
+    out: &mut [f32],
+    n: usize,
+    c: usize,
+    h: usize,
+    w: usize,
+    h_out: usize,
+    w_out: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+    dh: usize,
+    dw: usize,
+    parallel: bool,
+) {
+    let (in_plane, out_plane, k_plane) = (h * w, h_out * w_out, kh * kw);
+    // Per kernel column: the output columns whose input column `wo·sw + kj·dw - pw` is in
+    // [0, w), and the first such input column (padding clips the range, no per-element test).
+    let cols: Vec<(usize, usize, usize)> = (0..kw)
+        .map(|kj| {
+            let off = kj * dw;
+            let wo0 = pw.saturating_sub(off).div_ceil(sw);
+            let wo1 = if w + pw > off {
+                (w + pw - off).div_ceil(sw).min(w_out)
+            } else {
+                0
+            };
+            (wo0, wo1.max(wo0), (wo0 * sw + off).saturating_sub(pw))
+        })
+        .collect();
+    // One output row at a time: every tap accumulates into a row-sized buffer (L1-resident,
+    // as are the few input rows it reads), written out once. Accumulating tap by tap over
+    // the whole plane instead streams the output through memory `kh·kw` times, which is
+    // what limits a depthwise layer on a small core.
+    let plane = |nc: usize, o: &mut [f32]| {
+        let x = &inp[nc * in_plane..(nc + 1) * in_plane];
+        let k = &wt[(nc % c) * k_plane..(nc % c + 1) * k_plane];
+        let mut acc = vec![0f32; w_out];
+        for (ho, orow) in o.chunks_exact_mut(w_out).enumerate() {
+            acc.fill(0.0);
+            for ki in 0..kh {
+                let hi = ho * sh + ki * dh;
+                if hi < ph || hi - ph >= h {
+                    continue;
+                }
+                let row = &x[(hi - ph) * w..(hi - ph + 1) * w];
+                for (kj, &(wo0, wo1, wi0)) in cols.iter().enumerate() {
+                    if wo0 >= wo1 {
+                        continue;
+                    }
+                    let wv = k[ki * kw + kj];
+                    let dst = &mut acc[wo0..wo1];
+                    if sw == 1 {
+                        for (a, i) in dst.iter_mut().zip(&row[wi0..wi0 + (wo1 - wo0)]) {
+                            *a += wv * i;
+                        }
+                    } else {
+                        for (j, a) in dst.iter_mut().enumerate() {
+                            *a += wv * row[wi0 + j * sw];
+                        }
+                    }
+                }
+            }
+            orow.copy_from_slice(&acc);
+        }
+    };
+    let planes = n * c;
+    if parallel && crate::pool::num_threads() > 1 && planes > 1 {
+        let out_addr = out.as_mut_ptr() as usize;
+        crate::pool::par_for(planes, crate::pool::outer_chunk(planes), &|off, cnt| {
+            for nc in off..off + cnt {
+                // SAFETY: each `nc` owns the disjoint `out_plane` block at `nc * out_plane`.
+                let o = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (out_addr as *mut f32).add(nc * out_plane),
+                        out_plane,
+                    )
+                };
+                plane(nc, o);
+            }
+        });
+    } else {
+        for (nc, o) in out.chunks_exact_mut(out_plane).enumerate().take(planes) {
+            plane(nc, o);
+        }
+    }
+}
+
 /// Reference forward convolution: a direct scalar nested loop. Correct and
 /// dependency-free, but scalar / single-threaded with a bounds-check branch
 /// in the hot loop — orders of magnitude slower on training shapes. Kept as
@@ -3114,6 +3267,84 @@ pub(crate) fn col2im(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The depthwise kernel against the reference loop, over strides, padding, dilation and
+    /// kernel shapes (including padding wider than the kernel reach and 1-wide images).
+    #[test]
+    fn depthwise_matches_the_reference() {
+        let cases = [
+            // n, c, h, w, kh, kw, sh, sw, ph, pw, dh, dw
+            (1, 16, 12, 20, 3, 3, 1, 1, 1, 1, 1, 1),
+            (2, 5, 9, 7, 3, 3, 2, 2, 1, 1, 1, 1),
+            (1, 4, 6, 10, 5, 5, 1, 1, 2, 2, 1, 1),
+            (1, 3, 8, 8, 3, 3, 1, 1, 2, 2, 2, 2),
+            (1, 6, 5, 1, 3, 1, 1, 1, 1, 0, 1, 1),
+            (1, 2, 4, 4, 1, 1, 1, 1, 0, 0, 1, 1),
+            (1, 3, 7, 9, 3, 5, 2, 1, 0, 3, 1, 1),
+            (1, 64, 24, 40, 3, 3, 1, 1, 1, 1, 1, 1),
+        ];
+        for (n, c, h, w, kh, kw, sh, sw, ph, pw, dh, dw) in cases {
+            let h_out = (h + 2 * ph - dh * (kh - 1) - 1) / sh + 1;
+            let w_out = (w + 2 * pw - dw * (kw - 1) - 1) / sw + 1;
+            let x: Vec<f32> = (0..n * c * h * w)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+                .collect();
+            let k: Vec<f32> = (0..c * kh * kw)
+                .map(|i| ((i * 13 % 29) as f32 - 14.0) / 7.0)
+                .collect();
+            let mut got = vec![f32::NAN; n * c * h_out * w_out];
+            let mut want = vec![0f32; got.len()];
+            conv2d_forward_depthwise(
+                &x, &k, &mut got, n, c, h, w, h_out, w_out, kh, kw, sh, sw, ph, pw, dh, dw,
+            );
+            conv2d_forward_naive(
+                &x, &k, &mut want, n, c, h, w, c, h_out, w_out, kh, kw, sh, sw, ph, pw, dh, dw, c,
+            );
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-4 * (1.0 + b.abs()),
+                    "case {:?} at {i}: {a} vs {b}",
+                    (n, c, h, w, kh, kw, sh, sw, ph, pw, dh, dw)
+                );
+            }
+        }
+    }
+
+    /// Timing, not correctness: depthwise 3×3 (YuNet / MobileNet shapes), the direct kernel
+    /// against im2col + GEMM.
+    #[test]
+    #[ignore]
+    fn depthwise_timing() {
+        for (c, h, w) in [(16, 96, 160), (64, 24, 40), (64, 12, 20), (64, 6, 10)] {
+            let x: Vec<f32> = (0..c * h * w).map(|i| (i % 17) as f32).collect();
+            let k: Vec<f32> = (0..c * 9).map(|i| (i % 5) as f32).collect();
+            let mut o = vec![0f32; c * h * w];
+            let reps = (20_000_000 / (c * h * w * 9)).max(5);
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                conv2d_forward_im2col(
+                    &x, &k, &mut o, 1, c, h, w, c, h, w, 3, 3, 1, 1, 1, 1, 1, 1, c,
+                );
+            }
+            let im2col = t0.elapsed().as_secs_f64() / reps as f64;
+            let mut t = [0.0; 2];
+            for (i, par) in [false, true].into_iter().enumerate() {
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    depthwise_planes(
+                        &x, &k, &mut o, 1, c, h, w, h, w, 3, 3, 1, 1, 1, 1, 1, 1, par,
+                    );
+                }
+                t[i] = t0.elapsed().as_secs_f64() / reps as f64;
+            }
+            println!(
+                "depthwise {c}x{h}x{w}: im2col {:.1} µs, direct {:.1} µs serial / {:.1} µs threaded",
+                im2col * 1e6,
+                t[0] * 1e6,
+                t[1] * 1e6
+            );
+        }
+    }
 
     /// The per-element loop `fill_col_row` replaced, as the definition.
     #[allow(clippy::too_many_arguments)]

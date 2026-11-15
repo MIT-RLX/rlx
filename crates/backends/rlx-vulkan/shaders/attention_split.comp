@@ -1,0 +1,173 @@
+#version 450
+// Split-K pass of decode attention. `attention_coop.comp` gives each (batch,
+// head, query) row one workgroup, so a decode step with B·H rows over a long
+// memory (a DAN page: 4 heads, thousands of keys) keeps only B·H SMs busy and
+// waits on memory. Here workgroup (row, split) runs the same masked
+// online-softmax over keys [split·kps, split·kps + kps) only and writes that
+// slice's max, sum and unnormalised weighted values to scratch:
+// `scratch_off + (row·splits + split)·(dh + 2)` = [m, l, acc[0..dh]].
+// `attention_combine.comp` merges the slices. Same push block as
+// `attention_coop.comp` plus the scratch offset, slice length and count.
+layout(local_size_x = 256) in;
+
+const uint MAX_DH = 256u;
+const uint CHUNK = 2048u;   // kps ≤ CHUNK: one chunk per workgroup
+
+layout(push_constant) uniform PC {
+    uint b;
+    uint nh;
+    uint q_s;
+    uint k_s;
+    uint dh;
+    uint q_off;
+    uint k_off;
+    uint v_off;
+    uint o_off;
+    uint qrs;
+    uint krs;
+    uint vrs;
+    uint bhsd;
+    uint mask_kind;
+    uint mask_off;
+    uint window;
+    float scale;
+    float neg;
+    float thr;
+    uint scratch_off;
+    uint kps;
+    uint splits;
+} pc;
+
+shared float s[CHUNK];
+shared float qs[MAX_DH];
+shared float red[256];
+shared float part[256];
+
+float block_max(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) {
+        if (t < st) { red[t] = max(red[t], red[t + st]); }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+float block_sum(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) {
+        if (t < st) { red[t] += red[t + st]; }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint split = gl_WorkGroupID.y;
+    uint k0 = split * pc.kps;
+    uint k1 = min(pc.k_s, k0 + pc.kps);
+    if (row >= pc.b * pc.nh * pc.q_s || pc.dh > MAX_DH || k0 >= k1) { return; }
+    uint t = gl_LocalInvocationID.x;
+    uint qi = row % pc.q_s;
+    uint hi = (row / pc.q_s) % pc.nh;
+    uint bi = row / (pc.q_s * pc.nh);
+
+    uint q_base;
+    uint o_base;
+    if (pc.bhsd != 0u) {
+        q_base = pc.q_off + bi * pc.nh * pc.q_s * pc.dh + hi * pc.q_s * pc.dh + qi * pc.dh;
+        o_base = pc.o_off + bi * pc.nh * pc.q_s * pc.dh + hi * pc.q_s * pc.dh + qi * pc.dh;
+    } else {
+        q_base = pc.q_off + bi * pc.q_s * pc.qrs + qi * pc.qrs + hi * pc.dh;
+        o_base = pc.o_off + bi * pc.q_s * (pc.nh * pc.dh) + qi * (pc.nh * pc.dh) + hi * pc.dh;
+    }
+    if (t < pc.dh) { qs[t] = arena_load(q_base + t); }
+    barrier();
+
+    uint q_offset = (pc.k_s > pc.q_s) ? (pc.k_s - pc.q_s) : 0u;
+    uint abs_q = q_offset + qi;
+
+    float m = -3.402823466e38;
+    float l = 0.0;
+    uint slices = 256u / pc.dh;           // ≥ 1 since dh ≤ 256
+    uint dim = t % pc.dh;
+    uint slice = t / pc.dh;
+    bool active = slice < slices;         // the 256 % dh leftover threads idle
+    float acc = 0.0;   // this thread's partial of output dimension `dim`
+
+    for (uint c0 = k0; c0 < k1; c0 += CHUNK) {
+        uint n = min(CHUNK, k1 - c0);
+        float cmax = -3.402823466e38;
+        for (uint j = t; j < n; j += 256u) {
+            uint ki = c0 + j;
+            bool masked = false;
+            float bias = 0.0;
+            if (pc.mask_kind == 1u) {
+                masked = (ki > abs_q);
+            } else if (pc.mask_kind == 2u) {
+                uint lo = (abs_q > pc.window) ? (abs_q - pc.window) : 0u;
+                masked = (ki < lo) || (ki > abs_q);
+            } else if (pc.mask_kind == 3u) {
+                masked = arena_load(pc.mask_off + bi * pc.k_s + ki) < pc.thr;
+            } else if (pc.mask_kind == 4u) {
+                bias = arena_load(pc.mask_off + (bi * pc.nh + hi) * pc.q_s * pc.k_s + qi * pc.k_s + ki);
+            }
+            float score;
+            if (masked) {
+                score = pc.neg;
+            } else {
+                uint k_base = (pc.bhsd != 0u)
+                    ? pc.k_off + bi * pc.nh * pc.k_s * pc.dh + hi * pc.k_s * pc.dh + ki * pc.dh
+                    : pc.k_off + bi * pc.k_s * pc.krs + ki * pc.krs + hi * pc.dh;
+                float dot = 0.0;
+                for (uint d = 0u; d < pc.dh; d++) { dot += qs[d] * arena_load(k_base + d); }
+                score = dot * pc.scale + bias;
+            }
+            s[j] = score;
+            cmax = max(cmax, score);
+        }
+        float m_new = max(m, block_max(cmax));
+        float corr = exp(m - m_new);
+        float ps = 0.0;
+        for (uint j = t; j < n; j += 256u) {
+            float p = exp(s[j] - m_new);
+            s[j] = p;
+            ps += p;
+        }
+        l = l * corr + block_sum(ps);   // block_sum's barriers publish s[]
+        if (active) {
+            float a = acc * corr;
+            for (uint j = slice; j < n; j += slices) {
+                uint ki = c0 + j;
+                uint v_base = (pc.bhsd != 0u)
+                    ? pc.v_off + bi * pc.nh * pc.k_s * pc.dh + hi * pc.k_s * pc.dh + ki * pc.dh
+                    : pc.v_off + bi * pc.k_s * pc.vrs + ki * pc.vrs + hi * pc.dh;
+                a += s[j] * arena_load(v_base + dim);
+            }
+            acc = a;
+        }
+        m = m_new;
+        barrier();   // s[] is rewritten by the next chunk
+    }
+    // Sum the slices of each dimension.
+    part[t] = active ? acc : 0.0;
+    barrier();
+    uint base = pc.scratch_off + (row * pc.splits + split) * (pc.dh + 2u);
+    if (t < pc.dh) {
+        float o = 0.0;
+        for (uint sl = 0u; sl < slices; sl++) { o += part[sl * pc.dh + t]; }
+        arena_store(base + 2u + t, o);
+    }
+    if (t == 0u) {
+        arena_store(base, m);
+        arena_store(base + 1u, l);
+    }
+}
