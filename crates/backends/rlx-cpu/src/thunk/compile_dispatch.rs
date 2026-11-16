@@ -290,7 +290,27 @@ pub fn compile_thunks_with_rng(
         sgd_elim.insert(lr_v);
     }
 
+    let conv_act = conv3d_activation_fusion(graph, arena);
+    // fused node -> (convolution, its epilogue)
+    let mut fused_into: HashMap<NodeId, (NodeId, ConvEpilogue)> = HashMap::new();
+    for (&c, e) in &conv_act {
+        for n in e.chain.iter().flatten() {
+            fused_into.insert(*n, (c, *e));
+        }
+    }
+
     for node in graph.nodes() {
+        // A node a `Conv3d` computes in its own store (`conv3d_activation_fusion`): nothing left
+        // to do, or, for the last, a copy out of the convolution's buffer.
+        if let Some(&(conv, e)) = fused_into.get(&node.id) {
+            let (from, to) = (node_offset(arena, conv), node_offset(arena, node.id));
+            if node.id != e.last || e.direct || from == to {
+                thunks.push(Thunk::Nop);
+            } else {
+                thunks.push(Thunk::Copy { src: from, dst: to, len: node.shape.num_elements().unwrap() as u32 });
+            }
+            continue;
+        }
         // View ops (Reshape / same-dtype Cast / axis-0 Narrow) are aliased
         // to their parent's slot by the memory planner — no copy needed.
         // Plan #46.
@@ -1512,6 +1532,22 @@ pub fn compile_thunks_with_rng(
                 ..
             } => compile_elementwise_region(node, graph, arena, &matmul_fold, &rng_shared, rng),
             _ => Thunk::Nop,
+        };
+        let t = match (t, conv_act.get(&node.id)) {
+            (Thunk::Conv3d { src, weight, dst, bias, n, c_in, d, h, w, c_out, d_out, h_out, w_out, kd, kh, kw, sd, sh, sw, pd, ph, pw, dd, dh, dw, groups, .. }, Some(e)) => {
+                Thunk::Conv3d {
+                    src,
+                    weight,
+                    dst: if e.direct { node_offset(arena, e.last) } else { dst },
+                    bias,
+                    act: e.act,
+                    scale: e.affine.map(|(s, _)| node_offset(arena, s)),
+                    shift: e.affine.map(|(_, t)| node_offset(arena, t)),
+                    leaky: e.leaky.map(|l| node_offset(arena, l)),
+                    n, c_in, d, h, w, c_out, d_out, h_out, w_out, kd, kh, kw, sd, sh, sw, pd, ph, pw, dd, dh, dw, groups,
+                }
+            }
+            (t, _) => t,
         };
         thunks.push(t);
     }
@@ -3876,4 +3912,169 @@ pub fn compile_thunks_with_rng(
         #[cfg(feature = "wave-exec")]
         waves: Default::default(),
     }
+}
+
+
+/// What a `Conv3d` applies in its store beyond its bias (`conv3d_activation_fusion`).
+#[derive(Clone, Copy)]
+struct ConvEpilogue {
+    /// An `Op::Activation`, or LeakyReLU spelled `Max(y, Mul(y, slope))` with the slope's
+    /// one-element node.
+    act: Option<Activation>,
+    leaky: Option<NodeId>,
+    /// The per-channel `[C]` operands of a `Mul` → `Add` after the activation (a batch norm
+    /// at inference).
+    affine: Option<(NodeId, NodeId)>,
+    /// The fused nodes after the convolution, in order; the last holds the result.
+    chain: [Option<NodeId>; 4],
+    last: NodeId,
+    /// The convolution writes straight into `last`'s buffer; otherwise into its own, and `last`
+    /// is a copy out of it.
+    direct: bool,
+}
+
+/// `[C]` per-channel operand: rank 1, or NCDHW with every axis but the channel 1.
+fn per_channel(graph: &Graph, id: NodeId, c: usize) -> bool {
+    let sh = &graph.node(id).shape;
+    let dims: Vec<usize> = sh.dims().iter().map(|d| match d {
+        rlx_ir::Dim::Static(v) => *v,
+        _ => 0,
+    }).collect();
+    sh.dtype() == rlx_ir::DType::F32
+        && (dims == [c] || (dims.len() == 5 && dims[1] == c && dims.iter().enumerate().all(|(i, &v)| i == 1 || v == 1)))
+}
+
+/// `Conv3d` nodes whose activation (an `Op::Activation`, or LeakyReLU as `max(y, slope · y)`)
+/// — and the per-channel scale and shift after it, when present — the convolution can apply
+/// as it stores its output.
+///
+/// The convolution then writes straight into the last fused node's buffer and the fused
+/// nodes' thunks are `Nop`s: one pass over the layer's output instead of a store, a copy, an
+/// in-place activation, a multiply and an add. Taken only when nothing could observe the
+/// difference: each fused node is the single reader of the one before; the activation is f32,
+/// of the convolution's shape, and has a per-element form
+/// ([`activation_epilogue`](super::ops::activation_epilogue)); everything that runs between
+/// the convolution and the last fused node is one of them or writes nothing (parameters and
+/// pure views); none is a graph output but the last; and the buffer written overlaps none of
+/// the convolution's inputs (when it does, the convolution keeps its own buffer and the last
+/// node becomes a copy out of it).
+fn conv3d_activation_fusion(graph: &Graph, arena: &Arena) -> HashMap<NodeId, ConvEpilogue> {
+    let nodes = graph.nodes();
+    let mut uses: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for n in nodes {
+        for &i in &n.inputs {
+            uses.entry(i).or_default().push(n.id);
+        }
+    }
+    let outputs: std::collections::HashSet<NodeId> = graph.outputs.iter().copied().collect();
+    let position: HashMap<NodeId, usize> = nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
+    let only_reader = |id: NodeId| match uses.get(&id).map(Vec::as_slice) {
+        Some([one]) if !outputs.contains(&id) => Some(*one),
+        _ => None,
+    };
+    let range = |id: NodeId| {
+        let at = arena.byte_offset(id);
+        at..at + arena.byte_size(id)
+    };
+    let inert = |n: &rlx_ir::Node| {
+        matches!(n.op, Op::Param { .. } | Op::Input { .. } | Op::Constant { .. }) || rlx_opt::is_pure_view(graph, n)
+    };
+    let mut fused = HashMap::new();
+    let scalar = |id: NodeId| {
+        let sh = &graph.node(id).shape;
+        sh.dtype() == rlx_ir::DType::F32 && sh.num_elements() == Some(1) && arena.has_buffer(id)
+    };
+    let same = |n: &rlx_ir::Node, conv: &rlx_ir::Node| n.shape.dims() == conv.shape.dims() && n.shape.dtype() == rlx_ir::DType::F32;
+    for conv in nodes {
+        if !matches!(conv.op, Op::Conv3d { .. }) || conv.shape.dtype() != rlx_ir::DType::F32 || conv.shape.rank() != 5 || outputs.contains(&conv.id) {
+            continue;
+        }
+        let c = match conv.shape.dims()[1] {
+            rlx_ir::Dim::Static(c) => c,
+            _ => continue,
+        };
+        let readers = uses.get(&conv.id).cloned().unwrap_or_default();
+        // The activation: an `Op::Activation` that is the convolution's sole reader, or
+        // LeakyReLU as `Max(y, Mul(y, slope))` with those two its only readers.
+        let (mut chain, act, leaky): (Vec<NodeId>, Option<Activation>, Option<NodeId>) = match readers.as_slice() {
+            [one] => {
+                let n = graph.node(*one);
+                match n.op {
+                    Op::Activation(kind) if n.inputs.as_slice() == [conv.id] && same(n, conv) && super::ops::activation_epilogue(kind).is_some() => {
+                        (vec![n.id], Some(kind), None)
+                    }
+                    _ => continue,
+                }
+            }
+            [p, q] => {
+                let (mul, max) = if matches!(graph.node(*p).op, Op::Binary(rlx_ir::op::BinaryOp::Mul)) { (*p, *q) } else { (*q, *p) };
+                let (m, x) = (graph.node(mul), graph.node(max));
+                let slope = match (&m.op, m.inputs.as_slice()) {
+                    (Op::Binary(rlx_ir::op::BinaryOp::Mul), [y, s]) | (Op::Binary(rlx_ir::op::BinaryOp::Mul), [s, y]) if *y == conv.id && scalar(*s) => *s,
+                    _ => continue,
+                };
+                let paired = matches!(x.op, Op::Binary(rlx_ir::op::BinaryOp::Max))
+                    && (x.inputs.as_slice() == [conv.id, mul] || x.inputs.as_slice() == [mul, conv.id]);
+                if !paired || only_reader(mul) != Some(max) || !same(m, conv) || !same(x, conv) {
+                    continue;
+                }
+                (vec![mul, max], None, Some(slope))
+            }
+            _ => continue,
+        };
+        let act_id = *chain.last().unwrap();
+        // A following `Mul(·, [C])` → `Add(·, [C])`, each the sole reader of the one before.
+        let affine = only_reader(act_id).and_then(|m| {
+            let mul = graph.node(m);
+            let scale = match (&mul.op, mul.inputs.as_slice()) {
+                (Op::Binary(rlx_ir::op::BinaryOp::Mul), [x, s]) if *x == act_id && per_channel(graph, *s, c) => *s,
+                (Op::Binary(rlx_ir::op::BinaryOp::Mul), [s, x]) if *x == act_id && per_channel(graph, *s, c) => *s,
+                _ => return None,
+            };
+            let add = graph.node(only_reader(m)?);
+            let shift = match (&add.op, add.inputs.as_slice()) {
+                (Op::Binary(rlx_ir::op::BinaryOp::Add), [x, t]) if *x == m && per_channel(graph, *t, c) => *t,
+                (Op::Binary(rlx_ir::op::BinaryOp::Add), [t, x]) if *x == m && per_channel(graph, *t, c) => *t,
+                _ => return None,
+            };
+            let ok = same(mul, conv) && same(add, conv) && arena.has_buffer(scale) && arena.has_buffer(shift);
+            ok.then_some((m, add.id, scale, shift))
+        });
+        if let Some((m, a, _, _)) = affine {
+            chain.extend([m, a]);
+        }
+        let last = *chain.last().unwrap();
+        // Nothing that writes may run between the convolution and the last fused node.
+        let (from, to) = (position[&conv.id], position[&last]);
+        if nodes[from + 1..to].iter().any(|n| !chain.contains(&n.id) && !inert(n)) {
+            continue;
+        }
+        let mut reads: Vec<NodeId> = conv.inputs.clone();
+        if let Some((_, _, s, t)) = affine {
+            reads.extend([s, t]);
+        }
+        reads.extend(leaky);
+        if !arena.has_buffer(last) || reads.iter().any(|&i| !arena.has_buffer(i)) {
+            continue;
+        }
+        let overlaps = |a: std::ops::Range<usize>| {
+            reads.iter().any(|&i| {
+                let r = range(i);
+                r.start < a.end && a.start < r.end
+            })
+        };
+        let direct = if !overlaps(range(last)) {
+            true
+        } else if arena.has_buffer(conv.id) && !overlaps(range(conv.id)) {
+            false
+        } else {
+            continue;
+        };
+        let mut fixed = [None; 4];
+        for (f, &n) in fixed.iter_mut().zip(&chain) {
+            *f = Some(n);
+        }
+        fused.insert(conv.id, ConvEpilogue { act, leaky, affine: affine.map(|(_, _, s, t)| (s, t)), chain: fixed, last, direct });
+    }
+    fused
 }

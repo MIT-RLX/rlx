@@ -55,6 +55,7 @@ const INLINED_HERE: &[OpKind] = &[
 pub fn prepare_graph_for_thunks(graph: Graph) -> Graph {
     let graph = expand_cpu_nop_fused(graph);
     let graph = fuse_strided_softmax(graph);
+    let graph = fold_conv3d_bias_add(graph);
     // I32 / U32 stay integers; f32-computing ops get casts around them.
     let graph = crate::int_storage::legalize_int_storage(graph);
     // TransformRegion / BatchElementwiseRegion → ResizeNearest2x + ElementwiseRegion
@@ -445,6 +446,130 @@ pub fn fuse_strided_softmax(g: Graph) -> Graph {
     }
     out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
     out
+}
+
+/// The rank-1 `[c]` f32 tensor behind a chain of `Reshape` / `Expand` (at least one): a
+/// per-channel bias as a graph builder spells it before broadcasting it over NCDHW.
+fn per_channel_source(g: &Graph, mut id: NodeId, c: usize) -> Option<NodeId> {
+    let mut peeled = 0;
+    while peeled < 4 {
+        match &g.node(id).op {
+            Op::Reshape { .. } | Op::Expand { .. } => {
+                id = g.node(id).inputs[0];
+                peeled += 1;
+            }
+            _ => break,
+        }
+    }
+    let sh = &g.node(id).shape;
+    (peeled > 0 && sh.rank() == 1 && sh.dims()[0] == rlx_ir::Dim::Static(c) && sh.dtype() == rlx_ir::DType::F32).then_some(id)
+}
+
+/// `Conv3d → Add(bias broadcast from [C_out])` as the **3-input** `Op::Conv3d` whose thunk adds
+/// the bias in its store, as [`fold_conv3d_bias`] does for a fused op.
+///
+/// Every 3-D network FreeSurfer runs (SynthSeg, SynthStrip, SynthMorph, the sclimbic and
+/// hypothalamic U-Nets) builds its convolutions this way; `FuseConvBiasAct` only matches 2-D
+/// convolutions, so each layer paid an extra full pass over its output for the add, and the
+/// broadcast operand besides. Matched only for a single-use, 2-input, f32 convolution whose
+/// add has the convolution's shape, before memory planning.
+pub fn fold_conv3d_bias_add(g: Graph) -> Graph {
+    let mut uses: HashMap<NodeId, usize> = HashMap::new();
+    for n in g.nodes() {
+        for &i in &n.inputs {
+            *uses.entry(i).or_insert(0) += 1;
+        }
+    }
+    let outputs: std::collections::HashSet<NodeId> = g.outputs.iter().copied().collect();
+    // add id -> (conv id, bias source)
+    let mut fold: HashMap<NodeId, (NodeId, NodeId)> = HashMap::new();
+    let mut folded_convs: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    for add in g.nodes() {
+        if !matches!(add.op, Op::Binary(rlx_ir::op::BinaryOp::Add)) || add.inputs.len() != 2 {
+            continue;
+        }
+        for (ci, bi) in [(0, 1), (1, 0)] {
+            let conv = g.node(add.inputs[ci]);
+            if !matches!(conv.op, Op::Conv3d { .. })
+                || conv.inputs.len() != 2
+                || uses.get(&conv.id) != Some(&1)
+                || outputs.contains(&conv.id)
+                || conv.shape.dims() != add.shape.dims()
+                || conv.shape.dtype() != rlx_ir::DType::F32
+                || conv.shape.rank() != 5
+            {
+                continue;
+            }
+            let rlx_ir::Dim::Static(c_out) = conv.shape.dims()[1] else { continue };
+            if let Some(bias) = per_channel_source(&g, add.inputs[bi], c_out) {
+                fold.insert(add.id, (conv.id, bias));
+                folded_convs.insert(conv.id);
+                break;
+            }
+        }
+    }
+    if fold.is_empty() {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        if folded_convs.contains(&node.id) {
+            continue;
+        }
+        let new_id = match fold.get(&node.id) {
+            Some(&(conv_id, bias)) => {
+                let conv = g.node(conv_id);
+                let ins = vec![id_map[&conv.inputs[0]], id_map[&conv.inputs[1]], id_map[&bias]];
+                out.add_node(conv.op.clone(), ins, node.shape.clone())
+            }
+            None => {
+                let ins: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+                out.add_node(node.op.clone(), ins, node.shape.clone())
+            }
+        };
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+#[cfg(test)]
+mod conv3d_bias_tests {
+    use super::*;
+    use rlx_ir::{DType, Shape};
+
+    #[test]
+    fn a_broadcast_bias_add_folds_into_the_convolution() {
+        let mut g = Graph::new("t");
+        let x = g.input("x", Shape::new(&[1, 2, 4, 4, 4], DType::F32));
+        let w = g.param("w", Shape::new(&[3, 2, 3, 3, 3], DType::F32));
+        let b = g.param("b", Shape::new(&[3], DType::F32));
+        let y = g.conv3d(x, w, [1, 1, 1], [1, 1, 1], [1, 1, 1], 1);
+        let br = g.add_node(Op::Reshape { new_shape: vec![1, 3, 1, 1, 1] }, vec![b], Shape::new(&[1, 3, 1, 1, 1], DType::F32));
+        let z = g.binary(rlx_ir::op::BinaryOp::Add, y, br, Shape::new(&[1, 3, 4, 4, 4], DType::F32));
+        g.set_outputs(vec![z]);
+        let f = fold_conv3d_bias_add(g);
+        let convs: Vec<_> = f.nodes().iter().filter(|n| matches!(n.op, Op::Conv3d { .. })).collect();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].inputs.len(), 3);
+        assert!(!f.nodes().iter().any(|n| matches!(n.op, Op::Binary(_))));
+        assert_eq!(f.outputs, vec![convs[0].id]);
+    }
+
+    #[test]
+    fn a_convolution_read_twice_is_left_alone() {
+        let mut g = Graph::new("t");
+        let x = g.input("x", Shape::new(&[1, 2, 4, 4, 4], DType::F32));
+        let w = g.param("w", Shape::new(&[3, 2, 3, 3, 3], DType::F32));
+        let b = g.param("b", Shape::new(&[3], DType::F32));
+        let y = g.conv3d(x, w, [1, 1, 1], [1, 1, 1], [1, 1, 1], 1);
+        let br = g.add_node(Op::Reshape { new_shape: vec![1, 3, 1, 1, 1] }, vec![b], Shape::new(&[1, 3, 1, 1, 1], DType::F32));
+        let z = g.binary(rlx_ir::op::BinaryOp::Add, y, br, Shape::new(&[1, 3, 4, 4, 4], DType::F32));
+        g.set_outputs(vec![z, y]);
+        let f = fold_conv3d_bias_add(g);
+        assert!(f.nodes().iter().any(|n| matches!(n.op, Op::Binary(_))));
+    }
 }
 
 #[cfg(test)]

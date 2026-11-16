@@ -314,6 +314,10 @@ pub(crate) fn compile_conv3d(
                 weight: node_offset(arena, node.inputs[1]),
                 dst: node_offset(arena, node.id),
                 bias: node.inputs.get(2).map(|&b| node_offset(arena, b)),
+                act: None,
+                scale: None,
+                shift: None,
+                leaky: None,
                 n,
                 c_in,
                 d,
@@ -1066,6 +1070,10 @@ pub(crate) fn exec_conv3d(t: &Thunk, base: *mut u8) {
         weight,
         dst,
         bias,
+        act,
+        scale,
+        shift,
+        leaky,
         n,
         c_in,
         d,
@@ -1096,6 +1104,9 @@ pub(crate) fn exec_conv3d(t: &Thunk, base: *mut u8) {
         execute_conv3d_forward_f32(
             *src, *weight, *dst, *n, *c_in, *d, *h, *w, *c_out, *d_out, *h_out, *w_out, *kd, *kh,
             *kw, *sd, *sh, *sw, *pd, *ph, *pw, *dd, *dh, *dw, *groups, base, *bias,
+            act.and_then(super::elementwise::activation_epilogue),
+            *leaky,
+            scale.zip(*shift),
         );
     }
 }
@@ -2112,6 +2123,9 @@ pub unsafe fn execute_conv3d_forward_f32(
     groups: u32,
     base: *mut u8,
     bias: Option<usize>,
+    act: Option<fn(f32) -> f32>,
+    leaky: Option<usize>,
+    affine: Option<(usize, usize)>,
 ) {
     let n = n as usize;
     let c_in = c_in as usize;
@@ -2140,9 +2154,14 @@ pub unsafe fn execute_conv3d_forward_f32(
     let wt = sl(weight, base, c_out * c_in_per_g * kd * kh * kw);
     let out = sl_mut(dst, base, n * c_out * d_out * h_out * w_out);
     let bias = bias.map(|b| sl(b, base, c_out));
-    crate::conv_fwd::conv3d_forward_ncdhw_f32(
+    let epi = crate::conv_fwd::Epilogue {
+        act,
+        leaky: leaky.map(|a| sl(a, base, 1)[0]),
+        affine: affine.map(|(s, t)| (sl(s, base, c_out), sl(t, base, c_out))),
+    };
+    crate::conv_fwd::conv3d_forward_ncdhw_f32_fused(
         inp, wt, out, n, c_in, d, h, w, c_out, d_out, h_out, w_out, kd, kh, kw, sd, sh, sw, pd, ph,
-        pw, dd, dh, dw, groups, bias,
+        pw, dd, dh, dw, groups, bias, epi,
     );
 }
 

@@ -3728,6 +3728,50 @@ pub fn sscal(x: &mut [f32], alpha: f32) {
     }
 }
 
+/// `C = A @ B + beta·C` with every leading dimension explicit: `A` is `m×k` with rows
+/// `lda` apart, `B` is `k×n` with rows `ldb` apart, `C` is `m×n` with rows `ldc` apart.
+/// Lets a GEMM read a window of a larger buffer (rows of `B` may even overlap) without
+/// copying it out first.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn sgemm_ld(
+    a: &[f32],
+    lda: usize,
+    b: &[f32],
+    ldb: usize,
+    c: &mut [f32],
+    ldc: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    beta: f32,
+) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    debug_assert!(a.len() >= (m - 1) * lda + k);
+    debug_assert!(k == 0 || b.len() >= (k - 1) * ldb + n);
+    debug_assert!(c.len() >= (m - 1) * ldc + n);
+    unsafe {
+        cblas_sgemm(
+            ROW_MAJOR,
+            NO_TRANS,
+            NO_TRANS,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            lda as i32,
+            b.as_ptr(),
+            ldb as i32,
+            beta,
+            c.as_mut_ptr(),
+            ldc as i32,
+        );
+    }
+}
+
 /// C = A @ B with custom strides (for reading interleaved data).
 /// lda = stride between rows of A, ldc = stride between rows of C.
 #[inline]

@@ -1837,23 +1837,140 @@ pub fn interpolate3d_ncdhw(
     h_out: usize,
     w_out: usize,
 ) {
-    for bn in 0..n {
-        for ch in 0..c {
-            let in_base = (bn * c + ch) * d_in * h_in * w_in;
-            let out_base = (bn * c + ch) * d_out * h_out * w_out;
-            for do_ in 0..d_out {
-                let di = ((do_ * d_in) / d_out).min(d_in.saturating_sub(1));
-                for ho in 0..h_out {
-                    let hi = ((ho * h_in) / h_out).min(h_in.saturating_sub(1));
-                    for wo in 0..w_out {
-                        let wi = ((wo * w_in) / w_out).min(w_in.saturating_sub(1));
-                        let src = in_base + (di * h_in + hi) * w_in + wi;
-                        let dst = out_base + (do_ * h_out + ho) * w_out + wo;
-                        output[dst] = input[src];
+    let (hw_in, hw_out) = (h_in * w_in, h_out * w_out);
+    if n * c * d_out * hw_out == 0 || d_in * hw_in == 0 {
+        return;
+    }
+    // Source index per output coordinate, once, rather than three divisions per element.
+    let map = |o: usize, i: usize, len: usize| ((o * i) / len).min(i.saturating_sub(1));
+    let di_map: Vec<usize> = (0..d_out).map(|o| map(o, d_in, d_out)).collect();
+    let hi_map: Vec<usize> = (0..h_out).map(|o| map(o, h_in, h_out)).collect();
+    let wi_map: Vec<usize> = (0..w_out).map(|o| map(o, w_in, w_out)).collect();
+    let doubled = w_out == 2 * w_in;
+    // One output depth slice per task unit: slices are disjoint, contiguous runs of `output`.
+    let slices = n * c * d_out;
+    let out_at = OutPtr(output.as_mut_ptr());
+    crate::pool::par_for(slices, crate::pool::grain_for(hw_out), &|off, cnt| {
+        // SAFETY: each unit writes only its own depth slice.
+        let output = unsafe { std::slice::from_raw_parts_mut(out_at.get(), slices * hw_out) };
+        for u in off..off + cnt {
+            let (nc, od) = (u / d_out, u % d_out);
+            let plane = &input[(nc * d_in + di_map[od]) * hw_in..][..hw_in];
+            let slab = &mut output[u * hw_out..(u + 1) * hw_out];
+            for ho in 0..h_out {
+                if ho > 0 && hi_map[ho] == hi_map[ho - 1] {
+                    // Nearest neighbour repeats a source row: copy the row just written.
+                    slab.copy_within((ho - 1) * w_out..ho * w_out, ho * w_out);
+                    continue;
+                }
+                let src = &plane[hi_map[ho] * w_in..][..w_in];
+                let dst = &mut slab[ho * w_out..(ho + 1) * w_out];
+                if doubled {
+                    for (pair, &v) in dst.chunks_exact_mut(2).zip(src) {
+                        pair[0] = v;
+                        pair[1] = v;
+                    }
+                } else {
+                    for (o, &wi) in dst.iter_mut().zip(&wi_map) {
+                        *o = src[wi];
                     }
                 }
             }
         }
+    });
+}
+
+/// 3-D max, sum or mean pooling over NCDHW with zero-excluded padding (padding taps are skipped,
+/// and the mean still divides by the full kernel volume), one output depth slice per task.
+/// The unpadded 2×2×2 stride-2 max — every U-Net's down step — takes a row-pair fast path.
+#[allow(clippy::too_many_arguments)]
+pub fn pool3d_ncdhw(
+    inp: &[f32],
+    out: &mut [f32],
+    n: usize,
+    c: usize,
+    [d, h, w]: [usize; 3],
+    [d_out, h_out, w_out]: [usize; 3],
+    [kd, kh, kw]: [usize; 3],
+    [sd, sh, sw]: [usize; 3],
+    [pd, ph, pw]: [usize; 3],
+    is_max: bool,
+    is_mean: bool,
+) {
+    let hw_out = h_out * w_out;
+    let slices = n * c * d_out;
+    if slices * hw_out == 0 {
+        return;
+    }
+    let kernel_vol = (kd * kh * kw) as f32;
+    let halving = is_max
+        && [kd, kh, kw, sd, sh, sw] == [2; 6]
+        && [pd, ph, pw] == [0; 3]
+        && 2 * d_out <= d
+        && 2 * h_out <= h
+        && 2 * w_out <= w;
+    let out_at = OutPtr(out.as_mut_ptr());
+    crate::pool::par_for(slices, crate::pool::grain_for(hw_out * kd * kh * kw), &|off, cnt| {
+        // SAFETY: each unit writes only its own depth slice.
+        let out = unsafe { std::slice::from_raw_parts_mut(out_at.get(), slices * hw_out) };
+        for u in off..off + cnt {
+            let (nc, od) = (u / d_out, u % d_out);
+            let vol = &inp[nc * d * h * w..(nc + 1) * d * h * w];
+            let slab = &mut out[u * hw_out..(u + 1) * hw_out];
+            if halving {
+                let (p0, p1) = (2 * od * h * w, (2 * od + 1) * h * w);
+                for ho in 0..h_out {
+                    let rows = [p0 + 2 * ho * w, p0 + (2 * ho + 1) * w, p1 + 2 * ho * w, p1 + (2 * ho + 1) * w];
+                    let dst = &mut slab[ho * w_out..(ho + 1) * w_out];
+                    for (wo, o) in dst.iter_mut().enumerate() {
+                        let mut acc = f32::NEG_INFINITY;
+                        for &r in &rows {
+                            acc = acc.max(vol[r + 2 * wo]).max(vol[r + 2 * wo + 1]);
+                        }
+                        *o = acc;
+                    }
+                }
+                continue;
+            }
+            for ho in 0..h_out {
+                for wo in 0..w_out {
+                    let mut acc = if is_max { f32::NEG_INFINITY } else { 0.0 };
+                    for kz in 0..kd {
+                        for ki in 0..kh {
+                            for kj in 0..kw {
+                                let (di, hi, wi) = (od * sd + kz, ho * sh + ki, wo * sw + kj);
+                                if di < pd || hi < ph || wi < pw {
+                                    continue;
+                                }
+                                let (di, hi, wi) = (di - pd, hi - ph, wi - pw);
+                                if di >= d || hi >= h || wi >= w {
+                                    continue;
+                                }
+                                let v = vol[(di * h + hi) * w + wi];
+                                if is_max {
+                                    acc = acc.max(v);
+                                } else {
+                                    acc += v;
+                                }
+                            }
+                        }
+                    }
+                    slab[ho * w_out + wo] = if is_mean { acc / kernel_vol } else { acc };
+                }
+            }
+        }
+    });
+}
+
+/// An output base pointer shared with tasks that write disjoint ranges of it.
+#[derive(Clone, Copy)]
+struct OutPtr(*mut f32);
+// SAFETY: every user hands each task a disjoint range.
+unsafe impl Send for OutPtr {}
+unsafe impl Sync for OutPtr {}
+impl OutPtr {
+    fn get(self) -> *mut f32 {
+        self.0
     }
 }
 

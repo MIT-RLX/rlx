@@ -186,6 +186,162 @@ pub fn conv3d_forward_ncdhw_f32_budgeted(
     col_budget: usize,
     bias: Option<&[f32]>,
 ) {
+    conv3d_forward_impl(
+        inp,
+        wt,
+        out,
+        n,
+        c_in,
+        d,
+        h,
+        w,
+        c_out,
+        d_out,
+        h_out,
+        w_out,
+        kd,
+        kh,
+        kw,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
+        dd,
+        dh,
+        dw,
+        groups,
+        col_budget,
+        bias,
+        Epilogue::default(),
+    )
+}
+
+/// [`conv3d_forward_ncdhw_f32`] with `epi` applied to every output value after the bias: an
+/// activation and a batch norm fused into the store, applied while the stored run is still in
+/// cache.
+#[allow(clippy::too_many_arguments)]
+pub fn conv3d_forward_ncdhw_f32_fused(
+    inp: &[f32],
+    wt: &[f32],
+    out: &mut [f32],
+    n: usize,
+    c_in: usize,
+    d: usize,
+    h: usize,
+    w: usize,
+    c_out: usize,
+    d_out: usize,
+    h_out: usize,
+    w_out: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    dd: usize,
+    dh: usize,
+    dw: usize,
+    groups: usize,
+    bias: Option<&[f32]>,
+    epi: Epilogue<'_>,
+) {
+    conv3d_forward_impl(
+        inp,
+        wt,
+        out,
+        n,
+        c_in,
+        d,
+        h,
+        w,
+        c_out,
+        d_out,
+        h_out,
+        w_out,
+        kd,
+        kh,
+        kw,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
+        dd,
+        dh,
+        dw,
+        groups,
+        COL_BUDGET_F32,
+        bias,
+        epi,
+    )
+}
+
+/// What a convolution applies to each output value after its bias, in this order: an
+/// activation (`act`, or LeakyReLU as `max(x, slope · x)`), then a per-channel `x · scale +
+/// shift`. Each step is the same f32 operation the unfused graph's thunk performs, so applying
+/// it in the store changes no bit of the result.
+#[derive(Clone, Copy, Default)]
+pub struct Epilogue<'a> {
+    pub act: Option<fn(f32) -> f32>,
+    pub leaky: Option<f32>,
+    pub affine: Option<(&'a [f32], &'a [f32])>,
+}
+
+impl Epilogue<'_> {
+    /// Apply to one stored run of output channel `co`.
+    #[inline]
+    fn finish(&self, run: &mut [f32], co: usize) {
+        if let Some(f) = self.act {
+            run.iter_mut().for_each(|v| *v = f(*v));
+        }
+        if let Some(a) = self.leaky {
+            run.iter_mut().for_each(|v| *v = v.max(*v * a));
+        }
+        if let Some((s, t)) = self.affine {
+            let (s, t) = (s[co], t[co]);
+            run.iter_mut().for_each(|v| *v = *v * s + t);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv3d_forward_impl(
+    inp: &[f32],
+    wt: &[f32],
+    out: &mut [f32],
+    n: usize,
+    c_in: usize,
+    d: usize,
+    h: usize,
+    w: usize,
+    c_out: usize,
+    d_out: usize,
+    h_out: usize,
+    w_out: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    dd: usize,
+    dh: usize,
+    dw: usize,
+    groups: usize,
+    col_budget: usize,
+    bias: Option<&[f32]>,
+    epi: Epilogue<'_>,
+) {
     let c_in_per_g = c_in / groups;
     let c_out_per_g = c_out / groups;
     debug_assert_eq!(inp.len(), n * c_in * d * h * w);
@@ -197,6 +353,29 @@ pub fn conv3d_forward_ncdhw_f32_budgeted(
     let dhw_out = d_out * hw_out;
     if k == 0 || hw_out == 0 || d_out == 0 {
         return;
+    }
+    if groups == 1
+        && [sd, sh, sw, dd, dh, dw] == [1; 6]
+        && d_out + kd == d + 2 * pd + 1
+        && h_out + kh == h + 2 * ph + 1
+        && w_out + kw == w + 2 * pw + 1
+        && !crate::blas::f64_accum_enabled()
+    {
+        return conv3d_unit_stride(
+            inp,
+            wt,
+            out,
+            n,
+            c_in,
+            [d, h, w],
+            c_out,
+            [d_out, h_out, w_out],
+            [kd, kh, kw],
+            [pd, ph, pw],
+            col_budget,
+            bias,
+            epi,
+        );
     }
 
     // Work splits by output depth slice: each (batch, group, slice) is one
@@ -324,6 +503,7 @@ pub fn conv3d_forward_ncdhw_f32_budgeted(
                         if let Some(b) = bias {
                             run.iter_mut().for_each(|v| *v += b[co]);
                         }
+                        epi.finish(run, co);
                     }
                     p0 += len;
                 }
@@ -331,6 +511,178 @@ pub fn conv3d_forward_ncdhw_f32_budgeted(
         },
     );
 }
+
+/// Unit-stride, undilated, ungrouped 3-D convolution with the in-plane taps as pointer offsets.
+///
+/// The general path gathers a column row per `(c_in, kd, kh, kw)` — 27 copies of the input for a
+/// 3×3×3 kernel — and that gather, not the GEMM, was most of a SynthSeg layer: 0.5 TFLOP/s on
+/// an M4 Pro against the 2 TFLOP/s its BLAS reaches on the same shapes. Here the buffer holds
+/// one zero-padded row per `(c_in, kd)` covering the tile's output rows and the `kh − 1` below
+/// them, `wp = w + 2·pw` wide. An output at `(ho, wo)` sits at `ho·wp + wo` on that padded grid,
+/// and its tap `(kh, kw)` is the same buffer read `kh·wp + kw` further on, so each of the
+/// `kh·kw` taps is one accumulating GEMM over a shifted view with `K = c_in·kd`: a ninth of the
+/// copying. The `wp − w_out` columns past each output row are computed and dropped.
+///
+/// With one or two input channels that `K` is too short for the GEMM to pay, so only `kw` is
+/// folded (`kh` joins the buffer's rows): `kw` GEMMs with `K = c_in·kd·kh`.
+#[allow(clippy::too_many_arguments)]
+fn conv3d_unit_stride(
+    inp: &[f32],
+    wt: &[f32],
+    out: &mut [f32],
+    n: usize,
+    c_in: usize,
+    [d, h, w]: [usize; 3],
+    c_out: usize,
+    [d_out, h_out, w_out]: [usize; 3],
+    [kd, kh, kw]: [usize; 3],
+    [pd, ph, pw]: [usize; 3],
+    col_budget: usize,
+    bias: Option<&[f32]>,
+    epi: Epilogue<'_>,
+) {
+    let fold_h = c_in * kd >= 8;
+    let taps: Vec<(usize, usize)> = if fold_h {
+        (0..kh).flat_map(|a| (0..kw).map(move |b| (a, b))).collect()
+    } else {
+        (0..kw).map(|b| (0, b)).collect()
+    };
+    // Buffer rows per tap, `(ci, z)` or `(ci, z, y)`, matching the weight rows below.
+    let rows_per_ci = if fold_h { kd } else { kd * kh };
+    let kr = c_in * rows_per_ci;
+    let k = c_in * kd * kh * kw;
+    // `[tap][c_out][kr]`: the weight's columns for one tap, contiguous for the GEMM.
+    let mut wts = vec![0f32; taps.len() * c_out * kr];
+    let wts_at = SendPtr(wts.as_mut_ptr());
+    let wts_len = wts.len();
+    let taps_ref = &taps;
+    crate::pool::par_for(
+        c_out,
+        crate::pool::grain_for(k * taps.len()),
+        &|off, cnt| {
+            // SAFETY: each task fills only the rows of its own output channels.
+            let wts = unsafe { std::slice::from_raw_parts_mut(wts_at.get(), wts_len) };
+            for o in off..off + cnt {
+                for (t, &(a, b)) in taps_ref.iter().enumerate() {
+                    let dst = &mut wts[(t * c_out + o) * kr..(t * c_out + o + 1) * kr];
+                    for (r, v) in dst.iter_mut().enumerate() {
+                        let (ci, rest) = (r / rows_per_ci, r % rows_per_ci);
+                        let (z, y) = if fold_h {
+                            (rest, a)
+                        } else {
+                            (rest / kh, rest % kh)
+                        };
+                        *v = wt[(((o * c_in + ci) * kd + z) * kh + y) * kw + b];
+                    }
+                }
+            }
+        },
+    );
+    let wts = &wts;
+
+    let wp = w + 2 * pw;
+    let span_extra = if fold_h { kh - 1 } else { 0 };
+    // Output rows per tile: the buffer, `kr` rows of `(rows + span_extra)·wp`, sized to a
+    // worker's share of the budget. Capped well under the general path's budget: the
+    // buffer is read once per tap, so it pays to keep it in cache.
+    let workers = crate::pool::num_threads().max(1);
+    let share = col_budget.min(UNIT_STRIDE_BUDGET_F32) / workers;
+    let rows = (share / (kr * wp))
+        .saturating_sub(span_extra)
+        .clamp(1, h_out);
+    let chunks = h_out.div_ceil(rows);
+    let units = n * d_out * chunks;
+    let hw_in = h * w;
+    let dhw_out = d_out * h_out * w_out;
+    let out_at = SendPtr(out.as_mut_ptr());
+    let out_len = out.len();
+    // Units are handed out one at a time rather than split up front: with performance and
+    // efficiency cores (or a busy machine) a static split waits on the slowest share.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = k * c_out * rows * wp;
+    let tasks = if units * work < crate::pool::TASK_WORK_FLOOR {
+        1
+    } else {
+        workers.min(units)
+    };
+    crate::pool::par_for(tasks, 1, &|_, _| {
+        let len = (rows + span_extra) * wp + kw;
+        let mut buf = vec![0f32; kr * len];
+        let mut acc = vec![0f32; c_out * rows * wp];
+        // SAFETY: a unit writes only output rows `[ho0, ho0 + nr)` of its own depth slice,
+        // and each unit is taken by exactly one task.
+        let out = unsafe { std::slice::from_raw_parts_mut(out_at.get(), out_len) };
+        loop {
+            let u = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if u >= units {
+                break;
+            }
+            let ch = u % chunks;
+            let od = (u / chunks) % d_out;
+            let ni = u / (chunks * d_out);
+            let ho0 = ch * rows;
+            let nr = rows.min(h_out - ho0);
+            let lines = nr + span_extra;
+            for (r, row) in buf.chunks_exact_mut(len).enumerate() {
+                let (ci, rest) = (r / rows_per_ci, r % rows_per_ci);
+                let (z, y) = if fold_h {
+                    (rest, 0)
+                } else {
+                    (rest / kh, rest % kh)
+                };
+                // Out-of-range (padding) coordinates wrap to huge values and fail `< d`.
+                let iz = (od + z).wrapping_sub(pd);
+                for (l, seg) in row[..lines * wp].chunks_exact_mut(wp).enumerate() {
+                    let iy = (ho0 + l + y).wrapping_sub(ph);
+                    if iz >= d || iy >= h {
+                        seg.fill(0.0);
+                    } else {
+                        let at = ((ni * c_in + ci) * d + iz) * hw_in + iy * w;
+                        let src = &inp[at..at + w];
+                        seg[..pw].fill(0.0);
+                        seg[pw..pw + w].copy_from_slice(src);
+                        seg[pw + w..].fill(0.0);
+                    }
+                }
+                row[lines * wp..].fill(0.0);
+            }
+            let cols = nr * wp;
+            for (t, &(a, b)) in taps.iter().enumerate() {
+                crate::blas::sgemm_ld(
+                    &wts[t * c_out * kr..(t + 1) * c_out * kr],
+                    kr,
+                    &buf[a * wp + b..],
+                    len,
+                    &mut acc,
+                    cols,
+                    c_out,
+                    kr,
+                    cols,
+                    if t == 0 { 0.0 } else { 1.0 },
+                );
+            }
+            for co in 0..c_out {
+                let base = (ni * c_out + co) * dhw_out + (od * h_out + ho0) * w_out;
+                let b = bias.map_or(0.0, |b| b[co]);
+                for l in 0..nr {
+                    let src = &acc[co * cols + l * wp..co * cols + l * wp + w_out];
+                    let dst = &mut out[base + l * w_out..base + (l + 1) * w_out];
+                    if bias.is_some() {
+                        for (o, v) in dst.iter_mut().zip(src) {
+                            *o = v + b;
+                        }
+                    } else {
+                        dst.copy_from_slice(src);
+                    }
+                    epi.finish(dst, co);
+                }
+            }
+        }
+    });
+}
+
+/// [`conv3d_unit_stride`]'s buffer cap, in f32 elements (16 MB) across all workers.
+const UNIT_STRIDE_BUDGET_F32: usize = 4 * 1024 * 1024;
 
 /// `out`'s base pointer, handed to the depth-slice tasks.
 #[derive(Clone, Copy)]
@@ -682,6 +1034,42 @@ mod tests {
                 2,
                 budget,
             );
+        }
+    }
+
+    #[test]
+    fn the_unit_stride_path_matches_at_every_tiling() {
+        // (n, c_in, d, h, w, c_out, kd, kh, kw, pad): one input channel folds only kW,
+        // the rest fold kH too; valid, same and over-padded; 1×1 and anisotropic kernels.
+        let cases = [
+            (1, 1, 5, 6, 7, 3, 3, 3, 3, [1, 1, 1]),
+            (2, 3, 4, 5, 6, 4, 3, 3, 3, [1, 1, 1]),
+            (1, 4, 6, 5, 7, 2, 3, 3, 3, [0, 0, 0]),
+            (1, 5, 3, 4, 5, 6, 1, 1, 1, [0, 0, 0]),
+            (1, 3, 5, 6, 7, 2, 3, 1, 5, [1, 0, 2]),
+            (1, 2, 6, 7, 5, 3, 5, 5, 5, [2, 2, 2]),
+            (1, 3, 4, 4, 4, 2, 3, 3, 3, [2, 2, 2]),
+        ];
+        for (n, c_in, d, h, w, c_out, kd, kh, kw, pad) in cases {
+            for budget in [1, 50, 300, BIG] {
+                check(
+                    &format!("unit{c_in}x{kd}{kh}{kw}p{pad:?}b{budget}"),
+                    n,
+                    c_in,
+                    d,
+                    h,
+                    w,
+                    c_out,
+                    kd,
+                    kh,
+                    kw,
+                    [1; 3],
+                    pad,
+                    [1; 3],
+                    1,
+                    budget,
+                );
+            }
         }
     }
 

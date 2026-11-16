@@ -1052,6 +1052,16 @@ pub enum Thunk {
         /// a per-channel bias added in the store: a `FusedConvBiasAct` the
         /// CPU expand folded into the conv (`expand::fold_conv3d_bias`)
         bias: Option<usize>,
+        /// an activation applied in the store: the single following
+        /// `Op::Activation`, fused at compile time (`compile_dispatch`)
+        act: Option<Activation>,
+        /// per-channel `[C_out]` multiply then add applied after `act` (a batch
+        /// norm at inference), fused with it
+        scale: Option<usize>,
+        shift: Option<usize>,
+        /// a one-element slope: LeakyReLU as the graph's `max(x, slope · x)`,
+        /// fused in place of `act`
+        leaky: Option<usize>,
         n: u32,
         c_in: u32,
         d: u32,

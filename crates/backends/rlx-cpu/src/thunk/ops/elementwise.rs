@@ -2040,6 +2040,30 @@ pub(crate) fn exec_gather(t: &Thunk, base: *mut u8) {
 const CHEAP_ELEMENTWISE_PAR_FLOOR: usize = 1 << 20;
 
 #[inline(always)]
+fn relu_f32(x: f32) -> f32 {
+    x.max(0.0)
+}
+
+fn sigmoid_f32(x: f32) -> f32 {
+    1.0 / (1.0 + crate::vmath::exp_poly(-x))
+}
+
+fn elu_f32(x: f32) -> f32 {
+    if x > 0.0 { x } else { crate::vmath::exp_poly(x) - 1.0 }
+}
+
+/// The per-element function `ActivationInPlace` applies for `act`, for a kernel that applies it
+/// in its own store (the same function, so the fused result is bit-identical). `None` for the
+/// activations computed by whole-slice kernels.
+pub(crate) fn activation_epilogue(act: Activation) -> Option<fn(f32) -> f32> {
+    match act {
+        Activation::Relu => Some(relu_f32),
+        Activation::Sigmoid => Some(sigmoid_f32),
+        Activation::Elu => Some(elu_f32),
+        _ => None,
+    }
+}
+
 pub(crate) fn exec_activation_in_place(t: &Thunk, base: *mut u8) {
     let Thunk::ActivationInPlace { data, len, act } = t else {
         unreachable!()
@@ -2082,14 +2106,12 @@ pub(crate) fn exec_activation_in_place(t: &Thunk, base: *mut u8) {
                 Activation::Gelu => crate::kernels::par_gelu_inplace(d),
                 Activation::GeluApprox => crate::kernels::par_gelu_approx_inplace(d),
                 Activation::Silu => crate::kernels::par_silu_inplace(d),
-                Activation::Relu => apply!(|x: f32| x.max(0.0)),
+                Activation::Relu => apply!(relu_f32),
                 // These five used a libm call per element while their siblings
                 // (Tanh/Exp above, Gelu/Silu via `kernels`) all run polynomial
                 // arms unconditionally. Matching them removes the call and lets
                 // the loop vectorize on every arch.
-                Activation::Sigmoid => {
-                    apply!(|x: f32| 1.0 / (1.0 + crate::vmath::exp_poly(-x)))
-                }
+                Activation::Sigmoid => apply!(sigmoid_f32),
                 Activation::Tanh => crate::vmath::vvtanhf_hot_inplace(d),
                 Activation::Exp => crate::vmath::vvexpf_hot_inplace(d),
                 Activation::Log => crate::vmath::vvlogf_inplace(d),
@@ -2118,13 +2140,7 @@ pub(crate) fn exec_activation_in_place(t: &Thunk, base: *mut u8) {
                     })
                 }
                 Activation::Softplus => apply!(crate::vmath::softplus_poly),
-                Activation::Elu => {
-                    apply!(|x: f32| if x > 0.0 {
-                        x
-                    } else {
-                        crate::vmath::exp_poly(x) - 1.0
-                    })
-                }
+                Activation::Elu => apply!(elu_f32),
                 Activation::Erf => apply!(|x: f32| erf_f32(x)),
                 Activation::HardSwish => apply!(|x: f32| x * (x + 3.0).clamp(0.0, 6.0) / 6.0),
                 Activation::HardSigmoid => apply!(|x: f32| (x / 6.0 + 0.5).clamp(0.0, 1.0)),
