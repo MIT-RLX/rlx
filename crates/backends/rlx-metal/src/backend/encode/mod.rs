@@ -7219,7 +7219,11 @@ impl MetalExecutable {
                     // host so the end-of-segment ordering stays correct.
                     if deferred_host.is_empty() {
                         let (o, r, inn, im) = (*outer, *reduced, *inner, *is_max as u32);
-                        if inn == 1 {
+                        // Many short rows (o-means' [units·rows, 64] tiles):
+                        // a 256-lane threadgroup per row leaves most lanes
+                        // idle, so one thread per row is faster there.
+                        let short_rows = r <= 128 && o >= 4096;
+                        if inn == 1 && !short_rows {
                             // Cooperative last-axis reduction — one threadgroup
                             // folds the whole row (decode: vocab ~128k on a
                             // single lane via the serial kernel was the stall).
@@ -7235,8 +7239,10 @@ impl MetalExecutable {
                                 height: 1,
                                 depth: 1,
                             };
+                            // A power of two (the tree reduction needs one),
+                            // no wider than the row.
                             let tg = crate::mtl::MTLSize {
-                                width: 256,
+                                width: (r as u64).next_power_of_two().clamp(32, 256),
                                 height: 1,
                                 depth: 1,
                             };

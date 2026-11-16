@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 328" width="760" height="328" role="img" aria-labelledby="t d">
+
+<style>
+  .surface { fill: #fcfcfb; }
+  .ink { fill: #0b0b0b; }
+  .ink2 { fill: #52514e; }
+  .muted { fill: #898781; }
+  .grid { stroke: #e1e0d9; stroke-width: 1; }
+  .axis { stroke: #c3c2b7; stroke-width: 1; }
+  .ref { stroke: #52514e; stroke-width: 1.5; stroke-dasharray: 4 3; }
+  .s1 { fill: #2a78d6; }
+  .s2 { fill: #eb6834; }
+  .s3 { fill: #1baf7a; }
+  .ring { stroke: #fcfcfb; stroke-width: 2; }
+  text { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; }
+  @media (prefers-color-scheme: dark) {
+    .surface { fill: #1a1a19; }
+    .ink { fill: #f0efec; }
+    .ink2 { fill: #c3c2b7; }
+    .grid { stroke: #2c2c2a; }
+    .axis { stroke: #383835; }
+    .ref { stroke: #c3c2b7; }
+    .s1 { fill: #3987e5; }
+    .s2 { fill: #d95926; }
+    .s3 { fill: #199e70; }
+    .ring { stroke: #1a1a19; }
+  }
+</style>
+
+<title id="t">Device o-means speed-up over dense device e-means</title>
+<desc id="d">n = 200,000, d = 96, k = 16384, one epoch. CUDA (RTX 3080 Ti) 2.29x, CPU (msi) 2.20x, ROCm (780M) 2.03x, Vulkan (RTX 3080 Ti) 1.31x, wgpu (RTX 3080 Ti) 1.04x, Metal (Apple M-series) 0.87x.</desc>
+<rect class="surface" width="760" height="328" rx="8"/>
+<text class="ink" x="20" y="30" font-size="16" font-weight="600">o-means speed-up over dense e-means, same device</text>
+<text class="ink2" x="20" y="50" font-size="12">n = 200k, d = 96, k = 16,384, one epoch; right of the dashed line is faster</text>
+<line class="grid" x1="190.0" x2="190.0" y1="70" y2="274"/>
+<text class="muted" x="190.0" y="290" font-size="11" text-anchor="middle">0×</text>
+<line class="grid" x1="284.0" x2="284.0" y1="70" y2="274"/>
+<text class="muted" x="284.0" y="290" font-size="11" text-anchor="middle">0.5×</text>
+<line class="grid" x1="378.0" x2="378.0" y1="70" y2="274"/>
+<text class="muted" x="378.0" y="290" font-size="11" text-anchor="middle">1×</text>
+<line class="grid" x1="472.0" x2="472.0" y1="70" y2="274"/>
+<text class="muted" x="472.0" y="290" font-size="11" text-anchor="middle">1.5×</text>
+<line class="grid" x1="566.0" x2="566.0" y1="70" y2="274"/>
+<text class="muted" x="566.0" y="290" font-size="11" text-anchor="middle">2×</text>
+<line class="grid" x1="660.0" x2="660.0" y1="70" y2="274"/>
+<text class="muted" x="660.0" y="290" font-size="11" text-anchor="middle">2.5×</text>
+<g><title>CUDA (RTX 3080 Ti): 2.29× </title><path class="s1" d="M190,78 H616.5 Q620.5,78 620.5,82 V94 Q620.5,98 616.5,98 H190 Z"/></g>
+<text class="ink2" x="180" y="92" font-size="12" text-anchor="end">CUDA (RTX 3080 Ti)</text>
+<text class="ink" x="626.5" y="92" font-size="12">2.29×</text>
+<g><title>CPU (msi): 2.20× </title><path class="s1" d="M190,112 H599.6 Q603.6,112 603.6,116 V128 Q603.6,132 599.6,132 H190 Z"/></g>
+<text class="ink2" x="180" y="126" font-size="12" text-anchor="end">CPU (msi)</text>
+<text class="ink" x="609.6" y="126" font-size="12">2.20×</text>
+<g><title>ROCm (780M): 2.03× </title><path class="s1" d="M190,146 H567.6 Q571.6,146 571.6,150 V162 Q571.6,166 567.6,166 H190 Z"/></g>
+<text class="ink2" x="180" y="160" font-size="12" text-anchor="end">ROCm (780M)</text>
+<text class="ink" x="577.6" y="160" font-size="12">2.03×</text>
+<g><title>Vulkan (RTX 3080 Ti): 1.31× </title><path class="s1" d="M190,180 H432.3 Q436.3,180 436.3,184 V196 Q436.3,200 432.3,200 H190 Z"/></g>
+<text class="ink2" x="180" y="194" font-size="12" text-anchor="end">Vulkan (RTX 3080 Ti)</text>
+<text class="ink" x="442.3" y="194" font-size="12">1.31×</text>
+<g><title>wgpu (RTX 3080 Ti): 1.04× </title><path class="s1" d="M190,214 H381.5 Q385.5,214 385.5,218 V230 Q385.5,234 381.5,234 H190 Z"/></g>
+<text class="ink2" x="180" y="228" font-size="12" text-anchor="end">wgpu (RTX 3080 Ti)</text>
+<text class="ink" x="391.5" y="228" font-size="12">1.04×</text>
+<g><title>Metal (Apple M-series): 0.87× </title><path class="s1" d="M190,248 H349.6 Q353.6,248 353.6,252 V264 Q353.6,268 349.6,268 H190 Z"/></g>
+<text class="ink2" x="180" y="262" font-size="12" text-anchor="end">Metal (Apple M-series)</text>
+<text class="ink" x="386.0" y="262" font-size="12">0.87×</text>
+<line class="axis" x1="190" x2="190" y1="70" y2="274"/>
+<line class="ref" x1="378.0" x2="378.0" y1="64" y2="278"/>
+<text class="ink2" x="382.0" y="62" font-size="11">same speed</text>
+</svg>

@@ -540,10 +540,6 @@ impl Emeans {
     /// Equation 2 on the mass/position form. f32 arithmetic in the same order
     /// as the reference so both runs round alike.
     fn apply_statistics(&mut self, stats: &BatchStats, alpha: f64) {
-        let d = self.d;
-        let alpha_f = alpha as f32;
-        let replace = alpha == 1.0;
-        let decay = (1.0 - alpha) as f32;
         self.objective += stats.objective;
         for (pc, &c) in self.pass_counts.iter_mut().zip(&stats.counts) {
             *pc += c as f64;
@@ -553,31 +549,14 @@ impl Emeans {
                 *p += s;
             }
         }
-        if !replace {
-            for u in &mut self.usage {
-                *u *= decay;
-            }
-        }
-        for j in 0..self.k {
-            let n_j = stats.counts[j];
-            if n_j <= 0.0 {
-                continue;
-            }
-            let retained = if replace { 0.0 } else { self.usage[j] };
-            let mass = retained + alpha_f * n_j;
-            let weight = alpha_f * n_j / mass;
-            let c = &mut self.centroids[j * d..(j + 1) * d];
-            let s = &stats.sums[j * d..(j + 1) * d];
-            for (cv, &sv) in c.iter_mut().zip(s) {
-                let mean = sv / n_j;
-                *cv = if weight == 1.0 {
-                    mean
-                } else {
-                    *cv + weight * (mean - *cv)
-                };
-            }
-            self.usage[j] = mass;
-        }
+        ema_step(
+            &mut self.centroids,
+            &mut self.usage,
+            &stats.sums,
+            &stats.counts,
+            self.d,
+            alpha,
+        );
     }
 
     /// Split donors into clusters whose mass fell below `τ · mean(N)`.
@@ -622,31 +601,7 @@ impl Emeans {
     }
 
     fn split(&mut self, src: usize, dst: usize) {
-        let d = self.d;
-        let base: Vec<f32> = self.centroids[src * d..(src + 1) * d].to_vec();
-        let mut donor = vec![0f32; d];
-        let mut child = vec![0f32; d];
-        for t in 0..d {
-            let sign = if t % 2 == 0 { 1.0f32 } else { -1.0 };
-            let offset = SPLIT_EPSILON * sign;
-            donor[t] = base[t] * (1.0 - offset);
-            child[t] = base[t] * (1.0 + offset);
-        }
-        // Identical copies (e.g. a zero donor) would never separate: move one
-        // coordinate of the child by one ulp.
-        if donor == child {
-            let up = child[0].next_up();
-            child[0] = if up.is_finite() {
-                up
-            } else {
-                child[0].next_down()
-            };
-        }
-        let half = self.usage[src] / 2.0;
-        self.usage[src] = half;
-        self.usage[dst] = half;
-        self.centroids[src * d..(src + 1) * d].copy_from_slice(&donor);
-        self.centroids[dst * d..(dst + 1) * d].copy_from_slice(&child);
+        split_pair(&mut self.centroids, &mut self.usage, self.d, src, dst);
         self.n_splits += 1;
     }
 
@@ -800,6 +755,81 @@ pub fn initial_centroids(x: &[f32], d: usize, k: usize, cfg: &EmeansConfig) -> V
     }
 }
 
+/// Equation 2 for every cluster with `counts[j] > 0`; the others only decay
+/// their mass. f32 arithmetic in the same order as the reference so both runs
+/// round alike. `alpha == 1` replaces the mass instead of decaying it.
+pub(crate) fn ema_step(
+    centroids: &mut [f32],
+    usage: &mut [f32],
+    sums: &[f32],
+    counts: &[f32],
+    d: usize,
+    alpha: f64,
+) {
+    let alpha_f = alpha as f32;
+    let replace = alpha == 1.0;
+    let decay = (1.0 - alpha) as f32;
+    if !replace {
+        for u in usage.iter_mut() {
+            *u *= decay;
+        }
+    }
+    for (j, &n_j) in counts.iter().enumerate() {
+        if n_j <= 0.0 {
+            continue;
+        }
+        let retained = if replace { 0.0 } else { usage[j] };
+        let mass = retained + alpha_f * n_j;
+        let weight = alpha_f * n_j / mass;
+        let c = &mut centroids[j * d..(j + 1) * d];
+        let s = &sums[j * d..(j + 1) * d];
+        for (cv, &sv) in c.iter_mut().zip(s) {
+            let mean = sv / n_j;
+            *cv = if weight == 1.0 {
+                mean
+            } else {
+                *cv + weight * (mean - *cv)
+            };
+        }
+        usage[j] = mass;
+    }
+}
+
+/// Split donor `src` into itself and `dst`: the two move apart by a relative
+/// [`SPLIT_EPSILON`] with alternating signs and share the donor's mass.
+pub(crate) fn split_pair(
+    centroids: &mut [f32],
+    usage: &mut [f32],
+    d: usize,
+    src: usize,
+    dst: usize,
+) {
+    let base: Vec<f32> = centroids[src * d..(src + 1) * d].to_vec();
+    let mut donor = vec![0f32; d];
+    let mut child = vec![0f32; d];
+    for t in 0..d {
+        let sign = if t % 2 == 0 { 1.0f32 } else { -1.0 };
+        let offset = SPLIT_EPSILON * sign;
+        donor[t] = base[t] * (1.0 - offset);
+        child[t] = base[t] * (1.0 + offset);
+    }
+    // Identical copies (e.g. a zero donor) would never separate: move one
+    // coordinate of the child by one ulp.
+    if donor == child {
+        let up = child[0].next_up();
+        child[0] = if up.is_finite() {
+            up
+        } else {
+            child[0].next_down()
+        };
+    }
+    let half = usage[src] / 2.0;
+    usage[src] = half;
+    usage[dst] = half;
+    centroids[src * d..(src + 1) * d].copy_from_slice(&donor);
+    centroids[dst * d..(dst + 1) * d].copy_from_slice(&child);
+}
+
 fn gather_rows(x: &[f32], idx: &[usize], d: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(idx.len() * d);
     for &i in idx {
@@ -884,7 +914,6 @@ pub(crate) fn build_step(
         "e-means: assignment precision must be F64, F32, F16 or BF16, got {assign:?}"
     );
     let b = g.shape(x).dim(0).unwrap_static();
-    let d = g.shape(x).dim(1).unwrap_static();
     let k = g.shape(c).dim(0).unwrap_static();
 
     // Assignment: proxy[B, k] = ‖c‖²(row) − 2·x·cᵀ, written as an add (see
@@ -910,6 +939,24 @@ pub(crate) fn build_step(
     let c_norm_row = g.reshape_(c_norm, vec![1, k as i64]);
     let proxy = g.add(c_norm_row, neg_two_cross);
     let labels = g.argmin(proxy, 1, false, Shape::new(&[b], DType::F32));
+    build_update(g, x, weight, c, usage, alpha, labels)
+}
+
+/// Statistics, objective and EMA of one step whose rows `x[B, d]` are already
+/// labelled (`labels[B]`, f32-encoded cluster ids).
+pub(crate) fn build_update(
+    g: &mut Graph,
+    x: NodeId,
+    weight: Option<NodeId>,
+    c: NodeId,
+    usage: NodeId,
+    alpha: NodeId,
+    labels: NodeId,
+) -> StepNodes {
+    use rlx_ir::infer::GraphExt as _;
+    let b = g.shape(x).dim(0).unwrap_static();
+    let d = g.shape(x).dim(1).unwrap_static();
+    let k = g.shape(c).dim(0).unwrap_static();
 
     // Objective: Σ w·‖x − c_label‖², in f32.
     let chosen = g.gather_(c, labels, 0);

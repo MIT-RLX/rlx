@@ -80,7 +80,16 @@ impl Prec {
     /// mantissa, or the device's own matmul precision when that is coarser
     /// (the XDNA NPU multiplies in INT8 per channel, bf16 at best).
     fn eps_on(self, dev: Device) -> f32 {
-        self.eps().max(device_floor(dev))
+        let eps = self.eps().max(device_floor(dev));
+        // CoreML has no bf16 (it demotes to f16) and runs half-precision
+        // graphs on the Neural Engine, whose f16 runs land like bf16 ones
+        // elsewhere: a cast:f16 run ended 2.4e-2 above the host, where every
+        // other backend's ended within 1e-4. Its f32 runs are exact.
+        if dev == Device::Ane && eps > 1e-5 {
+            eps.max(Prec::Cast(DType::BF16).eps())
+        } else {
+            eps
+        }
     }
 
     /// Mantissa-scale relative error this setting may introduce.

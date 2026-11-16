@@ -1878,10 +1878,10 @@ pub fn lower_with_env_writeback(
                 //
                 // So pick the set arithmetically (threshold + running count, which
                 // has no ordering ambiguity), then turn it into indices by
-                // partitioning a key that has no ties left by construction.
-                // Ordering *within* the returned k is index order rather than
-                // descending value — the same guarantee this lowering gave before,
-                // and every rlx consumer treats the result as a set.
+                // partitioning a key that has no ties left by construction, and
+                // order the k winners as the contract says (value descending,
+                // ties to the smaller index) — o-means reads its probes in rank
+                // order, so a set is not enough.
                 let x = lookup(&env, node.inputs[0])?;
                 let in_shape = node_input_shape(graph, node.inputs[0]);
                 if in_shape.is_empty() {
@@ -1938,14 +1938,44 @@ pub fn lower_with_env_writeback(
                 let n_arr = Array::from_f32_slice(&[last_size as f32], &[1], DType::F32)?;
                 let bump = ops::mul(&ops::sub(&one, &keep_f)?, &n_arr)?;
                 let key = ops::add(&iota, &bump)?;
-                let order = ops::argpartition(&key, *k as i32, last_axis)?;
-                let mut kstart = vec![0i32; n];
+                // kth = k − 1 puts the k smallest first and stays valid when
+                // k is the whole row (MLX rejects kth == size).
+                let order = ops::argpartition(&key, *k as i32 - 1, last_axis)?;
+                let kstart = vec![0i32; n];
                 let mut kstop = in_shape.clone();
                 kstop[n - 1] = *k as i32;
                 let idx = ops::slice(&order, &kstart, &kstop)?;
-                kstart[n - 1] = 0;
+
+                // Rank each winner i among the k: the number of winners j with
+                // a larger value, or an equal value at a smaller index. The
+                // ranks are a permutation of 0..k (no ties by construction), so
+                // `out[p] = Σ_i idx_i · [rank_i == p]` places every winner. Pairwise
+                // [.., k, k] work is fine for the small k rlx uses TopK with.
+                let kk = *k as i32;
+                let mut col_shape = kstop.clone();
+                col_shape.push(1); // [.., k, 1]: i
+                let mut row_shape = kstop.clone();
+                row_shape.insert(n - 1, 1); // [.., 1, k]: j
+                let vals = ops::take_along_axis(x, &idx, last_axis)?;
+                let idx_f = ops::cast(&idx, DType::F32)?;
+                let (vi, vj) = (ops::reshape(&vals, &col_shape)?, ops::reshape(&vals, &row_shape)?);
+                let (ii, ij) = (ops::reshape(&idx_f, &col_shape)?, ops::reshape(&idx_f, &row_shape)?);
+                let larger = ops::select(&ops::gt(&vj, &vi)?, &one, &zero)?;
+                let earlier_tie = ops::select(
+                    &ops::eq(&vj, &vi)?,
+                    &ops::select(&ops::lt(&ij, &ii)?, &one, &zero)?,
+                    &zero,
+                )?;
+                let beats = ops::max(&larger, &earlier_tie)?;
+                let rank = ops::reduce(&beats, MlxReduce::Sum, &[n as i32], /*keep_dim=*/ true)?;
+                let pos_v: Vec<f32> = (0..kk).map(|p| p as f32).collect();
+                let mut pos_shape = vec![1usize; n + 1];
+                pos_shape[n] = kk as usize;
+                let pos = Array::from_f32_slice(&pos_v, &pos_shape, DType::F32)?;
+                let onehot = ops::select(&ops::eq(&rank, &pos)?, &one, &zero)?; // [.., i, p]
+                let placed = ops::mul(&onehot, &ii)?;
                 // rlx encodes indices as f32 at the I/O boundary.
-                ops::cast(&idx, DType::F32)?
+                ops::reduce(&placed, MlxReduce::Sum, &[(n - 1) as i32], /*keep_dim=*/ false)?
             }
             Op::ScatterAdd { axis } => {
             // Every backend kernel implements the axis-0 form only;

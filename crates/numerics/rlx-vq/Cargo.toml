@@ -22,6 +22,10 @@ metal = ["dep:rlx-metal"]
 emeans = ["dep:rlx-rng"]
 # Device-resident e-means (`emeans::device`): state lives in GPU handles.
 emeans-device = ["emeans", "dep:rlx-runtime"]
+# o-means: e-means with a two-level (cells over the centroids) assignment.
+omeans = ["emeans"]
+# GPU o-means (`omeans::device`): the two-level assignment as rlx graphs.
+omeans-device = ["omeans", "emeans-device"]
 
 [dependencies]
 rlx-ir = { workspace = true }

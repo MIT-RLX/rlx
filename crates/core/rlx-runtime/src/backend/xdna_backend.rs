@@ -72,6 +72,8 @@ impl Backend for XdnaBackend {
             // index are memory-bound, and the NPU's INT8 / bf16 matmul would
             // quantize them).
             OpKind::ScatterAdd,
+            // Host step: a selection, no arithmetic for the NPU to do.
+            OpKind::TopK,
             // Host step too: a graph that rounds to bf16 itself (casts under
             // `HalfCasts::Round`, number formats) feeds the bf16 microkernel
             // operands it reproduces exactly, so every term of an expression

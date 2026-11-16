@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 390" width="800" height="390" role="img" aria-labelledby="t d">
+
+<style>
+  .surface { fill: #fcfcfb; }
+  .ink { fill: #0b0b0b; }
+  .ink2 { fill: #52514e; }
+  .muted { fill: #898781; }
+  .grid { stroke: #e1e0d9; stroke-width: 1; }
+  .axis { stroke: #c3c2b7; stroke-width: 1; }
+  .ref { stroke: #52514e; stroke-width: 1.5; stroke-dasharray: 4 3; }
+  .s1 { fill: #2a78d6; }
+  .s2 { fill: #eb6834; }
+  .s3 { fill: #1baf7a; }
+  .ring { stroke: #fcfcfb; stroke-width: 2; }
+  text { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; }
+  @media (prefers-color-scheme: dark) {
+    .surface { fill: #1a1a19; }
+    .ink { fill: #f0efec; }
+    .ink2 { fill: #c3c2b7; }
+    .grid { stroke: #2c2c2a; }
+    .axis { stroke: #383835; }
+    .ref { stroke: #c3c2b7; }
+    .s1 { fill: #3987e5; }
+    .s2 { fill: #d95926; }
+    .s3 { fill: #199e70; }
+    .ring { stroke: #1a1a19; }
+  }
+</style>
+
+<title id="t">Training MSE against wall time</title>
+<desc id="d">Host runs on 100,000 rows of dimension 32 from the same random rows. At k = 1024, Lloyd-25 reaches MSE 7.75 in 5.7 s; e-means and o-means reach 3.97 to 5.46 in 0.5 to 4.2 s. At k = 4096, Lloyd-25 reaches 6.83 in 30.3 s; e-means and o-means reach 3.86 to 4.21 in 1.4 to 6.6 s.</desc>
+<rect class="surface" width="800" height="390" rx="8"/>
+<text class="ink" x="20" y="30" font-size="16" font-weight="600">Training MSE against wall time (lower left is better)</text>
+<text class="ink2" x="20" y="50" font-size="12">Host, n = 100k, d = 32, same random starting rows; labels give the epochs</text>
+<circle class="s1 ring" cx="26.0" cy="66.0" r="5"/>
+<text class="ink2" x="36" y="70" font-size="12">Lloyd-25</text>
+<rect class="s2 ring" x="121.0" y="61.0" width="10" height="10" rx="1.5"/>
+<text class="ink2" x="136" y="70" font-size="12">e-means</text>
+<polygon class="s3 ring" points="226.0,60.2 231.8,70.6 220.2,70.6"/>
+<text class="ink2" x="236" y="70" font-size="12">o-means</text>
+<text class="ink" x="70" y="100" font-size="13" font-weight="600">k = 1024</text>
+<line class="grid" x1="70" x2="370" y1="330.0" y2="330.0"/>
+<text class="muted" x="62" y="334.0" font-size="11" text-anchor="end">0</text>
+<line class="grid" x1="70" x2="370" y1="256.7" y2="256.7"/>
+<text class="muted" x="62" y="260.7" font-size="11" text-anchor="end">3</text>
+<line class="grid" x1="70" x2="370" y1="183.3" y2="183.3"/>
+<text class="muted" x="62" y="187.3" font-size="11" text-anchor="end">6</text>
+<line class="grid" x1="70" x2="370" y1="110.0" y2="110.0"/>
+<text class="muted" x="62" y="114.0" font-size="11" text-anchor="end">9</text>
+<line class="grid" x1="100.0" x2="100.0" y1="110" y2="330"/>
+<text class="muted" x="100.0" y="346" font-size="11" text-anchor="middle">0.5</text>
+<line class="grid" x1="140.6" x2="140.6" y1="110" y2="330"/>
+<text class="muted" x="140.6" y="346" font-size="11" text-anchor="middle">1</text>
+<line class="grid" x1="181.2" x2="181.2" y1="110" y2="330"/>
+<text class="muted" x="181.2" y="346" font-size="11" text-anchor="middle">2</text>
+<line class="grid" x1="235.0" x2="235.0" y1="110" y2="330"/>
+<text class="muted" x="235.0" y="346" font-size="11" text-anchor="middle">5</text>
+<line class="grid" x1="275.6" x2="275.6" y1="110" y2="330"/>
+<text class="muted" x="275.6" y="346" font-size="11" text-anchor="middle">10</text>
+<line class="grid" x1="316.3" x2="316.3" y1="110" y2="330"/>
+<text class="muted" x="316.3" y="346" font-size="11" text-anchor="middle">20</text>
+<line class="grid" x1="370.0" x2="370.0" y1="110" y2="330"/>
+<text class="muted" x="370.0" y="346" font-size="11" text-anchor="middle">50</text>
+<line class="axis" x1="70" x2="370" y1="330" y2="330"/>
+<text class="muted" x="220.0" y="364" font-size="11" text-anchor="middle">seconds (log scale)</text>
+<text class="muted" x="26" y="220.0" font-size="11" text-anchor="middle" transform="rotate(-90 26 220.0)">training MSE</text>
+<g><title>Lloyd-25: MSE 7.7478 in 5.70 s</title><circle class="s1 ring" cx="242.7" cy="140.6" r="5.5"/></g>
+<text class="ink2" x="242.7" y="130.6" font-size="10" text-anchor="middle">Lloyd-25</text>
+<g><title>e-means T=1: MSE 4.1831 in 0.78 s</title><rect class="s2 ring" x="120.5" y="222.2" width="11.0" height="11.0" rx="1.5"/></g>
+<text class="ink2" x="126.0" y="217.7" font-size="10" text-anchor="middle">T=1</text>
+<g><title>e-means T=2: MSE 3.9736 in 1.21 s</title><rect class="s2 ring" x="146.3" y="227.4" width="11.0" height="11.0" rx="1.5"/></g>
+<text class="ink2" x="151.8" y="222.9" font-size="10" text-anchor="middle">T=2</text>
+<g><title>e-means T=5: MSE 5.4566 in 3.56 s</title><rect class="s2 ring" x="209.6" y="191.1" width="11.0" height="11.0" rx="1.5"/></g>
+<text class="ink2" x="215.1" y="186.6" font-size="10" text-anchor="middle">T=5</text>
+<g><title>o-means T=1: MSE 4.0131 in 0.52 s</title><polygon class="s3 ring" points="102.3,225.6 108.6,237.0 95.9,237.0"/></g>
+<text class="ink2" x="102.3" y="249.9" font-size="10" text-anchor="middle">T=1</text>
+<g><title>o-means T=2: MSE 3.9736 in 2.29 s</title><polygon class="s3 ring" points="189.2,226.5 195.5,237.9 182.9,237.9"/></g>
+<text class="ink2" x="189.2" y="250.9" font-size="10" text-anchor="middle">T=2</text>
+<g><title>o-means T=5: MSE 5.4566 in 4.19 s</title><polygon class="s3 ring" points="224.6,190.3 230.9,201.7 218.3,201.7"/></g>
+<text class="ink2" x="224.6" y="214.6" font-size="10" text-anchor="middle">T=5</text>
+<text class="ink" x="460" y="100" font-size="13" font-weight="600">k = 4096</text>
+<line class="grid" x1="460" x2="760" y1="330.0" y2="330.0"/>
+<text class="muted" x="452" y="334.0" font-size="11" text-anchor="end">0</text>
+<line class="grid" x1="460" x2="760" y1="256.7" y2="256.7"/>
+<text class="muted" x="452" y="260.7" font-size="11" text-anchor="end">3</text>
+<line class="grid" x1="460" x2="760" y1="183.3" y2="183.3"/>
+<text class="muted" x="452" y="187.3" font-size="11" text-anchor="end">6</text>
+<line class="grid" x1="460" x2="760" y1="110.0" y2="110.0"/>
+<text class="muted" x="452" y="114.0" font-size="11" text-anchor="end">9</text>
+<line class="grid" x1="490.0" x2="490.0" y1="110" y2="330"/>
+<text class="muted" x="490.0" y="346" font-size="11" text-anchor="middle">0.5</text>
+<line class="grid" x1="530.6" x2="530.6" y1="110" y2="330"/>
+<text class="muted" x="530.6" y="346" font-size="11" text-anchor="middle">1</text>
+<line class="grid" x1="571.2" x2="571.2" y1="110" y2="330"/>
+<text class="muted" x="571.2" y="346" font-size="11" text-anchor="middle">2</text>
+<line class="grid" x1="625.0" x2="625.0" y1="110" y2="330"/>
+<text class="muted" x="625.0" y="346" font-size="11" text-anchor="middle">5</text>
+<line class="grid" x1="665.6" x2="665.6" y1="110" y2="330"/>
+<text class="muted" x="665.6" y="346" font-size="11" text-anchor="middle">10</text>
+<line class="grid" x1="706.3" x2="706.3" y1="110" y2="330"/>
+<text class="muted" x="706.3" y="346" font-size="11" text-anchor="middle">20</text>
+<line class="grid" x1="760.0" x2="760.0" y1="110" y2="330"/>
+<text class="muted" x="760.0" y="346" font-size="11" text-anchor="middle">50</text>
+<line class="axis" x1="460" x2="760" y1="330" y2="330"/>
+<text class="muted" x="610.0" y="364" font-size="11" text-anchor="middle">seconds (log scale)</text>
+<g><title>Lloyd-25: MSE 6.8297 in 30.27 s</title><circle class="s1 ring" cx="730.6" cy="163.1" r="5.5"/></g>
+<text class="ink2" x="730.6" y="153.1" font-size="10" text-anchor="middle">Lloyd-25</text>
+<g><title>e-means T=1: MSE 4.2086 in 1.76 s</title><rect class="s2 ring" x="558.3" y="221.6" width="11.0" height="11.0" rx="1.5"/></g>
+<text class="ink2" x="563.8" y="217.1" font-size="10" text-anchor="middle">T=1</text>
+<g><title>e-means T=2: MSE 3.8965 in 2.89 s</title><rect class="s2 ring" x="587.3" y="229.3" width="11.0" height="11.0" rx="1.5"/></g>
+<text class="ink2" x="592.8" y="224.8" font-size="10" text-anchor="middle">T=2</text>
+<g><title>e-means T=5: MSE 3.8652 in 6.55 s</title><rect class="s2 ring" x="635.3" y="230.0" width="11.0" height="11.0" rx="1.5"/></g>
+<text class="ink2" x="640.8" y="225.5" font-size="10" text-anchor="middle">T=5</text>
+<g><title>o-means T=1: MSE 3.9748 in 1.40 s</title><polygon class="s3 ring" points="550.3,226.5 556.7,237.9 544.0,237.9"/></g>
+<text class="ink2" x="550.3" y="250.8" font-size="10" text-anchor="middle">T=1</text>
+<g><title>o-means T=2: MSE 3.8996 in 2.81 s</title><polygon class="s3 ring" points="591.2,228.4 597.5,239.7 584.9,239.7"/></g>
+<text class="ink2" x="591.2" y="252.7" font-size="10" text-anchor="middle">T=2</text>
+<g><title>o-means T=5: MSE 3.8632 in 5.89 s</title><polygon class="s3 ring" points="634.6,229.2 640.9,240.6 628.3,240.6"/></g>
+<text class="ink2" x="634.6" y="253.6" font-size="10" text-anchor="middle">T=5</text>
+</svg>

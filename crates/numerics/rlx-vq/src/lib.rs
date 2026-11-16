@@ -42,6 +42,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "emeans")]
 pub mod emeans;
+#[cfg(feature = "omeans")]
+pub mod omeans;
 
 use rlx_ir::{DType, Graph, NodeId, OpExtension, Shape, register_op};
 
