@@ -133,6 +133,18 @@ pub(crate) enum Step {
         c_off: u32,
         op: u32,
     },
+    /// `Binary` reading each operand through per-axis strides, so the
+    /// `Expand` before it is never materialised (`binary_broadcast.cu`;
+    /// meta = out dims, a strides, b strides).
+    BinaryBroadcast {
+        n: u32,
+        a_off: u32,
+        b_off: u32,
+        c_off: u32,
+        op: u32,
+        rank: u32,
+        meta_idx: usize,
+    },
     Compare {
         n: u32,
         a_off: u32,
@@ -696,8 +708,9 @@ pub(crate) enum Step {
         rev_mask: Vec<bool>,
         elem_bytes: u32,
     },
-    /// Host-staged ArgMax/ArgMin (f32-encoded indices).
-    ArgReduceHost {
+    /// ArgMax/ArgMin over the middle of [outer, reduced, inner] on the GPU
+    /// (`argreduce` / `argreduce_row`, f32-encoded indices).
+    ArgReduce {
         src_byte_off: u64,
         dst_byte_off: u64,
         outer: u32,
@@ -1465,6 +1478,14 @@ pub(crate) enum Step {
         w: u32,
         num_groups: u32,
         eps_bits: u32,
+        /// Activation applied as the norm writes (0 none, 1 ReLU, 2 LeakyReLU
+        /// with `alpha_bits`, 3 SiLU); `dst_off` is then the activation's
+        /// output (`rlx_opt::memory::adjacent_group_norm_activations`).
+        act: u32,
+        alpha_bits: u32,
+        /// f32 offset of the split kernels' statistics scratch, shared by
+        /// every group norm — a write, so concurrent streams order them.
+        stats_off: u32,
     },
     GroupNormBackwardInput {
         x_off: u32,
@@ -1835,6 +1856,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ScaledQuantizeGeneral { .. } => "rlx::ScaledQuantizeGeneral",
         Step::ScaledDequantizeGeneral { .. } => "rlx::ScaledDequantizeGeneral",
         Step::Binary { .. } => "rlx::Binary",
+        Step::BinaryBroadcast { .. } => "rlx::BinaryBroadcast",
         Step::Compare { .. } => "rlx::Compare",
         Step::Unary { .. } => "rlx::Unary",
         Step::Where { .. } => "rlx::Where",
@@ -1890,7 +1912,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::FftButterflyStage { .. } => "rlx::FftButterflyStage",
         Step::Im2ColHost { .. } => "rlx::Im2ColHost",
         Step::ReverseHost { .. } => "rlx::ReverseHost",
-        Step::ArgReduceHost { .. } => "rlx::ArgReduceHost",
+        Step::ArgReduce { .. } => "rlx::ArgReduce",
         Step::AxialRope2d { .. } => "rlx::AxialRope2d",
         Step::GatedDeltaNet { .. } => "rlx::GatedDeltaNet",
         Step::Lstm { .. } => "rlx::Lstm",
@@ -2170,6 +2192,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             vec![*out_off_f32],
         ),
         Step::Binary {
+            a_off,
+            b_off,
+            c_off,
+            ..
+        }
+        | Step::BinaryBroadcast {
             a_off,
             b_off,
             c_off,
@@ -2597,7 +2625,7 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             dst_byte_off,
             ..
         }
-        | Step::ArgReduceHost {
+        | Step::ArgReduce {
             src_byte_off,
             dst_byte_off,
             ..
@@ -3045,8 +3073,9 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             g_off,
             b_off,
             dst_off,
+            stats_off,
             ..
-        } => (vec![*src_off, *g_off, *b_off], vec![*dst_off]),
+        } => (vec![*src_off, *g_off, *b_off], vec![*dst_off, *stats_off]),
         Step::GroupNormBackwardInput {
             x_off,
             gamma_off,
@@ -3357,9 +3386,14 @@ impl Step {
         matches!(
             self,
             Step::ActivationBackward { .. }
+                // u64 byte offsets, passed to `argreduce` as u64 element
+                // offsets.
+                | Step::ArgReduce { .. }
                 | Step::Attention { .. }
                 | Step::AttentionBackward { .. }
                 | Step::Binary { .. }
+                // binary_broadcast.cu: f32 element offsets, `size_t` indices.
+                | Step::BinaryBroadcast { .. }
                 | Step::Concat { .. }
                 // conv2d*.cu / conv_bias_act_epilogue.cu index f32 elements
                 // with products bounded by their own tensors; the backward
@@ -3368,6 +3402,14 @@ impl Step {
                 | Step::Conv2d { .. }
                 | Step::Conv2dBackwardInput { .. }
                 | Step::Conv2dBackwardWeight { .. }
+                // conv3d.cu / conv_transpose3d.cu: `arena[in_off + idx]`, f32
+                // element offsets, `idx` bounded by the tensor; MIOpen's
+                // pointers are `arena + off_f32 as u64 * 4`.
+                | Step::Conv3d { .. }
+                | Step::ConvTranspose3d { .. }
+                // group_norm.cu (split kernels): element offsets, the stats
+                // scratch included; `base + i` < the group's tensor.
+                | Step::GroupNorm { .. }
                 | Step::Expand { .. }
                 | Step::Gather { .. }
                 // gated_residual.cu: element offsets, `mod_base + col` < gate size.
@@ -3380,6 +3422,9 @@ impl Step {
                 | Step::RmsNormBackwardGamma { .. }
                 | Step::RmsNormBackwardBeta { .. }
                 | Step::Rope { .. }
+                // round_to_format.cu: `arena + in_off` / `out_off` / `amax_off`
+                // as f32 element offsets, `t < n`.
+                | Step::RoundToFormat { .. }
                 | Step::RopeBackward { .. }
                 | Step::ScatterAddAcc { .. }
                 | Step::ScatterAddZero { .. }
@@ -3400,6 +3445,7 @@ impl Step {
         matches!(
             self,
             Step::Binary { .. }
+                | Step::BinaryBroadcast { .. }
                 | Step::Compare { .. }
                 | Step::Unary { .. }
                 | Step::Where { .. }
@@ -3462,7 +3508,6 @@ impl Step {
             | Step::DenseSolveNative { .. }
             | Step::BatchedDenseSolveNative { .. }
             | Step::ReverseHost { .. }
-            | Step::ArgReduceHost { .. }
             | Step::GruHost { .. }
             | Step::RnnHost { .. }
             | Step::Mamba2Host { .. }

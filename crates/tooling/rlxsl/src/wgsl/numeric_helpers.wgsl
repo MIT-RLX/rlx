@@ -84,7 +84,13 @@ fn rlx_exp(x: f32) -> f32 {
     if ((bx & 0x7fffffffu) > 0x7f800000u) { return x; }
     let xc = clamp(x, -110.0, 89.0);
     let n = round(xc * 1.44269504);
-    let r = fma(n, -1.428606765330187e-6, fma(n, -0.693145751953125, xc));
+    // Cody–Waite: `xc − n·ln2_hi` is exact, then the low part. `n·ln2_hi` is
+    // built in integers (ln2_hi = 45426·2^-16, |n·45426| < 2^24, so exact):
+    // written as two nested `fma(n, …)` the reduction was folded into one
+    // `fma(n, −(hi + lo), xc)` by AMD's Vulkan compiler (RADV), which SPIR-V
+    // permits for any op not marked precise, and `exp` drifted up to 4 ULP.
+    let nh = ldexp(f32(i32(n) * 45426), -16);
+    let r = fma(n, -1.428606765330187e-6, xc - nh);
     var p = 1.9875691500e-4;
     p = fma(p, r, 1.3981999507e-3);
     p = fma(p, r, 8.3334519073e-3);

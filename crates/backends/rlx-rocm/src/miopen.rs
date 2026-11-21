@@ -60,6 +60,15 @@ impl std::error::Error for MiopenError {}
 
 /// `miopenDataType_t::miopenFloat = 1` (matches AMD enum).
 const MIOPEN_FLOAT: c_int = 1;
+/// `miopenDataType_t::miopenHalf = 0`.
+const MIOPEN_HALF: c_int = 0;
+
+/// The forward algorithm `miopenFindConvolutionForwardAlgorithm` chose, per
+/// 3-D problem (shape, pads, strides, dilations, groups, dtype). Find
+/// benchmarks the candidates; run once a problem, not once a convolution a
+/// run. `RLX_ROCM_MIOPEN_FIND_ALWAYS=1` finds every time.
+static CONV3D_FWD_ALGO: std::sync::Mutex<Option<std::collections::HashMap<[u32; 26], c_int>>> =
+    std::sync::Mutex::new(None);
 /// `miopenConvolutionMode_t::miopenConvolution = 0`.
 const MIOPEN_CONVOLUTION: c_int = 0;
 
@@ -328,6 +337,8 @@ impl Drop for MiopenContext {
 /// `arena_dev_ptr`, `workspace_dev_ptr`, and the offsets into them
 /// must point to live HIP device memory of the right shape;
 /// `miopen` must be a valid context bound to the active HIP stream.
+///
+/// MIOpen forward 3-D convolution on the f32 arena (see [`conv3d_forward_raw`]).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn conv3d_forward(
     miopen: &MiopenContext,
@@ -360,6 +371,118 @@ pub unsafe fn conv3d_forward(
     w_off_f32: u32,
     out_off_f32: u32,
 ) -> Result<(), MiopenError> {
+    unsafe {
+        conv3d_forward_raw(
+            miopen,
+            workspace_dev_ptr,
+            workspace_size,
+            n,
+            c_in,
+            c_out,
+            d,
+            h,
+            w,
+            d_out,
+            h_out,
+            w_out,
+            kd,
+            kh,
+            kw,
+            sd,
+            sh,
+            sw,
+            pd,
+            ph,
+            pw,
+            dd,
+            dh,
+            dw,
+            groups,
+            false,
+            arena_dev_ptr + (in_off_f32 as u64) * 4,
+            arena_dev_ptr + (w_off_f32 as u64) * 4,
+            arena_dev_ptr + (out_off_f32 as u64) * 4,
+        )
+    }
+}
+
+/// Forward conv3d on raw device pointers (`half` selects f16).
+///
+/// # Safety
+///
+/// `x_dev`, `w_dev`, `y_dev` and `workspace_dev_ptr` must point to live HIP
+/// device memory of the right shape and dtype; `miopen` must be a valid
+/// context bound to the active HIP stream.
+pub unsafe fn conv3d_forward_raw(
+    miopen: &MiopenContext,
+    workspace_dev_ptr: u64,
+    workspace_size: usize,
+    n: u32,
+    c_in: u32,
+    c_out: u32,
+    d: u32,
+    h: u32,
+    w: u32,
+    d_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kd: u32,
+    kh: u32,
+    kw: u32,
+    sd: u32,
+    sh: u32,
+    sw: u32,
+    pd: u32,
+    ph: u32,
+    pw: u32,
+    dd: u32,
+    dh: u32,
+    dw: u32,
+    groups: u32,
+    half: bool,
+    x_dev: u64,
+    w_dev: u64,
+    y_dev: u64,
+) -> Result<(), MiopenError> {
+    let dt = if half { MIOPEN_HALF } else { MIOPEN_FLOAT };
+    let key: [u32; 26] = [
+        n,
+        c_in,
+        c_out,
+        d,
+        h,
+        w,
+        d_out,
+        h_out,
+        w_out,
+        kd,
+        kh,
+        kw,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
+        dd,
+        dh,
+        dw,
+        groups,
+        u32::from(half),
+        0,
+        0,
+        0,
+    ];
+    let find_always = rlx_ir::env::flag("RLX_ROCM_MIOPEN_FIND_ALWAYS");
+    let cached = if find_always {
+        None
+    } else {
+        CONV3D_FWD_ALGO
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&key).copied())
+    };
     let rt = &miopen.runtime;
     unsafe {
         let mut x_desc: MiopenTensorDescriptor = ptr::null_mut();
@@ -408,12 +531,9 @@ pub unsafe fn conv3d_forward(
             (rt.create_tensor_desc)(&mut w_desc).ok()?;
             (rt.create_conv_desc)(&mut conv_desc).ok()?;
 
-            (rt.set_tensor_desc)(x_desc, MIOPEN_FLOAT, 5, x_dims.as_ptr(), x_strides.as_ptr())
-                .ok()?;
-            (rt.set_tensor_desc)(y_desc, MIOPEN_FLOAT, 5, y_dims.as_ptr(), y_strides.as_ptr())
-                .ok()?;
-            (rt.set_tensor_desc)(w_desc, MIOPEN_FLOAT, 5, f_dims.as_ptr(), f_strides.as_ptr())
-                .ok()?;
+            (rt.set_tensor_desc)(x_desc, dt, 5, x_dims.as_ptr(), x_strides.as_ptr()).ok()?;
+            (rt.set_tensor_desc)(y_desc, dt, 5, y_dims.as_ptr(), y_strides.as_ptr()).ok()?;
+            (rt.set_tensor_desc)(w_desc, dt, 5, f_dims.as_ptr(), f_strides.as_ptr()).ok()?;
             (rt.init_conv_nd_desc)(
                 conv_desc,
                 3,
@@ -441,53 +561,83 @@ pub unsafe fn conv3d_forward(
                 return Err(MiopenError(-1));
             }
 
-            let x_ptr = (arena_dev_ptr + (in_off_f32 as u64) * 4) as *const c_void;
-            let w_ptr = (arena_dev_ptr + (w_off_f32 as u64) * 4) as *const c_void;
-            let y_ptr = (arena_dev_ptr + (out_off_f32 as u64) * 4) as *mut c_void;
+            let x_ptr = x_dev as *const c_void;
+            let w_ptr = w_dev as *const c_void;
+            let y_ptr = y_dev as *mut c_void;
             let workspace_ptr = workspace_dev_ptr as *mut c_void;
 
-            let mut returned: c_int = 0;
-            let mut perf = std::mem::MaybeUninit::<MiopenConvAlgoPerf>::uninit();
-            (rt.find_conv_fwd_algo)(
-                miopen.handle,
-                x_desc,
-                x_ptr,
-                w_desc,
-                w_ptr,
-                conv_desc,
-                y_desc,
-                y_ptr,
-                1,
-                &mut returned,
-                perf.as_mut_ptr(),
-                workspace_ptr,
-                workspace_size,
-                false,
-            )
-            .ok()?;
-            if returned == 0 {
-                return Err(MiopenError(-2));
-            }
-            let algo = perf.assume_init().fwd_algo;
+            let find = || -> Result<c_int, MiopenError> {
+                let mut returned: c_int = 0;
+                let mut perf = std::mem::MaybeUninit::<MiopenConvAlgoPerf>::uninit();
+                (rt.find_conv_fwd_algo)(
+                    miopen.handle,
+                    x_desc,
+                    x_ptr,
+                    w_desc,
+                    w_ptr,
+                    conv_desc,
+                    y_desc,
+                    y_ptr,
+                    1,
+                    &mut returned,
+                    perf.as_mut_ptr(),
+                    workspace_ptr,
+                    workspace_size,
+                    false,
+                )
+                .ok()?;
+                if returned == 0 {
+                    return Err(MiopenError(-2));
+                }
+                Ok(perf.assume_init().fwd_algo)
+            };
+            let algo = match cached {
+                Some(a) => a,
+                None => {
+                    let a = find()?;
+                    CONV3D_FWD_ALGO
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(Default::default)
+                        .insert(key, a);
+                    a
+                }
+            };
 
             let alpha: f32 = 1.0;
             let beta: f32 = 0.0;
-            (rt.conv_fwd)(
-                miopen.handle,
-                &alpha as *const _ as *const c_void,
-                x_desc,
-                x_ptr,
-                w_desc,
-                w_ptr,
-                conv_desc,
-                algo,
-                &beta as *const _ as *const c_void,
-                y_desc,
-                y_ptr,
-                workspace_ptr,
-                workspace_size,
-            )
-            .ok()?;
+            let run = |algo: c_int| {
+                (rt.conv_fwd)(
+                    miopen.handle,
+                    &alpha as *const _ as *const c_void,
+                    x_desc,
+                    x_ptr,
+                    w_desc,
+                    w_ptr,
+                    conv_desc,
+                    algo,
+                    &beta as *const _ as *const c_void,
+                    y_desc,
+                    y_ptr,
+                    workspace_ptr,
+                    workspace_size,
+                )
+                .ok()
+            };
+            match (run(algo), cached) {
+                (Ok(()), _) => {}
+                // A cached choice MIOpen will not run without its own Find.
+                (Err(_), Some(_)) => {
+                    let a = find()?;
+                    CONV3D_FWD_ALGO
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(Default::default)
+                        .insert(key, a);
+                    run(a)?;
+                }
+                (Err(e), None) => return Err(e),
+            }
             Ok(())
         };
 

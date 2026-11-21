@@ -157,7 +157,11 @@ impl MetalExecutable {
         let fused = match policy {
             Some(p) => {
                 use rlx_opt::pass::Pass;
-                let g = rlx_opt::AutoMixedPrecision::new(p).run(fused);
+                // Metal has half conv3d and group-norm kernels.
+                let g = rlx_opt::AutoMixedPrecision::new(p)
+                    .with_f16_conv3d(true)
+                    .with_f16_params(true)
+                    .run(fused);
                 if verbose {
                     eprintln!("[rlx-metal] after AutoMixedPrecision: {} nodes", g.len());
                 }
@@ -238,6 +242,7 @@ impl MetalExecutable {
         let conv_bwd_scratch = conv_bwd_scratch_bytes(&fused);
         let attn_bwd_scratch = crate::attention_bwd_gpu::scratch_bytes(&fused);
         let rms_norm_bwd_scratch = rms_norm_bwd_scratch_bytes(&fused);
+        let gn_stats_scratch = crate::thunk::group_norm_stats_layout(&fused).0;
         let rnn_gru_scratch = rnn_gru_scratch_bytes(&fused);
         let onnx_qmatmul_act_scratch = if crate::onnx_qmatmul::ingraph_gpu_enabled() {
             crate::onnx_qmatmul::act_scratch_bytes(&fused)
@@ -750,6 +755,14 @@ impl MetalExecutable {
         } else {
             0
         };
+        let gn_stats_scratch_off = if gn_stats_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + gn_stats_scratch;
+            off
+        } else {
+            0
+        };
         let rnn_gru_scratch_off = if rnn_gru_scratch > 0 {
             tail = (tail + 127) & !127;
             let off = tail;
@@ -1221,6 +1234,7 @@ impl MetalExecutable {
             conv_bwd_scratch_off,
             attn_bwd_scratch_off,
             rms_norm_bwd_scratch_off,
+            gn_stats_scratch_off,
             rnn_gru_scratch_off,
             onnx_qmatmul_act_scratch_off,
             f16_weight_scratch: std::cell::RefCell::new(None),

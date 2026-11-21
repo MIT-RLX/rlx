@@ -106,6 +106,14 @@ pub struct CudaExecutable {
     /// `RLX_CUDA_NO_TF32` does for every graph. See
     /// [`Self::set_exact_f32_matmul`].
     exact_f32_matmul: bool,
+    /// Run cuDNN 3-D convolutions in f16 (half input/filter/output, f32
+    /// accumulation, tensor cores), converting at the f32 arena's boundary.
+    /// See [`Self::set_conv_f16`].
+    conv_f16: bool,
+    /// Half scratch for [`Self::conv_f16`]: one conv's input, filter and
+    /// output, sized for the largest at `set_conv_f16` (no allocation while
+    /// a CUDA graph is captured).
+    conv_half_scratch: Option<cudarc::driver::CudaSlice<u16>>,
     /// cuBLAS handle bound to the same default stream as `ctx`. Used for
     /// plain matmul (no fused bias/activation); falls back to the custom
     /// kernel when cuBLAS isn't available (e.g., on Mac via the panic-
@@ -695,6 +703,49 @@ impl CudaExecutable {
         self.exact_f32_matmul = on;
     }
 
+    /// Run this graph's 3-D convolutions in f16 on tensor cores (half input,
+    /// filter and output, f32 accumulation; ~1e-3 relative error, as f16
+    /// storage gives). The arena stays f32: each conv converts its input and
+    /// filter to half and its output back. Call before the first run.
+    pub fn set_conv_f16(&mut self, on: bool) {
+        self.conv_f16 = on;
+        if !on {
+            self.conv_half_scratch = None;
+            return;
+        }
+        let need = self
+            .schedule
+            .iter()
+            .filter_map(|s| match s {
+                Step::Conv3d {
+                    n,
+                    c_in,
+                    c_out,
+                    d,
+                    h,
+                    w,
+                    d_out,
+                    h_out,
+                    w_out,
+                    kd,
+                    kh,
+                    kw,
+                    groups,
+                    ..
+                } => Some(
+                    (*n * *c_in * *d * *h * *w) as usize
+                        + (*c_out * (*c_in / (*groups).max(1)) * *kd * *kh * *kw) as usize
+                        + (*n * *c_out * *d_out * *h_out * *w_out) as usize,
+                ),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        if need > 0 {
+            self.conv_half_scratch = self.ctx.default_stream().alloc_zeros::<u16>(need).ok();
+        }
+    }
+
     pub fn clone_for_cache(&self) -> Self {
         let mut exe = Self::compile_with_rng(
             self.graph.clone(),
@@ -703,6 +754,7 @@ impl CudaExecutable {
             self.rng(),
         );
         exe.exact_f32_matmul = self.exact_f32_matmul;
+        exe.set_conv_f16(self.conv_f16);
         for (k, v) in &self.gpu_handles {
             exe.bind_gpu_handle(k, v);
         }

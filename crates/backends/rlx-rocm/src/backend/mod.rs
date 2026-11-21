@@ -82,6 +82,13 @@ pub struct RocmExecutable {
     /// Scratch workspace for MIOpen-selected conv algorithms (32 MiB
     /// — same shape as rlx-cuda's cuDNN workspace).
     pub(crate) dnn_workspace: Option<HipBuffer<u8>>,
+    /// Run 3-D convolutions with f16 input and filter (f32 accumulation and
+    /// output), converting at the f32 arena's boundary. See
+    /// [`Self::set_conv_f16`].
+    pub(crate) conv_f16: bool,
+    /// Half scratch for [`Self::conv_f16`]: one conv's input and filter,
+    /// sized for the largest at `set_conv_f16`.
+    pub(crate) conv_half_scratch: Option<HipBuffer<u16>>,
     /// Byte offset in the f32 arena for GGUF dequant scratch (0 = none).
     pub(crate) dequant_scratch_off: usize,
     pub(crate) graph: Graph,
@@ -148,6 +155,46 @@ pub struct RocmExecutable {
 }
 
 impl RocmExecutable {
+    /// Run this graph's 3-D convolutions reading f16 (half the bytes;
+    /// ~1e-3 relative error, as f16 storage gives): each conv converts its
+    /// input and filter into a half buffer and `conv3d_cot_h` reads them,
+    /// accumulating and writing f32. Ungrouped, at most 27 taps; others stay
+    /// f32. Call before the first run.
+    pub fn set_conv_f16(&mut self, on: bool) {
+        self.conv_f16 = on;
+        self.conv_half_scratch = None;
+        if !on {
+            return;
+        }
+        let need = self
+            .schedule
+            .iter()
+            .filter_map(|s| match s {
+                Step::Conv3d {
+                    n,
+                    c_in,
+                    c_out,
+                    d,
+                    h,
+                    w,
+                    kd,
+                    kh,
+                    kw,
+                    groups,
+                    ..
+                } => Some(
+                    (*n * *c_in * *d * *h * *w) as usize
+                        + (*c_out * (*c_in / (*groups).max(1)) * *kd * *kh * *kw) as usize,
+                ),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        if need > 0 {
+            self.conv_half_scratch = HipBuffer::<u16>::alloc_zeros(&self.ctx.runtime, need).ok();
+        }
+    }
+
     /// Install a per-MoE-layer GPU residency table (hot experts). Enables the
     /// hot-on-GPU / cold-on-CPU split in the plain `GroupedMatmul` step.
     pub fn set_moe_resident_experts_per_layer(&mut self, masks: &[&[bool]]) {

@@ -1508,9 +1508,8 @@ pub(crate) unsafe fn cudnn_conv2d_backward_filter(
     result
 }
 
-/// cuDNN forward 3-D convolution. NCDHW input, KCDRS filter, NCDHW
-/// output. Uses cuDNN's nd-descriptor APIs (set_tensornd / set_filternd
-/// / set_convolutionnd) since the 4D versions only cover up to 2D conv.
+/// cuDNN forward 3-D convolution on the f32 arena (see
+/// [`cudnn_conv3d_forward_raw`]).
 pub(crate) unsafe fn cudnn_conv3d_forward(
     handle: cudnn_sys::cudnnHandle_t,
     workspace_dev_ptr: u64,
@@ -1542,9 +1541,87 @@ pub(crate) unsafe fn cudnn_conv3d_forward(
     w_off_f32: u32,
     out_off_f32: u32,
 ) -> Result<(), cudnn_result::CudnnError> {
+    unsafe {
+        cudnn_conv3d_forward_raw(
+            handle,
+            workspace_dev_ptr,
+            workspace_size,
+            n,
+            c_in,
+            c_out,
+            d,
+            h,
+            w,
+            d_out,
+            h_out,
+            w_out,
+            kd,
+            kh,
+            kw,
+            sd,
+            sh,
+            sw,
+            pd,
+            ph,
+            pw,
+            dd,
+            dh,
+            dw,
+            groups,
+            false,
+            arena_dev_ptr + (in_off_f32 as u64) * 4,
+            arena_dev_ptr + (w_off_f32 as u64) * 4,
+            arena_dev_ptr + (out_off_f32 as u64) * 4,
+        )
+    }
+}
+
+/// cuDNN forward 3-D convolution. NCDHW input, KCDRS filter, NCDHW
+/// output, at device addresses. Uses cuDNN's nd-descriptor APIs
+/// (set_tensornd / set_filternd / set_convolutionnd) since the 4D versions
+/// only cover up to 2D conv. `half`: the three tensors are f16.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn cudnn_conv3d_forward_raw(
+    handle: cudnn_sys::cudnnHandle_t,
+    workspace_dev_ptr: u64,
+    workspace_size: usize,
+    n: u32,
+    c_in: u32,
+    c_out: u32,
+    d: u32,
+    h: u32,
+    w: u32,
+    d_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kd: u32,
+    kh: u32,
+    kw: u32,
+    sd: u32,
+    sh: u32,
+    sw: u32,
+    pd: u32,
+    ph: u32,
+    pw: u32,
+    dd: u32,
+    dh: u32,
+    dw: u32,
+    groups: u32,
+    half: bool,
+    x_dev: u64,
+    w_dev: u64,
+    y_dev: u64,
+) -> Result<(), cudnn_result::CudnnError> {
     use core::ffi::c_void;
 
-    let dt = cudnn_sys::cudnnDataType_t::CUDNN_DATA_FLOAT;
+    // `half`: f16 input, filter and output, float accumulation (cuDNN's
+    // pseudo-half configuration) on tensor cores.
+    let dt = if half {
+        cudnn_sys::cudnnDataType_t::CUDNN_DATA_HALF
+    } else {
+        cudnn_sys::cudnnDataType_t::CUDNN_DATA_FLOAT
+    };
+    let compute_dt = cudnn_sys::cudnnDataType_t::CUDNN_DATA_FLOAT;
     let fmt = cudnn_sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW;
 
     let x_desc = cudnn_result::create_tensor_descriptor()?;
@@ -1601,14 +1678,19 @@ pub(crate) unsafe fn cudnn_conv3d_forward(
             strides.as_ptr(),
             dilations.as_ptr(),
             cudnn_sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
-            dt,
+            compute_dt,
         )?;
         if groups > 1 {
             cudnn_sys::cudnnSetConvolutionGroupCount(conv_desc, groups as i32).result()?;
         }
         // FMA by default; TF32 tensor cores only under RLX_CUDA_CONV_TF32 (they
         // destabilize large-batch training — see `conv_math_type`).
-        cudnn_sys::cudnnSetConvolutionMathType(conv_desc, conv_math_type()).result()?;
+        let math = if half {
+            cudnn_sys::cudnnMathType_t::CUDNN_TENSOR_OP_MATH
+        } else {
+            conv_math_type()
+        };
+        cudnn_sys::cudnnSetConvolutionMathType(conv_desc, math).result()?;
         Ok::<(), cudnn_result::CudnnError>(())
     };
 
@@ -1643,9 +1725,9 @@ pub(crate) unsafe fn cudnn_conv3d_forward(
 
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
-        let x_ptr = (arena_dev_ptr + (in_off_f32 as u64) * 4) as *const c_void;
-        let w_ptr = (arena_dev_ptr + (w_off_f32 as u64) * 4) as *const c_void;
-        let y_ptr = (arena_dev_ptr + (out_off_f32 as u64) * 4) as *mut c_void;
+        let x_ptr = x_dev as *const c_void;
+        let w_ptr = w_dev as *const c_void;
+        let y_ptr = y_dev as *mut c_void;
         let workspace_ptr = workspace_dev_ptr as *mut c_void;
 
         cudnn_result::convolution_forward(

@@ -4062,6 +4062,7 @@ pub fn sgemm_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: us
 /// sample. A wrong guess stays correct (and cheap: rows found dense go to
 /// BLAS). Off under [`rlx_ir::reproducible`] (the summation order differs
 /// from BLAS).
+#[cfg(not(feature = "parity-gemm"))]
 #[inline]
 fn sparse_lhs_worth(a: &[f32], m: usize, k: usize, n: usize) -> bool {
     const SAMPLE: usize = 256;
@@ -4080,6 +4081,7 @@ fn sparse_lhs_worth(a: &[f32], m: usize, k: usize, n: usize) -> bool {
 /// `C = A @ B` for a mostly-zero `A`: each output row is the sum of `B`'s
 /// rows selected by that row's nonzeros, scaled by them. Rows are split
 /// across the pool; a row with more than k/8 nonzeros goes to BLAS instead.
+#[cfg(not(feature = "parity-gemm"))]
 fn sgemm_sparse_lhs(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     let (a_addr, b_addr, c_addr) = (
         a.as_ptr() as usize,

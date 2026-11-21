@@ -84,6 +84,7 @@ pub mod eplb;
 pub mod mesh;
 pub mod moe_ep;
 pub mod planner;
+pub mod tp;
 
 pub use eplb::{
     EpReplicaMap, all_reduce_hits, count_hits_f32, default_placement, experts_on_rank,
@@ -133,12 +134,17 @@ pub mod prelude {
     };
     // Device mesh + placement planner.
     pub use crate::{mesh, planner};
+    // Tensor parallelism: group handle, shard math, HIR collectives.
+    pub use crate::tp::{
+        HirTpExt, TpError, TpGroup, run_local_ranks, shard_col_blocks, shard_col_blocks_batched,
+        shard_cols, shard_cols_batched, shard_rows, shard_rows_batched,
+    };
     // Transport layer (rlx-driver): process groups, transports, node discovery,
     // reduction mode (Ring / Deterministic).
     pub use rlx_driver::{
-        LocalTransport, NetTransport, Node, ProcessGroup, ReduceKind, ReduceMode, TcpTransport,
-        ThunderboltTransport, Topology, Transport, announce_coordinator, discover_coordinator,
-        discover_peers, env_reduce_mode, local_ip,
+        InProcessTransport, LocalTransport, NetTransport, Node, ProcessGroup, ReduceKind,
+        ReduceMode, TcpTransport, ThunderboltTransport, Topology, Transport, announce_coordinator,
+        discover_coordinator, discover_peers, env_reduce_mode, local_ip,
     };
 }
 
@@ -754,8 +760,13 @@ impl CpuKernel for ReduceFromParallelCpu {
 // ── registration + graph helper ───────────────────────────────────
 
 /// Install the `collective.all_reduce` op (IR shape extension + CPU
-/// kernel). Idempotent — safe to call once per process at startup.
+/// kernel). Idempotent — the first call installs, later calls do nothing.
 pub fn register() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(register_all);
+}
+
+fn register_all() {
     register_op(Arc::new(AllReduceExt));
     register_op(Arc::new(AllGatherExt));
     register_op(Arc::new(ReduceScatterExt));

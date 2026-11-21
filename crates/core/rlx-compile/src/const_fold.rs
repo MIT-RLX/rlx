@@ -103,6 +103,19 @@ fn broadcast_to(src: &[f32], src_dims: &[usize], out_dims: &[usize]) -> Option<V
     Some(out)
 }
 
+/// Largest result a broadcast may be folded to, in elements.
+const MAX_FOLDED_BROADCAST: usize = 1 << 16;
+
+/// True if folding `node` would materialise a broadcast: a result larger
+/// than its inputs together and than [`MAX_FOLDED_BROADCAST`]. Such a
+/// constant costs host memory at compile time and arena bytes at run time
+/// for what the broadcast computes for free (MedGemma's vision tower held
+/// tens of GB of expanded constants during CUDA compile).
+fn grows(node: &rlx_ir::Node, inputs: &[&Vec<f32>]) -> bool {
+    let out = node.shape.num_elements().unwrap_or(usize::MAX);
+    out > MAX_FOLDED_BROADCAST && out > inputs.iter().map(|v| v.len()).sum::<usize>()
+}
+
 /// Evaluate a foldable node given precomputed input values + their static dims.
 /// Returns a flat f32 buffer of the result, or None if not supported.
 pub(crate) fn evaluate(
@@ -310,6 +323,7 @@ impl Pass for ConstantFolding {
                     .map(|i| static_dims(&graph.node(*i).shape))
                     .collect();
                 if let Some(in_dims) = in_dims
+                    && !grows(node, &inputs)
                     && let Some(result) = evaluate(node, &inputs, &in_dims)
                 {
                     folded.insert(node.id);
@@ -386,6 +400,36 @@ mod tests {
             assert!((v - 5.0).abs() < 1e-6);
         } else {
             panic!("expected folded Constant, got {:?}", out_node.op);
+        }
+    }
+
+    #[test]
+    fn folds_small_broadcasts_only() {
+        // const(2) + const(3) broadcast to [n]: folded for a small n, left
+        // to run for a large one.
+        for (n, fold) in [(64usize, true), (1 << 18, false)] {
+            let mut g = Graph::new("test");
+            let scalar = |g: &mut Graph, v: f32| {
+                g.add_node(
+                    Op::Constant {
+                        data: v.to_le_bytes().to_vec(),
+                    },
+                    vec![],
+                    Shape::new(&[1], DType::F32),
+                )
+            };
+            let a = scalar(&mut g, 2.0);
+            let b = scalar(&mut g, 3.0);
+            let sum = g.binary(op::BinaryOp::Add, a, b, Shape::new(&[n], DType::F32));
+            g.set_outputs(vec![sum]);
+            let folded = ConstantFolding.run(g);
+            let out = folded.node(folded.outputs[0]);
+            assert_eq!(
+                matches!(out.op, Op::Constant { .. }),
+                fold,
+                "n = {n}: {:?}",
+                out.op
+            );
         }
     }
 

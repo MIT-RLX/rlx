@@ -104,6 +104,9 @@ pub const GATHER_WGSL: &str = include_str!("gather.wgsl");
 pub const GATHER_SPLIT_WGSL: &str = include_str!("gather_split.wgsl");
 pub const GATHER_AXIS_WGSL: &str = include_str!("gather_axis.wgsl");
 pub const ATTENTION_WGSL: &str = include_str!("attention.wgsl");
+/// Tiled many-row SDPA; `{{HD}}` / `{{BK}}` are substituted per head width
+/// ([`attention_tiled_kernel`]).
+pub const ATTENTION_TILED_WGSL: &str = include_str!("attention_tiled.wgsl");
 pub const ATTENTION_BWD_WGSL: &str = include_str!("attention_bwd.wgsl");
 pub const ROPE_WGSL: &str = include_str!("rope.wgsl");
 pub const EXPAND_WGSL: &str = include_str!("expand.wgsl");
@@ -4353,6 +4356,40 @@ pub fn attention_coop_kernel(device: &wgpu::Device) -> &'static Kernel {
             "attention_coop",
         )
     })
+}
+/// [`attention_kernel`] for many query rows: a 64-thread workgroup per 64
+/// rows of one (batch, head), K/V tiles staged in workgroup memory and `q` /
+/// `O` in registers of exactly `head_dim`. Built once per head width; `None`
+/// for widths it does not cover (not 16–128 or not dividing 1024, or a V
+/// width different from `head_dim`), which keep the other kernels.
+pub fn attention_tiled_kernel(
+    device: &wgpu::Device,
+    head_dim: u32,
+    v_head_dim: u32,
+) -> Option<&'static Kernel> {
+    if v_head_dim != head_dim || !(16..=128).contains(&head_dim) || 1024 % head_dim != 0 {
+        return None;
+    }
+    static TILED: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, &'static Kernel>>> =
+        OnceLock::new();
+    let cache = TILED.get_or_init(Default::default);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let k = *cache.entry(head_dim).or_insert_with(|| {
+        let wgsl = ATTENTION_TILED_WGSL
+            .replace("{{HD}}", &head_dim.to_string())
+            .replace("{{BK}}", &(1024 / head_dim).to_string());
+        let label: &'static str =
+            Box::leak(format!("rlx-wgpu attention_tiled hd{head_dim}").into_boxed_str());
+        Box::leak(Box::new(build_kernel(
+            device,
+            label,
+            &wgsl,
+            "attention_tiled",
+        )))
+    });
+    Some(k)
 }
 pub fn attention_bwd_kernel(device: &wgpu::Device) -> &'static Kernel {
     ATTENTION_BWD.get_or_init(|| {

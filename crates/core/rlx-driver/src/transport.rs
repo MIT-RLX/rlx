@@ -1231,66 +1231,118 @@ impl ProcessGroup {
     }
 }
 
+/// In-process [`Transport`]: every rank is a thread of this process and
+/// messages go through one shared mailbox — no sockets, no ports.
+///
+/// For unit tests and single-machine experiments with a multi-rank program:
+/// [`InProcessTransport::fan_out`] returns one transport per rank; run each
+/// rank on its own thread with a [`ProcessGroup`] over its transport.
+///
+/// ```
+/// use rlx_driver::{InProcessTransport, ProcessGroup, ReduceKind};
+/// let handles: Vec<_> = InProcessTransport::fan_out(2)
+///     .into_iter()
+///     .map(|t| std::thread::spawn(move || {
+///         let g = ProcessGroup::new(t);
+///         let mut x = vec![g.rank() as f32 + 1.0];
+///         g.all_reduce(&mut x, ReduceKind::Sum).unwrap();
+///         x[0]
+///     }))
+///     .collect();
+/// for h in handles {
+///     assert_eq!(h.join().unwrap(), 3.0);
+/// }
+/// ```
+pub struct InProcessTransport {
+    rank: u32,
+    world: u32,
+    mailbox: Arc<Mailbox>,
+}
+
+type Mailbox = (
+    std::sync::Mutex<
+        std::collections::HashMap<(u32, u32, u32), std::collections::VecDeque<Vec<u8>>>,
+    >,
+    std::sync::Condvar,
+);
+
+impl InProcessTransport {
+    /// One transport per rank `0..world`, all sharing one mailbox.
+    pub fn fan_out(world: u32) -> Vec<Arc<InProcessTransport>> {
+        let mailbox: Arc<Mailbox> = Arc::new(Default::default());
+        (0..world)
+            .map(|r| {
+                Arc::new(InProcessTransport {
+                    rank: r,
+                    world,
+                    mailbox: mailbox.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+impl Transport for InProcessTransport {
+    fn rank(&self) -> u32 {
+        self.rank
+    }
+    fn world_size(&self) -> u32 {
+        self.world
+    }
+    fn send_bytes(&self, to: u32, tag: u32, bytes: &[u8]) -> Result<(), CollectiveError> {
+        if to >= self.world {
+            return Err(CollectiveError::TransportError {
+                reason: format!("in-process send to rank {to} of {}", self.world),
+            });
+        }
+        let (m, cv) = &*self.mailbox;
+        m.lock()
+            .unwrap()
+            .entry((to, self.rank, tag))
+            .or_default()
+            .push_back(bytes.to_vec());
+        cv.notify_all();
+        Ok(())
+    }
+    fn recv_bytes(&self, from: u32, tag: u32) -> Result<Vec<u8>, CollectiveError> {
+        Ok(self
+            .recv_bytes_timeout(from, tag, Duration::MAX)?
+            .expect("unbounded wait returns a message"))
+    }
+    fn recv_bytes_timeout(
+        &self,
+        from: u32,
+        tag: u32,
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>, CollectiveError> {
+        let deadline = Instant::now().checked_add(timeout);
+        let (m, cv) = &*self.mailbox;
+        let mut guard = m.lock().unwrap();
+        loop {
+            if let Some(q) = guard.get_mut(&(self.rank, from, tag))
+                && let Some(v) = q.pop_front()
+            {
+                return Ok(Some(v));
+            }
+            guard = match deadline {
+                None => cv.wait(guard).unwrap(),
+                Some(d) => {
+                    let now = Instant::now();
+                    if now >= d {
+                        return Ok(None);
+                    }
+                    cv.wait_timeout(guard, d - now).unwrap().0
+                }
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, VecDeque};
-    use std::sync::{Condvar, Mutex};
 
-    /// In-process [`Transport`] over shared queues — exercises the
-    /// `ProcessGroup` collectives without sockets. One shared mailbox
-    /// keyed by `(dst, src, tag)`; `send` pushes, `recv` blocks-pops.
-    struct ChannelTransport {
-        rank: u32,
-        world: u32,
-        mailbox: Arc<(Mutex<HashMap<(u32, u32, u32), VecDeque<Vec<u8>>>>, Condvar)>,
-    }
-
-    impl ChannelTransport {
-        fn fan_out(world: u32) -> Vec<Arc<ChannelTransport>> {
-            let mailbox = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
-            (0..world)
-                .map(|r| {
-                    Arc::new(ChannelTransport {
-                        rank: r,
-                        world,
-                        mailbox: mailbox.clone(),
-                    })
-                })
-                .collect()
-        }
-    }
-
-    impl Transport for ChannelTransport {
-        fn rank(&self) -> u32 {
-            self.rank
-        }
-        fn world_size(&self) -> u32 {
-            self.world
-        }
-        fn send_bytes(&self, to: u32, tag: u32, bytes: &[u8]) -> Result<(), CollectiveError> {
-            let (m, cv) = &*self.mailbox;
-            m.lock()
-                .unwrap()
-                .entry((to, self.rank, tag))
-                .or_default()
-                .push_back(bytes.to_vec());
-            cv.notify_all();
-            Ok(())
-        }
-        fn recv_bytes(&self, from: u32, tag: u32) -> Result<Vec<u8>, CollectiveError> {
-            let (m, cv) = &*self.mailbox;
-            let mut guard = m.lock().unwrap();
-            loop {
-                if let Some(q) = guard.get_mut(&(self.rank, from, tag))
-                    && let Some(v) = q.pop_front()
-                {
-                    return Ok(v);
-                }
-                guard = cv.wait(guard).unwrap();
-            }
-        }
-    }
+    use crate::InProcessTransport as ChannelTransport;
 
     fn run_ranks<F>(world: u32, body: F) -> Vec<()>
     where

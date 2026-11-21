@@ -116,6 +116,8 @@ pub struct MetalExecutable {
     attn_bwd_scratch_off: usize,
     /// Arena tail scratch for parallel RMSNorm param backward.
     rms_norm_bwd_scratch_off: usize,
+    /// Arena tail scratch for the split group norm's per-chunk statistics.
+    gn_stats_scratch_off: usize,
     /// Arena tail scratch (ping-pong pair) for native multi-layer GRU / Elman RNN.
     rnn_gru_scratch_off: usize,
     /// Arena tail scratch for in-graph onnx.QMatMul act dequant (f32).

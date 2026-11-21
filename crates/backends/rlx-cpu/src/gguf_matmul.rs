@@ -49,6 +49,12 @@ pub(crate) fn dequant_block(scheme: QuantScheme, block: &[u8], out: &mut [f32; Q
                 .try_into()
                 .unwrap(),
         ),
+        QuantScheme::GgufQ2_0G64 => rlx_gguf::q2_dequant::dequant_q2_0_g64_block(
+            block,
+            (&mut out[..rlx_gguf::q2_dequant::QK2_0_G64])
+                .try_into()
+                .unwrap(),
+        ),
         // Fermion five-value ternary (Neutrino): 256-element blocks == QK_K,
         // so `out` maps 1:1. FV5 = transformer linears, FV5B = int8 embed/lm_head.
         QuantScheme::GgufFV5 => rlx_gguf::fv5_dequant::dequant_fv5_block(block, out),
@@ -696,6 +702,7 @@ pub fn dequant_moe_weights_to_grouped_f32(
             QuantScheme::GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(slab, k * n),
             QuantScheme::GgufQ1_0 => rlx_gguf::q1_dequant::dequant_q1_0(slab, k * n),
             QuantScheme::GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(slab, k * n),
+            QuantScheme::GgufQ2_0G64 => rlx_gguf::q2_dequant::dequant_q2_0_g64(slab, k * n),
             QuantScheme::GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0(slab, k * n),
             QuantScheme::GgufPtq1_0 => rlx_gguf::ptq1_dequant::dequant_ptq1_0(slab, k * n),
             QuantScheme::Fp8E4m3B128 | QuantScheme::Fp8E5m2B128 => Ok(

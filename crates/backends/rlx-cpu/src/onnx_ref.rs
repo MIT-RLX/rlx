@@ -275,7 +275,14 @@ impl CpuKernel for IsNaNKernel {
 }
 
 /// Register generic ONNX reference kernels (Mod, IsNaN, ConcatFromSequence, …).
+/// Idempotent: several backends (CPU, Metal, CoreML, the GPU host path) call
+/// it, and a process using two of them at once must not register twice.
 pub fn register_onnx_reference_kernels() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(register_all);
+}
+
+fn register_all() {
     register_cpu_kernel(Arc::new(ModKernel));
     register_cpu_kernel(Arc::new(IsNaNKernel));
     register_cpu_kernel(Arc::new(ConcatFromSequenceKernel));

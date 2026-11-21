@@ -60,12 +60,59 @@ pub fn set_param_sharing_scope(label: &str) {
     let _ = label;
 }
 
+/// A process-wide lock around scoped compiles, reentrant per thread.
+mod scope_section {
+    use std::cell::Cell;
+    use std::sync::{Condvar, Mutex};
+    use std::thread::ThreadId;
+
+    static OWNER: Mutex<Option<ThreadId>> = Mutex::new(None);
+    static FREE: Condvar = Condvar::new();
+
+    thread_local! {
+        static DEPTH: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) struct Section;
+
+    pub(super) fn enter() -> Section {
+        if DEPTH.with(Cell::get) == 0 {
+            let me = std::thread::current().id();
+            let mut owner = OWNER.lock().unwrap_or_else(|e| e.into_inner());
+            while owner.is_some() {
+                owner = FREE.wait(owner).unwrap_or_else(|e| e.into_inner());
+            }
+            *owner = Some(me);
+        }
+        DEPTH.with(|d| d.set(d.get() + 1));
+        Section
+    }
+
+    impl Drop for Section {
+        fn drop(&mut self) {
+            let left = DEPTH.with(|d| {
+                d.set(d.get() - 1);
+                d.get()
+            });
+            if left == 0 {
+                *OWNER.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                FREE.notify_all();
+            }
+        }
+    }
+}
+
 /// `f` with [`set_param_sharing_scope`]`(label)` in force, the scope before
 /// it restored after: for a model that compiles its graphs at different times
 /// (a package's prompt function and decode step), alongside other models
 /// with their own scopes. The scope is process-wide, so compiles on other
-/// threads during `f` see it too.
+/// threads during `f` see it too — which is why scoped sections are
+/// serialized: two threads each running `f` under its own label would
+/// otherwise compile under each other's label, and a weight is matched by
+/// name, dtype and size alone, so one model would silently map the other's
+/// weights. Nested calls on one thread do not wait on themselves.
 pub fn with_param_sharing_scope<R>(label: &str, f: impl FnOnce() -> R) -> R {
+    let _section = scope_section::enter();
     // CPU: large read-only weights on pages shared by the scope's executables
     // (`rlx_cpu::shared_params`); `RLX_CPU_SHARED_WEIGHTS=0` keeps a copy each.
     #[cfg(feature = "cpu")]

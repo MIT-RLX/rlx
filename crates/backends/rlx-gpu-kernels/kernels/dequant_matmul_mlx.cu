@@ -645,7 +645,14 @@ extern "C" __global__ void dequant_grouped_matmul_mlx_mxfp4_splitk(
     }
     #pragma unroll
     for (unsigned int off = 16u; off > 0u; off >>= 1) {
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__HIP_PLATFORM_AMD__)
+        // hipRTC wants a 64-bit mask on `_sync` shuffles, and a 32-bit one
+        // failed the whole file (every MLX-quantised GEMM) on ROCm. Width 32
+        // keeps each 32-lane group apart on wave64 hardware too.
+        acc += __shfl_down(acc, off, 32);
+#else
         acc += __shfl_down_sync(0xffffffffu, acc, off);
+#endif
     }
     if (lane == 0u) {
         arena[out_off + (unsigned long long)row * (unsigned long long)n + (unsigned long long)col] = acc;

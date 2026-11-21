@@ -34,6 +34,7 @@ fn cpu_dequant_gguf(scheme_id: u32, packed: &[u8], elems: usize) -> Vec<f32> {
         GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b(packed, elems).unwrap(),
         GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0(packed, elems).unwrap(),
         GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(packed, elems).unwrap(),
+        GgufQ2_0G64 => rlx_gguf::q2_dequant::dequant_q2_0_g64(packed, elems).unwrap(),
         GgufPtq1_0 => rlx_gguf::ptq1_dequant::dequant_ptq1_0(packed, elems).unwrap(),
         other => panic!("cpu_dequant_gguf: unsupported scheme_id {scheme_id} ({other})"),
     }
@@ -354,6 +355,11 @@ fn ptq1_0_wgsl_matches_cpu_reference() {
 #[test]
 fn mxfp4_encode_wgsl_matches_cpu_reference() {
     encode_parity(10, rlx_gguf::GgmlType::MXFP4, 512, 1e-4, "MXFP4 encode");
+}
+
+#[test]
+fn q2_0_group_64_encode_wgsl_matches_cpu_reference() {
+    encode_parity(32, rlx_gguf::GgmlType::Q2_0, 512, 1e-5, "Q2_0 (group 64)");
 }
 
 #[test]

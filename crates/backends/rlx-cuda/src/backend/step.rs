@@ -814,8 +814,9 @@ pub(crate) enum Step {
         rank: u32,
         meta_idx: usize,
     },
-    /// Host-staged ArgMax/ArgMin (f32-encoded indices).
-    ArgReduceHost {
+    /// ArgMax/ArgMin over the middle of [outer, reduced, inner] on the GPU
+    /// (`argreduce` / `argreduce_row`, f32-encoded indices).
+    ArgReduce {
         src_byte_off: u64,
         dst_byte_off: u64,
         outer: u32,
@@ -1621,6 +1622,14 @@ pub(crate) enum Step {
         w: u32,
         num_groups: u32,
         eps_bits: u32,
+        /// Activation applied as the norm writes (0 none, 1 ReLU, 2 LeakyReLU
+        /// with `alpha_bits`, 3 SiLU); `dst_off` is then the activation's
+        /// output (`rlx_opt::memory::adjacent_group_norm_activations`).
+        act: u32,
+        alpha_bits: u32,
+        /// f32 offset of the split kernels' statistics scratch, shared by
+        /// every group norm — a write, so concurrent streams order them.
+        stats_off: u32,
     },
     /// NCHW GroupNorm backward w.r.t. input. Inputs `[x, gamma, beta, dy]`.
     GroupNormBackwardInput {
@@ -2076,7 +2085,6 @@ impl Step {
             | Step::ReverseHost { .. }
             | Step::PadHost { .. }
             | Step::SliceHost { .. }
-            | Step::ArgReduceHost { .. }
             | Step::ScanHost { .. }
             | Step::Lstm { .. }
             | Step::GruHost { .. }
@@ -2417,7 +2425,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::Pad { .. } => "rlx::Pad",
         Step::SliceHost { .. } => "rlx::SliceHost",
         Step::Slice { .. } => "rlx::Slice",
-        Step::ArgReduceHost { .. } => "rlx::ArgReduceHost",
+        Step::ArgReduce { .. } => "rlx::ArgReduce",
         Step::AxialRope2d { .. } => "rlx::AxialRope2d",
         Step::GatedDeltaNet { .. } => "rlx::GatedDeltaNet",
         Step::Lstm { .. } => "rlx::Lstm",
@@ -3215,7 +3223,7 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             dst_byte_off,
             ..
         }
-        | Step::ArgReduceHost {
+        | Step::ArgReduce {
             src_byte_off,
             dst_byte_off,
             ..
@@ -3658,8 +3666,9 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             g_off,
             b_off,
             dst_off,
+            stats_off,
             ..
-        } => (vec![*src_off, *g_off, *b_off], vec![*dst_off]),
+        } => (vec![*src_off, *g_off, *b_off], vec![*dst_off, *stats_off]),
         Step::GroupNormBackwardInput {
             x_off,
             gamma_off,

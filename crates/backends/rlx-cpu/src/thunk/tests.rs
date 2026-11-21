@@ -1052,6 +1052,76 @@ fn fused_attn_block_respects_causal_mask() {
     assert!(last > 1e-4, "last position must react to its own token");
 }
 
+/// Regression: a bias-free QKV projection feeding a *biased* out projection
+/// (timm EVA / DINOv3 blocks: `qkv_bias=False`, `proj` biased) must keep the
+/// out bias. `FusedAttnBlock` has one `has_bias` for both projections and took
+/// it from the QKV side, so the chain fused and silently dropped the bias —
+/// only below the small-`batch·seq` threshold, so a 1-frame ViT on a small
+/// grid was wrong while larger inputs were right.
+#[test]
+fn attn_chain_with_bias_only_on_out_projection_keeps_the_bias() {
+    let f = DType::F32;
+    let (s, d, nh, dh) = (6usize, 8usize, 2usize, 4usize);
+
+    let mut g = Graph::new("out_bias_only");
+    let hidden = g.input("hidden", Shape::new(&[s, d], f));
+    let wqkv = g.input("wqkv", Shape::new(&[d, 3 * d], f));
+    let wo = g.input("wo", Shape::new(&[d, d], f));
+    let bo = g.input("bo", Shape::new(&[d], f));
+    let qkv = g.matmul(hidden, wqkv, Shape::new(&[s, 3 * d], f));
+    let q = g.narrow_(qkv, 1, 0, d);
+    let k = g.narrow_(qkv, 1, d, d);
+    let v = g.narrow_(qkv, 1, 2 * d, d);
+    let q3 = g.reshape(q, vec![1, s as i64, d as i64], Shape::new(&[1, s, d], f));
+    let k3 = g.reshape(k, vec![1, s as i64, d as i64], Shape::new(&[1, s, d], f));
+    let v3 = g.reshape(v, vec![1, s as i64, d as i64], Shape::new(&[1, s, d], f));
+    let attn = g.attention_kind(
+        q3,
+        k3,
+        v3,
+        nh,
+        dh,
+        rlx_ir::op::MaskKind::None,
+        Shape::new(&[1, s, d], f),
+    );
+    let a2 = g.reshape(attn, vec![s as i64, d as i64], Shape::new(&[s, d], f));
+    let out = g.add_node(
+        Op::FusedMatMulBiasAct { activation: None },
+        vec![a2, wo, bo],
+        Shape::new(&[s, d], f),
+    );
+    g.set_outputs(vec![out]);
+
+    let wqkv_d: Vec<f32> = (0..d * 3 * d)
+        .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
+        .collect();
+    let wo_d: Vec<f32> = (0..d * d).map(|i| ((i % 5) as f32 - 2.0) * 0.05).collect();
+    let h_d: Vec<f32> = (0..s * d).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
+    let bias: Vec<f32> = (0..d).map(|j| 0.25 + j as f32).collect();
+    let run = |b: &[f32]| {
+        run_graph(
+            &g,
+            &[(hidden, &h_d), (wqkv, &wqkv_d), (wo, &wo_d), (bo, b)],
+            out,
+            s * d,
+        )
+    };
+    let with = run(&bias);
+    let without = run(&vec![0f32; d]);
+    for r in 0..s {
+        for j in 0..d {
+            let i = r * d + j;
+            assert!(
+                (with[i] - (without[i] + bias[j])).abs() < 1e-5,
+                "row {r} col {j}: {} vs {} + {}",
+                with[i],
+                without[i],
+                bias[j]
+            );
+        }
+    }
+}
+
 // ── Backward / training op parity tests ────────────────────
 //
 // Strategy: build a graph that contains exactly the backward op

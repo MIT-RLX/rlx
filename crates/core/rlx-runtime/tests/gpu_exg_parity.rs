@@ -184,6 +184,7 @@ fn check_biquad(dev: Device) {
 fn run_all(dev: Device) {
     check_vector_quantize(dev);
     check_interpolate1d(dev);
+    check_interpolate1d_nearest(dev);
     check_conv_transpose1d(dev);
     check_spectrogram(dev);
     check_band_power(dev);

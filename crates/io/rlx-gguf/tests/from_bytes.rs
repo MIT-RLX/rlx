@@ -179,3 +179,67 @@ fn retain_map_renames_in_place_when_keeping_all() {
         f.dequant_f32("x.b").unwrap().0
     );
 }
+
+/// A one-tensor-plus-sentinel GGUF holding `data` as `dtype`, with the
+/// tensor's on-disk type id rewritten to `id` (to build the files the
+/// header cannot tell apart on its own).
+fn q2_file(dtype: GgmlType, n: usize, data: Vec<u8>, id: u32) -> Vec<u8> {
+    let mut w = GgufWriter::new();
+    w.set_arch("q2test");
+    w.add_tensor_bytes("w".to_string(), vec![n], dtype, data)
+        .unwrap();
+    // A successor, so `w` has a measurable span.
+    w.add_tensor_bytes("z".to_string(), vec![32], GgmlType::F32, vec![0u8; 128])
+        .unwrap();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    w.write(&mut buf).unwrap();
+    let mut bytes = buf.into_inner();
+    // Tensor info: name (u64 len + bytes), n_dims u32, dims u64…, type u32.
+    let pat = [
+        &1u64.to_le_bytes()[..],
+        b"w",
+        &1u32.to_le_bytes(),
+        &(n as u64).to_le_bytes(),
+    ]
+    .concat();
+    let at = bytes
+        .windows(pat.len())
+        .position(|win| win == pat.as_slice())
+        .expect("tensor info")
+        + pat.len();
+    bytes[at..at + 4].copy_from_slice(&id.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn q2_0_type_42_is_ggml_group_64() {
+    // ggml `dequantize_row_q2_0`: code (qs[j/4] >> 2(j%4)) & 3, value (q-1)·d.
+    let n = 256;
+    // Ternary values: exact under ggml's `d = amax` encoder.
+    let src: Vec<f32> = (0..n).map(|i| ((i * 7) % 3) as f32 - 1.0).collect();
+    let q = rlx_gguf::quantize::quantize(&src, GgmlType::Q2_0).unwrap();
+    assert_eq!(q.len(), n / 64 * 18);
+    let f = GgufFile::from_bytes(q2_file(GgmlType::Q2_0, n, q.clone(), 42)).unwrap();
+    assert_eq!(f.get("w").unwrap().dtype, GgmlType::Q2_0);
+    let got = f.dequant_f32("w").unwrap().0;
+    for (j, g) in got.iter().enumerate() {
+        let b = &q[j / 64 * 18..];
+        let d = half::f16::from_le_bytes([b[0], b[1]]).to_f32();
+        let code = (b[2 + (j % 64) / 4] >> (((j % 64) % 4) * 2)) & 3;
+        assert_eq!(*g, (code as i32 - 1) as f32 * d, "element {j}");
+    }
+    assert_eq!(got, src);
+}
+
+#[test]
+fn old_group_128_type_42_files_read_as_pq2_0() {
+    // Ternary Bonsai v1 wrote group-128 blocks under id 42. Large enough that
+    // the two layouts' sizes differ by more than the alignment padding.
+    let n = 4096;
+    let src: Vec<f32> = (0..n).map(|i| ((i * 3) % 3) as f32 - 1.0).collect();
+    let q = rlx_gguf::quantize::quantize(&src, GgmlType::PQ2_0).unwrap();
+    assert_eq!(q.len(), n / 128 * 34);
+    let f = GgufFile::from_bytes(q2_file(GgmlType::PQ2_0, n, q, 42)).unwrap();
+    assert_eq!(f.get("w").unwrap().dtype, GgmlType::PQ2_0);
+    assert_eq!(f.dequant_f32("w").unwrap().0, src);
+}

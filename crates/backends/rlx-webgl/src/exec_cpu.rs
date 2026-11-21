@@ -697,6 +697,63 @@ pub fn run_cpu(plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> 
                 let o = run_custom_collective(name, &vals[*input], plan.slot_len[*out], attrs)?;
                 vals[*out] = o;
             }
+            Step::ConvTranspose3d {
+                out,
+                x,
+                w,
+                n,
+                cin,
+                din,
+                cout,
+                dout,
+                k,
+                stride,
+                pad,
+                dil,
+                groups,
+            } => {
+                let (xv, wv) = (&vals[*x], &vals[*w]);
+                let (cin_g, cout_g) = (cin / groups, cout / groups);
+                let in_vol = din[0] * din[1] * din[2];
+                let out_vol = dout[0] * dout[1] * dout[2];
+                let kvol = k[0] * k[1] * k[2];
+                // the input position a tap reaches along one axis, if any
+                let at = |o: usize, t: usize, a: usize| {
+                    (o + pad[a])
+                        .checked_sub(t * dil[a])
+                        .filter(|v| v % stride[a] == 0 && v / stride[a] < din[a])
+                        .map(|v| v / stride[a])
+                };
+                let mut o = vec![0f32; plan.slot_len[*out]];
+                for (lin, slot) in o.iter_mut().enumerate().take(n * cout * out_vol) {
+                    // the GL shader's order, so the sums round alike
+                    let ow = lin % dout[2];
+                    let oh = lin / dout[2] % dout[1];
+                    let od = lin / (dout[2] * dout[1]) % dout[0];
+                    let co = lin / out_vol % cout;
+                    let ni = lin / (out_vol * cout);
+                    let (g, co_g) = (co / cout_g, co % cout_g);
+                    let mut s = 0f32;
+                    for ci in 0..cin_g {
+                        let ic = g * cin_g + ci;
+                        let x_base = (ni * cin + ic) * in_vol;
+                        let w_base = (ic * cout_g + co_g) * kvol;
+                        for kd in 0..k[0] {
+                            let Some(id) = at(od, kd, 0) else { continue };
+                            for kh in 0..k[1] {
+                                let Some(ih) = at(oh, kh, 1) else { continue };
+                                for kw in 0..k[2] {
+                                    let Some(iw) = at(ow, kw, 2) else { continue };
+                                    s += xv[x_base + (id * din[1] + ih) * din[2] + iw]
+                                        * wv[w_base + (kd * k[1] + kh) * k[2] + kw];
+                                }
+                            }
+                        }
+                    }
+                    *slot = s;
+                }
+                vals[*out] = o;
+            }
             Step::Conv3d {
                 out,
                 x,

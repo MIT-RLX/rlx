@@ -155,8 +155,12 @@ pub(super) fn dequant_scheme(scheme: QuantScheme, bytes: &[u8], n: usize) -> Res
         GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(bytes, n),
         GgufQ1_0 => rlx_gguf::q1_dequant::dequant_q1_0(bytes, n),
         GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(bytes, n),
+        GgufQ2_0G64 => rlx_gguf::q2_dequant::dequant_q2_0_g64(bytes, n),
         GgufFV5 => rlx_gguf::fv5_dequant::dequant_fv5(bytes, n),
         GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b(bytes, n),
+        GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0(bytes, n),
+        GgufPtq1_0 => rlx_gguf::ptq1_dequant::dequant_ptq1_0(bytes, n),
+        GgufBF16 => rlx_gguf::dequant_typed(rlx_gguf::GgmlType::BF16, bytes, n, "bf16"),
         Fp8E4m3B128 | Fp8E5m2B128 => {
             return rlx_ir::lowp_codec::fp8_b128::dequant_scheme(scheme, bytes, n)
                 .map_err(|e| CoremlError::Runtime(format!("fp8 block dequant: {e}")));
@@ -733,7 +737,7 @@ use rlx_gguf::iq_grids::{
 };
 const QK: usize = 32;
 const QK_K: usize = 256;
-const QK_NVFP4: usize = 16;
+const QK_NVFP4: usize = 64;
 const K_SCALE_SIZE: usize = 12;
 const IQ1S_DELTA: f32 = 0.125;
 
@@ -1333,10 +1337,11 @@ fn split_mxfp4_ondevice(bytes: &[u8], nb: usize) -> Result<(Vec<f32>, Vec<f32>, 
     for i in 0..nb {
         let off = i * BLOCK;
         scales[i] = rlx_gguf::mx_dequant::e8m0_scale_to_f32(bytes[off]);
+        // ggml `block_mxfp4`: byte j holds values j (low) and j + 16 (high).
         for j in 0..QK / 2 {
             let bx = bytes[off + 1 + j];
-            qs[i * QK + 2 * j] = fp4_e2m1(bx);
-            qs[i * QK + 2 * j + 1] = fp4_e2m1(bx >> 4);
+            qs[i * QK + j] = fp4_e2m1(bx);
+            qs[i * QK + j + QK / 2] = fp4_e2m1(bx >> 4);
         }
     }
     Ok((qs, scales, offsets))
@@ -1502,31 +1507,32 @@ fn split_tq1_0_ondevice(bytes: &[u8], nb: usize) -> Result<(Vec<f32>, Vec<f32>, 
     Ok((qs, scales, offsets))
 }
 
+/// ggml `block_nvfp4`: 64 values in 36 bytes — four UE4M3 scales, then per
+/// 16-value group `s` byte `8s + j` holds values `16s + j` (low) and
+/// `16s + j + 8` (high). One block covers two 32-value chunks.
 fn split_nvfp4_ondevice(bytes: &[u8], nb: usize) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-    const BLOCK: usize = 1 + QK_NVFP4 / 2;
-    let nvfp4_nb = nb * 2;
-    if bytes.len() != nvfp4_nb * BLOCK {
+    const BLOCK: usize = 36;
+    const SUB: usize = 16;
+    if !nb.is_multiple_of(QK_NVFP4 / QK) || bytes.len() != nb / 2 * BLOCK {
         return Err(CoremlError::Runtime(format!(
-            "NVFP4 ondevice: expected {} bytes, got {}",
-            nvfp4_nb * BLOCK,
+            "NVFP4 ondevice: {nb} chunks of {QK} need {} bytes, got {}",
+            nb / 2 * BLOCK,
             bytes.len()
         )));
     }
     let mut qs = vec![0f32; nb * QK];
     let mut scales = vec![0f32; nb * QK];
     let offsets = vec![0f32; nb * QK];
-    for i in 0..nb {
-        for half in 0..2 {
-            let bidx = i * 2 + half;
-            let off = bidx * BLOCK;
-            let s = rlx_gguf::mx_dequant::e4m3_scale_to_f32(bytes[off]);
-            for j in 0..QK_NVFP4 / 2 {
-                let bx = bytes[off + 1 + j];
-                let pos = i * QK + half * QK_NVFP4 + 2 * j;
+    for (b, blk) in bytes.chunks(BLOCK).enumerate() {
+        for sub in 0..QK_NVFP4 / SUB {
+            let d = rlx_gguf::mx_dequant::ue4m3_scale_to_f32(blk[sub]);
+            for j in 0..SUB / 2 {
+                let bx = blk[4 + sub * SUB / 2 + j];
+                let pos = b * QK_NVFP4 + sub * SUB + j;
                 qs[pos] = fp4_e2m1(bx);
-                qs[pos + 1] = fp4_e2m1(bx >> 4);
-                scales[pos] = s;
-                scales[pos + 1] = s;
+                qs[pos + SUB / 2] = fp4_e2m1(bx >> 4);
+                scales[pos] = d;
+                scales[pos + SUB / 2] = d;
             }
         }
     }

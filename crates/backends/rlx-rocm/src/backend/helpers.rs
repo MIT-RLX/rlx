@@ -168,6 +168,27 @@ pub(crate) fn activation_op_id(act: Activation) -> u32 {
 /// Upload a `&[u32]` to a freshly-allocated device buffer (analogue of
 /// cudarc's `stream.clone_htod`). Used for transpose / expand meta
 /// buffers.
+/// Strides (in elements) for reading a row-major tensor of `in_dims` at
+/// each coordinate of `out_dims`: right-aligned, 0 on broadcast axes.
+pub(crate) fn broadcast_strides_for_out(in_dims: &[usize], out_dims: &[u32]) -> Vec<u32> {
+    let rank = out_dims.len();
+    let mut idims: Vec<u32> = vec![1; rank - in_dims.len()];
+    idims.extend(in_dims.iter().map(|&d| d as u32));
+    let mut cstr = vec![1u32; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        cstr[i] = cstr[i + 1] * idims[i + 1];
+    }
+    (0..rank)
+        .map(|i| {
+            if idims[i] == 1 && out_dims[i] != 1 {
+                0
+            } else {
+                cstr[i]
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn upload_meta(ctx: &Arc<RocmContext>, data: &[u32]) -> HipBuffer<u32> {
     let mut buf = HipBuffer::<u32>::alloc_zeros(&ctx.runtime, data.len().max(1))
         .expect("rlx-rocm: meta upload alloc failed");

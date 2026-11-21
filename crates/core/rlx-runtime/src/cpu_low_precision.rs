@@ -404,6 +404,18 @@ fn promote(graph: Graph, keep: Keep) -> Graph {
         if keep_dtype && matches!(shape.dtype(), DType::F16 | DType::BF16) {
             kept_lowp.insert(node.id);
         }
+        // A cast promotion made an identity (f16 -> f32 over what is now f32)
+        // is dropped: readers take its input. Left in, it hid each broadcast
+        // from the backends' Expand -> Binary folding (CUDA SynthSeg under
+        // `AlwaysF16`: 236 materialised Expands). Outputs keep their node.
+        if let Op::Cast { to } = &node.op
+            && !graph.outputs.contains(&node.id)
+            && out.node(inputs[0]).shape == shape
+            && promote_dtype(*to) == shape.dtype()
+        {
+            id_map.insert(node.id, inputs[0]);
+            continue;
+        }
         let op = match &node.op {
             Op::Constant { data } => Op::Constant {
                 data: widen_constant_bytes(data, node.shape.dtype()),
@@ -467,6 +479,53 @@ mod tests {
     /// F16 then `Transpose` (the operand order of `x @ cast(c)ᵀ`) kept the
     /// transpose F16 over the cast's now-f32 buffer: Metal's matmul read the
     /// f32 bits as pairs of halves and returned garbage, with no error.
+    #[test]
+    fn casts_made_identities_are_dropped() {
+        // x -> f16 -> expand -> f32 -> add: once promoted both casts are
+        // f32 -> f32, so the add reads the expand directly. A cast that is
+        // an output stays.
+        let mut g = Graph::new("casts");
+        let x = g.input("x", Shape::new(&[1, 4], DType::F32));
+        let y = g.input("y", Shape::new(&[3, 4], DType::F32));
+        let h = g.add_node(
+            Op::Cast { to: DType::F16 },
+            vec![x],
+            Shape::new(&[1, 4], DType::F16),
+        );
+        let e = g.add_node(
+            Op::Expand {
+                target_shape: vec![3, 4],
+            },
+            vec![h],
+            Shape::new(&[3, 4], DType::F16),
+        );
+        let f = g.add_node(
+            Op::Cast { to: DType::F32 },
+            vec![e],
+            Shape::new(&[3, 4], DType::F32),
+        );
+        let sum = g.add(f, y);
+        let out = g.add_node(
+            Op::Cast { to: DType::F32 },
+            vec![sum],
+            Shape::new(&[3, 4], DType::F32),
+        );
+        g.set_outputs(vec![out]);
+        let p = promote_to_f32(g);
+        let casts = p
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Cast { .. }))
+            .count();
+        assert_eq!(casts, 1, "only the output cast stays");
+        let add = p
+            .nodes()
+            .iter()
+            .find(|n| matches!(n.op, Op::Binary(_)))
+            .unwrap();
+        assert!(matches!(p.node(add.inputs[0]).op, Op::Expand { .. }));
+    }
+
     #[test]
     fn a_layout_op_over_a_promoted_cast_is_promoted() {
         for dt in [DType::F16, DType::BF16] {

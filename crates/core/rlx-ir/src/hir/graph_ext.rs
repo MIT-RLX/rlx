@@ -108,6 +108,11 @@ impl<'a> HirMut<'a> {
     }
 
     /// Additive attention bias `[batch, num_heads, query_len, key_len]`.
+    ///
+    /// A bias that only broadcasts to that shape (`[1, 1, q, k]`, `[b, 1, q, k]`,
+    /// `[q, k]`, …) is expanded to it here: the kernels read the bias as a dense
+    /// `[b, heads, q, k]` buffer, so a smaller one would be read past its end.
+    /// Panics when the bias does not broadcast.
     pub fn attention_bias(
         &mut self,
         q: HirNodeId,
@@ -118,6 +123,7 @@ impl<'a> HirMut<'a> {
         head_dim: usize,
         shape: Shape,
     ) -> HirNodeId {
+        let bias = self.broadcast_attention_bias(q, k, bias, num_heads);
         self.0.mir(
             crate::ops::attention::attention_kind_op(
                 num_heads,
@@ -130,6 +136,52 @@ impl<'a> HirMut<'a> {
             vec![q, k, v, bias],
             shape,
         )
+    }
+
+    /// `bias` expanded to the dense `[batch, num_heads, q_len, k_len]` layout
+    /// the attention kernels index, for `q` `[batch, q_len, ·]` and `k`
+    /// `[batch, k_len, ·]` (other ranks are passed through unchanged).
+    fn broadcast_attention_bias(
+        &mut self,
+        q: HirNodeId,
+        k: HirNodeId,
+        bias: HirNodeId,
+        num_heads: usize,
+    ) -> HirNodeId {
+        let dims = |g: &Self, x: HirNodeId| -> Option<Vec<usize>> {
+            g.shape(x)
+                .dims()
+                .iter()
+                .map(|d| match d {
+                    crate::shape::Dim::Static(n) => Some(*n),
+                    crate::shape::Dim::Dynamic(_) => None,
+                })
+                .collect::<Option<Vec<_>>>()
+        };
+        let (Some(qd), Some(kd), Some(bd)) = (dims(self, q), dims(self, k), dims(self, bias))
+        else {
+            return bias;
+        };
+        if qd.len() != 3 || kd.len() != 3 {
+            return bias;
+        }
+        let target = [qd[0], num_heads, qd[1], kd[1]];
+        if bd == target {
+            return bias;
+        }
+        assert!(
+            bd.len() <= 4
+                && bd
+                    .iter()
+                    .rev()
+                    .zip(target.iter().rev())
+                    .all(|(&b, &t)| b == t || b == 1),
+            "attention bias {bd:?} does not broadcast to [batch, heads, q, k] = {target:?}"
+        );
+        let mut b4 = vec![1i64; 4 - bd.len()];
+        b4.extend(bd.iter().map(|&d| d as i64));
+        let b4 = self.reshape_(bias, b4);
+        self.expand_(b4, target.iter().map(|&d| d as i64).collect())
     }
 
     /// Bilinear 2-D resize of NCHW `x` to `[N, C, out_h, out_w]` — see

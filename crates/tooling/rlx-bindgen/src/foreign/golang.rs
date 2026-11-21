@@ -228,11 +228,7 @@ pub fn emit(h: &Header, cfg: &Config) -> String {
                 args.push(format!("c{n}"));
             } else if p.ty.is("char", 1) {
                 o += &format!("\tc{n} := C.CString({n})\n\tdefer C.free(unsafe.Pointer(c{n}))\n");
-                args.push(if p.ty.konst {
-                    format!("c{n}")
-                } else {
-                    format!("c{n}")
-                });
+                args.push(format!("c{n}"));
             } else if p.ty.is("char", 2) && !p.ty.konst {
                 o += &format!(
                     "\tc{n} := (*[1 << 20]*C.char)(C.malloc(C.size_t(len({n})+1) * C.size_t(unsafe.Sizeof(uintptr(0)))))\n"

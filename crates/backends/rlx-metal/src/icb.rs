@@ -209,6 +209,7 @@ fn thunk_kind(t: &Thunk) -> &'static str {
         Thunk::LayerNorm { .. } => "LayerNorm",
         Thunk::RmsNorm { .. } => "RmsNorm",
         Thunk::Softmax { .. } => "Softmax",
+        Thunk::SoftmaxAdd { .. } => "SoftmaxAdd",
         Thunk::SoftmaxCrossEntropyDense { .. } => "SoftmaxCrossEntropy",
         Thunk::Reduce { .. } => "Reduce",
         Thunk::Gather { .. } => "Gather",

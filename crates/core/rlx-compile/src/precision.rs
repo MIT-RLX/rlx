@@ -360,6 +360,20 @@ pub struct AutoMixedPrecision {
     /// f16 attention kernel; CoreML lowers attention to generic MIL ops that
     /// run in f16, which is what puts it on the Neural Engine.
     pub f16_attention: bool,
+    /// Let `Op::Conv3d`, `Op::ConvTranspose3d` and `Op::GroupNorm` take the
+    /// policy's precision instead of staying F32. Off by default; Metal turns
+    /// it on, having half kernels for all three (`conv3d*_h`,
+    /// `conv_transpose3d*_h`, `group_norm_{stats,apply}_h`: half storage,
+    /// float accumulation). With them f32, an f16 3D network pays a cast
+    /// into and out of every conv and norm, and runs slower than f32
+    /// (SegResNet 128^3: 0.85x).
+    pub f16_conv3d: bool,
+    /// Store a weight (`Op::Param`) as F16 when everything reads it through a
+    /// `Cast` to F16, dropping the casts: the backend converts it once as it
+    /// is uploaded instead of on every run, and holds it in half the memory.
+    /// Needs a backend whose parameter upload converts f32 data to the
+    /// slot's dtype (Metal's `set_param` does). Off by default.
+    pub f16_params: bool,
 }
 
 impl AutoMixedPrecision {
@@ -367,7 +381,21 @@ impl AutoMixedPrecision {
         Self {
             policy,
             f16_attention: false,
+            f16_conv3d: false,
+            f16_params: false,
         }
+    }
+
+    /// See [`Self::f16_params`].
+    pub fn with_f16_params(mut self, on: bool) -> Self {
+        self.f16_params = on;
+        self
+    }
+
+    /// See [`Self::f16_conv3d`].
+    pub fn with_f16_conv3d(mut self, on: bool) -> Self {
+        self.f16_conv3d = on;
+        self
     }
 
     /// See [`Self::f16_attention`].
@@ -439,16 +467,24 @@ impl Pass for AutoMixedPrecision {
                 Op::GatedDeltaNet { .. }
                 | Op::SelectiveScan { .. }
                 | Op::Conv { .. }
-                | Op::Conv3d { .. }
+                // A conv + bias fused before this pass runs the same f32
+                // kernel. Tagged F16 it read half bytes as floats: FlexibleUNet's
+                // segmentation head gave non-finite logits
+                // (`rlx-metal/tests/precision_policy_f16_conv3d.rs`).
+                | Op::FusedConvBiasAct { .. }
                 | Op::ConvTranspose2d { .. }
-                | Op::ConvTranspose3d { .. }
                 | Op::Im2Col { .. }
                 | Op::Pool { .. }
                 | Op::QConv2d { .. }
                 | Op::Conv2dBackwardInput { .. }
                 | Op::Conv2dBackwardWeight { .. } => true,
                 // Reduction / data-movement ops without Metal `_h` yet.
-                Op::Cumsum { .. }
+                // `argreduce` reads floats: tagged F16, half of SynthSeg
+                // robust's cascade one-hots were wrong
+                // (`rlx-metal/tests/precision_policy_f16_conv3d.rs`).
+                Op::ArgMax { .. }
+                | Op::ArgMin { .. }
+                | Op::Cumsum { .. }
                 | Op::Sample { .. }
                 | Op::Lstm { .. }
                 | Op::Gru { .. }
@@ -463,8 +499,8 @@ impl Pass for AutoMixedPrecision {
                 // `rlx-metal/tests/precision_policy_f16_attention.rs`'s sweep.
                 | Op::LayerNorm2d { .. }
                 | Op::LayerNormBackwardInput { .. }
-                | Op::LayerNormBackwardGamma { .. }
-                | Op::GroupNorm { .. } => true,
+                | Op::LayerNormBackwardGamma { .. } => true,
+                Op::Conv3d { .. } | Op::ConvTranspose3d { .. } | Op::GroupNorm { .. } => !self.f16_conv3d,
                 // `Op::Attention` and its backward. Metal dispatches the SAME
                 // f32 sdpa kernel regardless of the node's dtype — the `dt`
                 // flag does not select an f16 variant because none exists — so
@@ -487,6 +523,11 @@ impl Pass for AutoMixedPrecision {
                 | Op::MaxPool2dBackward { .. }
                 | Op::ResizeNearest2x
                 | Op::AxialRope2d { .. } => true,
+                // No Metal kernel: a host fallback that reads the arena as
+                // f32. Tagged F16 it read half bytes as floats — wrong values
+                // downsampling, a segfault upsampling
+                // (`rlx-metal/tests/precision_policy_f16_conv3d.rs`).
+                Op::Interpolate3d { .. } => true,
                 // SPD / eigh — host LAPACK or f32 native solvers.
                 Op::BiMap
                 | Op::ReEig { .. }
@@ -655,8 +696,52 @@ impl Pass for AutoMixedPrecision {
             .collect();
         new_graph.set_outputs(new_outputs);
 
-        new_graph
+        if self.f16_params {
+            half_params(new_graph)
+        } else {
+            new_graph
+        }
     }
+}
+
+/// Relabel each F32 `Op::Param` read only through `Cast { to: F16 }` as F16,
+/// and those casts as the param itself (see [`AutoMixedPrecision::f16_params`]).
+fn half_params(graph: Graph) -> Graph {
+    let mut consumers: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for n in graph.nodes() {
+        for &i in &n.inputs {
+            consumers.entry(i).or_default().push(n.id);
+        }
+    }
+    let halved = |n: &Node| {
+        matches!(n.op, Op::Param { .. })
+            && n.shape.dtype() == DType::F32
+            && !graph.outputs.contains(&n.id)
+            && consumers.get(&n.id).is_some_and(|cs| {
+                cs.iter()
+                    .all(|&c| matches!(graph.node(c).op, Op::Cast { to: DType::F16 }))
+            })
+    };
+    let mut out = Graph::new(&graph.name);
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for n in graph.nodes() {
+        if let Some(&p) = n.inputs.first().and_then(|i| id_map.get(i))
+            && matches!(n.op, Op::Cast { to: DType::F16 })
+            && halved(graph.node(n.inputs[0]))
+        {
+            id_map.insert(n.id, p);
+            continue;
+        }
+        let shape = if halved(n) {
+            n.shape.clone().with_dtype(DType::F16)
+        } else {
+            n.shape.clone()
+        };
+        let inputs = n.inputs.iter().map(|i| id_map[i]).collect();
+        id_map.insert(n.id, out.add_node(n.op.clone(), inputs, shape));
+    }
+    out.set_outputs(graph.outputs.iter().map(|o| id_map[o]).collect());
+    out
 }
 
 #[cfg(test)]
@@ -696,6 +781,79 @@ mod tests {
         assert!(out.len() >= 6);
         let final_node = out.node(out.outputs[0]);
         assert!(matches!(final_node.op, Op::Cast { to: DType::F32 }));
+    }
+
+    /// `Conv3d` and `GroupNorm` stay F32 under `AlwaysF16` unless the backend
+    /// says it has half kernels for them (`f16_conv3d`).
+    #[test]
+    fn f16_conv3d_keeps_conv3d_and_group_norm_half() {
+        let build = || {
+            let mut g = Graph::new("conv3d_gn");
+            let x = g.input("x", Shape::new(&[1, 4, 8, 8, 8], DType::F32));
+            let w = g.param("w", Shape::new(&[8, 4, 3, 3, 3], DType::F32));
+            let y = g.conv3d(x, w, [1; 3], [1; 3], [1; 3], 1);
+            let gamma = g.param("g", Shape::new(&[8], DType::F32));
+            let beta = g.param("b", Shape::new(&[8], DType::F32));
+            let y = g.group_norm(y, gamma, beta, 2, 1e-5);
+            g.set_outputs(vec![y]);
+            g
+        };
+        let dtypes = |g: &Graph| {
+            let of = |pick: fn(&Op) -> bool| {
+                g.nodes()
+                    .iter()
+                    .find(|n| pick(&n.op))
+                    .map(|n| n.shape.dtype())
+                    .unwrap()
+            };
+            (
+                of(|op| matches!(op, Op::Conv3d { .. })),
+                of(|op| matches!(op, Op::GroupNorm { .. })),
+            )
+        };
+        let casts = |g: &Graph| {
+            g.nodes()
+                .iter()
+                .filter(|n| matches!(n.op, Op::Cast { .. }))
+                .count()
+        };
+
+        let off = AutoMixedPrecision::new(PrecisionPolicy::AlwaysF16).run(build());
+        assert_eq!(dtypes(&off), (DType::F32, DType::F32));
+
+        let on = AutoMixedPrecision::new(PrecisionPolicy::AlwaysF16)
+            .with_f16_conv3d(true)
+            .run(build());
+        assert_eq!(dtypes(&on), (DType::F16, DType::F16));
+        // Casts at the boundaries only: x and the three params in, the output out.
+        assert_eq!(casts(&on), 5);
+    }
+
+    /// `f16_params` stores the weights half and drops their casts; the input
+    /// and output casts stay.
+    #[test]
+    fn f16_params_drops_weight_casts() {
+        let mut g = Graph::new("conv3d_params");
+        let x = g.input("x", Shape::new(&[1, 4, 8, 8, 8], DType::F32));
+        let w = g.param("w", Shape::new(&[8, 4, 3, 3, 3], DType::F32));
+        let y = g.conv3d(x, w, [1; 3], [1; 3], [1; 3], 1);
+        g.set_outputs(vec![y]);
+        let out = AutoMixedPrecision::new(PrecisionPolicy::AlwaysF16)
+            .with_f16_conv3d(true)
+            .with_f16_params(true)
+            .run(g);
+        let param = out
+            .nodes()
+            .iter()
+            .find(|n| matches!(n.op, Op::Param { .. }))
+            .unwrap();
+        assert_eq!(param.shape.dtype(), DType::F16);
+        let casts = out
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Cast { .. }))
+            .count();
+        assert_eq!(casts, 2, "x in, the output out");
     }
 
     #[test]

@@ -561,6 +561,9 @@ impl MetalExecutable {
         };
         let dev = metal_device().expect("Metal device required");
         let mut cmd_buf = dev.queue.new_command_buffer().to_owned();
+        // The run's first buffer, for `gpu_span`: a host thunk mid-run commits
+        // `cmd_buf` and starts another, and the span runs from this one's start.
+        let first_cmd_buf = cmd_buf.clone();
         let k = kernels();
 
         // Lazy compute encoder — created on first MSL thunk, ended right
@@ -2405,7 +2408,10 @@ impl MetalExecutable {
                     w,
                     num_groups,
                     eps,
-                    dt: _,
+                    dt,
+                    stats,
+                    act,
+                    alpha,
                 } => {
                     let n = scale(*n);
                     if n == 0 {
@@ -2425,6 +2431,10 @@ impl MetalExecutable {
                         *w,
                         *num_groups,
                         *eps,
+                        *dt,
+                        self.gn_stats_scratch_off + *stats,
+                        *act,
+                        *alpha,
                     );
                 }
                 Thunk::LayerNorm2d {
@@ -2539,7 +2549,7 @@ impl MetalExecutable {
                     dh,
                     dw,
                     groups,
-                    dt: _,
+                    dt,
                 } => {
                     let n = scale(*n);
                     if n == 0 {
@@ -2578,6 +2588,7 @@ impl MetalExecutable {
                         *dh,
                         *dw,
                         *groups,
+                        *dt,
                     );
                 }
                 Thunk::ConvTranspose3d {
@@ -2606,7 +2617,7 @@ impl MetalExecutable {
                     dh,
                     dw,
                     groups,
-                    dt: _,
+                    dt,
                 } => {
                     let n = scale(*n);
                     if n == 0 {
@@ -2641,6 +2652,7 @@ impl MetalExecutable {
                         *dh,
                         *dw,
                         *groups,
+                        *dt,
                     );
                 }
                 Thunk::ResizeNearest2x {
@@ -2905,14 +2917,16 @@ impl MetalExecutable {
                                 nu,
                             );
                         }
-                    } else if !matches!(dt, HalfFlag::F16)
-                        && !rlx_ir::env::flag("RLX_METAL_BMM_MPS")
-                    {
+                    } else if !rlx_ir::env::flag("RLX_METAL_BMM_MPS") {
                         // One dispatch for the whole batch (grid z). The
                         // per-matrix MPS loop below costs an encoder switch
                         // per matrix — B*H of them for multi-head attention.
                         let enc = e!();
-                        enc.set_compute_pipeline_state(&k.bmm_simd_4x4);
+                        enc.set_compute_pipeline_state(if matches!(dt, HalfFlag::F16) {
+                            &k.bmm_simd_4x4_h
+                        } else {
+                            &k.bmm_simd_4x4
+                        });
                         enc.set_buffer(0, Some(&self.arena.buffer), *a as u64);
                         enc.set_buffer(1, Some(&self.arena.buffer), *b as u64);
                         enc.set_buffer(2, Some(&self.arena.buffer), *c as u64);
@@ -2990,8 +3004,8 @@ impl MetalExecutable {
                     if total_out == 0 {
                         continue;
                     }
-                    // F16 path still falls back to the host (no f16 MSL
-                    // kernel yet); f32 uses the dedicated GPU kernel.
+                    // f32 has fast paths for common broadcast shapes; f16
+                    // takes the general kernel.
                     if matches!(dt, HalfFlag::F32) {
                         let op_id: u32 = op.opcode();
                         // Sub/Div/Pow are non-commutative. The scalar/col/row/
@@ -3087,6 +3101,7 @@ impl MetalExecutable {
                                 mid,
                                 op_id,
                                 rhs_1ax,
+                                false,
                             );
                             continue;
                         }
@@ -3150,30 +3165,77 @@ impl MetalExecutable {
                         };
                         enc.dispatch_threads(grid, tg);
                     } else {
-                        // f16: unified-memory host fallback (rare path
-                        // until we get a half-precision kernel).
-                        end_msl!();
-                        cmd_buf.commit();
-                        cmd_buf.wait_until_completed();
-                        let arena_ptr = self.arena.buffer.contents() as *mut u8;
-                        let lhs_len_in = inferred_input_len(lhs_strides, out_dims);
-                        let rhs_len_in = inferred_input_len(rhs_strides, out_dims);
-                        unsafe {
-                            binary_broadcast_host::<half::f16>(
-                                arena_ptr.add(*lhs) as *const half::f16,
-                                lhs_len_in,
-                                arena_ptr.add(*rhs) as *const half::f16,
-                                rhs_len_in,
-                                arena_ptr.add(*dst) as *mut half::f16,
-                                total_out,
-                                *rank as usize,
-                                out_dims,
-                                lhs_strides,
-                                rhs_strides,
-                                *op,
+                        // f16: a broadcast along one axis (an attention bias
+                        // over windows, a mask over heads) has its half fast
+                        // path; anything else takes the general strided kernel.
+                        let op_id: u32 = op.opcode();
+                        let commutative = matches!(
+                            op,
+                            rlx_ir::op::BinaryOp::Add
+                                | rlx_ir::op::BinaryOp::Mul
+                                | rlx_ir::op::BinaryOp::Max
+                                | rlx_ir::op::BinaryOp::Min
+                        );
+                        let enc = e!();
+                        if let Some((rows, cols, mid, rhs_1ax)) =
+                            detect_single_axis_broadcast(*rank, out_dims, lhs_strides, rhs_strides)
+                                .filter(|&(_, _, _, rhs_1ax)| rhs_1ax || commutative)
+                        {
+                            encode_binary_broadcast_1ax(
+                                enc,
+                                k,
+                                &self.arena.buffer,
+                                *lhs,
+                                *rhs,
+                                *dst,
+                                rows,
+                                cols,
+                                mid,
+                                op_id,
+                                rhs_1ax,
+                                true,
                             );
+                            continue;
                         }
-                        cmd_buf = dev.queue.new_command_buffer().to_owned();
+                        enc.set_compute_pipeline_state(&k.binary_broadcast_h);
+                        enc.set_buffer(0, Some(&self.arena.buffer), *lhs as u64);
+                        enc.set_buffer(1, Some(&self.arena.buffer), *rhs as u64);
+                        enc.set_buffer(2, Some(&self.arena.buffer), *dst as u64);
+                        let len_u32 = total_out as u32;
+                        enc.set_bytes(3, 4, &len_u32 as *const u32 as *const _);
+                        enc.set_bytes(4, 4, rank as *const u32 as *const _);
+                        enc.set_bytes(
+                            5,
+                            (out_dims.len() * 4) as u64,
+                            out_dims.as_ptr() as *const _,
+                        );
+                        enc.set_bytes(
+                            6,
+                            (lhs_strides.len() * 4) as u64,
+                            lhs_strides.as_ptr() as *const _,
+                        );
+                        enc.set_bytes(
+                            7,
+                            (rhs_strides.len() * 4) as u64,
+                            rhs_strides.as_ptr() as *const _,
+                        );
+                        enc.set_bytes(8, 4, &op_id as *const u32 as *const _);
+                        let tg_w = k
+                            .binary_broadcast_h
+                            .thread_execution_width()
+                            .min(total_out as u64);
+                        enc.dispatch_threads(
+                            crate::mtl::MTLSize {
+                                width: total_out as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                            crate::mtl::MTLSize {
+                                width: tg_w,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
                     }
                 }
                 Thunk::FusedResidualLN {
@@ -4988,6 +5050,30 @@ impl MetalExecutable {
                         continue;
                     }
                     encode_softmax(e!(), k, &self.arena.buffer, *src, *data, rows, *cols, *dt);
+                }
+                Thunk::SoftmaxAdd {
+                    src,
+                    dst,
+                    rows,
+                    cols,
+                    adds,
+                    dt,
+                } => {
+                    let rows = scale(*rows);
+                    if rows == 0 {
+                        continue;
+                    }
+                    encode_softmax_add(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *src,
+                        *dst,
+                        rows,
+                        *cols,
+                        adds,
+                        *dt,
+                    );
                 }
                 Thunk::SoftmaxCrossEntropyDense {
                     logits,
@@ -9152,8 +9238,18 @@ impl MetalExecutable {
                     slab_bytes,
                     scheme,
                     scale_bf16,
+                    scale_f32,
                 } => {
                     let launch = scheme.mlx_gpu_launch();
+                    // Kernel scale storage: 1 = BF16, 2 = f32 (both decoded),
+                    // 0 = raw E8M0 bytes.
+                    let scale_kind = if *scale_bf16 {
+                        1u32
+                    } else if *scale_f32 {
+                        2
+                    } else {
+                        0
+                    };
                     let use_gpu = launch.is_some()
                         && deferred_host.is_empty()
                         && !crate::runtime_config().dequant_gpu_disable
@@ -9177,7 +9273,7 @@ impl MetalExecutable {
                                 bits,
                                 group_size,
                                 *slab_bytes,
-                                u32::from(*scale_bf16),
+                                scale_kind,
                             );
                         } else {
                             encode_grouped_dequant_matmul_mlx_gemm(
@@ -9197,7 +9293,7 @@ impl MetalExecutable {
                                 bits,
                                 group_size,
                                 *slab_bytes,
-                                u32::from(*scale_bf16),
+                                scale_kind,
                             );
                         }
                     } else {
@@ -9379,6 +9475,14 @@ impl MetalExecutable {
                 None
             };
             check_cmd_buf_status(&cmd_buf, "encode_commit (final wait)");
+            // Device span of the run, first buffer's start to the last one's
+            // end: gaps where a mid-run host thunk held the GPU idle count.
+            let (start, end) = (first_cmd_buf.gpu_start_time(), cmd_buf.gpu_end_time());
+            crate::gpu_span::record(if start > 0.0 && end > start {
+                (end - start) * 1e3
+            } else {
+                0.0
+            });
             if !tail_host.is_empty() {
                 let arena_ptr = self.arena.buffer.contents() as *mut u8;
                 for op in tail_host.drain(..) {

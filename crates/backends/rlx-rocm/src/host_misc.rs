@@ -30,26 +30,6 @@ pub fn run_reverse(
     rlx_gpu_host::run_reverse(&mut arena, src, dst, dims, rev_mask, elem_bytes);
 }
 
-/// ArgMax/ArgMin (f32-encoded indices) over the middle `reduced` axis.
-#[allow(clippy::too_many_arguments)]
-pub fn run_argreduce(
-    ctx: &RocmContext,
-    buffer: &HipBuffer<f32>,
-    src: usize,
-    dst: usize,
-    outer: usize,
-    reduced: usize,
-    inner: usize,
-    is_max: bool,
-) {
-    let mut arena = RocmArena {
-        ctx,
-        buffer,
-        size_bytes: 0,
-    };
-    rlx_gpu_host::run_argreduce(&mut arena, src, dst, outer, reduced, inner, is_max);
-}
-
 /// Axial 2-D RoPE on `[batch, seq, hidden]`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_axial_rope2d(

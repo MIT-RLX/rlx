@@ -20,6 +20,11 @@
 //! ```
 //!
 //! = 34 bytes / 128 elements. Dequant mirrors `dequantize_row_q2_0`.
+//!
+//! Upstream ggml now defines type 42 with the same codes at a group of 64
+//! (`block_q2_0`: f16 `d` + 16 code bytes = 18 bytes / 64 elements) — the
+//! `*_g64` functions below; the fork moved the group-128 block to `PQ2_0`.
+//! `GgufFile` tells old group-128 files apart by their tensor spans.
 
 use crate::read_f16_le;
 use anyhow::{Result, bail};
@@ -79,22 +84,29 @@ pub fn dequant_q2_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
 /// the max absolute value; each weight becomes
 /// `clamp(round(w/d) + 1, 0..=3)`. Lossy — used for tests / transcode.
 pub fn quantize_q2_0(src: &[f32]) -> Result<Vec<u8>> {
+    quantize_q2_0_groups(src, QK2_0)
+}
+
+/// Encode to ggml's `Q2_0` (64-value groups) — `quantize_row_q2_0_ref`.
+pub fn quantize_q2_0_g64(src: &[f32]) -> Result<Vec<u8>> {
+    quantize_q2_0_groups(src, QK2_0_G64)
+}
+
+/// `d = amax`, codes `clamp(round(w / d) + 1, 0, 3)`, LSB-first in each byte.
+fn quantize_q2_0_groups(src: &[f32], group: usize) -> Result<Vec<u8>> {
     let n = src.len();
-    if !n.is_multiple_of(QK2_0) {
-        bail!("Q2_0: n={n} not divisible by {QK2_0}");
+    if !n.is_multiple_of(group) {
+        bail!("Q2_0: n={n} not divisible by {group}");
     }
-    let nb = n / QK2_0;
-    let mut out = vec![0u8; nb * Q2_0_BLOCK_BYTES];
-    for i in 0..nb {
-        let group = &src[i * QK2_0..(i + 1) * QK2_0];
-        let amax = group.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let block = 2 + group / 4;
+    let mut out = vec![0u8; n / group * block];
+    for (g, o) in src.chunks_exact(group).zip(out.chunks_exact_mut(block)) {
+        let amax = g.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let id = if amax > 0.0 { 1.0 / amax } else { 0.0 };
-        let off = i * Q2_0_BLOCK_BYTES;
-        out[off..off + 2].copy_from_slice(&half::f16::from_f32(amax).to_le_bytes());
-        for (j, &v) in group.iter().enumerate() {
-            let mut q = (v * id).round() as i32 + 1;
-            q = q.clamp(0, 3);
-            out[off + 2 + j / 4] |= (q as u8) << ((j % 4) * 2);
+        o[..2].copy_from_slice(&half::f16::from_f32(amax).to_le_bytes());
+        for (j, &v) in g.iter().enumerate() {
+            let q = ((v * id).round() as i32 + 1).clamp(0, 3);
+            o[2 + j / 4] |= (q as u8) << ((j % 4) * 2);
         }
     }
     Ok(out)
@@ -194,6 +206,49 @@ pub fn q2_0_dot_q8_g128(w: &[u8], a: &[u8]) -> f32 {
         raw += (q - 1) * (acts[j] as i8 as i32);
     }
     d * dx * raw as f32
+}
+
+/// Group size of ggml's `Q2_0` (type 42).
+pub const QK2_0_G64: usize = 64;
+/// Bytes per ggml `Q2_0` block: f16 scale + 64×2-bit codes.
+pub const Q2_0_G64_BLOCK_BYTES: usize = 2 + QK2_0_G64 / 4; // 18
+
+/// Storage bytes for `n` ggml `Q2_0` elements.
+pub fn q2_0_g64_bytes(n: usize) -> Option<usize> {
+    n.is_multiple_of(QK2_0_G64)
+        .then(|| n / QK2_0_G64 * Q2_0_G64_BLOCK_BYTES)
+}
+
+/// Dequantize one ggml `Q2_0` block (18 bytes) into `out` (64 values): ggml's
+/// `dequantize_row_q2_0` — code `(qs[j / 4] >> ((j % 4) * 2)) & 3`, value
+/// `(q − 1) · d`.
+pub fn dequant_q2_0_g64_block(block: &[u8], out: &mut [f32; QK2_0_G64]) {
+    let d = read_f16_le(&block[0..2]);
+    let qs = &block[2..2 + QK2_0_G64 / 4];
+    for (j, slot) in out.iter_mut().enumerate() {
+        let q = (qs[j / 4] >> ((j % 4) * 2)) & 0x03;
+        *slot = (q as i32 - 1) as f32 * d;
+    }
+}
+
+/// Dequantize a full ggml `Q2_0` tensor of `n` elements to f32.
+pub fn dequant_q2_0_g64(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+    let Some(want) = q2_0_g64_bytes(n) else {
+        bail!("Q2_0: n={n} not divisible by {QK2_0_G64}");
+    };
+    if bytes.len() != want {
+        bail!("Q2_0: expected {want} bytes, got {}", bytes.len());
+    }
+    let mut out = vec![0f32; n];
+    for (blk, dst) in bytes
+        .as_chunks::<Q2_0_G64_BLOCK_BYTES>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<QK2_0_G64>().0)
+    {
+        dequant_q2_0_g64_block(blk, dst);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

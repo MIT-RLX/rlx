@@ -65,6 +65,14 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ### Fixed
 
+- `rlx-cpu`: the thunk-level attention fusion (`FusedAttnBlock`, which fires
+  when `batch · seq ≤ 64`) took one `has_bias` from the QKV projection for both
+  projections. A bias-free QKV feeding a biased output projection — timm EVA /
+  DINOv3 blocks (`qkv_bias=False`, `proj` biased) — silently dropped the output
+  bias, and the reverse read a bias from arena offset 0. Small inputs were
+  wrong while larger ones were right (a 29-token DINOv3 block was 6.0 off at
+  output scale 60). Mixed chains now stay unfused; regression test
+  `attn_chain_with_bias_only_on_out_projection_keeps_the_bias`.
 - `rlx-pkg`'s `remote` range reader uses reqwest over rustls with the
   pure-Rust RustCrypto provider instead of ureq (ring: C and assembly). HTTPS
   ranges of a Hugging Face file match `curl -r` (`tests/remote_range.rs`,
@@ -179,6 +187,23 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
   and nested types move into modules (`tensor_proto::DataType`).
   `prepare_onnx_file` output is identical before and after on 17 real models,
   external-data ones included.
+
+### Performance
+
+- `rlx-wgpu`: attention over many query rows runs a tiled kernel
+  (`attention_tiled.wgsl`): a 64-thread workgroup takes 64 rows of one
+  (batch, head), stages each K / V tile in workgroup memory once for all of
+  them, and keeps `q` and the output in registers of exactly `head_dim`
+  (constant-bounded `vec4` arrays; built per head width 16–128). The per-row
+  kernel it replaces kept them in 512-wide private arrays that spilled, and
+  read every key from device memory per thread. M4 Pro, 6 heads × 64: 3680 ×
+  3685 went from 125 to 13 ms of GPU time, 3680 × 58885 from 2.06 to 0.51 s;
+  a 20-frame 720p Depth Pro 2 video from 211 to 70 s. The q·k dot product
+  accumulates in the CPU's order, so it stays as close to the CPU as before
+  (≤ 3.2e-6 relative over 13 mask / GQA / soft-cap / tail cases,
+  `tests/attention_tiled_parity.rs`), and closer at long key lengths (its
+  softmax rescales per tile, not per key). Used from 32 query rows per head;
+  `RLX_WGPU_ATTENTION_UNTILED=1` restores the per-row kernels.
 
 ## [0.2.20] — 2026-11-02
 

@@ -39,7 +39,7 @@ pub fn quant_scheme(dtype: GgmlType) -> Option<QuantScheme> {
         GgmlType::MXFP4 => Some(QuantScheme::GgufMXFP4),
         GgmlType::NVFP4 => Some(QuantScheme::GgufNVFP4),
         GgmlType::Q1_0 => Some(QuantScheme::GgufQ1_0),
-        GgmlType::Q2_0 => Some(QuantScheme::GgufQ2_0),
+        GgmlType::Q2_0 => Some(QuantScheme::GgufQ2_0G64),
         GgmlType::FV5 => Some(QuantScheme::GgufFV5),
         GgmlType::FV5B => Some(QuantScheme::GgufFV5B),
         GgmlType::G8_0 => Some(QuantScheme::GgufG8_0),

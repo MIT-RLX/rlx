@@ -426,6 +426,12 @@ macro_rules! kernel_cache {
 }
 
 kernel_cache!(BINARY, binary_kernel, BINARY_CU, "binary");
+kernel_cache!(
+    BINARY_BROADCAST,
+    binary_broadcast_kernel,
+    BINARY_BROADCAST_CU,
+    "binary_broadcast"
+);
 kernel_cache!(GRU, gru_kernel, GRU_CU, "gru");
 kernel_cache!(RNN, rnn_kernel, RNN_CU, "rnn");
 kernel_cache!(MAMBA2, mamba2_kernel, MAMBA2_CU, "mamba2");
@@ -553,7 +559,27 @@ kernel_cache!(COMPARE, compare_kernel, COMPARE_CU, "compare");
 kernel_cache!(WHEREK, where_kernel, WHERE_CU, "where_select");
 kernel_cache!(FMA, fma_kernel, FMA_CU, "fma_elem");
 kernel_cache!(REDUCE, reduce_kernel, REDUCE_CU, "reduce");
+kernel_cache!(REDUCE_ROWS, reduce_rows_kernel, REDUCE_CU, "reduce_rows");
+kernel_cache!(ARGREDUCE, argreduce_kernel, REDUCE_CU, "argreduce");
+kernel_cache!(
+    ARGREDUCE_ROW,
+    argreduce_row_kernel,
+    REDUCE_CU,
+    "argreduce_row"
+);
 kernel_cache!(SOFTMAX, softmax_kernel, SOFTMAX_CU, "softmax");
+kernel_cache!(
+    SOFTMAX_ROWS,
+    softmax_rows_kernel,
+    SOFTMAX_CU,
+    "softmax_rows"
+);
+kernel_cache!(
+    SOFTMAX_WARP,
+    softmax_warp_kernel,
+    SOFTMAX_CU,
+    "softmax_warp"
+);
 kernel_cache!(
     RELU_BACKWARD,
     relu_backward_kernel,
@@ -942,6 +968,32 @@ kernel_cache!(
 );
 kernel_cache!(IM2COL, im2col_kernel, IM2COL_CU, "im2col");
 kernel_cache!(CONV3D, conv3d_kernel, CONV3D_CU, "conv3d");
+kernel_cache!(CONV3D_COT, conv3d_cot_kernel, CONV3D_CU, "conv3d_cot");
+kernel_cache!(CONV3D_COT_H, conv3d_cot_h_kernel, CONV3D_CU, "conv3d_cot_h");
+kernel_cache!(
+    CONV3D_WMMA,
+    conv3d_wmma_kernel,
+    rlx_gpu_kernels::CONV3D_WMMA_HIP,
+    "conv3d_wmma"
+);
+kernel_cache!(
+    CONV3D_WMMA_N64,
+    conv3d_wmma_n64_kernel,
+    rlx_gpu_kernels::CONV3D_WMMA_HIP,
+    "conv3d_wmma_n64"
+);
+kernel_cache!(
+    CONV3D_WMMA_PATCH,
+    conv3d_wmma_patch_kernel,
+    rlx_gpu_kernels::CONV3D_WMMA_HIP,
+    "conv3d_wmma_patch"
+);
+kernel_cache!(
+    CONV3D_WMMA_PATCH_N64,
+    conv3d_wmma_patch_n64_kernel,
+    rlx_gpu_kernels::CONV3D_WMMA_HIP,
+    "conv3d_wmma_patch_n64"
+);
 kernel_cache!(
     CONV3D_BACKWARD_INPUT,
     conv3d_backward_input_kernel,
@@ -985,6 +1037,18 @@ kernel_cache!(
     "axial_rope2d"
 );
 kernel_cache!(GROUP_NORM, group_norm_kernel, GROUP_NORM_CU, "group_norm");
+kernel_cache!(
+    GROUP_NORM_STATS,
+    group_norm_stats_kernel,
+    GROUP_NORM_CU,
+    "group_norm_stats"
+);
+kernel_cache!(
+    GROUP_NORM_APPLY,
+    group_norm_apply_kernel,
+    GROUP_NORM_CU,
+    "group_norm_apply"
+);
 kernel_cache!(
     GROUP_NORM_BWD_INPUT,
     group_norm_bwd_input_kernel,

@@ -1866,9 +1866,8 @@ pub fn interpolate3d_ncdhw(
                 let src = &plane[hi_map[ho] * w_in..][..w_in];
                 let dst = &mut slab[ho * w_out..(ho + 1) * w_out];
                 if doubled {
-                    for (pair, &v) in dst.chunks_exact_mut(2).zip(src) {
-                        pair[0] = v;
-                        pair[1] = v;
+                    for (pair, &v) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+                        *pair = [v, v];
                     }
                 } else {
                     for (o, &wi) in dst.iter_mut().zip(&wi_map) {
@@ -1910,56 +1909,65 @@ pub fn pool3d_ncdhw(
         && 2 * h_out <= h
         && 2 * w_out <= w;
     let out_at = OutPtr(out.as_mut_ptr());
-    crate::pool::par_for(slices, crate::pool::grain_for(hw_out * kd * kh * kw), &|off, cnt| {
-        // SAFETY: each unit writes only its own depth slice.
-        let out = unsafe { std::slice::from_raw_parts_mut(out_at.get(), slices * hw_out) };
-        for u in off..off + cnt {
-            let (nc, od) = (u / d_out, u % d_out);
-            let vol = &inp[nc * d * h * w..(nc + 1) * d * h * w];
-            let slab = &mut out[u * hw_out..(u + 1) * hw_out];
-            if halving {
-                let (p0, p1) = (2 * od * h * w, (2 * od + 1) * h * w);
-                for ho in 0..h_out {
-                    let rows = [p0 + 2 * ho * w, p0 + (2 * ho + 1) * w, p1 + 2 * ho * w, p1 + (2 * ho + 1) * w];
-                    let dst = &mut slab[ho * w_out..(ho + 1) * w_out];
-                    for (wo, o) in dst.iter_mut().enumerate() {
-                        let mut acc = f32::NEG_INFINITY;
-                        for &r in &rows {
-                            acc = acc.max(vol[r + 2 * wo]).max(vol[r + 2 * wo + 1]);
+    crate::pool::par_for(
+        slices,
+        crate::pool::grain_for(hw_out * kd * kh * kw),
+        &|off, cnt| {
+            // SAFETY: each unit writes only its own depth slice.
+            let out = unsafe { std::slice::from_raw_parts_mut(out_at.get(), slices * hw_out) };
+            for u in off..off + cnt {
+                let (nc, od) = (u / d_out, u % d_out);
+                let vol = &inp[nc * d * h * w..(nc + 1) * d * h * w];
+                let slab = &mut out[u * hw_out..(u + 1) * hw_out];
+                if halving {
+                    let (p0, p1) = (2 * od * h * w, (2 * od + 1) * h * w);
+                    for ho in 0..h_out {
+                        let rows = [
+                            p0 + 2 * ho * w,
+                            p0 + (2 * ho + 1) * w,
+                            p1 + 2 * ho * w,
+                            p1 + (2 * ho + 1) * w,
+                        ];
+                        let dst = &mut slab[ho * w_out..(ho + 1) * w_out];
+                        for (wo, o) in dst.iter_mut().enumerate() {
+                            let mut acc = f32::NEG_INFINITY;
+                            for &r in &rows {
+                                acc = acc.max(vol[r + 2 * wo]).max(vol[r + 2 * wo + 1]);
+                            }
+                            *o = acc;
                         }
-                        *o = acc;
                     }
+                    continue;
                 }
-                continue;
-            }
-            for ho in 0..h_out {
-                for wo in 0..w_out {
-                    let mut acc = if is_max { f32::NEG_INFINITY } else { 0.0 };
-                    for kz in 0..kd {
-                        for ki in 0..kh {
-                            for kj in 0..kw {
-                                let (di, hi, wi) = (od * sd + kz, ho * sh + ki, wo * sw + kj);
-                                if di < pd || hi < ph || wi < pw {
-                                    continue;
-                                }
-                                let (di, hi, wi) = (di - pd, hi - ph, wi - pw);
-                                if di >= d || hi >= h || wi >= w {
-                                    continue;
-                                }
-                                let v = vol[(di * h + hi) * w + wi];
-                                if is_max {
-                                    acc = acc.max(v);
-                                } else {
-                                    acc += v;
+                for ho in 0..h_out {
+                    for wo in 0..w_out {
+                        let mut acc = if is_max { f32::NEG_INFINITY } else { 0.0 };
+                        for kz in 0..kd {
+                            for ki in 0..kh {
+                                for kj in 0..kw {
+                                    let (di, hi, wi) = (od * sd + kz, ho * sh + ki, wo * sw + kj);
+                                    if di < pd || hi < ph || wi < pw {
+                                        continue;
+                                    }
+                                    let (di, hi, wi) = (di - pd, hi - ph, wi - pw);
+                                    if di >= d || hi >= h || wi >= w {
+                                        continue;
+                                    }
+                                    let v = vol[(di * h + hi) * w + wi];
+                                    if is_max {
+                                        acc = acc.max(v);
+                                    } else {
+                                        acc += v;
+                                    }
                                 }
                             }
                         }
+                        slab[ho * w_out + wo] = if is_mean { acc / kernel_vol } else { acc };
                     }
-                    slab[ho * w_out + wo] = if is_mean { acc / kernel_vol } else { acc };
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 /// An output base pointer shared with tasks that write disjoint ranges of it.

@@ -13,7 +13,7 @@
 //      8      | TQ1_0     | 256         | 54
 //      9      | TQ2_0     | 256         | 66
 //     10      | MXFP4     | 32          | 17
-//     11      | NVFP4     | 16          | 9
+//     11      | NVFP4     | 64          | 36
 //     12      | IQ2_XXS   | 256         | 66    (uses grid LUT)
 //     13      | IQ2_XS    | 256         | 74    (uses grid LUT)
 //     14      | IQ2_S     | 256         | 82    (uses grid LUT)
@@ -31,6 +31,7 @@
 //     26      | FV5       | 256         | 104
 //     27      | FV5B      | 256         | 260
 //     28      | G8_0      | 32          | 16   (Doses AI Pestle embed/lm_head)
+//     32      | Q2_0 (ggml) | 64        | 18
 //
 // Full backend matrix: docs/gguf-backend-paths.md
 //
@@ -54,7 +55,7 @@ constant uint DQ_QK_K = 256u;
 constant uint DQ_K_SCALE_SIZE = 12u;
 constant uint DQ_QK4_NL = 32u;
 constant uint DQ_QK_MXFP4 = 32u;
-constant uint DQ_QK_NVFP4 = 16u;
+constant uint DQ_QK_NVFP4 = 64u;
 
 constant uint IQ_GRID_OFF_KMASK     = 0u;
 constant uint IQ_GRID_OFF_KSIGNS    = 8u;
@@ -160,7 +161,8 @@ kernel void dequant_gguf(
         && scheme_id != 19u && scheme_id != 20u
         && scheme_id != 21u && scheme_id != 22u && scheme_id != 23u
         && scheme_id != 24u && scheme_id != 25u && scheme_id != 28u
-        && scheme_id != 29u && scheme_id != 30u && scheme_id != 31u) {
+        && scheme_id != 29u && scheme_id != 30u && scheme_id != 31u
+        && scheme_id != 32u) {
         device float* dst = arena + dst_f32_off + gid * DQ_QK_K;
 
         if (scheme_id == 3u) {
@@ -740,6 +742,19 @@ kernel void dequant_gguf(
         return;
     }
 
+    if (scheme_id == 32u) {
+        // ggml Q2_0: f16 d | 16 two-bit bytes (18 bytes / 64 elements).
+        uint off = gid * 18u;
+        float d = dq_read_f16(w_base, off);
+        device const uchar* qs = w_base + off + 2u;
+        device float* dst = arena + dst_f32_off + gid * 64u;
+        for (uint j = 0u; j < 64u; ++j) {
+            uint q = (uint(qs[j >> 2u]) >> ((j & 3u) * 2u)) & 3u;
+            dst[j] = float(int(q) - 1) * d;
+        }
+        return;
+    }
+
     if (scheme_id == 30u || scheme_id == 31u) {
         // FP8 block (HF fp8 / DeepSeek-V3): f32 scale | 128 codes (132 bytes /
         // 128 elems), E4M3 (30) or E5M2 (31); see `fp8_dec`.
@@ -890,40 +905,41 @@ kernel void dequant_gguf(
         device float* dst = arena + dst_f32_off + gid * DQ_QK_MXFP4;
         for (uint j = 0u; j < DQ_QK_MXFP4 / 2u; ++j) {
             uchar bx = qs[j];
-            dst[2u * j] = s * FP4[bx & 0x0Fu];
-            dst[2u * j + 1u] = s * FP4[bx >> 4];
+            dst[j] = s * FP4[bx & 0x0Fu];
+            dst[j + DQ_QK_MXFP4 / 2u] = s * FP4[bx >> 4];
         }
         return;
     }
 
-    // ── 16-elem block schemes: NVFP4 ──────────────────────────────
+    // ── 64-elem block schemes: NVFP4 ──────────────────────────────
     if (scheme_id == 11u) {
-        // NVFP4: E4M3 scale + 8 nibbles = 9 bytes / 16 elements.
+        // NVFP4 (ggml block_nvfp4): 4 UE4M3 scales + 32 nibble bytes = 36
+        // bytes / 64 elements. Sub-block s: byte 8s+j holds 16s+j (low) and
+        // 16s+j+8 (high). UE4M3: 0 and 0x7F are 0, the sign bit is ignored.
         const float FP4[16] = {
             0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
             -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
         };
-        uint off = gid * 9u;
-        uchar e = w_base[off];
-        // Inline E4M3 decode.
-        float s;
-        uint sign_b = (uint(e) >> 7) & 1u;
-        uint exp_v = (uint(e) >> 3) & 0x0Fu;
-        uint mant = uint(e) & 0x7u;
-        if (exp_v == 0u) {
-            s = (mant == 0u) ? 0.0f : (float(mant) / 8.0f) * exp2(-6.0f);
-        } else if (exp_v == 0x0Fu && mant == 0x7u) {
-            s = 0.0f;
-        } else {
-            s = (1.0f + float(mant) / 8.0f) * exp2(float(int(exp_v) - 7));
-        }
-        if (sign_b != 0u) s = -s;
-        device const uchar* qs = w_base + off + 1u;
+        uint off = gid * 36u;
+        device const uchar* qs = w_base + off + 4u;
         device float* dst = arena + dst_f32_off + gid * DQ_QK_NVFP4;
-        for (uint j = 0u; j < DQ_QK_NVFP4 / 2u; ++j) {
-            uchar bx = qs[j];
-            dst[2u * j] = s * FP4[bx & 0x0Fu];
-            dst[2u * j + 1u] = s * FP4[bx >> 4];
+        for (uint sb = 0u; sb < 4u; ++sb) {
+            uint e = uint(w_base[off + sb]);
+            uint exp_v = (e >> 3) & 0x0Fu;
+            uint mant = e & 0x7u;
+            float s;
+            if (e == 0u || e == 0x7Fu) {
+                s = 0.0f;
+            } else if (exp_v == 0u) {
+                s = float(mant) * exp2(-9.0f);
+            } else {
+                s = (1.0f + float(mant) / 8.0f) * exp2(float(int(exp_v) - 7));
+            }
+            for (uint j = 0u; j < 8u; ++j) {
+                uchar bx = qs[sb * 8u + j];
+                dst[sb * 16u + j] = s * FP4[bx & 0x0Fu];
+                dst[sb * 16u + j + 8u] = s * FP4[bx >> 4];
+            }
         }
         return;
     }

@@ -29,8 +29,10 @@
 //!   (Sterbenz). Inputs beyond `2^±60` are scaled by `2^∓100` so the remainders
 //!   neither underflow nor overflow, and the root is scaled back by `2^±50`.
 //!
-//! * `rlx_exp`: Cody–Waite reduction `x = n·ln2 + r` (ln2 split in two, each
-//!   step one `fma`), Cephes' degree-5 polynomial in `fma`s, and `ldexp`.
+//! * `rlx_exp`: Cody–Waite reduction `x = n·ln2 + r` (ln2 split in two: the
+//!   high product `n·ln2_hi` exact in integers, the low step one `fma` — two
+//!   nested `fma(n, …)` were folded into one by AMD's Vulkan compiler, up to
+//!   4 ULP), Cephes' degree-5 polynomial in `fma`s, and `ldexp`.
 //!   Within 1 ULP of the correctly rounded value, 99% of it exactly. The
 //!   builtin `exp` is not used because its rounding depends on the compiler's
 //!   math mode: native wgpu compiles Metal in Apple's fast math, Chrome (Dawn)

@@ -84,6 +84,7 @@ mod interop;
 pub mod lowp;
 #[cfg(feature = "eval")]
 mod model;
+mod moe;
 /// Data parallelism across the devices of one machine (GPU + NPU + CPU).
 #[cfg(feature = "optim")]
 pub mod parallel;

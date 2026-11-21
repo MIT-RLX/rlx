@@ -109,6 +109,14 @@ impl RocmExecutable {
         } else {
             0
         };
+        let gn_stats_scratch = group_norm_stats_bytes(&graph);
+        let gn_stats_scratch_off = if gn_stats_scratch > 0 {
+            let aligned = plan.arena_size.div_ceil(16) * 16;
+            plan.arena_size = aligned + gn_stats_scratch;
+            aligned
+        } else {
+            0
+        };
         // Arena addressing is 64-bit on the host side now: every `*_byte_off` in
         // `Step` is `u64` and every construction site casts `arena.offset(..)`
         // to `u64`, so nothing truncates before launch. That was the bug that
@@ -280,7 +288,54 @@ impl RocmExecutable {
                 }
             }
         }
+        // `Op::Expand` read only by real `Op::Binary`s is not materialised:
+        // each Binary becomes a `BinaryBroadcast` over the Expand's input (the
+        // arena keeps that input live; see `arena.rs`). SynthSeg 2.0 at 160^3
+        // spent 280 ms in 63 such Expands. `RLX_ROCM_NO_BCAST_BINARY=1` keeps
+        // them.
+        let elide_expand: std::collections::HashSet<NodeId> =
+            if rlx_ir::env::flag("RLX_ROCM_NO_BCAST_BINARY") {
+                std::collections::HashSet::new()
+            } else {
+                let outputs: std::collections::HashSet<NodeId> =
+                    graph.outputs.iter().copied().collect();
+                let mut binary_only: HashMap<NodeId, bool> = HashMap::new();
+                for n in graph.nodes() {
+                    let real_binary =
+                        matches!(n.op, Op::Binary(_)) && !n.shape.dtype().is_complex();
+                    for &i in &n.inputs {
+                        let e = binary_only.entry(i).or_insert(true);
+                        *e = *e && real_binary;
+                    }
+                }
+                graph
+                    .nodes()
+                    .iter()
+                    .filter(|n| matches!(n.op, Op::Expand { .. }) && !outputs.contains(&n.id))
+                    .filter(|n| n.shape.dtype() == rlx_ir::DType::F32)
+                    .filter(|n| binary_only.get(&n.id).copied().unwrap_or(false))
+                    .map(|n| n.id)
+                    .collect()
+            };
+        // Activations folded into the group norm before them (`act` on
+        // `Step::GroupNorm`); `RLX_GPU_NO_GROUP_NORM_ACT_FOLD=1` keeps them.
+        let gn_act: HashMap<NodeId, rlx_opt::memory::GroupNormActivation> =
+            if rlx_ir::env::flag("RLX_GPU_NO_GROUP_NORM_ACT_FOLD") {
+                HashMap::new()
+            } else {
+                rlx_opt::memory::adjacent_group_norm_activations(&graph)
+                    .into_iter()
+                    .map(|f| (f.norm, f))
+                    .collect()
+            };
+        let gn_act_folded: std::collections::HashSet<NodeId> = gn_act
+            .values()
+            .flat_map(|f| f.folded.iter().copied())
+            .collect();
         for node in graph.nodes() {
+            if gn_act_folded.contains(&node.id) {
+                continue;
+            }
             let elems = node.shape.num_elements().unwrap_or(0) as u32;
             match &node.op {
                 Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => continue,
@@ -642,12 +697,57 @@ impl RocmExecutable {
                         });
                         continue;
                     }
-                    schedule.push(Step::Binary {
+                    let (a_id, b_id) = (node.inputs[0], node.inputs[1]);
+                    if !elide_expand.contains(&a_id) && !elide_expand.contains(&b_id) {
+                        schedule.push(Step::Binary {
+                            n: elems,
+                            a_off: (arena.offset(a_id) / 4) as u32,
+                            b_off: (arena.offset(b_id) / 4) as u32,
+                            c_off: (arena.offset(node.id) / 4) as u32,
+                            op: binary_op_id(*bop),
+                        });
+                        continue;
+                    }
+                    // Read an elided Expand's source through broadcast strides
+                    // (0 on its size-1 axes); other operands are out-shaped.
+                    let out_dims: Vec<u32> = node
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static() as u32)
+                        .collect();
+                    let resolve = |id: NodeId| -> (NodeId, Vec<u32>) {
+                        let base = if elide_expand.contains(&id) {
+                            graph.node(id).inputs[0]
+                        } else {
+                            id
+                        };
+                        let in_dims: Vec<usize> = graph
+                            .node(base)
+                            .shape
+                            .dims()
+                            .iter()
+                            .map(|d| d.unwrap_static())
+                            .collect();
+                        (base, broadcast_strides_for_out(&in_dims, &out_dims))
+                    };
+                    let (a_src, a_str) = resolve(a_id);
+                    let (b_src, b_str) = resolve(b_id);
+                    let rank = out_dims.len();
+                    let mut meta_data: Vec<u32> = Vec::with_capacity(3 * rank);
+                    meta_data.extend_from_slice(&out_dims);
+                    meta_data.extend_from_slice(&a_str);
+                    meta_data.extend_from_slice(&b_str);
+                    let meta_idx = meta_buffers.len();
+                    meta_buffers.push(upload_meta(&ctx, &meta_data));
+                    schedule.push(Step::BinaryBroadcast {
                         n: elems,
-                        a_off: (arena.offset(node.inputs[0]) / 4) as u32,
-                        b_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        a_off: (arena.offset(a_src) / 4) as u32,
+                        b_off: (arena.offset(b_src) / 4) as u32,
                         c_off: (arena.offset(node.id) / 4) as u32,
                         op: binary_op_id(*bop),
+                        rank: rank as u32,
+                        meta_idx,
                     });
                 }
                 Op::Activation(act) => {
@@ -1374,6 +1474,9 @@ impl RocmExecutable {
                     });
                 }
                 Op::Expand { target_shape } => {
+                    if elide_expand.contains(&node.id) {
+                        continue; // read through strides by its BinaryBroadcast readers
+                    }
                     let in_id = node.inputs[0];
                     let in_shape = graph.node(in_id).shape.dims();
                     let rank = target_shape.len();
@@ -2267,7 +2370,7 @@ impl RocmExecutable {
                         .map(|i| in_shape.dim(i).unwrap_static())
                         .product::<usize>()
                         .max(1);
-                    schedule.push(Step::ArgReduceHost {
+                    schedule.push(Step::ArgReduce {
                         src_byte_off: arena.offset(node.inputs[0]) as u64,
                         dst_byte_off: arena.offset(node.id) as u64,
                         outer: outer as u32,
@@ -2949,13 +3052,21 @@ impl RocmExecutable {
                         src_off: (arena.offset(node.inputs[0]) / 4) as u32,
                         g_off: (arena.offset(node.inputs[1]) / 4) as u32,
                         b_off: (arena.offset(node.inputs[2]) / 4) as u32,
-                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        dst_off: (arena.offset(gn_act.get(&node.id).map_or(node.id, |f| f.out)) / 4)
+                            as u32,
                         n: in_shape.dim(0).unwrap_static() as u32,
                         c: in_shape.dim(1).unwrap_static() as u32,
-                        h: in_shape.dim(2).unwrap_static() as u32,
-                        w: in_shape.dim(3).unwrap_static() as u32,
+                        // Every axis after the channels, as one plane: the
+                        // kernel reads [N, C, h*w] contiguous, and a volume's
+                        // depth was dropped when only dims 2 and 3 were read
+                        // (`rlx-cuda/tests/conv3d_net_parity.rs`).
+                        h: spatial_extent(in_shape),
+                        w: 1,
                         num_groups: *num_groups as u32,
                         eps_bits: eps.to_bits(),
+                        act: gn_act.get(&node.id).map_or(0, |f| f.act),
+                        alpha_bits: gn_act.get(&node.id).map_or(0, |f| f.alpha.to_bits()),
+                        stats_off: (gn_stats_scratch_off / 4) as u32,
                     });
                 }
                 Op::BatchNormInference { eps } => {
@@ -3024,8 +3135,8 @@ impl RocmExecutable {
                     let x_shape = &graph.node(node.inputs[0]).shape;
                     let n = x_shape.dim(0).unwrap_static() as u32;
                     let c = x_shape.dim(1).unwrap_static() as u32;
-                    let h = x_shape.dim(2).unwrap_static() as u32;
-                    let w = x_shape.dim(3).unwrap_static() as u32;
+                    // All spatial axes as one plane, as in the forward.
+                    let (h, w) = (spatial_extent(x_shape), 1);
                     let eps_bits = eps.to_bits();
                     let num_groups = *num_groups as u32;
                     match &node.op {
@@ -4390,6 +4501,8 @@ impl RocmExecutable {
             blas_lt_workspace,
             dnn,
             dnn_workspace,
+            conv_f16: false,
+            conv_half_scratch: None,
             dequant_scratch_off,
             graph,
             arena,
@@ -4430,3 +4543,36 @@ impl RocmExecutable {
         )
     }
 }
+
+/// The product of a `[N, C, ...]` shape's axes after the channels (1 for
+/// rank 2): the plane a group norm reduces over with its channels.
+fn spatial_extent(shape: &rlx_ir::Shape) -> u32 {
+    (2..shape.rank())
+        .map(|i| shape.dim(i).unwrap_static() as u32)
+        .product()
+}
+
+/// Bytes of the split group norm's statistics: (mean, M2) as f32 per (batch,
+/// group, `GN_CHUNK` chunk) of the largest `GroupNorm`. One region serves them
+/// all: the stream runs each norm's two kernels before the next norm's.
+fn group_norm_stats_bytes(graph: &rlx_ir::Graph) -> usize {
+    graph
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.op {
+            rlx_ir::Op::GroupNorm { num_groups, .. } => {
+                let s = &graph.node(node.inputs[0]).shape;
+                let g = num_groups.max(1);
+                let count = s.dim(1).unwrap_static() / g * spatial_extent(s) as usize;
+                Some(
+                    s.dim(0).unwrap_static() * g * count.div_ceil(GN_CHUNK as usize).max(1) * 2 * 4,
+                )
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// `GN_CHUNK` in `group_norm.cu`: elements of a group one block reduces.
+pub(crate) const GN_CHUNK: u32 = 8192;

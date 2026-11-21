@@ -668,7 +668,8 @@ pub struct Conv3dEpilogueFolds {
     pub read_through: HashMap<NodeId, NodeId>,
 }
 
-/// Recognise the graph-level shape of the folds. Backend-specific conditions
+/// Recognise the graph-level shape of the folds (a group norm's activation
+/// too: `Op::Activation` ReLU/SiLU or the LeakyReLU pair after `GroupNorm`). Backend-specific conditions
 /// (arena residency, kernel selection) are *not* checked here — see the note on
 /// [`Conv3dEpilogueFolds`] about which way the two sides may disagree.
 pub fn conv3d_epilogue_folds(graph: &Graph) -> Conv3dEpilogueFolds {
@@ -695,13 +696,25 @@ pub fn conv3d_epilogue_folds(graph: &Graph) -> Conv3dEpilogueFolds {
     let scalar_const = |id: NodeId| -> bool {
         matches!(&graph.node(id).op, Op::Constant { data } if data.len() == 4)
     };
+    let is_group_norm = |id: NodeId| matches!(graph.node(id).op, Op::GroupNorm { .. });
 
     for node in graph.nodes() {
-        // LeakyReLU `max(conv, alpha*conv)` absorbed into the conv's store.
+        // ReLU / SiLU absorbed into a group norm's store (rlx-metal's split
+        // group norm applies it as it writes).
+        if let Op::Activation(rlx_ir::op::Activation::Relu | rlx_ir::op::Activation::Silu) = node.op
+            && let [g] = node.inputs[..]
+            && is_group_norm(g)
+            && uses.get(&g) == Some(&1)
+            && !graph.outputs.contains(&g)
+        {
+            out.absorbed.insert(node.id, g);
+        }
+        // LeakyReLU `max(x, alpha*x)` absorbed into the store of the conv or
+        // group norm producing `x`.
         if matches!(node.op, Op::Binary(BinaryOp::Max)) && node.inputs.len() == 2 {
             for (ci, mi) in [(0usize, 1usize), (1, 0)] {
                 let (c, m) = (node.inputs[ci], node.inputs[mi]);
-                if !is_conv3d(c) {
+                if !is_conv3d(c) && !is_group_norm(c) {
                     continue;
                 }
                 let mn = graph.node(m);
@@ -724,6 +737,13 @@ pub fn conv3d_epilogue_folds(graph: &Graph) -> Conv3dEpilogueFolds {
                 out.absorbed.insert(node.id, c);
                 out.absorbed.insert(m, c);
                 break;
+            }
+        }
+        // Scores and terms a folded softmax reads after the adds would have.
+        if let Some(f) = softmax_addends(graph, &uses, node.id) {
+            out.read_through.insert(f.base, node.id);
+            for (t, _, _) in f.addends {
+                out.read_through.insert(t, node.id);
             }
         }
         // A channel-wise `Concat`, and a nearest upsample feeding it, read in
@@ -753,6 +773,235 @@ pub fn conv3d_epilogue_folds(graph: &Graph) -> Conv3dEpilogueFolds {
                     }
                 }
             }
+        }
+    }
+    out
+}
+
+/// A last-axis softmax whose input is one or two broadcast adds (through
+/// reshapes): attention's `softmax(q·kᵀ + bias + mask)`. A backend can add
+/// the terms as the softmax reads, so the adds never run.
+#[derive(Debug, Clone)]
+pub struct SoftmaxAddends {
+    /// The tensor under the adds (the scores), in the softmax's element order.
+    pub base: NodeId,
+    /// Each term and its broadcast in flat index space: element `i` of the
+    /// scores reads element `(i / (mid * post)) * post + i % post` of it.
+    pub addends: Vec<(NodeId, usize, usize)>,
+    /// The adds and the reshapes between them, which the backend skips.
+    pub folded: Vec<NodeId>,
+}
+
+/// Recognise [`SoftmaxAddends`] at softmax `sm`. `uses` counts each node's
+/// consumers. Each folded node must have one consumer and not be an output.
+pub fn softmax_addends(
+    graph: &Graph,
+    uses: &HashMap<NodeId, u32>,
+    sm: NodeId,
+) -> Option<SoftmaxAddends> {
+    let node = graph.node(sm);
+    let Op::Softmax { axis } = node.op else {
+        return None;
+    };
+    let rank = node.shape.rank();
+    if rank < 2 || !(axis == -1 || axis as usize == rank - 1) {
+        return None;
+    }
+    let dims = |id: NodeId| -> Vec<usize> {
+        let s = &graph.node(id).shape;
+        (0..s.rank()).map(|i| s.dim(i).unwrap_static()).collect()
+    };
+    let private = |id: NodeId| uses.get(&id) == Some(&1) && !graph.outputs.contains(&id);
+    let mut x = node.inputs[0];
+    let mut folded = Vec::new();
+    let mut addends = Vec::new();
+    while addends.len() < 2 {
+        let (mark, before) = (folded.len(), x);
+        while matches!(graph.node(x).op, Op::Reshape { .. }) && private(x) {
+            folded.push(x);
+            x = graph.node(x).inputs[0];
+        }
+        let n = graph.node(x);
+        let is_add = matches!(n.op, Op::Binary(rlx_ir::op::BinaryOp::Add))
+            && n.inputs.len() == 2
+            && private(x);
+        let split = is_add
+            .then(|| {
+                let out = dims(x);
+                [(0usize, 1usize), (1, 0)].into_iter().find_map(|(fi, bi)| {
+                    let (f, b) = (n.inputs[fi], n.inputs[bi]);
+                    (dims(f) == out).then_some(())?;
+                    let bd = dims(b);
+                    if bd.len() > out.len() {
+                        return None;
+                    }
+                    let mut padded = vec![1usize; out.len() - bd.len()];
+                    padded.extend(bd);
+                    // One contiguous run of broadcast axes (or none).
+                    let diff: Vec<usize> =
+                        (0..out.len()).filter(|&j| padded[j] != out[j]).collect();
+                    if diff.iter().any(|&j| padded[j] != 1) {
+                        return None;
+                    }
+                    let (mid, post) = match (diff.first(), diff.last()) {
+                        (Some(&j0), Some(&j1)) => {
+                            if j1 - j0 + 1 != diff.len() {
+                                return None;
+                            }
+                            (
+                                out[j0..=j1].iter().product(),
+                                out[j1 + 1..].iter().product(),
+                            )
+                        }
+                        _ => (1, out.iter().product()),
+                    };
+                    Some((f, b, mid, post))
+                })
+            })
+            .flatten();
+        let Some((f, b, mid, post)) = split else {
+            folded.truncate(mark);
+            x = before;
+            break;
+        };
+        folded.push(x);
+        addends.push((b, mid, post));
+        x = f;
+    }
+    let numel = |id: NodeId| graph.node(id).shape.num_elements();
+    (!addends.is_empty() && numel(x) == numel(sm)).then_some(SoftmaxAddends {
+        base: x,
+        addends,
+        folded,
+    })
+}
+
+/// A group norm whose activation a backend applies as the norm writes its
+/// output, with nothing scheduled between them — so the fold needs no help
+/// from the memory planner: the activation's buffer is not read or written
+/// by any other step while the norm writes it early, and if the planner gave
+/// it the norm's input slot, the apply pass reads and writes each element at
+/// the same index. (rlx-metal folds more generally, with
+/// [`conv3d_epilogue_folds`] and its own planner.)
+#[derive(Debug, Clone)]
+pub struct GroupNormActivation {
+    /// The `GroupNorm`.
+    pub norm: NodeId,
+    /// 1 ReLU, 2 LeakyReLU (`alpha`), 3 SiLU.
+    pub act: u32,
+    pub alpha: f32,
+    /// The node whose buffer the norm writes: the activation's result.
+    pub out: NodeId,
+    /// The activation's nodes, which the backend skips.
+    pub folded: Vec<NodeId>,
+}
+
+/// Every [`GroupNormActivation`] of `graph`: `GroupNorm` → ReLU / SiLU, or
+/// → `max(x, alpha * x)` with `alpha` in [0, 1), the norm (and the `Mul`)
+/// read by nothing else and not outputs, and only `Constant` / `Param` nodes
+/// (no steps) and single-reader same-dtype `Cast`s (no-ops) in between in
+/// graph order.
+pub fn adjacent_group_norm_activations(graph: &Graph) -> Vec<GroupNormActivation> {
+    use rlx_ir::op::{Activation, BinaryOp};
+    let mut uses: HashMap<NodeId, u32> = HashMap::new();
+    for n in graph.nodes() {
+        for &i in &n.inputs {
+            *uses.entry(i).or_insert(0) += 1;
+        }
+    }
+    let nodes = graph.nodes();
+    let free = |id: NodeId| !graph.outputs.contains(&id);
+    let scalar = |id: NodeId| match &graph.node(id).op {
+        Op::Constant { data }
+            if data.len() == 4 && graph.node(id).shape.dtype() == rlx_ir::DType::F32 =>
+        {
+            Some(f32::from_le_bytes([data[0], data[1], data[2], data[3]]))
+        }
+        _ => None,
+    };
+    // The next node from `i` that runs a step.
+    let next_step = |mut i: usize| {
+        while i < nodes.len() && matches!(nodes[i].op, Op::Constant { .. } | Op::Param { .. }) {
+            i += 1;
+        }
+        (i < nodes.len()).then_some(i)
+    };
+    let index: HashMap<NodeId, usize> = nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
+    let mut out = Vec::new();
+    for (i, g0) in nodes.iter().enumerate() {
+        if !matches!(g0.op, Op::GroupNorm { .. }) || !free(g0.id) {
+            continue;
+        }
+        // Look through same-dtype `Cast`s with one reader: no-ops (an f16
+        // policy's casts, once a backend runs the graph in f32). The
+        // activation then reads the last of them.
+        let mut g = g0;
+        let mut i = i;
+        while uses.get(&g.id) == Some(&1)
+            && let Some(j) = next_step(i + 1)
+            && let Op::Cast { to } = nodes[j].op
+            && nodes[j].inputs[..] == [g.id]
+            && to == g.shape.dtype()
+            && free(nodes[j].id)
+        {
+            g = &nodes[j];
+            i = index[&g.id];
+        }
+        let Some(j) = next_step(i + 1) else { continue };
+        let a = &nodes[j];
+        if let Op::Activation(act @ (Activation::Relu | Activation::Silu)) = a.op
+            && a.inputs[..] == [g.id]
+            && uses.get(&g.id) == Some(&1)
+            && a.shape == g.shape
+        {
+            let act = if matches!(act, Activation::Relu) {
+                1
+            } else {
+                3
+            };
+            out.push(GroupNormActivation {
+                norm: g0.id,
+                act,
+                alpha: 0.0,
+                out: a.id,
+                folded: vec![a.id],
+            });
+            continue;
+        }
+        // LeakyReLU: Mul(g, alpha), then Max(g, that), either operand order.
+        if !matches!(a.op, Op::Binary(BinaryOp::Mul))
+            || a.inputs.len() != 2
+            || uses.get(&g.id) != Some(&2)
+        {
+            continue;
+        }
+        let Some(alpha) = (if a.inputs[0] == g.id {
+            scalar(a.inputs[1])
+        } else if a.inputs[1] == g.id {
+            scalar(a.inputs[0])
+        } else {
+            None
+        }) else {
+            continue;
+        };
+        let Some(k) = next_step(j + 1) else { continue };
+        let m = &nodes[k];
+        let pair =
+            m.inputs.len() == 2 && (m.inputs[..] == [g.id, a.id] || m.inputs[..] == [a.id, g.id]);
+        if matches!(m.op, Op::Binary(BinaryOp::Max))
+            && pair
+            && (0.0..1.0).contains(&alpha)
+            && uses.get(&a.id) == Some(&1)
+            && free(a.id)
+            && m.shape == g.shape
+        {
+            out.push(GroupNormActivation {
+                norm: g0.id,
+                act: 2,
+                alpha,
+                out: m.id,
+                folded: vec![a.id, m.id],
+            });
         }
     }
     out
@@ -1054,19 +1303,40 @@ pub fn is_static_weight_tensor(
         | Op::Activation(_)
         | Op::Concat { .. } => {
             !node.inputs.is_empty()
+                && !broadcasts(graph, node)
                 && node
                     .inputs
                     .iter()
                     .all(|&inp| is_static_weight_tensor(graph, inp, memo))
         }
-        Op::Binary(_) | Op::Where | Op::Fma => node
-            .inputs
-            .iter()
-            .all(|&inp| is_static_weight_tensor(graph, inp, memo)),
+        Op::Binary(_) | Op::Where | Op::Fma => {
+            !broadcasts(graph, node)
+                && node
+                    .inputs
+                    .iter()
+                    .all(|&inp| is_static_weight_tensor(graph, inp, memo))
+        }
         _ => false,
     };
     memo.insert(id, v);
     v
+}
+
+/// A node larger than its inputs together: a broadcast (an `Expand`, or a
+/// `Binary` of broadcast operands). Built from weights alone it is still not
+/// a weight pack: pinned for the whole run it costs its full size to save
+/// one cheap pass. SynthSeg's per-layer bias broadcasts and its upsample's
+/// zero tensor, each the size of an activation, took the CUDA arena from
+/// 3.0 to 8.9 GiB (the robust cascade to 19.8 GiB, past a 12 GB card).
+fn broadcasts(graph: &Graph, node: &rlx_ir::Node) -> bool {
+    let elems = |id: NodeId| graph.node(id).shape.num_elements();
+    match (
+        node.shape.num_elements(),
+        node.inputs.iter().map(|&i| elems(i)).sum::<Option<usize>>(),
+    ) {
+        (Some(out), Some(ins)) => out > ins,
+        _ => false,
+    }
 }
 
 /// Whether the active backend defers Expand/Concat/Transpose/Narrow to the host.
@@ -2602,6 +2872,51 @@ fn plan_memory_aligned_inner(
 mod schedule_hazard_tests {
     use super::*;
 
+    /// `adjacent_group_norm_activations`: ReLU right after a norm, a
+    /// LeakyReLU pair with its constant in between, and a ReLU behind a no-op
+    /// cast fold; a norm read twice does not.
+    #[test]
+    fn group_norm_activations_fold_only_when_adjacent_and_private() {
+        use rlx_ir::{DType, GraphExt, Shape};
+        let mut g = Graph::new("gn_act");
+        let x = g.input("x", Shape::new(&[1, 8, 4, 4, 4], DType::F32));
+        let (gm, bt) = (
+            g.param("g", Shape::new(&[8], DType::F32)),
+            g.param("b", Shape::new(&[8], DType::F32)),
+        );
+        let n1 = g.group_norm(x, gm, bt, 2, 1e-5);
+        let r = g.relu(n1);
+        let n2 = g.group_norm(r, gm, bt, 2, 1e-5);
+        let k = g.constant(0.01, DType::F32);
+        let m = g.mul(n2, k);
+        let dims = g.shape(n2).clone();
+        let l = g.binary(rlx_ir::op::BinaryOp::Max, n2, m, dims);
+        let n3 = g.group_norm(l, gm, bt, 2, 1e-5);
+        let r3 = g.relu(n3);
+        let y = g.add(r3, n3);
+        // Through a no-op cast (what an f16 policy leaves once run in f32).
+        let n4 = g.group_norm(y, gm, bt, 2, 1e-5);
+        let c4 = g.add_node(Op::Cast { to: DType::F32 }, vec![n4], g.shape(n4).clone());
+        let r4 = g.relu(c4);
+        g.set_outputs(vec![r4]);
+        let folds = adjacent_group_norm_activations(&g);
+        let by_norm: HashMap<NodeId, &GroupNormActivation> =
+            folds.iter().map(|f| (f.norm, f)).collect();
+        assert_eq!(folds.len(), 3, "{folds:?}");
+        assert_eq!((by_norm[&n4].act, by_norm[&n4].out), (1, r4));
+        assert_eq!((by_norm[&n1].act, by_norm[&n1].out), (1, r));
+        assert_eq!(
+            (
+                by_norm[&n2].act,
+                by_norm[&n2].out,
+                by_norm[&n2].folded.clone()
+            ),
+            (2, l, vec![m, l])
+        );
+        assert!((by_norm[&n2].alpha - 0.01).abs() < 1e-7);
+        assert!(!by_norm.contains_key(&n3), "n3 is also read by the add");
+    }
+
     fn r(off: usize, len: usize) -> ByteRange {
         ByteRange { off, len }
     }
@@ -2780,6 +3095,51 @@ mod schedule_hazard_tests {
 mod tests {
     use super::*;
     use rlx_ir::*;
+
+    /// A concat of weights is a pack; a weight broadcast to an activation's
+    /// size, or an add of such broadcasts, is not.
+    #[test]
+    fn broadcast_of_weights_is_not_a_static_pack() {
+        let mut g = Graph::new("packs");
+        let a = g.param("a", Shape::new(&[4, 8], DType::F32));
+        let b = g.param("b", Shape::new(&[4, 8], DType::F32));
+        let pack = g.add_node(
+            Op::Concat { axis: 0 },
+            vec![a, b],
+            Shape::new(&[8, 8], DType::F32),
+        );
+        let bias = g.param("bias", Shape::new(&[1, 8], DType::F32));
+        let wide = g.add_node(
+            Op::Expand {
+                target_shape: vec![64, 8],
+            },
+            vec![bias],
+            Shape::new(&[64, 8], DType::F32),
+        );
+        let zero = g.add_node(
+            Op::Expand {
+                target_shape: vec![64, 8],
+            },
+            vec![bias],
+            Shape::new(&[64, 8], DType::F32),
+        );
+        let sum = g.add_node(
+            Op::Binary(BinaryOp::Add),
+            vec![wide, zero],
+            Shape::new(&[64, 8], DType::F32),
+        );
+        let bcast = g.add_node(
+            Op::Binary(BinaryOp::Add),
+            vec![bias, pack],
+            Shape::new(&[8, 8], DType::F32),
+        );
+        let mut memo = HashMap::new();
+        assert!(is_static_weight_tensor(&g, pack, &mut memo));
+        assert!(!is_static_weight_tensor(&g, wide, &mut memo));
+        assert!(!is_static_weight_tensor(&g, sum, &mut memo));
+        // [1, 8] + [8, 8]: no larger than its operands together
+        assert!(is_static_weight_tensor(&g, bcast, &mut memo));
+    }
 
     #[test]
     fn arena_width_policies_size_slots() {

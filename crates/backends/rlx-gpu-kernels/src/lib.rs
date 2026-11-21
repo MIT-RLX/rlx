@@ -331,6 +331,8 @@ pub const CONV2D_BACKWARD_INPUT_CU: &str = include_str!("../kernels/conv2d_backw
 pub const CONV2D_BACKWARD_WEIGHT_CU: &str = include_str!("../kernels/conv2d_backward_weight.cu");
 pub const IM2COL_CU: &str = include_str!("../kernels/im2col.cu");
 pub const CONV3D_CU: &str = include_str!("../kernels/conv3d.cu");
+/// RDNA3 (gfx11) WMMA 3-D convolution, f16 products, f32 accumulation. HIP only.
+pub const CONV3D_WMMA_HIP: &str = include_str!("../kernels/conv3d_wmma.hip");
 pub const CONV3D_BACKWARD_INPUT_CU: &str = include_str!("../kernels/conv3d_backward_input.cu");
 pub const CONV3D_BACKWARD_WEIGHT_CU: &str = include_str!("../kernels/conv3d_backward_weight.cu");
 pub const CONV_TRANSPOSE3D_CU: &str = include_str!("../kernels/conv_transpose3d.cu");

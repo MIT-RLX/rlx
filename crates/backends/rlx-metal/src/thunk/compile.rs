@@ -693,6 +693,148 @@ impl ThunkSchedule {
             (fold, folded)
         };
 
+        // The activation after a group norm, folded into its store: the split
+        // group norm's apply kernel already holds each value in a register.
+        // ReLU or SiLU (`Op::Activation`), or LeakyReLU as `max(x, alpha*x)`.
+        // Map: group norm id → (act code, alpha, the node whose slot it
+        // writes); `folded_gn_act`: the activation nodes, which become Nops.
+        // `RLX_METAL_NO_GROUP_NORM_ACT_FOLD=1` keeps them separate.
+        let (gn_act_fold, folded_gn_act): (
+            std::collections::HashMap<NodeId, (u32, f32, NodeId)>,
+            std::collections::HashSet<NodeId>,
+        ) = {
+            let mut fold = std::collections::HashMap::new();
+            let mut folded = std::collections::HashSet::new();
+            let disabled = !folds_enabled || rlx_ir::env::flag("RLX_METAL_NO_GROUP_NORM_ACT_FOLD");
+            let mut uses: std::collections::HashMap<NodeId, u32> = std::collections::HashMap::new();
+            for node in graph.nodes() {
+                for &inp in &node.inputs {
+                    *uses.entry(inp).or_insert(0) += 1;
+                }
+            }
+            let is_gn = |id: NodeId| matches!(graph.node(id).op, Op::GroupNorm { .. });
+            let free = |id: NodeId| !graph.outputs.contains(&id);
+            let slot_ok = |id: NodeId| {
+                let o = off(id);
+                o != usize::MAX && !is_weight_off(o)
+            };
+            let same = |a: NodeId, b: NodeId| graph.node(a).shape == graph.node(b).shape;
+            for node in graph.nodes() {
+                if disabled {
+                    break;
+                }
+                // ReLU / SiLU.
+                if let Op::Activation(
+                    act @ (rlx_ir::op::Activation::Relu | rlx_ir::op::Activation::Silu),
+                ) = &node.op
+                    && let [g] = node.inputs[..]
+                    && is_gn(g)
+                    && uses.get(&g) == Some(&1)
+                    && free(g)
+                    && same(g, node.id)
+                    && slot_ok(node.id)
+                    && planned_folds.absorbed.get(&node.id) == Some(&g)
+                    && !fold.contains_key(&g)
+                {
+                    let code = if matches!(act, rlx_ir::op::Activation::Relu) {
+                        1
+                    } else {
+                        3
+                    };
+                    fold.insert(g, (code, 0.0, node.id));
+                    folded.insert(node.id);
+                    continue;
+                }
+                // LeakyReLU: max(g, alpha*g), either operand order.
+                if !matches!(node.op, Op::Binary(BinaryOp::Max)) || node.inputs.len() != 2 {
+                    continue;
+                }
+                for (gi, mi) in [(0usize, 1usize), (1, 0)] {
+                    let (g, m_id) = (node.inputs[gi], node.inputs[mi]);
+                    if !is_gn(g) || fold.contains_key(&g) {
+                        continue;
+                    }
+                    let m = graph.node(m_id);
+                    if !matches!(m.op, Op::Binary(BinaryOp::Mul)) || m.inputs.len() != 2 {
+                        continue;
+                    }
+                    let k_id = if m.inputs[0] == g {
+                        m.inputs[1]
+                    } else if m.inputs[1] == g {
+                        m.inputs[0]
+                    } else {
+                        continue;
+                    };
+                    let kn = graph.node(k_id);
+                    let Op::Constant { data } = &kn.op else {
+                        continue;
+                    };
+                    if data.len() != 4 || kn.shape.dtype() != DType::F32 {
+                        continue;
+                    }
+                    let alpha = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    if !(0.0..1.0).contains(&alpha)
+                        || uses.get(&g) != Some(&2)
+                        || uses.get(&m_id) != Some(&1)
+                        || !free(g)
+                        || !free(m_id)
+                        || !same(g, node.id)
+                        || !slot_ok(node.id)
+                        || planned_folds.absorbed.get(&node.id) != Some(&g)
+                        || planned_folds.absorbed.get(&m_id) != Some(&g)
+                    {
+                        continue;
+                    }
+                    fold.insert(g, (2, alpha, node.id));
+                    folded.insert(m_id);
+                    folded.insert(node.id);
+                    break;
+                }
+            }
+            (fold, folded)
+        };
+        let gn_stats_at = crate::thunk::group_norm_stats_layout(graph).1;
+
+        // Attention's bias / mask adds folded into the softmax that reads
+        // them (`softmax_lastax_add*`): the scores are read once instead of
+        // through one full pass an add. Recognised by the planner's own
+        // `softmax_addends`, so liveness agrees; checked here for dtype and
+        // arena residency. `RLX_METAL_NO_SOFTMAX_ADD_FOLD=1` keeps the adds.
+        let (softmax_fold, folded_softmax_adds): (
+            std::collections::HashMap<NodeId, rlx_opt::memory::SoftmaxAddends>,
+            std::collections::HashSet<NodeId>,
+        ) = {
+            let mut fold = std::collections::HashMap::new();
+            let mut folded = std::collections::HashSet::new();
+            if folds_enabled && !rlx_ir::env::flag("RLX_METAL_NO_SOFTMAX_ADD_FOLD") {
+                let mut uses: std::collections::HashMap<NodeId, u32> =
+                    std::collections::HashMap::new();
+                for node in graph.nodes() {
+                    for &inp in &node.inputs {
+                        *uses.entry(inp).or_insert(0) += 1;
+                    }
+                }
+                for node in graph.nodes() {
+                    let Some(f) = rlx_opt::memory::softmax_addends(graph, &uses, node.id) else {
+                        continue;
+                    };
+                    let dt = node.shape.dtype();
+                    let ok =
+                        |id: NodeId| graph.node(id).shape.dtype() == dt && off(id) != usize::MAX;
+                    if !matches!(dt, DType::F32 | DType::F16)
+                        || !ok(f.base)
+                        || f.addends.iter().any(|&(t, _, _)| !ok(t))
+                        || planned_folds.read_through.get(&f.base) != Some(&node.id)
+                    {
+                        continue;
+                    }
+                    folded.extend(f.folded.iter().copied());
+                    fold.insert(node.id, f);
+                }
+            }
+            (fold, folded)
+        };
+
         // `RLX_METAL_FOLD_AUDIT=1`: for every fold, report whether the byte
         // range it touches outside the plan's expectation belongs to a node the
         // planner believes is live at that moment. The plan is self-consistent
@@ -798,6 +940,16 @@ impl ThunkSchedule {
             }
             // Read in place by the consuming conv3d's gather.
             if folded_concat.contains(&node.id) {
+                thunks.push(Thunk::Nop);
+                continue;
+            }
+            // Added by the consuming softmax as it reads.
+            if folded_softmax_adds.contains(&node.id) {
+                thunks.push(Thunk::Nop);
+                continue;
+            }
+            // Folded into the producing group norm's store.
+            if folded_gn_act.contains(&node.id) {
                 thunks.push(Thunk::Nop);
                 continue;
             }
@@ -1418,11 +1570,18 @@ impl ThunkSchedule {
                     for i in 2..rank {
                         spatial *= in_shape.dim(i).unwrap_static() as u32;
                     }
+                    let (act, alpha, dst) = gn_act_fold
+                        .get(&node.id)
+                        .copied()
+                        .unwrap_or((0, 0.0, node.id));
                     Thunk::GroupNorm {
                         src: off(node.inputs[0]),
                         g: off(node.inputs[1]),
                         b: off(node.inputs[2]),
-                        dst: off(node.id),
+                        dst: off(dst),
+                        stats: gn_stats_at[&node.id],
+                        act,
+                        alpha,
                         n: in_shape.dim(0).unwrap_static() as u32,
                         c: in_shape.dim(1).unwrap_static() as u32,
                         h: spatial,
@@ -2435,22 +2594,37 @@ impl ThunkSchedule {
                     let total = node.shape.num_elements().unwrap();
                     let in_off = off(node.inputs[0]);
                     let out_off = off(node.id);
-                    // f32 has an out-of-place kernel (`softmax_lastax_out`,
-                    // bit-identical to Copy + in-place). The f16 kernel is
-                    // in-place only: when the planner doesn't alias input and
-                    // output, prepend a Copy so it sees the input data.
                     let dt: HalfFlag = node.shape.dtype().into();
-                    let src = if in_off != out_off && dt == HalfFlag::F16 {
-                        thunks.push(Thunk::Copy {
-                            src: in_off,
+                    let rows = (total / cols) as u32;
+                    // Folded addends, or f16 out of place (the in-place f16
+                    // kernel used to need a Copy in front): `softmax_lastax_add*`.
+                    if let Some(f) = softmax_fold.get(&node.id) {
+                        let mut adds = [None; 2];
+                        for (slot, &(t, mid, post)) in f.addends.iter().enumerate() {
+                            adds[slot] = Some((off(t), mid as u32, post as u32));
+                        }
+                        thunks.push(Thunk::SoftmaxAdd {
+                            src: off(f.base),
                             dst: out_off,
-                            len: total as u32,
+                            rows,
+                            cols: cols as u32,
+                            adds,
                             dt,
                         });
-                        out_off
-                    } else {
-                        in_off
-                    };
+                        continue;
+                    }
+                    if in_off != out_off && dt == HalfFlag::F16 {
+                        thunks.push(Thunk::SoftmaxAdd {
+                            src: in_off,
+                            dst: out_off,
+                            rows,
+                            cols: cols as u32,
+                            adds: [None; 2],
+                            dt,
+                        });
+                        continue;
+                    }
+                    let src = in_off;
                     Thunk::Softmax {
                         src,
                         data: out_off,
@@ -2935,6 +3109,7 @@ impl ThunkSchedule {
                         slab_bytes: slab_bytes as u32,
                         scheme: *scheme,
                         scale_bf16: scales_shape.dtype() == rlx_ir::DType::BF16,
+                        scale_f32: scales_shape.dtype() == rlx_ir::DType::F32,
                     }
                 }
 

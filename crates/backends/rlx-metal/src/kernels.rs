@@ -1547,22 +1547,28 @@ kernel void sgemm_simd_4x4(
 // grid z. `strides` = per-matrix element strides of (A, B, C); 0 broadcasts
 // matrix 0. Same tile math as `sgemm_simd_4x4` — replaces `batch` separate MPS
 // encodes, which dominated many-head attention (B*H tiny matmuls per call).
+// `T` is the storage type: half tiles and half MMA operands, float
+// accumulators; `stage` (16 x 64 floats) holds an 8x8 output tile on its
+// way to memory — the f32 kernels pass `A_tg`, half ones a buffer of their
+// own (a float matrix cannot be stored into half memory directly).
+template <typename T>
 inline void bmm_simd_4x4_tile(
-    device const float* A,
-    device const float* B,
-    device float* C,
+    device const T* A,
+    device const T* B,
+    device T* C,
     uint M, uint K, uint N,
     uint3 tgid, uint sgid, uint slid,
-    threadgroup float* A_tg,
-    threadgroup float* B_tg
+    threadgroup T* A_tg,
+    threadgroup T* B_tg,
+    threadgroup float* stage_all
 ) {
     uint sg_row = sgid / 4;
     uint sg_col = sgid % 4;
     uint tg_row_base = tgid.y * 32;
     uint tg_col_base = tgid.x * 32;
 
-    simdgroup_float8x8 a, b, c;
-    c = simdgroup_float8x8(0.0f);
+    simdgroup_matrix<T, 8, 8> a, b;
+    simdgroup_float8x8 c = simdgroup_float8x8(0.0f);
 
     for (uint kk = 0; kk < K; kk += 32) {
         uint linear = sgid * 32 + slid;
@@ -1570,13 +1576,13 @@ inline void bmm_simd_4x4_tile(
             uint idx = i * 512 + linear;
             uint ar = tg_row_base + idx / 32;
             uint ac = kk + idx % 32;
-            A_tg[idx] = (ar < M && ac < K) ? A[ar * K + ac] : 0.0f;
+            A_tg[idx] = (ar < M && ac < K) ? A[ar * K + ac] : T(0);
         }
         for (uint i = 0; i < 2; ++i) {
             uint idx = i * 512 + linear;
             uint br = kk + idx / 32;
             uint bc = tg_col_base + idx % 32;
-            B_tg[idx] = (br < K && bc < N) ? B[br * N + bc] : 0.0f;
+            B_tg[idx] = (br < K && bc < N) ? B[br * N + bc] : T(0);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint k_inner = 0; k_inner < 32; k_inner += 8) {
@@ -1589,11 +1595,11 @@ inline void bmm_simd_4x4_tile(
 
     uint out_row = tg_row_base + sg_row * 8;
     uint out_col = tg_col_base + sg_col * 8;
-    if (out_row + 8u <= M && out_col + 8u <= N) {
-        simdgroup_store(c, &C[out_row * N + out_col], N);
+    if (is_same<T, float>::value && out_row + 8u <= M && out_col + 8u <= N) {
+        simdgroup_store(c, reinterpret_cast<device float*>(&C[out_row * N + out_col]), N);
     } else if (out_row < M && out_col < N) {
-        // Masked edge store — see `sgemm_simd_4x4`.
-        threadgroup float* stage = &A_tg[sgid * 64];
+        // Masked edge store (and every half store) — see `sgemm_simd_4x4`.
+        threadgroup float* stage = &stage_all[sgid * 64];
         simdgroup_store(c, stage, 8);
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = 0; i < 2; ++i) {
@@ -1601,7 +1607,7 @@ inline void bmm_simd_4x4_tile(
             uint r = out_row + idx / 8;
             uint cc = out_col + idx % 8;
             if (r < M && cc < N) {
-                C[r * N + cc] = stage[idx];
+                C[r * N + cc] = T(stage[idx]);
             }
         }
     }
@@ -1621,8 +1627,29 @@ kernel void bmm_simd_4x4(
 ) {
     threadgroup float A_tg[32 * 32];
     threadgroup float B_tg[32 * 32];
-    bmm_simd_4x4_tile(A0 + (ulong)tgid.z * strides.x, B0 + (ulong)tgid.z * strides.y,
-                      C0 + (ulong)tgid.z * strides.z, M, K, N, tgid, sgid, slid, A_tg, B_tg);
+    bmm_simd_4x4_tile<float>(A0 + (ulong)tgid.z * strides.x, B0 + (ulong)tgid.z * strides.y,
+                      C0 + (ulong)tgid.z * strides.z, M, K, N, tgid, sgid, slid, A_tg, B_tg, A_tg);
+}
+
+// `bmm_simd_4x4` over half matrices. f16 batched matmuls looped over MPS, one
+// encode a matrix — SwinUNETR's window attention has 343 a call.
+kernel void bmm_simd_4x4_h(
+    device const half* A0 [[buffer(0)]],
+    device const half* B0 [[buffer(1)]],
+    device half* C0       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& K      [[buffer(4)]],
+    constant uint& N      [[buffer(5)]],
+    constant uint3& strides [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint slid  [[thread_index_in_simdgroup]]
+) {
+    threadgroup half A_tg[32 * 32];
+    threadgroup half B_tg[32 * 32];
+    threadgroup float stage[16 * 64];
+    bmm_simd_4x4_tile<half>(A0 + (ulong)tgid.z * strides.x, B0 + (ulong)tgid.z * strides.y,
+                      C0 + (ulong)tgid.z * strides.z, M, K, N, tgid, sgid, slid, A_tg, B_tg, stage);
 }
 
 // `bmm_simd_4x4` for broadcasts no single stride expresses (`[2,1,M,K]·[2,3,K,N]`):
@@ -1646,9 +1673,9 @@ kernel void bmm_simd_4x4_indexed(
 ) {
     threadgroup float A_tg[32 * 32];
     threadgroup float B_tg[32 * 32];
-    bmm_simd_4x4_tile(A0 + (ulong)a_index[tgid.z] * strides.x,
+    bmm_simd_4x4_tile<float>(A0 + (ulong)a_index[tgid.z] * strides.x,
                       B0 + (ulong)b_index[tgid.z] * strides.y,
-                      C0 + (ulong)(z0 + tgid.z) * strides.z, M, K, N, tgid, sgid, slid, A_tg, B_tg);
+                      C0 + (ulong)(z0 + tgid.z) * strides.z, M, K, N, tgid, sgid, slid, A_tg, B_tg, A_tg);
 }
 
 // Register-blocked simdgroup GEMM family (plain + split-K) — generated per tile
@@ -2359,6 +2386,40 @@ kernel void binary_broadcast_1ax_f32(
     dst[li] = out;
 }
 
+// `binary_broadcast_1ax_f32` over half tensors (float arithmetic). SwinUNETR's
+// attention bias and shift mask, at f16, took the general strided kernel
+// without it.
+kernel void binary_broadcast_1ax_h(
+    device const half* lhs [[buffer(0)]],
+    device const half* rhs [[buffer(1)]],
+    device half* dst       [[buffer(2)]],
+    constant uint& rows     [[buffer(3)]],
+    constant uint& cols     [[buffer(4)]],
+    constant uint& mid      [[buffer(5)]],
+    constant uint& op       [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint col = gid.x;
+    uint row = gid.y;
+    if (col >= cols || row >= rows) return;
+    uint pre_i = row / mid;
+    uint li = row * cols + col;
+    uint ri = pre_i * cols + col;
+    float lv = float(lhs[li]);
+    float rv = float(rhs[ri]);
+    float out;
+    switch (op) {
+        case 0: out = lv + rv; break;
+        case 1: out = lv - rv; break;
+        case 2: out = lv * rv; break;
+        case 3: out = lv / rv; break;
+        case 4: out = max(lv, rv); break;
+        case 5: out = min(lv, rv); break;
+        default: out = rlx_pow_scalar(lv, rv); break;
+    }
+    dst[li] = half(out);
+}
+
 kernel void binary_broadcast_1ax4(
     device const float* lhs [[buffer(0)]],
     device const float* rhs [[buffer(1)]],
@@ -2635,17 +2696,19 @@ kernel void binary_broadcast_rank24(
 // and walking `lhs_strides`/`rhs_strides` (stride 0 ⇒ broadcast).
 // Op encoding matches `rlx_ir::op::BinaryOp` discriminant order:
 //   0=Add, 1=Sub, 2=Mul, 3=Div, 4=Max, 5=Min, 6=Pow. Rank capped at 8.
-kernel void binary_broadcast_f32(
-    device const float* lhs       [[buffer(0)]],
-    device const float* rhs       [[buffer(1)]],
-    device float* dst             [[buffer(2)]],
-    constant uint& len            [[buffer(3)]],
-    constant uint& rank           [[buffer(4)]],
-    constant uint* out_dims       [[buffer(5)]],
-    constant uint* lhs_strides    [[buffer(6)]],
-    constant uint* rhs_strides    [[buffer(7)]],
-    constant uint& op             [[buffer(8)]],
-    uint gid [[thread_position_in_grid]]
+// `T` is the storage type; the arithmetic is float.
+template <typename T>
+void binary_broadcast_impl(
+    device const T* lhs,
+    device const T* rhs,
+    device T* dst,
+    constant uint& len,
+    constant uint& rank,
+    constant uint* out_dims,
+    constant uint* lhs_strides,
+    constant uint* rhs_strides,
+    constant uint& op,
+    uint gid
 ) {
     if (gid >= len) return;
     uint rem = gid;
@@ -2660,8 +2723,8 @@ kernel void binary_broadcast_f32(
         li += coord * lhs_strides[ax];
         ri += coord * rhs_strides[ax];
     }
-    float lv = lhs[li];
-    float rv = rhs[ri];
+    float lv = float(lhs[li]);
+    float rv = float(rhs[ri]);
     float out;
     switch (op) {
         case 0: out = lv + rv; break;
@@ -2672,7 +2735,25 @@ kernel void binary_broadcast_f32(
         case 5: out = min(lv, rv); break;
         default: out = rlx_pow_scalar(lv, rv); break;
     }
-    dst[gid] = out;
+    dst[gid] = T(out);
+}
+
+#define RLX_BINARY_BROADCAST_ARGS(T) \
+    device const T* lhs [[buffer(0)]], device const T* rhs [[buffer(1)]], \
+    device T* dst [[buffer(2)]], constant uint& len [[buffer(3)]], \
+    constant uint& rank [[buffer(4)]], constant uint* out_dims [[buffer(5)]], \
+    constant uint* lhs_strides [[buffer(6)]], constant uint* rhs_strides [[buffer(7)]], \
+    constant uint& op [[buffer(8)]], uint gid [[thread_position_in_grid]]
+
+kernel void binary_broadcast_f32(RLX_BINARY_BROADCAST_ARGS(float)) {
+    binary_broadcast_impl<float>(lhs, rhs, dst, len, rank, out_dims, lhs_strides, rhs_strides, op, gid);
+}
+
+// `binary_broadcast_f32` over half tensors. Without it an f16 broadcast fell
+// back to the host: a full GPU sync and a single-threaded loop (SegResNet's
+// output bias at 128^3: ~40 ms, the whole of f16's gain).
+kernel void binary_broadcast_h(RLX_BINARY_BROADCAST_ARGS(half)) {
+    binary_broadcast_impl<half>(lhs, rhs, dst, len, rank, out_dims, lhs_strides, rhs_strides, op, gid);
 }
 
 // Element-wise multiply: c = a * b
@@ -3187,26 +3268,47 @@ kernel void conv_transpose2d(
 // (contiguous filter) for B, so both gathers coalesce. Threadgroup rows are
 // padded by one float to keep 32 lanes off the same bank.
 //
-// Requires groups == 1 and kd*kh*kw <= 32; `encode_conv3d` checks both.
+// Requires groups == 1, which `encode_conv3d` checks; a filter of more than
+// 32 taps runs in 32-tap chunks.
 // Templated on the channel-tile width. A tile loads BM*K values of A and
 // serves BN output channels with them, so total A traffic is
 // `M * K * ceil(C_out / BN)` — doubling BN from 32 to 64 halves the reads for
 // every 64-channel layer, and SynthStrip has eight of them. Threadgroup
 // arrays come in as pointers because MSL only allows them at kernel scope.
-template <uint BM_T, uint BN_T, uint PAD_T>
+//
+// `T` is the tensors' storage type: float, or half for an f16 graph, where
+// the input, filter, bias and output are all half, the tiles are staged as
+// half and fed to the MMA as half matrices, and the accumulators stay float.
+// `Cs` is the float output tile; the f32 kernel aliases it onto `As`.
+// `TI` and `TW` are the input's and filter's storage when they differ from
+// `T`: `uchar`, one f8 (e4m3) code a byte, decoded to `T` as it is gathered.
+// Storage to arithmetic: float and half as they are; a byte is an f8 e4m3
+// code (sign, 4 exponent bits biased 7, 3 mantissa bits). Moved into half's
+// bit layout, exponent bias 15, that is the value / 2^8, subnormals
+// included — so one shift, one or and one multiply. (e4m3's NaN, 0x7f,
+// decodes to 480; f8 producers saturate rather than emit it.)
+inline float rlx_decode(float v) { return v; }
+inline half rlx_decode(half v) { return v; }
+inline half rlx_decode(uchar b) {
+    ushort bits = ushort((uint(b & 0x7fu) << 7) | (uint(b & 0x80u) << 8));
+    return as_type<half>(bits) * half(256.0h);
+}
+
+template <typename T, uint BM_T, uint BN_T, uint PAD_T, typename TI = T, typename TW = T>
 void conv3d_gemm_c_impl(
-    device const float* src,
-    device const float* wt,
-    device float* dst,
+    device const TI* src,
+    device const TW* wt,
+    device T* dst,
     constant uint4& a, constant uint4& b, constant uint4& c,
     constant uint4& d, constant uint4& e, constant uint4& f,
-    device const float* bias,   // per-output-channel; f.z says whether it is real
+    device const T* bias,       // per-output-channel; f.z says whether it is real
     constant float& leaky_alpha, // epilogue slope; f.w selects the epilogue
-    device const float* src2,   // second half of a channel-concatenated input
+    device const TI* src2,      // second half of a channel-concatenated input
     constant uint& c_split,     // channels taken from `src`; == c_in when unfused
     constant uint4& up,         // [sc_d, sc_h, sc_w, _]; all 1 when `src` is not upsampled
-    threadgroup float* As,
-    threadgroup float* Bs,
+    threadgroup T* As,
+    threadgroup T* Bs,
+    threadgroup float* Cs,
     uint2 tgid, uint sgid, uint slid
 ) {
     constexpr uint BM = BM_T, BK = 32u, NT = 128u;
@@ -3263,9 +3365,17 @@ void conv3d_gemm_c_impl(
     // The tap index, and every B-slot quantity below, are affine in the slot
     // number — holding them in registers costs occupancy, which is what
     // decides this kernel.
+    simdgroup_float8x8 acc[RB * NACC];
+    for (uint j = 0; j < RB * NACC; ++j)
+        acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    // A filter of more than BK taps (5^3: 125) runs in chunks of BK taps,
+    // each a full pass over the input channels into the same accumulators;
+    // the slots' offsets are decoded once a chunk. One chunk below BK taps.
+    for (uint t0 = 0; t0 < ktap; t0 += BK) {
     uint a_base[SLOTS]; uint a_base_a[SLOTS]; bool a_ok[SLOTS];
     for (uint j = 0; j < SLOTS; ++j) {
-        uint tap = kk_base + KK_STRIDE * j;
+        uint tap = t0 + kk_base + KK_STRIDE * j;
         a_ok[j] = false;
         a_base[j] = 0u;
         a_base_a[j] = 0u;
@@ -3299,18 +3409,14 @@ void conv3d_gemm_c_impl(
     // output channel — a one-time layout change at parameter upload, not
     // something the kernel can do for itself.
     // B slots: column = sgid + 4j, tap = slid — recomputed where used.
-    bool b_tap_ok = slid < ktap;
+    bool b_tap_ok = t0 + slid < ktap;
 
-    simdgroup_float8x8 acc[RB * NACC];
-    for (uint j = 0; j < RB * NACC; ++j)
-        acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-
-    uint nblk = (ktap + 7u) / 8u;
+    uint nblk = (min(ktap - t0, BK) + 7u) / 8u;
 
     // Software pipeline. The device loads for channel ci+1 depend on nothing
     // in the threadgroup, so they are issued before the MMAs for channel ci
     // and their latency is paid while the tensor units are busy.
-    float a_reg[SLOTS], b_reg[BSLOTS];
+    T a_reg[SLOTS], b_reg[BSLOTS];
     // A channel-concatenated input is read in place rather than materialised:
     // channels below `c_split` come from `src`, the rest from `src2`. The
     // branch is on the loop counter, so it is uniform across the threadgroup —
@@ -3320,10 +3426,10 @@ void conv3d_gemm_c_impl(
     // to the plain form.
     uint base_a = nn * c_split * dhw_a;
     uint base_b = nn * (c_in - c_split) * dhw;
-    for (uint j = 0; j < SLOTS; ++j) a_reg[j] = a_ok[j] ? src[base_a + a_base_a[j]] : 0.0f;
+    for (uint j = 0; j < SLOTS; ++j) a_reg[j] = a_ok[j] ? T(rlx_decode(src[base_a + a_base_a[j]])) : T(0);
     for (uint j = 0; j < BSLOTS; ++j) {
         uint co = n0 + sgid + 4u * j;
-        b_reg[j] = (b_tap_ok && co < c_out) ? wt[co * K + slid] : 0.0f;
+        b_reg[j] = (b_tap_ok && co < c_out) ? T(rlx_decode(wt[co * K + t0 + slid])) : T(0);
     }
 
     for (uint ci = 0; ci < c_in; ++ci) {
@@ -3339,15 +3445,15 @@ void conv3d_gemm_c_impl(
             if (nci < c_split) {
                 uint soff = base_a + nci * dhw_a;
                 for (uint j = 0; j < SLOTS; ++j)
-                    a_reg[j] = a_ok[j] ? src[a_base_a[j] + soff] : 0.0f;
+                    a_reg[j] = a_ok[j] ? T(rlx_decode(src[a_base_a[j] + soff])) : T(0);
             } else {
                 uint soff = base_b + (nci - c_split) * dhw;
                 for (uint j = 0; j < SLOTS; ++j)
-                    a_reg[j] = a_ok[j] ? src2[a_base[j] + soff] : 0.0f;
+                    a_reg[j] = a_ok[j] ? T(rlx_decode(src2[a_base[j] + soff])) : T(0);
             }
             for (uint j = 0; j < BSLOTS; ++j) {
                 uint co = n0 + sgid + 4u * j;
-                b_reg[j] = (b_tap_ok && co < c_out) ? wt[co * K + slid + woff] : 0.0f;
+                b_reg[j] = (b_tap_ok && co < c_out) ? T(rlx_decode(wt[co * K + t0 + slid + woff])) : T(0);
             }
         }
 
@@ -3357,11 +3463,11 @@ void conv3d_gemm_c_impl(
         // threadgroup write, two barriers — is what bounds this kernel:
         // measured, its runtime is flat from 1 tap to 32.
         for (uint kb = 0; kb < nblk; ++kb) {
-            simdgroup_float8x8 bv;
+            simdgroup_matrix<T, 8, 8> bv;
             for (uint j = 0; j < NACC; ++j) {
                 simdgroup_load(bv, Bs + kb * 8u * LDB + j * 8u, LDB);
                 for (uint r = 0; r < RB; ++r) {
-                    simdgroup_float8x8 av;
+                    simdgroup_matrix<T, 8, 8> av;
                     simdgroup_load(av, As + (sgid * RB + r) * 8u * LDA + kb * 8u, LDA);
                     simdgroup_multiply_accumulate(acc[r * NACC + j], av, bv,
                                                   acc[r * NACC + j]);
@@ -3370,6 +3476,7 @@ void conv3d_gemm_c_impl(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    }
 
     // Bs is dead once the last MMA has run, and it is the larger of the two
     // staging buffers, so the output tile lands there rather than claiming a
@@ -3377,7 +3484,6 @@ void conv3d_gemm_c_impl(
     // As is dead once the last MMA has run and is the buffer sized BM x 33,
     // which is exactly what the BM x BN output tile needs.
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    threadgroup float* Cs = As;
     for (uint r = 0; r < RB; ++r)
         for (uint j = 0; j < NACC; ++j)
             simdgroup_store(acc[r * NACC + j],
@@ -3394,13 +3500,13 @@ void conv3d_gemm_c_impl(
         // registers, so folding it in costs one add per output element and
         // saves a whole separate pass over the tensor.
         float v = Cs[row * LDC + col];
-        if (f.z) v += bias[co];
+        if (f.z) v += float(bias[co]);
         // LeakyReLU in the store. `max(v, alpha*v)` is exactly LeakyReLU for
         // any alpha < 1, and here it is two instructions on a value already in
         // a register — against two more full passes over the tensor if the
         // activation is left as its own Mul and Max nodes.
         if (f.w == 1u) v = max(v, leaky_alpha * v);
-        dst[(((nn * c_out + co) * d_out + d_o) * h_out + ho) * w_out + wo] = v;
+        dst[(((nn * c_out + co) * d_out + d_o) * h_out + ho) * w_out + wo] = T(v);
     }
 }
 
@@ -3440,8 +3546,39 @@ kernel void conv3d_gemm_c(
 ) {
     threadgroup float As[32u * 33u];
     threadgroup float Bs[32u * 33u];
-    conv3d_gemm_c_impl<32u, 32u, 1u>(src, wt, dst, a, b, c, d, e, f, bias, leaky_alpha,
-                                     src2, c_split, up, As, Bs, tgid, sgid, slid);
+    conv3d_gemm_c_impl<float, 32u, 32u, 1u>(src, wt, dst, a, b, c, d, e, f, bias, leaky_alpha,
+                                            src2, c_split, up, As, Bs, As, tgid, sgid, slid);
+}
+
+// `conv3d_gemm_c` over half tensors, with 64-position tiles. At f32 the
+// wider tile lost to occupancy (see above); half tiles bring it back to the
+// f32 32x32 kernel's 8.4 KiB, the float output tile holding both staging
+// tiles. Measured against 32-position half tiles: SegResNet 128^3, 312 ->
+// 292 ms GPU.
+kernel void conv3d_gemm_c_h(
+    device const half* src [[buffer(0)]],
+    device const half* wt  [[buffer(1)]],
+    device half* dst       [[buffer(2)]],
+    constant uint4& a       [[buffer(3)]],
+    constant uint4& b       [[buffer(4)]],
+    constant uint4& c       [[buffer(5)]],
+    constant uint4& d       [[buffer(6)]],
+    constant uint4& e       [[buffer(7)]],
+    constant uint4& f       [[buffer(8)]],
+    device const half* bias [[buffer(9)]],
+    constant float& leaky_alpha [[buffer(10)]],
+    device const half* src2 [[buffer(11)]],
+    constant uint& c_split [[buffer(12)]],
+    constant uint4& up [[buffer(13)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  slid [[thread_index_in_simdgroup]]
+) {
+    threadgroup float Cs[64u * 33u];
+    threadgroup half* As = reinterpret_cast<threadgroup half*>(Cs);
+    conv3d_gemm_c_impl<half, 64u, 32u, 1u>(src, wt, dst, a, b, c, d, e, f, bias, leaky_alpha,
+                                           src2, c_split, up, As, As + 64u * 33u, Cs,
+                                           tgid, sgid, slid);
 }
 
 
@@ -3472,24 +3609,28 @@ kernel void conv3d_gemm_c(
 //
 // Tile: 32 positions x 32 channels, 16 taps per pass, 128 threads
 // (4 simdgroups, one per 8 rows, each holding 4 column accumulators).
-kernel void conv3d_gemm(
-    device const float* src    [[buffer(0)]],
-    device const float* wt     [[buffer(1)]],
-    device float* dst          [[buffer(2)]],
-    constant uint4& a          [[buffer(3)]],  // [N, C_in, D, H]
-    constant uint4& b          [[buffer(4)]],  // [W, C_out, D_out, H_out]
-    constant uint4& c          [[buffer(5)]],  // [W_out, kd, kh, kw]
-    constant uint4& d          [[buffer(6)]],  // [sd, sh, sw, groups]
-    constant uint4& e          [[buffer(7)]],  // [pd, ph, pw, dd]
-    constant uint4& f          [[buffer(8)]],  // [dh, dw, has_bias, act]
-    device const float* bias   [[buffer(9)]],  // per-channel; f.z = present
-    constant float& leaky_alpha [[buffer(10)]], // epilogue slope; f.w selects
-    device const float* src2   [[buffer(11)]], // second half of a concat input
-    constant uint& c_split     [[buffer(12)]], // channels from `src`; == c_in if none
-    constant uint4& up         [[buffer(13)]], // [sc_d, sc_h, sc_w, _]; 1 = not upsampled
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint  sgid [[simdgroup_index_in_threadgroup]],
-    uint  slid [[thread_index_in_simdgroup]]
+template <typename T>
+void conv3d_gemm_impl(
+    device const T* src,
+    device const T* wt,
+    device T* dst,
+    constant uint4& a,  // [N, C_in, D, H]
+    constant uint4& b,  // [W, C_out, D_out, H_out]
+    constant uint4& c,  // [W_out, kd, kh, kw]
+    constant uint4& d,  // [sd, sh, sw, groups]
+    constant uint4& e,  // [pd, ph, pw, dd]
+    constant uint4& f,  // [dh, dw, has_bias, act]
+    device const T* bias,  // per-channel; f.z = present
+    constant float& leaky_alpha, // epilogue slope; f.w selects
+    device const T* src2, // second half of a concat input
+    constant uint& c_split, // channels from `src`; == c_in if none
+    constant uint4& up, // [sc_d, sc_h, sc_w, _]; 1 = not upsampled
+    uint2 tgid,
+    uint  sgid,
+    uint  slid,
+    threadgroup T* As,
+    threadgroup T* Bs,
+    threadgroup float* Cs
 ) {
     constexpr uint BM = 32u, BN = 32u, BK = 16u, NT = 128u;
 
@@ -3506,9 +3647,6 @@ kernel void conv3d_gemm(
     uint n0 = tgid.y * BN;
     uint tix = sgid * 32u + slid;  // 0..127
 
-    threadgroup float As[BM * BK];
-    threadgroup float Bs[BK * BN];
-    threadgroup float Cs[BM * BN];
 
     simdgroup_float8x8 acc[4];
     for (uint j = 0; j < 4u; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
@@ -3522,7 +3660,7 @@ kernel void conv3d_gemm(
             uint row = p - kk * BM;
             uint m = m0 + row;
             uint k = k0 + kk;
-            float v = 0.0f;
+            T v = T(0);
             if (m < M && k < K) {
                 uint wo = m % w_out; uint t = m / w_out;
                 uint ho = t % h_out; t /= h_out;
@@ -3557,12 +3695,12 @@ kernel void conv3d_gemm(
             uint kk = p - col * BK;
             uint k = k0 + kk;
             uint co = n0 + col;
-            Bs[kk * BN + col] = (co < c_out && k < K) ? wt[co * K + k] : 0.0f;
+            Bs[kk * BN + col] = (co < c_out && k < K) ? wt[co * K + k] : T(0);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint kb = 0; kb < BK / 8u; ++kb) {
-            simdgroup_float8x8 av, bv;
+            simdgroup_matrix<T, 8, 8> av, bv;
             simdgroup_load(av, As + sgid * 8u * BK + kb * 8u, BK);
             for (uint j = 0; j < 4u; ++j) {
                 simdgroup_load(bv, Bs + kb * 8u * BN + j * 8u, BN);
@@ -3588,18 +3726,13 @@ kernel void conv3d_gemm(
         uint ho = t % h_out; t /= h_out;
         uint d_o = t % d_out; uint nn = t / d_out;
         float v = Cs[row * BN + col];
-        if (f.z) v += bias[co];
+        if (f.z) v += float(bias[co]);
         if (f.w == 1u) v = max(v, leaky_alpha * v);
-        dst[(((nn * c_out + co) * d_out + d_o) * h_out + ho) * w_out + wo] = v;
+        dst[(((nn * c_out + co) * d_out + d_o) * h_out + ho) * w_out + wo] = T(v);
     }
 }
 
-// The scalar conv3d: one thread, one output element, a walk over every tap.
-//
-// Correct for every shape, and the reference the GEMM kernels above are
-// tested against. It still runs for the cases they decline — grouped
-// convolution, and tiles too small to be worth filling.
-kernel void conv3d(
+kernel void conv3d_gemm(
     device const float* src    [[buffer(0)]],
     device const float* wt     [[buffer(1)]],
     device float* dst          [[buffer(2)]],
@@ -3614,7 +3747,64 @@ kernel void conv3d(
     device const float* src2   [[buffer(11)]], // second half of a concat input
     constant uint& c_split     [[buffer(12)]], // channels from `src`; == c_in if none
     constant uint4& up         [[buffer(13)]], // [sc_d, sc_h, sc_w, _]; 1 = not upsampled
-    uint3 gid [[thread_position_in_grid]]
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  slid [[thread_index_in_simdgroup]]
+) {
+    threadgroup float As[32u * 16u];
+    threadgroup float Bs[16u * 32u];
+    threadgroup float Cs[32u * 32u];
+    conv3d_gemm_impl<float>(src, wt, dst, a, b, c, d, e, f, bias, leaky_alpha, src2, c_split, up, tgid, sgid, slid, As, Bs, Cs);
+}
+
+// `conv3d_gemm` over half tensors; accumulates in float.
+kernel void conv3d_gemm_h(
+    device const half* src    [[buffer(0)]],
+    device const half* wt     [[buffer(1)]],
+    device half* dst          [[buffer(2)]],
+    constant uint4& a          [[buffer(3)]],  // [N, C_in, D, H]
+    constant uint4& b          [[buffer(4)]],  // [W, C_out, D_out, H_out]
+    constant uint4& c          [[buffer(5)]],  // [W_out, kd, kh, kw]
+    constant uint4& d          [[buffer(6)]],  // [sd, sh, sw, groups]
+    constant uint4& e          [[buffer(7)]],  // [pd, ph, pw, dd]
+    constant uint4& f          [[buffer(8)]],  // [dh, dw, has_bias, act]
+    device const half* bias   [[buffer(9)]],  // per-channel; f.z = present
+    constant float& leaky_alpha [[buffer(10)]], // epilogue slope; f.w selects
+    device const half* src2   [[buffer(11)]], // second half of a concat input
+    constant uint& c_split     [[buffer(12)]], // channels from `src`; == c_in if none
+    constant uint4& up         [[buffer(13)]], // [sc_d, sc_h, sc_w, _]; 1 = not upsampled
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  slid [[thread_index_in_simdgroup]]
+) {
+    threadgroup half As[32u * 16u];
+    threadgroup half Bs[16u * 32u];
+    threadgroup float Cs[32u * 32u];
+    conv3d_gemm_impl<half>(src, wt, dst, a, b, c, d, e, f, bias, leaky_alpha, src2, c_split, up, tgid, sgid, slid, As, Bs, Cs);
+}
+
+// The scalar conv3d: one thread, one output element, a walk over every tap.
+//
+// Correct for every shape, and the reference the GEMM kernels above are
+// tested against. It still runs for the cases they decline — grouped
+// convolution, and tiles too small to be worth filling.
+template <typename T>
+void conv3d_impl(
+    device const T* src,
+    device const T* wt,
+    device T* dst,
+    constant uint4& a,  // [N, C_in, D, H]
+    constant uint4& b,  // [W, C_out, D_out, H_out]
+    constant uint4& c,  // [W_out, kd, kh, kw]
+    constant uint4& d,  // [sd, sh, sw, groups]
+    constant uint4& e,  // [pd, ph, pw, dd]
+    constant uint4& f,  // [dh, dw, has_bias, act]
+    device const T* bias,  // per-channel; f.z = present
+    constant float& leaky_alpha, // epilogue slope; f.w selects
+    device const T* src2, // second half of a concat input
+    constant uint& c_split, // channels from `src`; == c_in if none
+    constant uint4& up, // [sc_d, sc_h, sc_w, _]; 1 = not upsampled
+    uint3 gid
 ) {
     uint n = a.x; uint c_in = a.y; uint din = a.z; uint hin = a.w;
     uint win = b.x; uint c_out = b.y; uint d_out = b.z; uint h_out = b.w;
@@ -3667,14 +3857,12 @@ kernel void conv3d(
             }
         }
     }
-    if (f.z) acc += bias[co];
+    if (f.z) acc += float(bias[co]);
     if (f.w == 1u) acc = max(acc, leaky_alpha * acc);
-    dst[(((nn * c_out + co) * d_out + d_o) * h_out + ho) * w_out + wo] = acc;
+    dst[(((nn * c_out + co) * d_out + d_o) * h_out + ho) * w_out + wo] = T(acc);
 }
 
-// 3D NCDHW transposed conv (output-centric gather).
-// Weight: [C_in, C_out/groups, kD, kH, kW] (PyTorch ConvTranspose3d).
-kernel void conv_transpose3d(
+kernel void conv3d(
     device const float* src    [[buffer(0)]],
     device const float* wt     [[buffer(1)]],
     device float* dst          [[buffer(2)]],
@@ -3684,7 +3872,52 @@ kernel void conv_transpose3d(
     constant uint4& d          [[buffer(6)]],  // [sd, sh, sw, groups]
     constant uint4& e          [[buffer(7)]],  // [pd, ph, pw, dd]
     constant uint4& f          [[buffer(8)]],  // [dh, dw, has_bias, act]
+    device const float* bias   [[buffer(9)]],  // per-channel; f.z = present
+    constant float& leaky_alpha [[buffer(10)]], // epilogue slope; f.w selects
+    device const float* src2   [[buffer(11)]], // second half of a concat input
+    constant uint& c_split     [[buffer(12)]], // channels from `src`; == c_in if none
+    constant uint4& up         [[buffer(13)]], // [sc_d, sc_h, sc_w, _]; 1 = not upsampled
     uint3 gid [[thread_position_in_grid]]
+) {
+    conv3d_impl<float>(src, wt, dst, a, b, c, d, e, f, bias, leaky_alpha, src2, c_split, up, gid);
+}
+
+// `conv3d` over half tensors; accumulates in float.
+kernel void conv3d_h(
+    device const half* src    [[buffer(0)]],
+    device const half* wt     [[buffer(1)]],
+    device half* dst          [[buffer(2)]],
+    constant uint4& a          [[buffer(3)]],  // [N, C_in, D, H]
+    constant uint4& b          [[buffer(4)]],  // [W, C_out, D_out, H_out]
+    constant uint4& c          [[buffer(5)]],  // [W_out, kd, kh, kw]
+    constant uint4& d          [[buffer(6)]],  // [sd, sh, sw, groups]
+    constant uint4& e          [[buffer(7)]],  // [pd, ph, pw, dd]
+    constant uint4& f          [[buffer(8)]],  // [dh, dw, has_bias, act]
+    device const half* bias   [[buffer(9)]],  // per-channel; f.z = present
+    constant float& leaky_alpha [[buffer(10)]], // epilogue slope; f.w selects
+    device const half* src2   [[buffer(11)]], // second half of a concat input
+    constant uint& c_split     [[buffer(12)]], // channels from `src`; == c_in if none
+    constant uint4& up         [[buffer(13)]], // [sc_d, sc_h, sc_w, _]; 1 = not upsampled
+    uint3 gid [[thread_position_in_grid]]
+) {
+    conv3d_impl<half>(src, wt, dst, a, b, c, d, e, f, bias, leaky_alpha, src2, c_split, up, gid);
+}
+
+// 3D NCDHW transposed conv (output-centric gather).
+// Weight: [C_in, C_out/groups, kD, kH, kW] (PyTorch ConvTranspose3d).
+// `T` is the storage type; accumulation is float.
+template <typename T>
+void conv_transpose3d_impl(
+    device const T* src,
+    device const T* wt,
+    device T* dst,
+    constant uint4& a,  // [N, C_in, D, H]
+    constant uint4& b,  // [W, C_out, D_out, H_out]
+    constant uint4& c,  // [W_out, kd, kh, kw]
+    constant uint4& d,  // [sd, sh, sw, groups]
+    constant uint4& e,  // [pd, ph, pw, dd]
+    constant uint4& f,  // [dh, dw, has_bias, act]
+    uint3 gid
 ) {
     uint n = a.x; uint c_in = a.y; uint din = a.z; uint hin = a.w;
     uint win = b.x; uint c_out = b.y; uint d_out = b.z; uint h_out = b.w;
@@ -3728,104 +3961,293 @@ kernel void conv_transpose3d(
                     uint ci = ci_start + ci_off;
                     uint in_idx = (((nn * c_in + ci) * din + id) * hin + ih) * win + iw;
                     uint w_idx = (((ci * c_out_per_g + oc_off) * kd + kz) * kh + ky) * kw + kx;
-                    acc += src[in_idx] * wt[w_idx];
+                    acc += float(src[in_idx]) * float(wt[w_idx]);
                 }
             }
         }
     }
-    dst[(((nn * c_out + co) * d_out + d_o) * h_out + ho) * w_out + wo] = acc;
+    dst[(((nn * c_out + co) * d_out + d_o) * h_out + ho) * w_out + wo] = T(acc);
 }
 
-// NCHW group norm: normalize each (C/G)×H×W block. One threadgroup per
-// (batch, group); 256-wide reduction then normalize.
-kernel void group_norm(
+kernel void conv_transpose3d(
     device const float* src    [[buffer(0)]],
-    device const float* gamma [[buffer(1)]],
-    device const float* beta  [[buffer(2)]],
-    device float* dst          [[buffer(3)]],
-    constant uint4& nchw      [[buffer(4)]],   // [N, C, H, W]
-    constant uint& num_groups [[buffer(5)]],
-    constant float& eps       [[buffer(6)]],
-    uint ng [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tsize [[threads_per_threadgroup]]
+    device const float* wt     [[buffer(1)]],
+    device float* dst          [[buffer(2)]],
+    constant uint4& a          [[buffer(3)]],  // [N, C_in, D, H]
+    constant uint4& b          [[buffer(4)]],  // [W, C_out, D_out, H_out]
+    constant uint4& c          [[buffer(5)]],  // [W_out, kd, kh, kw]
+    constant uint4& d          [[buffer(6)]],  // [sd, sh, sw, groups]
+    constant uint4& e          [[buffer(7)]],  // [pd, ph, pw, dd]
+    constant uint4& f          [[buffer(8)]],  // [dh, dw, has_bias, act]
+    uint3 gid [[thread_position_in_grid]]
 ) {
-    uint batch = nchw.x;
-    uint c = nchw.y;
-    uint h = nchw.z;
-    uint w = nchw.w;
-    if (ng >= batch * num_groups) return;
-    uint n = ng / num_groups;
-    uint g = ng % num_groups;
-    uint cpg = c / num_groups;
+    conv_transpose3d_impl<float>(src, wt, dst, a, b, c, d, e, f, gid);
+}
+
+// `conv_transpose3d` over half tensors.
+kernel void conv_transpose3d_h(
+    device const half* src    [[buffer(0)]],
+    device const half* wt     [[buffer(1)]],
+    device half* dst          [[buffer(2)]],
+    constant uint4& a          [[buffer(3)]],  // [N, C_in, D, H]
+    constant uint4& b          [[buffer(4)]],  // [W, C_out, D_out, H_out]
+    constant uint4& c          [[buffer(5)]],  // [W_out, kd, kh, kw]
+    constant uint4& d          [[buffer(6)]],  // [sd, sh, sw, groups]
+    constant uint4& e          [[buffer(7)]],  // [pd, ph, pw, dd]
+    constant uint4& f          [[buffer(8)]],  // [dh, dw, has_bias, act]
+    uint3 gid [[thread_position_in_grid]]
+) {
+    conv_transpose3d_impl<half>(src, wt, dst, a, b, c, d, e, f, gid);
+}
+
+// The transposed conv UNETR-style decoders use, kernel 2 = stride 2, no
+// padding, ungrouped, as the matrix multiply it is. Each output voxel reads
+// one input voxel, so with
+//
+//     M = N * D * H * W   input positions      K = C_in
+//     cols = C_out * 8    (channel, tap) pairs
+//
+// the output is A x B with A[m, ci] the input and B[ci, col] the filter
+// exactly as stored ([C_in, C_out, 2, 2, 2] is [C_in, cols] row-major), then
+// scattered into each position's 2x2x2 block. The gather kernel above does
+// the same products but walks every tap with a divisibility test, one scalar
+// FMA per two loads; here they run as 8x8 simdgroup matrices.
+//
+// Tile: 32 positions x 32 columns, 16 channels a pass, 128 threads (4
+// simdgroups, one per 8 rows, 4 column accumulators each). `T` is the
+// storage type; accumulation is float.
+template <typename T>
+void conv_transpose3d_k2s2_impl(
+    device const T* src, device const T* wt, device T* dst,
+    constant uint4& a, constant uint4& b,
+    uint2 tgid, uint sgid, uint slid,
+    threadgroup T* As, threadgroup T* Bs, threadgroup float* Cs
+) {
+    constexpr uint BM = 32u, BN = 32u, BK = 16u, NT = 128u;
+    uint nb = a.x, c_in = a.y, din = a.z, hin = a.w, win = b.x, c_out = b.y;
+    uint dhw = din * hin * win;
+    uint M = nb * dhw, COLS = c_out * 8u;
+    uint m0 = tgid.x * BM, n0 = tgid.y * BN;
+    uint tix = sgid * 32u + slid;
+    simdgroup_float8x8 acc[4];
+    for (uint j = 0; j < 4u; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint k0 = 0; k0 < c_in; k0 += BK) {
+        // A: consecutive threads take consecutive positions, contiguous in
+        // NCDHW for one channel.
+        for (uint p = tix; p < BM * BK; p += NT) {
+            uint kk = p / BM, row = p % BM;
+            uint m = m0 + row, ci = k0 + kk;
+            T v = T(0);
+            if (m < M && ci < c_in) {
+                uint nn = m / dhw, sp = m % dhw;
+                v = src[(nn * c_in + ci) * dhw + sp];
+            }
+            As[row * BK + kk] = v;
+        }
+        // B: consecutive threads take consecutive columns of a filter row.
+        for (uint p = tix; p < BK * BN; p += NT) {
+            uint kk = p / BN, col = p % BN;
+            uint ci = k0 + kk, cc = n0 + col;
+            Bs[kk * BN + col] = (ci < c_in && cc < COLS) ? wt[ci * COLS + cc] : T(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kb = 0; kb < BK / 8u; ++kb) {
+            simdgroup_matrix<T, 8, 8> av, bv;
+            simdgroup_load(av, As + sgid * 8u * BK + kb * 8u, BK);
+            for (uint j = 0; j < 4u; ++j) {
+                simdgroup_load(bv, Bs + kb * 8u * BN + j * 8u, BN);
+                simdgroup_multiply_accumulate(acc[j], av, bv, acc[j]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint j = 0; j < 4u; ++j)
+        simdgroup_store(acc[j], Cs + (sgid * 8u) * BN + j * 8u, BN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Scatter: column (co, tz, ty, tx) of position (n, z, y, x) lands at
+    // (n, co, 2z + tz, 2y + ty, 2x + tx).
+    uint h_out = 2u * hin, w_out = 2u * win, d_out = 2u * din;
+    for (uint p = tix; p < BM * BN; p += NT) {
+        uint col = p / BM, row = p % BM;
+        uint m = m0 + row, cc = n0 + col;
+        if (m >= M || cc >= COLS) continue;
+        uint nn = m / dhw, sp = m % dhw;
+        uint x = sp % win, t = sp / win, y = t % hin, z = t / hin;
+        uint co = cc / 8u, tap = cc % 8u;
+        uint tz = tap / 4u, ty = (tap / 2u) % 2u, tx = tap % 2u;
+        dst[(((nn * c_out + co) * d_out + 2u * z + tz) * h_out + 2u * y + ty) * w_out + 2u * x + tx]
+            = T(Cs[row * BN + col]);
+    }
+}
+
+#define RLX_CT3_K2S2_ARGS(T) \
+    device const T* src [[buffer(0)]], device const T* wt [[buffer(1)]], \
+    device T* dst [[buffer(2)]], constant uint4& a [[buffer(3)]], \
+    constant uint4& b [[buffer(4)]], uint2 tgid [[threadgroup_position_in_grid]], \
+    uint sgid [[simdgroup_index_in_threadgroup]], uint slid [[thread_index_in_simdgroup]]
+
+kernel void conv_transpose3d_k2s2(RLX_CT3_K2S2_ARGS(float)) {
+    threadgroup float As[32u * 16u];
+    threadgroup float Bs[16u * 32u];
+    threadgroup float Cs[32u * 32u];
+    conv_transpose3d_k2s2_impl<float>(src, wt, dst, a, b, tgid, sgid, slid, As, Bs, Cs);
+}
+
+kernel void conv_transpose3d_k2s2_h(RLX_CT3_K2S2_ARGS(half)) {
+    threadgroup half As[32u * 16u];
+    threadgroup half Bs[16u * 32u];
+    threadgroup float Cs[32u * 32u];
+    conv_transpose3d_k2s2_impl<half>(src, wt, dst, a, b, tgid, sgid, slid, As, Bs, Cs);
+}
+
+// NCHW group norm, split across the GPU. One threadgroup per (batch, group)
+// left SegResNet's 8 groups to 8 threadgroups and the norm a third of the
+// network's time (118 of 351 ms at 128^3; 15 ms split). A group is cut into
+// `GN_CHUNK`-element chunks:
+//
+//   group_norm_stats   one threadgroup a chunk: the chunk's mean, then its
+//                      centred sum of squares. Two passes because the single
+//                      pass E[x^2] - mean^2 cancels on data with a DC offset
+//                      (7e-4 relative error over a 96^3 group at offset 50),
+//                      and chunks because one float running sum over a whole
+//                      group drifts (SegResNet's 96^3 logits moved 1e-4);
+//   group_norm_apply   one threadgroup a chunk again: merges the group's
+//                      chunk statistics (Chan et al.'s pairwise update, stable
+//                      for any number of chunks), normalises its chunk,
+//                      applies gamma and beta, then the activation the graph
+//                      had after the norm — `act` 0 none, 1 ReLU, 2 LeakyReLU
+//                      (`alpha`), 3 SiLU — saving that activation's own pass.
+//
+// `stats` holds (mean, M2) per (batch, group, chunk), in a slice of the
+// arena tail this node owns.
+constant uint GN_CHUNK = 8192u;
+
+template <typename T>
+void group_norm_stats_impl(
+    device const T* src, device float* stats,
+    constant uint4& nchw, constant uint& num_groups,
+    uint2 tg, uint tid, uint tsize, threadgroup float* partial
+) {
+    uint c = nchw.y, plane = nchw.z * nchw.w;
+    uint cpg = c / num_groups, count = cpg * plane;
+    uint chunks = (count + GN_CHUNK - 1u) / GN_CHUNK;
+    uint ng = tg.y, k = tg.x;
+    if (k >= chunks) return;
+    uint n = ng / num_groups, g = ng % num_groups;
+    uint base = (n * c + g * cpg) * plane;
+    uint start = k * GN_CHUNK, end = min(count, start + GN_CHUNK);
+    float s = 0.0f;
+    for (uint i = start + tid; i < end; i += tsize) s += float(src[base + i]);
+    partial[tid] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = tsize / 2; st > 0; st /= 2) {
+        if (tid < st) partial[tid] += partial[tid + st];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = partial[0] / float(end - start);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q = 0.0f;
+    for (uint i = start + tid; i < end; i += tsize) {
+        float d = float(src[base + i]) - mean;
+        q += d * d;
+    }
+    partial[tid] = q;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = tsize / 2; st > 0; st /= 2) {
+        if (tid < st) partial[tid] += partial[tid + st];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        stats[(ng * chunks + k) * 2u] = mean;
+        stats[(ng * chunks + k) * 2u + 1u] = partial[0];
+    }
+}
+
+// Merge (nb, mb, qb) into (na, ma, qa): count, mean, centred sum of squares.
+inline void gn_merge(thread float& na, thread float& ma, thread float& qa,
+                     float nb, float mb, float qb) {
+    if (nb == 0.0f) return;
+    float nt = na + nb, d = mb - ma;
+    ma += d * (nb / nt);
+    qa += qb + d * d * (na * nb / nt);
+    na = nt;
+}
+
+template <typename T>
+void group_norm_apply_impl(
+    device const T* src, device const T* gamma, device const T* beta, device T* dst,
+    device const float* stats, constant uint4& nchw, constant uint& num_groups,
+    constant float& eps, constant uint& act, constant float& alpha,
+    uint2 tg, uint tid, uint tsize, threadgroup float* sm
+) {
+    uint c = nchw.y, plane = nchw.z * nchw.w;
+    uint cpg = c / num_groups, count = cpg * plane;
+    uint chunks = (count + GN_CHUNK - 1u) / GN_CHUNK;
+    uint ng = tg.y, k = tg.x;
+    if (k >= chunks) return;
+    uint n = ng / num_groups, g = ng % num_groups;
+    // The group's statistics, from its chunks: each thread folds a strided
+    // share, then a tree merges the threads'.
+    float na = 0.0f, ma = 0.0f, qa = 0.0f;
+    for (uint j = tid; j < chunks; j += tsize) {
+        float nb = float(min(count - j * GN_CHUNK, GN_CHUNK));
+        gn_merge(na, ma, qa, nb, stats[(ng * chunks + j) * 2u], stats[(ng * chunks + j) * 2u + 1u]);
+    }
+    sm[tid] = na; sm[tsize + tid] = ma; sm[2u * tsize + tid] = qa;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = tsize / 2; st > 0; st /= 2) {
+        if (tid < st) {
+            float a0 = sm[tid], a1 = sm[tsize + tid], a2 = sm[2u * tsize + tid];
+            gn_merge(a0, a1, a2, sm[tid + st], sm[tsize + tid + st], sm[2u * tsize + tid + st]);
+            sm[tid] = a0; sm[tsize + tid] = a1; sm[2u * tsize + tid] = a2;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = sm[tsize], inv = rsqrt(sm[2u * tsize] / float(count) + eps);
     uint c0 = g * cpg;
-    uint plane = h * w;
-    uint count = cpg * plane;
-
-    // Two passes: the mean, then the centred sum of squares. The single-pass
-    // E[x^2] - mean^2 cancels on data with a DC offset — over a 96^3 group at
-    // offset 50 it gave 7e-4 relative error — the same reason wgpu's
-    // group_norm.wgsl and layernorm use the stable form.
-    //
-    // Each pass sums in blocks: a thread's share of a 96^3 group is ~14k
-    // values, and one float32 running sum over them drifts by ~1e-4 of the
-    // statistics (SegResNet's 96^3 sliding-window logits moved 1e-4 relative
-    // from the float64-statistics CPU). Strided blocks of GN_BLOCK first, then
-    // the block totals, keep every running sum short without relying on
-    // IEEE ordering, which this fast-math library does not guarantee.
-    // The group's channels are contiguous: element i is at base + i.
-    threadgroup float partial[256];
-    const uint GN_BLOCK = 64;
     uint base = (n * c + c0) * plane;
-    float local_sum = 0.0f;
-    for (uint start = tid; start < count; start += tsize * GN_BLOCK) {
-        uint end = min(count, start + tsize * GN_BLOCK);
-        float block = 0.0f;
-        for (uint i = start; i < end; i += tsize) {
-            block += src[base + i];
-        }
-        local_sum += block;
+    uint start = k * GN_CHUNK, end = min(count, start + GN_CHUNK);
+    for (uint i = start + tid; i < end; i += tsize) {
+        uint ch = c0 + i / plane;
+        float v = (float(src[base + i]) - mean) * inv * float(gamma[ch]) + float(beta[ch]);
+        if (act == 1u) v = max(v, 0.0f);
+        else if (act == 2u) v = max(v, alpha * v);
+        else if (act == 3u) v = v / (1.0f + exp(-v));
+        dst[base + i] = T(v);
     }
-    partial[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
-        if (tid < stride) {
-            partial[tid] += partial[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float mean = partial[0] / float(count);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
 
-    float local_sq = 0.0f;
-    for (uint start = tid; start < count; start += tsize * GN_BLOCK) {
-        uint end = min(count, start + tsize * GN_BLOCK);
-        float block = 0.0f;
-        for (uint i = start; i < end; i += tsize) {
-            float d = src[base + i] - mean;
-            block += d * d;
-        }
-        local_sq += block;
-    }
-    partial[tid] = local_sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
-        if (tid < stride) {
-            partial[tid] += partial[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float var = partial[0] / float(count);
-    float inv = rsqrt(var + eps);
+#define RLX_GN_STATS_ARGS(T) \
+    device const T* src [[buffer(0)]], device float* stats [[buffer(1)]], \
+    constant uint4& nchw [[buffer(2)]], constant uint& num_groups [[buffer(3)]], \
+    uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]], \
+    uint2 tsize2 [[threads_per_threadgroup]]
+#define RLX_GN_APPLY_ARGS(T) \
+    device const T* src [[buffer(0)]], device const T* gamma [[buffer(1)]], \
+    device const T* beta [[buffer(2)]], device T* dst [[buffer(3)]], \
+    device const float* stats [[buffer(4)]], constant uint4& nchw [[buffer(5)]], \
+    constant uint& num_groups [[buffer(6)]], constant float& eps [[buffer(7)]], \
+    constant uint& act [[buffer(8)]], constant float& alpha [[buffer(9)]], \
+    uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]], \
+    uint2 tsize2 [[threads_per_threadgroup]]
 
-    for (uint i = tid; i < count; i += tsize) {
-        uint c_off = i / plane;
-        uint s = i % plane;
-        uint ch = c0 + c_off;
-        uint idx = ((n * c + ch) * plane) + s;
-        float v = (src[idx] - mean) * inv;
-        dst[idx] = v * gamma[ch] + beta[ch];
-    }
+kernel void group_norm_stats(RLX_GN_STATS_ARGS(float)) {
+    threadgroup float partial[256];
+    group_norm_stats_impl<float>(src, stats, nchw, num_groups, tg, tid2.x, tsize2.x, partial);
+}
+kernel void group_norm_stats_h(RLX_GN_STATS_ARGS(half)) {
+    threadgroup float partial[256];
+    group_norm_stats_impl<half>(src, stats, nchw, num_groups, tg, tid2.x, tsize2.x, partial);
+}
+kernel void group_norm_apply(RLX_GN_APPLY_ARGS(float)) {
+    threadgroup float sm[3 * 256];
+    group_norm_apply_impl<float>(src, gamma, beta, dst, stats, nchw, num_groups, eps, act, alpha,
+                                 tg, tid2.x, tsize2.x, sm);
+}
+kernel void group_norm_apply_h(RLX_GN_APPLY_ARGS(half)) {
+    threadgroup float sm[3 * 256];
+    group_norm_apply_impl<half>(src, gamma, beta, dst, stats, nchw, num_groups, eps, act, alpha,
+                                tg, tid2.x, tsize2.x, sm);
 }
 
 // Nearest-neighbor 2× upsample on planar NCHW. One thread per output pixel.
@@ -5485,6 +5907,102 @@ kernel void softmax_lastax(
 // `softmax_lastax` reading `src` and writing `data` — the same arithmetic in the
 // same order, so bit-identical to Copy(src→data) + the in-place kernel, minus
 // the copy's full read+write pass.
+// Last-axis softmax, out of place, of `src` plus up to two broadcast
+// addends: what attention computes as `softmax(q·kᵀ + bias + mask)`, with the
+// adds folded in instead of each a full pass over the scores. Addend `a` is
+// present when `ax.x` is 1; element `i` of the scores reads element
+// `(i / (mid*post)) * post + i % post` of it (`mid = ax.y`, `post = ax.z`):
+// a broadcast along one axis of size `mid` with `post` elements after it.
+// `T` is the storage type (float, half); arithmetic is float. With no
+// addends this is also the out-of-place f16 softmax, which used to need a
+// copy in front of the in-place kernel.
+template <typename T>
+inline float softmax_add_load(device const T* src, device const T* add0, device const T* add1,
+                              constant uint4& a0, constant uint4& a1, uint li) {
+    float v = float(src[li]);
+    if (a0.x != 0u) v += float(add0[(li / (a0.y * a0.z)) * a0.z + li % a0.z]);
+    if (a1.x != 0u) v += float(add1[(li / (a1.y * a1.z)) * a1.z + li % a1.z]);
+    return v;
+}
+
+template <typename T>
+void softmax_lastax_add_impl(
+    device const T* src, constant uint& cols, device T* dst,
+    device const T* add0, device const T* add1,
+    constant uint4& a0, constant uint4& a1,
+    uint row, uint tid, uint tsize, threadgroup float* partial
+) {
+    uint base = row * cols;
+#define load(i) softmax_add_load(src, add0, add1, a0, a1, base + (i))
+    constexpr uint MAXV = 8;
+    bool cached = cols <= MAXV * tsize;
+    float v[MAXV];
+    float local_max = -INFINITY;
+    if (cached) {
+        for (uint j = 0; j < MAXV; ++j) {
+            uint i = tid + j * tsize;
+            if (i < cols) {
+                v[j] = load(i);
+                local_max = max(local_max, v[j]);
+            }
+        }
+    } else {
+        for (uint i = tid; i < cols; i += tsize) local_max = max(local_max, load(i));
+    }
+    partial[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = tsize / 2; st > 0; st /= 2) {
+        if (tid < st) partial[tid] = max(partial[tid], partial[tid + st]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = partial[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float local_sum = 0.0f;
+    if (cached) {
+        for (uint j = 0; j < MAXV; ++j) {
+            uint i = tid + j * tsize;
+            if (i < cols) {
+                v[j] = exp(v[j] - row_max);
+                local_sum += v[j];
+            }
+        }
+    } else {
+        for (uint i = tid; i < cols; i += tsize) local_sum += exp(load(i) - row_max);
+    }
+    partial[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = tsize / 2; st > 0; st /= 2) {
+        if (tid < st) partial[tid] += partial[tid + st];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0f / partial[0];
+    if (cached) {
+        for (uint j = 0; j < MAXV; ++j) {
+            uint i = tid + j * tsize;
+            if (i < cols) dst[base + i] = T(v[j] * inv);
+        }
+    } else {
+        for (uint i = tid; i < cols; i += tsize) dst[base + i] = T(exp(load(i) - row_max) * inv);
+    }
+#undef load
+}
+
+#define RLX_SOFTMAX_ADD_ARGS(T) \
+    device const T* src [[buffer(0)]], constant uint& cols [[buffer(1)]], \
+    device T* dst [[buffer(2)]], device const T* add0 [[buffer(3)]], \
+    device const T* add1 [[buffer(4)]], constant uint4& a0 [[buffer(5)]], \
+    constant uint4& a1 [[buffer(6)]], uint row [[threadgroup_position_in_grid]], \
+    uint tid [[thread_position_in_threadgroup]], uint tsize [[threads_per_threadgroup]]
+
+kernel void softmax_lastax_add(RLX_SOFTMAX_ADD_ARGS(float)) {
+    threadgroup float partial[256];
+    softmax_lastax_add_impl<float>(src, cols, dst, add0, add1, a0, a1, row, tid, tsize, partial);
+}
+kernel void softmax_lastax_add_h(RLX_SOFTMAX_ADD_ARGS(half)) {
+    threadgroup float partial[256];
+    softmax_lastax_add_impl<half>(src, cols, dst, add0, add1, a0, a1, row, tid, tsize, partial);
+}
+
 kernel void softmax_lastax_out(
     device const float* src [[buffer(0)]],
     constant uint& cols   [[buffer(1)]],
@@ -8676,6 +9194,14 @@ kernel void dequant_matmul_mlx_gemv(
 
 inline float mlx_bf16(ushort b) { return as_type<float>(uint(b) << 16); }
 
+// An FP4/FP8 group scale by storage (`scale_bf16`, a kind despite the name):
+// 1 = BF16 and 2 = f32 hold the decoded value, 0 = raw E8M0 bytes.
+inline float mlx_scale_at(device const float* scales, uint si, uint gs, uint kind) {
+    if (kind == 1u) return mlx_bf16(((device const ushort*)scales)[si]);
+    if (kind == 2u) return scales[si];
+    return mlx_group_scale(uint(((device const uchar*)scales)[si]), gs);
+}
+
 // Grouped decode GEMV (m==1) — the native MoE expert kernel. Identical dequant
 // math to dequant_matmul_mlx_gemv, but the (single) row's expert e = e_idx[0]
 // offsets into the stacked [E,n,k] weight slab (wq + e*slab_bytes) and the
@@ -8775,19 +9301,19 @@ kernel void grouped_dequant_matmul_mlx_gemv(
                 code = codes[in_pack];
             }
             uint si = sc_off + j * n_groups + g;
-            float sv = scale_bf16 ? mlx_bf16(scale_bf[si]) : scales[si];
-            float bv = scale_bf16 ? mlx_bf16(bias_bf[si]) : biases[si];
+            float sv = (scale_bf16 == 1u) ? mlx_bf16(scale_bf[si]) : scales[si];
+            float bv = (scale_bf16 == 1u) ? mlx_bf16(bias_bf[si]) : biases[si];
             w_dq = sv * float(code) + bv;
         } else if (kind == 1u) {
             uint bidx = j * (k / 2u) + (p / 2u);
             uchar byte = wqe[bidx];
             uint nib = ((p & 1u) == 0u) ? (uint(byte) & 0x0Fu) : (uint(byte) >> 4);
             uint si = sc_off + j * n_groups + g;
-            float sv = scale_bf16 ? mlx_bf16(scale_bf[si]) : mlx_group_scale(uint(scale_u[si]), gs);
+            float sv = mlx_scale_at(scales, si, gs, scale_bf16);
             w_dq = DQ_FP4_E2M1[nib] * sv;
         } else {
             uint si = sc_off + j * n_groups + g;
-            float sv = scale_bf16 ? mlx_bf16(scale_bf[si]) : mlx_group_scale(uint(scale_u[si]), gs);
+            float sv = mlx_scale_at(scales, si, gs, scale_bf16);
             w_dq = dq_fp8_e4m3(wqe[j * k + p]) * sv;
         }
         acc += x[p] * w_dq;
@@ -9006,19 +9532,19 @@ inline float mlx_grouped_w(
             code = codes[in_pack];
         }
         uint si = sc_off + col * n_groups + g;
-        float sv = scale_bf16 ? mlx_bf16(scale_bf[si]) : scales[si];
-        float bv = scale_bf16 ? mlx_bf16(bias_bf[si]) : biases[si];
+        float sv = (scale_bf16 == 1u) ? mlx_bf16(scale_bf[si]) : scales[si];
+        float bv = (scale_bf16 == 1u) ? mlx_bf16(bias_bf[si]) : biases[si];
         return sv * float(code) + bv;
     } else if (kind == 1u) {
         uint bidx = col * (k / 2u) + (p / 2u);
         uchar byte = wqe[bidx];
         uint nib = ((p & 1u) == 0u) ? (uint(byte) & 0x0Fu) : (uint(byte) >> 4);
         uint si = sc_off + col * n_groups + g;
-        float sv = scale_bf16 ? mlx_bf16(scale_bf[si]) : mlx_group_scale(uint(scale_u[si]), gs);
+        float sv = mlx_scale_at(scales, si, gs, scale_bf16);
         return DQ_FP4_E2M1[nib] * sv;
     } else {
         uint si = sc_off + col * n_groups + g;
-        float sv = scale_bf16 ? mlx_bf16(scale_bf[si]) : mlx_group_scale(uint(scale_u[si]), gs);
+        float sv = mlx_scale_at(scales, si, gs, scale_bf16);
         return dq_fp8_e4m3(wqe[col * k + p]) * sv;
     }
 }
@@ -14556,7 +15082,10 @@ macro_rules! concat_midaxis_variant {
     };
 }
 
-pub(crate) fn msl_source() -> String {
+/// The full kernel library source, generated parts substituted: what the
+/// pipelines compile. Public so a benchmark can compile its own kernel
+/// variants against the same templates (`examples/conv3d_f8_bench.rs`).
+pub fn msl_source() -> String {
     // Substitute the generated dispatch/kernels at their markers. The backward
     // derivative dispatch must be defined before the `activation_backward` kernel
     // that calls it; the in-place activation kernels are standalone entry points.
@@ -14684,6 +15213,7 @@ pub struct Kernels {
     pub sgemm_simd_4x4: ComputePipelineState,
     pub bmm_simd_4x4: ComputePipelineState,
     pub bmm_simd_4x4_indexed: ComputePipelineState,
+    pub bmm_simd_4x4_h: ComputePipelineState,
     pub sgemm_simd64: ComputePipelineState,
     pub sgemm_simd64_splitk: ComputePipelineState,
     pub zero_f32: ComputePipelineState,
@@ -14781,6 +15311,8 @@ pub struct Kernels {
     pub elem_add4: ComputePipelineState,
     pub elem_sub4: ComputePipelineState,
     pub binary_broadcast_f32: ComputePipelineState,
+    pub binary_broadcast_h: ComputePipelineState,
+    pub binary_broadcast_1ax_h: ComputePipelineState,
     pub binary_broadcast_rank2_f32: ComputePipelineState,
     pub binary_broadcast_rank24: ComputePipelineState,
     pub elem_mul: ComputePipelineState,
@@ -14938,13 +15470,25 @@ pub struct Kernels {
     pub depthwise_conv1d_bsc: ComputePipelineState,
     pub conv2d_w1: ComputePipelineState,
     pub layer_norm2d: ComputePipelineState,
-    pub group_norm: ComputePipelineState,
+    /// Split group norm: per-chunk statistics, then merge + apply (+ act).
+    pub group_norm_stats: ComputePipelineState,
+    pub group_norm_stats_h: ComputePipelineState,
+    pub group_norm_apply: ComputePipelineState,
+    pub group_norm_apply_h: ComputePipelineState,
     pub resize_nearest_2x: ComputePipelineState,
     pub conv_transpose2d: ComputePipelineState,
     pub conv3d: ComputePipelineState,
     pub conv3d_gemm: ComputePipelineState,
     pub conv3d_gemm_c: ComputePipelineState,
+    /// The three conv3d kernels over half tensors (float accumulation).
+    pub conv3d_h: ComputePipelineState,
+    pub conv3d_gemm_h: ComputePipelineState,
+    pub conv3d_gemm_c_h: ComputePipelineState,
     pub conv_transpose3d: ComputePipelineState,
+    pub conv_transpose3d_h: ComputePipelineState,
+    /// Kernel 2 = stride 2 transposed conv as a simdgroup GEMM (+ half).
+    pub conv_transpose3d_k2s2: ComputePipelineState,
+    pub conv_transpose3d_k2s2_h: ComputePipelineState,
     pub relu_inplace: ComputePipelineState,
     pub sigmoid_inplace: ComputePipelineState,
     pub tanh_inplace: ComputePipelineState,
@@ -14962,6 +15506,9 @@ pub struct Kernels {
     pub atan_inplace: ComputePipelineState,
     pub softmax_lastax: ComputePipelineState,
     pub softmax_lastax_out: ComputePipelineState,
+    /// Out-of-place softmax with up to two folded broadcast addends (+ half).
+    pub softmax_lastax_add: ComputePipelineState,
+    pub softmax_lastax_add_h: ComputePipelineState,
     pub softmax_lastax_causal: ComputePipelineState,
     pub softmax_cross_entropy_dense: ComputePipelineState,
     pub softmax_cross_entropy_with_logits: ComputePipelineState,
@@ -15497,6 +16044,7 @@ impl Kernels {
             sgemm_simd_4x4: pipeline("sgemm_simd_4x4"),
             bmm_simd_4x4: pipeline("bmm_simd_4x4"),
             bmm_simd_4x4_indexed: pipeline("bmm_simd_4x4_indexed"),
+            bmm_simd_4x4_h: pipeline("bmm_simd_4x4_h"),
             sgemm_simd64: pipeline("sgemm_simd64"),
             sgemm_simd64_splitk: pipeline("sgemm_simd64_splitk"),
             zero_f32: pipeline("zero_f32"),
@@ -15592,6 +16140,8 @@ impl Kernels {
             elem_add4: pipeline("elem_add4"),
             elem_sub4: pipeline("elem_sub4"),
             binary_broadcast_f32: pipeline("binary_broadcast_f32"),
+            binary_broadcast_h: pipeline("binary_broadcast_h"),
+            binary_broadcast_1ax_h: pipeline("binary_broadcast_1ax_h"),
             binary_broadcast_rank2_f32: pipeline("binary_broadcast_rank2_f32"),
             binary_broadcast_rank24: pipeline("binary_broadcast_rank24"),
             elem_mul: pipeline("elem_mul"),
@@ -15731,13 +16281,22 @@ impl Kernels {
             depthwise_conv1d_bsc: pipeline("depthwise_conv1d_bsc"),
             conv2d_w1: pipeline("conv2d_w1"),
             layer_norm2d: pipeline("layer_norm2d"),
-            group_norm: pipeline("group_norm"),
+            group_norm_stats: pipeline("group_norm_stats"),
+            group_norm_stats_h: pipeline("group_norm_stats_h"),
+            group_norm_apply: pipeline("group_norm_apply"),
+            group_norm_apply_h: pipeline("group_norm_apply_h"),
             resize_nearest_2x: pipeline("resize_nearest_2x"),
             conv_transpose2d: pipeline("conv_transpose2d"),
             conv3d: pipeline("conv3d"),
             conv3d_gemm: pipeline("conv3d_gemm"),
             conv3d_gemm_c: pipeline("conv3d_gemm_c"),
+            conv3d_h: pipeline("conv3d_h"),
+            conv3d_gemm_h: pipeline("conv3d_gemm_h"),
+            conv3d_gemm_c_h: pipeline("conv3d_gemm_c_h"),
             conv_transpose3d: pipeline("conv_transpose3d"),
+            conv_transpose3d_h: pipeline("conv_transpose3d_h"),
+            conv_transpose3d_k2s2: pipeline("conv_transpose3d_k2s2"),
+            conv_transpose3d_k2s2_h: pipeline("conv_transpose3d_k2s2_h"),
             relu_inplace: pipeline("relu_inplace"),
             sigmoid_inplace: pipeline("sigmoid_inplace"),
             tanh_inplace: pipeline("tanh_inplace"),
@@ -15755,6 +16314,8 @@ impl Kernels {
             atan_inplace: pipeline("atan_inplace"),
             softmax_lastax: pipeline("softmax_lastax"),
             softmax_lastax_out: pipeline("softmax_lastax_out"),
+            softmax_lastax_add: pipeline("softmax_lastax_add"),
+            softmax_lastax_add_h: pipeline("softmax_lastax_add_h"),
             softmax_lastax_causal: pipeline("softmax_lastax_causal"),
             softmax_cross_entropy_dense: pipeline("softmax_cross_entropy_dense"),
             softmax_cross_entropy_with_logits: pipeline("softmax_cross_entropy_with_logits"),

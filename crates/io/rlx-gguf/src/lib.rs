@@ -745,6 +745,8 @@ impl GgufFile {
             );
         }
 
+        resolve_q2_0_layout(&mut tensors, alignment);
+
         // Data segment starts at the next `alignment` boundary. Compute
         // its file offset unconditionally so the mmap path can reuse a
         // header-only parse.
@@ -1083,6 +1085,39 @@ impl GgufFile {
     }
 }
 
+/// Type 42 is ggml's `Q2_0` — 64-value blocks of 18 bytes. Ternary Bonsai v1
+/// files from the PrismML fork used the same id for a 128-value, 34-byte block
+/// (which that fork has since moved to [`GgmlType::PQ2_0`]). The header does
+/// not say which, so read it off the file: a type-42 tensor's span up to the
+/// next tensor fits one layout's size (plus alignment padding) and not the
+/// other's. A file whose spans fit only the 128-value layout has its type-42
+/// tensors read as `PQ2_0`, the same codec.
+fn resolve_q2_0_layout(tensors: &mut HashMap<String, GgufTensor>, alignment: u64) {
+    let mut offsets: Vec<u64> = tensors.values().map(|t| t.offset).collect();
+    offsets.sort_unstable();
+    let fits = |span: u64, bytes: Option<usize>| {
+        bytes.is_some_and(|b| span >= b as u64 && span < b as u64 + alignment.max(1))
+    };
+    let mut old_layout = false;
+    for t in tensors.values().filter(|t| t.dtype == GgmlType::Q2_0) {
+        let i = offsets.partition_point(|&o| o <= t.offset);
+        let Some(&next) = offsets.get(i) else {
+            continue;
+        };
+        let span = next - t.offset;
+        let n = t.n_elements();
+        if fits(span, q2_dequant::q2_0_bytes(n)) && !fits(span, q2_dequant::q2_0_g64_bytes(n)) {
+            old_layout = true;
+            break;
+        }
+    }
+    if old_layout {
+        for t in tensors.values_mut().filter(|t| t.dtype == GgmlType::Q2_0) {
+            t.dtype = GgmlType::PQ2_0;
+        }
+    }
+}
+
 // ─── byte-count helpers ───────────────────────────────────────────
 
 /// Legacy Q8_0 block size (32 elements).
@@ -1142,7 +1177,7 @@ pub fn dequant_typed(dtype: GgmlType, bytes: &[u8], n: usize, label: &str) -> Re
         GgmlType::IQ1S => iq_dequant::dequant_iq1_s(bytes, n)?,
         GgmlType::IQ1M => iq_dequant::dequant_iq1_m(bytes, n)?,
         GgmlType::Q1_0 => q1_dequant::dequant_q1_0(bytes, n)?,
-        GgmlType::Q2_0 => q2_dequant::dequant_q2_0(bytes, n)?,
+        GgmlType::Q2_0 => q2_dequant::dequant_q2_0_g64(bytes, n)?,
         GgmlType::FV5 => fv5_dequant::dequant_fv5(bytes, n)?,
         GgmlType::FV5B => fv5_dequant::dequant_fv5b(bytes, n)?,
         GgmlType::G8_0 => g8_dequant::dequant_g8_0(bytes, n)?,
@@ -1225,7 +1260,7 @@ fn bytes_for(dtype: GgmlType, n: usize) -> Option<usize> {
         GgmlType::IQ1M => iq_dequant::iq1_m_bytes(n),
         // Custom 1-bit format (PrismML Bonsai-27B): f16 scale + 128 sign bits.
         GgmlType::Q1_0 => q1_dequant::q1_0_bytes(n),
-        GgmlType::Q2_0 => q2_dequant::q2_0_bytes(n),
+        GgmlType::Q2_0 => q2_dequant::q2_0_g64_bytes(n),
         // Fermion five-value ternary (Neutrino): 256-elem blocks.
         GgmlType::FV5 => fv5_dequant::fv5_bytes(n),
         GgmlType::FV5B => fv5_dequant::fv5b_bytes(n),

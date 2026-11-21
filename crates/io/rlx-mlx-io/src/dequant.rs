@@ -514,6 +514,44 @@ pub fn dequant_matvec_mxfp4(
     Ok(out)
 }
 
+/// **FUSED MXFP8 matvec**: `out[n] = x[k] @ dequant(W)ᵀ` over raw FP8 E4M3 codes
+/// (`n·k` bytes) and decoded f32 group scales `[n, k/group_size]` — the 8-bit
+/// sibling of [`dequant_matvec_mxfp4`], same accumulation order.
+pub fn dequant_matvec_mxfp8(
+    x: &[f32],
+    w: &[u8],
+    scales: &[f32],
+    group_size: u32,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>> {
+    use rayon::prelude::*;
+    let gs = group_size as usize;
+    if gs == 0 || !k.is_multiple_of(gs) {
+        bail!("mxfp8 matvec: k={k} not divisible by group_size={gs}");
+    }
+    let n_groups = k / gs;
+    if w.len() < n * k {
+        bail!("mxfp8 matvec: weight bytes {} < {}", w.len(), n * k);
+    }
+    if scales.len() < n * n_groups {
+        bail!("mxfp8 matvec: scales {} < {}", scales.len(), n * n_groups);
+    }
+    let mut out = vec![0f32; n];
+    out.par_iter_mut().enumerate().for_each(|(j, o)| {
+        let row = &w[j * k..(j + 1) * k];
+        let mut acc = 0f32;
+        for g in 0..n_groups {
+            let scale = scales[j * n_groups + g];
+            for p in g * gs..(g + 1) * gs {
+                acc += x[p] * dequant_scale_fp8_e4m3(row[p]) * scale;
+            }
+        }
+        *o = acc;
+    });
+    Ok(out)
+}
+
 /// Decode an MLX E8M0 uint8 group scale to f32 (public for grouped-MoE loaders
 /// that pre-convert MXFP4 scales so the matmul op stays f32-uniform).
 pub fn mxfp4_scale_e8m0_to_f32(s: u8) -> f32 {
@@ -528,8 +566,9 @@ fn dequant_scale_e8m0(s: u8) -> f32 {
     half::bf16::from_bits((s as u16) << 7).to_f32()
 }
 
-/// Decode FP8 E4M3 byte (OCP) to f32 — used when group_size == 16.
-fn dequant_scale_fp8_e4m3(s: u8) -> f32 {
+/// Decode one FP8 E4M3 byte (OCP) to f32: MXFP8 codes, and NVFP4-style
+/// group scales when `group_size == 16`.
+pub fn dequant_scale_fp8_e4m3(s: u8) -> f32 {
     // Match MLX FromFP8 for E4M3: reuse half conversion via softfloat-ish path.
     // Bias 7, no inf; NaN at 0x7f / 0xff.
     let sign = (s >> 7) as u32;

@@ -60,10 +60,13 @@ impl Backend for RocmBackend {
 
     fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
         let (graph, io_manifest) = prepare_rocm_exec_graph(graph, options, true);
-        Box::new(RocmExecutableWrapper {
-            inner: RocmExecutable::compile_rng(graph, options.rng),
-            io_manifest,
-        })
+        let mut inner = RocmExecutable::compile_rng(graph, options.rng);
+        // Under `AlwaysF16` the 3-D convolutions read f16 (see `set_conv_f16`).
+        inner.set_conv_f16(matches!(
+            options.policy,
+            Some(rlx_opt::PrecisionPolicy::AlwaysF16)
+        ));
+        Box::new(RocmExecutableWrapper { inner, io_manifest })
     }
 
     fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
@@ -74,10 +77,12 @@ impl Backend for RocmBackend {
             "rocm",
         );
         let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(fused);
-        Box::new(RocmExecutableWrapper {
-            inner: RocmExecutable::compile_rng(graph, options.rng),
-            io_manifest,
-        })
+        let mut inner = RocmExecutable::compile_rng(graph, options.rng);
+        inner.set_conv_f16(matches!(
+            options.policy,
+            Some(rlx_opt::PrecisionPolicy::AlwaysF16)
+        ));
+        Box::new(RocmExecutableWrapper { inner, io_manifest })
     }
 }
 

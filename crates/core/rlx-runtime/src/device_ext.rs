@@ -708,16 +708,13 @@ fn coreml_supports(op: &Op) -> bool {
     ))]
     {
         let kind = op.kind();
-        if rlx_coreml::SUPPORTED_OPS.contains(&kind) {
-            return true;
-        }
         #[cfg(feature = "training")]
         if rlx_coreml::BACKWARD_OPS.contains(&kind)
             || rlx_coreml::NATIVE_BACKWARD_OPS.contains(&kind)
         {
             return true;
         }
-        false
+        rlx_coreml::SUPPORTED_OPS.contains(&kind)
     }
     #[cfg(not(all(
         feature = "coreml",

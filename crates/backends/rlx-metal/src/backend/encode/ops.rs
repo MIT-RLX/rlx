@@ -1129,13 +1129,14 @@ pub(crate) fn encode_binary_broadcast_1ax(
     mid: u32,
     op: u32,
     rhs_is_broadcast: bool,
+    half: bool,
 ) {
     let (a, b) = if rhs_is_broadcast {
         (lhs, rhs)
     } else {
         (rhs, lhs)
     };
-    let use_vec4 = cols.is_multiple_of(4) && cols >= 4;
+    let use_vec4 = !half && cols.is_multiple_of(4) && cols >= 4;
     if use_vec4 {
         let cols4 = cols / 4;
         enc.set_compute_pipeline_state(&k.binary_broadcast_1ax4);
@@ -1159,7 +1160,11 @@ pub(crate) fn encode_binary_broadcast_1ax(
         enc.dispatch_threads(grid, tg);
         return;
     }
-    enc.set_compute_pipeline_state(&k.binary_broadcast_1ax_f32);
+    enc.set_compute_pipeline_state(if half {
+        &k.binary_broadcast_1ax_h
+    } else {
+        &k.binary_broadcast_1ax_f32
+    });
     enc.set_buffer(0, Some(buffer), a as u64);
     enc.set_buffer(1, Some(buffer), b as u64);
     enc.set_buffer(2, Some(buffer), dst as u64);
@@ -8234,6 +8239,9 @@ pub(crate) fn encode_conv2d(
     enc.dispatch_threads(grid, tg);
 }
 
+/// The split group norm: per-chunk statistics, a barrier, then merge, apply
+/// and the folded activation (`act`, `alpha`; see `Thunk::GroupNorm`).
+/// `stats` is the absolute arena byte offset of this node's scratch slice.
 pub(crate) fn encode_group_norm(
     enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -8248,29 +8256,50 @@ pub(crate) fn encode_group_norm(
     w: u32,
     num_groups: u32,
     eps: f32,
+    dt: crate::thunk::HalfFlag,
+    stats: usize,
+    act: u32,
+    alpha: f32,
 ) {
+    let half = matches!(dt, crate::thunk::HalfFlag::F16);
     let nchw: [u32; 4] = [n, c, h, w];
-    enc.set_compute_pipeline_state(&k.group_norm);
-    enc.set_buffer(0, Some(buffer), src as u64);
-    enc.set_buffer(1, Some(buffer), g as u64);
-    enc.set_buffer(2, Some(buffer), b as u64);
-    enc.set_buffer(3, Some(buffer), dst as u64);
-    enc.set_bytes(4, 16, nchw.as_ptr() as *const _);
-    enc.set_bytes(5, 4, &num_groups as *const u32 as *const _);
-    enc.set_bytes(6, 4, &eps as *const f32 as *const _);
-    let groups = (n * num_groups) as u64;
+    let count = (c / num_groups.max(1)) as usize * (h * w) as usize;
+    let grid = crate::mtl::MTLSize {
+        width: count.div_ceil(crate::thunk::GN_CHUNK).max(1) as u64,
+        height: (n * num_groups) as u64,
+        depth: 1,
+    };
     let tg = crate::mtl::MTLSize {
         width: 256,
         height: 1,
         depth: 1,
     };
-    // Dispatch one threadgroup per (batch, group) along grid *width* so
-    // `threadgroup_position_in_grid` (scalar .x) indexes 0..batch*num_groups-1.
-    let grid = crate::mtl::MTLSize {
-        width: groups.max(1),
-        height: 1,
-        depth: 1,
-    };
+    enc.set_compute_pipeline_state(if half {
+        &k.group_norm_stats_h
+    } else {
+        &k.group_norm_stats
+    });
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), stats as u64);
+    enc.set_bytes(2, 16, nchw.as_ptr() as *const _);
+    enc.set_bytes(3, 4, &num_groups as *const u32 as *const _);
+    enc.dispatch_thread_groups(grid, tg);
+    intra_thunk_barrier(enc);
+    enc.set_compute_pipeline_state(if half {
+        &k.group_norm_apply_h
+    } else {
+        &k.group_norm_apply
+    });
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), g as u64);
+    enc.set_buffer(2, Some(buffer), b as u64);
+    enc.set_buffer(3, Some(buffer), dst as u64);
+    enc.set_buffer(4, Some(buffer), stats as u64);
+    enc.set_bytes(5, 16, nchw.as_ptr() as *const _);
+    enc.set_bytes(6, 4, &num_groups as *const u32 as *const _);
+    enc.set_bytes(7, 4, &eps as *const f32 as *const _);
+    enc.set_bytes(8, 4, &act as *const u32 as *const _);
+    enc.set_bytes(9, 4, &alpha as *const f32 as *const _);
     enc.dispatch_thread_groups(grid, tg);
 }
 
@@ -8428,6 +8457,7 @@ pub(crate) fn encode_conv3d(
     dh: u32,
     dw: u32,
     groups: u32,
+    dt: crate::thunk::HalfFlag,
 ) {
     let a: [u32; 4] = [n, c_in, d, h];
     let b: [u32; 4] = [w, c_out, d_out, h_out];
@@ -8463,15 +8493,23 @@ pub(crate) fn encode_conv3d(
         && !forced.eq_ignore_ascii_case("naive")
         && (n * d_out * h_out * w_out) >= gemm_min_m()
         && c_out >= 8;
-    // One input channel per K-tile needs the taps to fit one tile; a 3^3 or
-    // smaller filter does, anything larger falls back to the general tiling.
-    let gemm_c = gemm && (kd * kh * kw) <= 32 && !forced.eq_ignore_ascii_case("gemm");
-    enc.set_compute_pipeline_state(if gemm_c {
-        &k.conv3d_gemm_c
-    } else if gemm {
-        &k.conv3d_gemm
-    } else {
-        &k.conv3d
+    // One input channel per K-tile, a larger filter than one tile's 32 taps
+    // in 32-tap chunks. The general tiling (`RLX_METAL_CONV3D=gemm`) decodes
+    // every K index: SynthSeg's 5^3 denoiser ran at 270 GFLOP/s on it,
+    // 6-9x below a 3^3 filter here.
+    let gemm_c = gemm && !forced.eq_ignore_ascii_case("gemm");
+    // An f16 node's tensors are half (`AutoMixedPrecision::f16_conv3d`); the
+    // `_h` kernels read and write half and accumulate in float.
+    // `conv3d_gemm_c_h` tiles 64 positions, not 32 (see the kernel).
+    let half = matches!(dt, crate::thunk::HalfFlag::F16);
+    let bm64 = gemm_c && half;
+    enc.set_compute_pipeline_state(match (gemm_c, gemm, half) {
+        (true, _, false) => &k.conv3d_gemm_c,
+        (true, _, true) => &k.conv3d_gemm_c_h,
+        (false, true, false) => &k.conv3d_gemm,
+        (false, true, true) => &k.conv3d_gemm_h,
+        (false, false, false) => &k.conv3d,
+        (false, false, true) => &k.conv3d_h,
     });
     enc.set_buffer(0, Some(buffer), src as u64);
     enc.set_buffer(1, Some(buffer), weight as u64);
@@ -8489,7 +8527,7 @@ pub(crate) fn encode_conv3d(
     enc.set_bytes(13, 16, up.as_ptr() as *const _);
     if gemm {
         // One threadgroup of 128 threads per (32 positions x 32 channels) tile.
-        let tiles_m = ((n * d_out * h_out * w_out) as u64).div_ceil(32);
+        let tiles_m = ((n * d_out * h_out * w_out) as u64).div_ceil(if bm64 { 64 } else { 32 });
         let tiles_n = (c_out as u64).div_ceil(32);
         enc.dispatch_threads(
             crate::mtl::MTLSize {
@@ -8549,14 +8587,58 @@ pub(crate) fn encode_conv_transpose3d(
     dh: u32,
     dw: u32,
     groups: u32,
+    dt: crate::thunk::HalfFlag,
 ) {
+    let half = matches!(dt, crate::thunk::HalfFlag::F16);
+    // Kernel 2 = stride 2, unpadded, ungrouped, no output padding: the GEMM.
+    // `RLX_METAL_CONV_TRANSPOSE3D=gather` forces the general kernel.
+    let k2s2 = [kd, kh, kw, sd, sh, sw] == [2; 6]
+        && [pd, ph, pw] == [0; 3]
+        && [dd, dh, dw] == [1; 3]
+        && groups <= 1
+        && [d_out, h_out, w_out] == [2 * d, 2 * h, 2 * w]
+        && !rlx_ir::env::var("RLX_METAL_CONV_TRANSPOSE3D")
+            .is_some_and(|v| v.eq_ignore_ascii_case("gather"));
+    if k2s2 {
+        let a: [u32; 4] = [n, c_in, d, h];
+        let b: [u32; 4] = [w, c_out, 0, 0];
+        enc.set_compute_pipeline_state(if half {
+            &k.conv_transpose3d_k2s2_h
+        } else {
+            &k.conv_transpose3d_k2s2
+        });
+        enc.set_buffer(0, Some(buffer), src as u64);
+        enc.set_buffer(1, Some(buffer), weight as u64);
+        enc.set_buffer(2, Some(buffer), dst as u64);
+        enc.set_bytes(3, 16, a.as_ptr() as *const _);
+        enc.set_bytes(4, 16, b.as_ptr() as *const _);
+        let tiles_m = ((n * d * h * w) as u64).div_ceil(32);
+        let tiles_n = ((c_out * 8) as u64).div_ceil(32);
+        enc.dispatch_threads(
+            crate::mtl::MTLSize {
+                width: tiles_m * 128,
+                height: tiles_n,
+                depth: 1,
+            },
+            crate::mtl::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
     let a: [u32; 4] = [n, c_in, d, h];
     let b: [u32; 4] = [w, c_out, d_out, h_out];
     let c: [u32; 4] = [w_out, kd, kh, kw];
     let dparams: [u32; 4] = [sd, sh, sw, groups];
     let e: [u32; 4] = [pd, ph, pw, dd];
     let f: [u32; 4] = [dh, dw, 0, 0];
-    enc.set_compute_pipeline_state(&k.conv_transpose3d);
+    enc.set_compute_pipeline_state(if half {
+        &k.conv_transpose3d_h
+    } else {
+        &k.conv_transpose3d
+    });
     enc.set_buffer(0, Some(buffer), src as u64);
     enc.set_buffer(1, Some(buffer), weight as u64);
     enc.set_buffer(2, Some(buffer), dst as u64);
@@ -10328,6 +10410,50 @@ pub(crate) fn encode_fake_quantize_perbatch(
 /// Standalone softmax: one threadgroup per row, in-place exp+normalize.
 /// Threadgroup size must be a power of 2 and ≤256 (the kernel's reduction
 /// buffer). Picks the largest pow2 ≤ cols, capped at 256.
+/// `Thunk::SoftmaxAdd`: one threadgroup a row, as `encode_softmax`.
+pub(crate) fn encode_softmax_add(
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &crate::mtl::Buffer,
+    src: usize,
+    dst: usize,
+    rows: u32,
+    cols: u32,
+    adds: &[Option<(usize, u32, u32)>; 2],
+    dt: crate::thunk::HalfFlag,
+) {
+    let mut tg_w: u64 = 1;
+    while tg_w * 2 <= cols as u64 && tg_w * 2 <= 256 {
+        tg_w *= 2;
+    }
+    enc.set_compute_pipeline_state(match dt {
+        crate::thunk::HalfFlag::F16 => &k.softmax_lastax_add_h,
+        crate::thunk::HalfFlag::F32 => &k.softmax_lastax_add,
+    });
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_bytes(1, 4, &cols as *const u32 as *const _);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    for (slot, a) in adds.iter().enumerate() {
+        // An absent addend is never read; bind the source so no buffer is nil.
+        let (off, mid, post) = a.unwrap_or((src, 1, 1));
+        let p: [u32; 4] = [u32::from(a.is_some()), mid, post, 0];
+        enc.set_buffer(3 + slot as u64, Some(buffer), off as u64);
+        enc.set_bytes(5 + slot as u64, 16, p.as_ptr() as *const _);
+    }
+    enc.dispatch_thread_groups(
+        crate::mtl::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        crate::mtl::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 pub(crate) fn encode_softmax(
     enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -10559,16 +10685,19 @@ pub(crate) fn encode_concat_midaxis(
         // f32 bytes as half (→ inf/NaN saturation).
         let src_dt = input_dts.get(seg_i).copied().unwrap_or(dt);
         // One outer row: the segment is a single contiguous block. Copy it
-        // four floats per thread instead of one element per index decode.
-        let dst_seg = dst as u64 + axis_off as u64 * inner_e * 4;
+        // 16 bytes per thread instead of one element per index decode — the
+        // same bytes whether they hold four floats or eight halves.
+        let elem: u64 = if matches!(dt, HalfFlag::F16) { 2 } else { 4 };
+        let dst_seg = dst as u64 + axis_off as u64 * inner_e * elem;
+        let bytes = total * elem;
         if outer == 1
-            && matches!((src_dt, dt), (HalfFlag::F32, HalfFlag::F32))
-            && total.is_multiple_of(4)
+            && src_dt == dt
+            && bytes.is_multiple_of(16)
             && dst_seg.is_multiple_of(16)
             && (src_off as u64).is_multiple_of(16)
-            && total / 4 <= u32::MAX as u64
+            && bytes / 16 <= u32::MAX as u64
         {
-            let n4 = (total / 4) as u32;
+            let n4 = (bytes / 16) as u32;
             let src_byte = src_off as u64;
             enc.set_compute_pipeline_state(&k.copy_f32x4);
             enc.set_buffer(0, Some(buffer), 0);
@@ -10640,11 +10769,18 @@ pub(crate) fn encode_concat_lastax(
     // at large arena offsets which silently drops writes on ≥4 GB models
     // (task #50). The multi kernel takes byte offsets from `ConcatSeg` (now
     // u64) and binds `arena` at offset 0 — works at any offset.
+    // The multi kernels copy 4-byte units. Half segments whose lengths are all
+    // even are whole units too: the same bytes, lengths halved.
+    let half_as_words = matches!(dt, HalfFlag::F16)
+        && dst_axis.is_multiple_of(2)
+        && inputs.iter().all(|&(_, len)| len.is_multiple_of(2));
     if inputs.len() >= 2
         && inputs.len() <= NARROW_BATCH_MAX
-        && matches!(dt, HalfFlag::F32)
+        && (matches!(dt, HalfFlag::F32) || half_as_words)
         && metal_concat_multi_enabled()
     {
+        let unit = if half_as_words { 2 } else { 1 };
+        let dst_axis = dst_axis / unit;
         let mut cum = 0u32;
         let segs: Vec<ConcatSegGpu> = inputs
             .iter()
@@ -10652,9 +10788,9 @@ pub(crate) fn encode_concat_lastax(
                 let seg = ConcatSegGpu {
                     src: src_off as u64,
                     dst_col: cum,
-                    len: src_axis,
+                    len: src_axis / unit,
                 };
-                cum += src_axis;
+                cum += src_axis / unit;
                 seg
             })
             .collect();

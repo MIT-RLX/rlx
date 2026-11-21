@@ -221,3 +221,52 @@ fn activations_folded_into_conv_and_group_norm() {
         assert!(worst <= 1e-4, "c{co}: worst relative error {worst}");
     }
 }
+
+/// `Step::ConvTranspose3d`'s shader against the CPU executor: the U-Net
+/// upsample (kernel 2, stride 2), strided / padded / dilated with output
+/// padding, anisotropic, grouped, batched.
+fn run_t(c: &Conv, out_pad: [usize; 3]) {
+    let sh = |d: &[usize]| Shape::new(d, DType::F32);
+    let xn = c.n * c.cin * c.dims.iter().product::<usize>();
+    let wn = c.cin * (c.cout / c.groups) * c.k.iter().product::<usize>();
+    let xs: Vec<f32> = (0..xn).map(|i| (i as f32 * 0.37).sin()).collect();
+    let ws: Vec<f32> = (0..wn).map(|i| 0.04 * (i % 23) as f32 - 0.45).collect();
+    let mut g = Graph::new("conv_transpose3d");
+    let x = g.input("x", sh(&[c.n, c.cin, c.dims[0], c.dims[1], c.dims[2]]));
+    let w = g.input("w", sh(&[c.cin, c.cout / c.groups, c.k[0], c.k[1], c.k[2]]));
+    let y = g.conv_transpose3d(x, w, c.s, c.p, c.d, out_pad, c.groups);
+    g.set_outputs(vec![y]);
+    let plan = rlx_webgl::build_plan(&g).expect("plan");
+    let inputs: [(&str, &[f32]); 2] = [("x", &xs), ("w", &ws)];
+    let want = rlx_webgl::run_cpu(&plan, &inputs)
+        .expect("run_cpu")
+        .remove(0);
+    let gl = rlx_webgl::exec_gl::GlBackend::new().expect("webgl2");
+    let got = gl.run(&plan, &inputs).expect("run gl").remove(0);
+    let label = format!(
+        "convT n{} c{}->{} {:?} k{:?} s{:?} p{:?} d{:?} op{out_pad:?} g{}",
+        c.n, c.cin, c.cout, c.dims, c.k, c.s, c.p, c.d, c.groups
+    );
+    assert_eq!(got.len(), want.len(), "{label}");
+    for (i, (a, e)) in got.iter().zip(&want).enumerate() {
+        assert!(
+            (a - e).abs() <= 1e-5 * (1.0 + e.abs()),
+            "{label} [{i}]: webgl {a} cpu {e}"
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+fn conv_transpose3d() {
+    run_t(&conv(6, 4, [3, 4, 5], 2, [2; 3], 0, 1), [0; 3]);
+    run_t(&conv(4, 6, [3, 3, 4], 3, [2, 1, 2], 1, 1), [1, 0, 1]);
+    run_t(&conv(3, 5, [4, 5, 3], 3, [2; 3], 1, 2), [1; 3]);
+    run_t(
+        &Conv {
+            n: 2,
+            groups: 2,
+            ..conv(4, 6, [3, 4, 4], 3, [2; 3], 1, 1)
+        },
+        [0; 3],
+    );
+}

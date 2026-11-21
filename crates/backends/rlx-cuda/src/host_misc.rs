@@ -78,26 +78,6 @@ pub fn run_pad(
     );
 }
 
-/// ArgMax/ArgMin (f32-encoded indices) over the middle `reduced` axis.
-#[allow(clippy::too_many_arguments)]
-pub fn run_argreduce(
-    stream: &Arc<CudaStream>,
-    buffer: &mut CudaSlice<f32>,
-    src: usize,
-    dst: usize,
-    outer: usize,
-    reduced: usize,
-    inner: usize,
-    is_max: bool,
-) {
-    let mut arena = CudaArena {
-        stream,
-        buffer,
-        size_bytes: 0,
-    };
-    rlx_gpu_host::run_argreduce(&mut arena, src, dst, outer, reduced, inner, is_max);
-}
-
 /// Axial 2-D RoPE on `[batch, seq, hidden]`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_axial_rope2d(

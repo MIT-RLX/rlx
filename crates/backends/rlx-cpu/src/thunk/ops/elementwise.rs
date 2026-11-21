@@ -2049,7 +2049,11 @@ fn sigmoid_f32(x: f32) -> f32 {
 }
 
 fn elu_f32(x: f32) -> f32 {
-    if x > 0.0 { x } else { crate::vmath::exp_poly(x) - 1.0 }
+    if x > 0.0 {
+        x
+    } else {
+        crate::vmath::exp_poly(x) - 1.0
+    }
 }
 
 /// The per-element function `ActivationInPlace` applies for `act`, for a kernel that applies it

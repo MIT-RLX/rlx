@@ -322,6 +322,39 @@ impl RocmExecutable {
                         [&mut arena_ptr, &n_s, a_off, b_off, c_off, op]
                     );
                 }
+                Step::BinaryBroadcast {
+                    n,
+                    a_off,
+                    b_off,
+                    c_off,
+                    op,
+                    rank,
+                    meta_idx,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = crate::kernels::binary_broadcast_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let mut meta_ptr = self.meta_buffers[*meta_idx].ptr;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            &n_s,
+                            a_off,
+                            b_off,
+                            c_off,
+                            op,
+                            rank,
+                            &mut meta_ptr
+                        ]
+                    );
+                }
                 Step::RocmGpuKernel {
                     name,
                     out_off,
@@ -564,11 +597,26 @@ impl RocmExecutable {
                     if outer_s == 0 {
                         continue;
                     }
-                    let kernel = reduce_kernel(&self.ctx);
+                    // Rows of a few elements (a 2x2x2 pool's): a thread a row,
+                    // not a block (`reduce_rows`, same accumulation).
+                    let short = *inner <= REDUCE_ROWS_MAX;
+                    let kernel = if short {
+                        crate::kernels::reduce_rows_kernel(&self.ctx)
+                    } else {
+                        reduce_kernel(&self.ctx)
+                    };
                     crate::launch_kernel!(
                         kernel,
                         stream,
-                        (outer_s, 1, 1),
+                        (
+                            if short {
+                                outer_s.div_ceil(256)
+                            } else {
+                                outer_s
+                            },
+                            1,
+                            1
+                        ),
                         (256, 1, 1),
                         [&mut arena_ptr, &outer_s, inner, in_off, out_off, op]
                     );
@@ -584,11 +632,26 @@ impl RocmExecutable {
                     if outer_s == 0 {
                         continue;
                     }
-                    let kernel = softmax_kernel(&self.ctx);
+                    // Short axes: a warp a vector when contiguous, a thread a
+                    // vector when strided (coalesced across vectors).
+                    let short = *inner <= SOFTMAX_ROWS_MAX;
+                    let (kernel, grid) = if short && *stride == 1 {
+                        (
+                            crate::kernels::softmax_warp_kernel(&self.ctx),
+                            outer_s.div_ceil(8),
+                        )
+                    } else if short {
+                        (
+                            crate::kernels::softmax_rows_kernel(&self.ctx),
+                            outer_s.div_ceil(256),
+                        )
+                    } else {
+                        (softmax_kernel(&self.ctx), outer_s)
+                    };
                     crate::launch_kernel!(
                         kernel,
                         stream,
-                        (outer_s, 1, 1),
+                        (grid, 1, 1),
                         (256, 1, 1),
                         [&mut arena_ptr, &outer_s, inner, stride, in_off, out_off]
                     );
@@ -3176,7 +3239,7 @@ impl RocmExecutable {
                         *elem_bytes as usize,
                     );
                 }
-                Step::ArgReduceHost {
+                Step::ArgReduce {
                     src_byte_off,
                     dst_byte_off,
                     outer,
@@ -3184,15 +3247,34 @@ impl RocmExecutable {
                     inner,
                     is_max,
                 } => {
-                    crate::host_misc::run_argreduce(
-                        &self.ctx,
-                        &self.arena.buffer,
-                        *src_byte_off as usize,
-                        *dst_byte_off as usize,
-                        *outer as usize,
-                        *reduced as usize,
-                        *inner as usize,
-                        *is_max,
+                    // A block a row for long last-axis rows, else a thread an
+                    // output (coalesced over `inner`).
+                    let row = *inner == 1 && *reduced > ARGREDUCE_ROW_MIN;
+                    let (kernel, grid) = if row {
+                        (crate::kernels::argreduce_row_kernel(&self.ctx), *outer)
+                    } else {
+                        let total = *outer as u64 * *inner as u64;
+                        (
+                            crate::kernels::argreduce_kernel(&self.ctx),
+                            total.div_ceil(256) as u32,
+                        )
+                    };
+                    let (in_off, out_off) = (*src_byte_off / 4, *dst_byte_off / 4);
+                    let is_max = *is_max as u32;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            outer,
+                            reduced,
+                            inner,
+                            &in_off,
+                            &out_off,
+                            &is_max
+                        ]
                     );
                 }
                 Step::AxialRope2d {
@@ -4924,13 +5006,28 @@ impl RocmExecutable {
                     w,
                     num_groups,
                     eps_bits,
+                    act,
+                    alpha_bits,
+                    stats_off,
                 } => {
-                    let kernel = group_norm_kernel(&self.ctx);
-                    let grid = n * num_groups;
+                    // Split: per-chunk statistics, then merge + normalise, one
+                    // block a chunk (`group_norm.cu`), as rlx-cuda.
+                    let plane = *h * *w;
+                    let count = (*c / (*num_groups).max(1)) * plane;
+                    let chunks = count.div_ceil(super::compile::GN_CHUNK).max(1);
+                    let stats = group_norm_stats_kernel(&self.ctx);
                     crate::launch_kernel!(
-                        kernel,
+                        stats,
                         stream,
-                        (grid, 1, 1),
+                        (chunks, *n * *num_groups, 1),
+                        (256, 1, 1),
+                        [&mut arena_ptr, src_off, stats_off, c, &plane, num_groups]
+                    );
+                    let apply = group_norm_apply_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        apply,
+                        stream,
+                        (chunks, *n * *num_groups, 1),
                         (256, 1, 1),
                         [
                             &mut arena_ptr,
@@ -4938,12 +5035,13 @@ impl RocmExecutable {
                             g_off,
                             b_off,
                             dst_off,
-                            n,
+                            stats_off,
                             c,
-                            h,
-                            w,
+                            &plane,
                             num_groups,
-                            eps_bits
+                            eps_bits,
+                            act,
+                            alpha_bits
                         ]
                     );
                 }
@@ -6156,6 +6254,209 @@ impl RocmExecutable {
                         continue;
                     }
 
+                    // f16 on RDNA3's matrix cores (`conv3d_wmma`): reads the f32
+                    // arena, rounds to f16 as it stages, f32 out. gfx11 only;
+                    // `RLX_ROCM_CONV3D_F16=cot` takes the path below instead.
+                    if self.conv_f16
+                        && *groups <= 1
+                        // K tiles are whole channels of at most 32 padded taps.
+                        && *kd * *kh * *kw <= 32
+                        && wmma_conv3d_available()
+                        && !rlx_ir::env::var("RLX_ROCM_CONV3D_F16").is_some_and(|v| v == "cot")
+                    {
+                        // Stride 1, dilation 1, filters up to 3^3: the input patch
+                        // a 4 x 16 output box reads is staged once a channel
+                        // (`conv3d_wmma_patch`). `RLX_ROCM_CONV3D_F16=gather`
+                        // keeps the per-element gather.
+                        if [*sd, *sh, *sw, *dd, *dh, *dw] == [1; 6]
+                            && *kd <= 3
+                            && *kh <= 3
+                            && *kw <= 3
+                            && !rlx_ir::env::var("RLX_ROCM_CONV3D_F16")
+                                .is_some_and(|v| v == "gather")
+                        {
+                            let (kernel, bn) = if *c_out >= 64 {
+                                (conv3d_wmma_patch_n64_kernel(&self.ctx), 64)
+                            } else {
+                                (conv3d_wmma_patch_kernel(&self.ctx), 32)
+                            };
+                            let blocks = *n * *d_out * h_out.div_ceil(4) * w_out.div_ceil(16);
+                            crate::launch_kernel!(
+                                kernel,
+                                stream,
+                                (blocks, c_out.div_ceil(bn), 1),
+                                (128, 1, 1),
+                                [
+                                    &mut arena_ptr,
+                                    n,
+                                    c_in,
+                                    c_out,
+                                    d,
+                                    h,
+                                    w,
+                                    d_out,
+                                    h_out,
+                                    w_out,
+                                    kd,
+                                    kh,
+                                    kw,
+                                    pd,
+                                    ph,
+                                    pw,
+                                    in_off,
+                                    w_off,
+                                    out_off
+                                ]
+                            );
+                            continue;
+                        }
+                        // 64-channel tiles once there are 64 channels to fill them.
+                        let (kernel, bn) = if *c_out >= 64 {
+                            (conv3d_wmma_n64_kernel(&self.ctx), 64)
+                        } else {
+                            (conv3d_wmma_kernel(&self.ctx), 32)
+                        };
+                        let m = *n * *d_out * *h_out * *w_out;
+                        crate::launch_kernel!(
+                            kernel,
+                            stream,
+                            (m.div_ceil(64), c_out.div_ceil(bn), 1),
+                            (128, 1, 1),
+                            [
+                                &mut arena_ptr,
+                                n,
+                                c_in,
+                                c_out,
+                                d,
+                                h,
+                                w,
+                                d_out,
+                                h_out,
+                                w_out,
+                                kd,
+                                kh,
+                                kw,
+                                sd,
+                                sh,
+                                sw,
+                                pd,
+                                ph,
+                                pw,
+                                dd,
+                                dh,
+                                dw,
+                                in_off,
+                                w_off,
+                                out_off
+                            ]
+                        );
+                        continue;
+                    }
+                    // f16 (`set_conv_f16`): input and filter cast into the half
+                    // scratch, read by `conv3d_cot_h`, output f32 in place.
+                    if self.conv_f16
+                        && *groups <= 1
+                        && *kh * *kw <= 27
+                        && let Some(scratch) = self.conv_half_scratch.as_ref()
+                    {
+                        let nx = *n * *c_in * *d * *h * *w;
+                        let nw = *c_out * *c_in * *kd * *kh * *kw;
+                        let xh = scratch.ptr;
+                        let wh = xh + nx as u64 * 2;
+                        let f16 = 0u32;
+                        for (src_off, len, dst) in [(*in_off, nx, xh), (*w_off, nw, wh)] {
+                            let src = arena_base + src_off as u64 * 4;
+                            let kernel = cast_f32_to_half_kernel(&self.ctx);
+                            let (grid, block) = dispatch_grid_1d(len, 256);
+                            crate::launch_kernel!(
+                                kernel,
+                                stream,
+                                (grid, 1, 1),
+                                (block, 1, 1),
+                                [&src, &dst, &len, &f16]
+                            );
+                        }
+                        let kernel = conv3d_cot_h_kernel(&self.ctx);
+                        let m = *n * *d_out * *h_out * *w_out;
+                        crate::launch_kernel!(
+                            kernel,
+                            stream,
+                            (m.div_ceil(256), c_out.div_ceil(8), 1),
+                            (256, 1, 1),
+                            [
+                                &xh,
+                                &wh,
+                                &mut arena_ptr,
+                                n,
+                                c_in,
+                                c_out,
+                                d,
+                                h,
+                                w,
+                                d_out,
+                                h_out,
+                                w_out,
+                                kd,
+                                kh,
+                                kw,
+                                sd,
+                                sh,
+                                sw,
+                                pd,
+                                ph,
+                                pw,
+                                dd,
+                                dh,
+                                dw,
+                                out_off
+                            ]
+                        );
+                        continue;
+                    }
+                    // Register-blocked kernel (`conv3d_cot`): eight output
+                    // channels a thread, the filter in shared memory.
+                    // `RLX_ROCM_CONV3D=naive` keeps the one-output kernel.
+                    if *groups <= 1
+                        && *kh * *kw <= 27
+                        && !rlx_ir::env::var("RLX_ROCM_CONV3D").is_some_and(|v| v == "naive")
+                    {
+                        let kernel = conv3d_cot_kernel(&self.ctx);
+                        let m = *n * *d_out * *h_out * *w_out;
+                        crate::launch_kernel!(
+                            kernel,
+                            stream,
+                            (m.div_ceil(256), c_out.div_ceil(8), 1),
+                            (256, 1, 1),
+                            [
+                                &mut arena_ptr,
+                                n,
+                                c_in,
+                                c_out,
+                                d,
+                                h,
+                                w,
+                                d_out,
+                                h_out,
+                                w_out,
+                                kd,
+                                kh,
+                                kw,
+                                sd,
+                                sh,
+                                sw,
+                                pd,
+                                ph,
+                                pw,
+                                dd,
+                                dh,
+                                dw,
+                                in_off,
+                                w_off,
+                                out_off
+                            ]
+                        );
+                        continue;
+                    }
                     let kernel = conv3d_kernel(&self.ctx);
                     let total = n * c_out * d_out * h_out * w_out;
                     let (grid, block) = dispatch_grid_1d(total, 256);
@@ -6399,3 +6700,21 @@ fn rdna_decode_gemv() -> bool {
                 .is_some_and(|a| ["gfx10", "gfx11", "gfx12"].iter().any(|p| a.starts_with(p)))
     })
 }
+
+/// RDNA3 (gfx11) has the WMMA instructions `conv3d_wmma` is built on.
+fn wmma_conv3d_available() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::hip::rocm_target_arch().is_some_and(|a| a.starts_with("gfx11")))
+}
+
+/// Longest reduced row `reduce_rows` takes (one thread a row); longer
+/// rows take `reduce`, a block a row.
+const REDUCE_ROWS_MAX: u32 = 32;
+
+/// Longest softmax axis `softmax_rows` takes (one thread a vector); longer
+/// axes take `softmax`, a block a vector.
+const SOFTMAX_ROWS_MAX: u32 = 64;
+
+/// Shortest last-axis row `argreduce_row` (a block a row) takes; shorter
+/// rows and middle axes take `argreduce`, a thread an output.
+const ARGREDUCE_ROW_MIN: u32 = 1024;

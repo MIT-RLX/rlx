@@ -68,6 +68,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         DequantMatMul,
         DequantMoEWeights,
         DequantGroupedMatMul,
+        DequantGroupedMatMulMlx,
         Quantize,
         Dequantize,
         // NOT SelectiveScan: `mil::ssm::lower_selective_scan` unrolls the whole

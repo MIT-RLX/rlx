@@ -7,10 +7,10 @@
 
 use anyhow::{Result, bail};
 
-use crate::mx_dequant::{QK_MXFP4, QK_NVFP4, e4m3_scale_to_f32, e8m0_scale_to_f32};
-
-const MXFP4_BLOCK_BYTES: usize = 1 + QK_MXFP4 / 2;
-const NVFP4_BLOCK_BYTES: usize = 1 + QK_NVFP4 / 2;
+use crate::mx_dequant::{
+    MXFP4_BLOCK_BYTES, NVFP4_BLOCK_BYTES, QK_MXFP4, QK_NVFP4, QK_NVFP4_SUB, e8m0_scale_to_f32,
+    ue4m3_scale_to_f32,
+};
 
 const FP4_E2M1: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
@@ -42,25 +42,35 @@ fn e8m0_from_amax(amax: f32) -> u8 {
     (amax.log2().floor() as i32 - 2 + 127).clamp(0, 254) as u8
 }
 
-/// Encode f32 scale as OCP E4M3 (unsigned-style, matches [`e4m3_scale_to_f32`] decode).
-fn fp32_to_e4m3_scale(target: f32) -> u8 {
-    if target <= 0.0 {
+/// Unsigned E4M3 scale byte for `x` — ggml's `ggml_fp32_to_ue4m3`, rounding
+/// and saturation included.
+fn fp32_to_ue4m3(x: f32) -> u8 {
+    // Also catches NaN, like ggml's `!(x > 0.0f)`.
+    if x.is_nan() || x <= 0.0 {
         return 0;
     }
-    let mut best = 0u8;
-    let mut best_err = e4m3_scale_to_f32(0).abs();
-    for b in 1..=254u8 {
-        let s = e4m3_scale_to_f32(b);
-        if s <= 0.0 {
-            continue;
-        }
-        let err = (s - target).abs();
-        if err < best_err {
-            best = b;
-            best_err = err;
+    let x = x.min(448.0);
+    let bits = x.to_bits();
+    let fp32_exp = ((bits >> 23) & 0xFF) as i32 - 127;
+    let fp32_man = ((bits >> 20) & 0x7) as i32;
+    let mut exp = fp32_exp + 7;
+    if exp <= 0 {
+        // Subnormal: value = man · 2^-9.
+        let man = ((x * 512.0 + 0.5) as i32).min(7);
+        return if man < 1 { 0 } else { man as u8 };
+    }
+    if exp >= 15 {
+        return 0x7E;
+    }
+    let mut man = fp32_man + ((bits >> 19) & 1) as i32;
+    if man > 7 {
+        man = 0;
+        exp += 1;
+        if exp >= 15 {
+            return 0x7E;
         }
     }
-    best
+    ((exp << 3) | man) as u8
 }
 
 /// Quantize one MXFP4 block (32 fp32 → 17 bytes).
@@ -80,20 +90,24 @@ pub fn quantize_mxfp4_block(src: &[f32], out: &mut [u8]) {
     }
 }
 
-/// Quantize one NVFP4 block (16 fp32 → 9 bytes).
+/// Quantize one NVFP4 block (64 fp32 → 36 bytes), ggml layout: four UE4M3
+/// scales (one per 16 values), then per scale group `s` byte `8s + j` holds
+/// values `16s + j` (low nibble) and `16s + j + 8` (high).
 pub fn quantize_nvfp4_block(src: &[f32], out: &mut [u8]) {
+    const HALF: usize = QK_NVFP4_SUB / 2;
+    const N_SUB: usize = QK_NVFP4 / QK_NVFP4_SUB;
     assert!(src.len() >= QK_NVFP4 && out.len() >= NVFP4_BLOCK_BYTES);
-    let mut amax = 0f32;
-    for &v in &src[..QK_NVFP4] {
-        amax = amax.max(v.abs());
-    }
-    let ue = fp32_to_e4m3_scale(amax / 6.0);
-    let d = e4m3_scale_to_f32(ue);
-    out[0] = ue;
-    for j in 0..QK_NVFP4 / 2 {
-        let x0 = best_index_fp4(src[j], d);
-        let x1 = best_index_fp4(src[j + QK_NVFP4 / 2], d);
-        out[1 + j] = x0 | (x1 << 4);
+    for s in 0..N_SUB {
+        let xb = &src[s * QK_NVFP4_SUB..(s + 1) * QK_NVFP4_SUB];
+        let amax = xb.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let ue = fp32_to_ue4m3(amax / 6.0);
+        out[s] = ue;
+        let d = ue4m3_scale_to_f32(ue);
+        for j in 0..HALF {
+            let x0 = best_index_fp4(xb[j], d);
+            let x1 = best_index_fp4(xb[j + HALF], d);
+            out[N_SUB + s * HALF + j] = x0 | (x1 << 4);
+        }
     }
 }
 

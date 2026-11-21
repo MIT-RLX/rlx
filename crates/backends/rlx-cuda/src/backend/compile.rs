@@ -96,6 +96,7 @@ impl CudaExecutable {
         t = mark("unfuse", t);
 
         let dequant_scratch = crate::gguf_gpu::dequant_gguf_scratch_bytes(&graph);
+        let gn_stats_scratch = group_norm_stats_bytes(&graph);
         // Native `Op::FusedAttentionBlock`: per-block packed-QKV + attn scratch
         // (the projections are GEMMs into these buffers, read by the
         // `fused_attn_block` kernel). Empty when every FAB was decomposed.
@@ -208,6 +209,13 @@ impl CudaExecutable {
         } else {
             0
         };
+        let mut gn_stats_scratch_off = if gn_stats_scratch > 0 {
+            let aligned = plan.arena_size.div_ceil(16) * 16;
+            plan.arena_size = aligned + gn_stats_scratch;
+            aligned
+        } else {
+            0
+        };
 
         if rlx_ir::env::flag("RLX_CUDA_ARENA_DEBUG") {
             eprintln!(
@@ -246,6 +254,9 @@ impl CudaExecutable {
             }
             if gdn_scratch > 0 {
                 gdn_scratch_off += arena_act_base;
+            }
+            if gn_stats_scratch > 0 {
+                gn_stats_scratch_off += arena_act_base;
             }
         }
         let half_widen_scratch_f32 = ((half_widen_scratch_off + arena_act_base) / 4) as u32;
@@ -537,7 +548,25 @@ impl CudaExecutable {
                     .collect()
             };
 
+        // Activations folded into the group norm before them (`act` on
+        // `Step::GroupNorm`); `RLX_GPU_NO_GROUP_NORM_ACT_FOLD=1` keeps them.
+        let gn_act: HashMap<NodeId, rlx_opt::memory::GroupNormActivation> =
+            if rlx_ir::env::flag("RLX_GPU_NO_GROUP_NORM_ACT_FOLD") {
+                HashMap::new()
+            } else {
+                rlx_opt::memory::adjacent_group_norm_activations(&graph)
+                    .into_iter()
+                    .map(|f| (f.norm, f))
+                    .collect()
+            };
+        let gn_act_folded: std::collections::HashSet<NodeId> = gn_act
+            .values()
+            .flat_map(|f| f.folded.iter().copied())
+            .collect();
         for node in graph.nodes() {
+            if gn_act_folded.contains(&node.id) {
+                continue;
+            }
             #[cfg(feature = "native-cuda-fft")]
             if fft_real_skip.contains(&node.id) {
                 continue; // fused into the real-input FFT below
@@ -2863,7 +2892,7 @@ impl CudaExecutable {
                         .map(|i| in_shape.dim(i).unwrap_static())
                         .product::<usize>()
                         .max(1);
-                    schedule.push(Step::ArgReduceHost {
+                    schedule.push(Step::ArgReduce {
                         src_byte_off: arena.offset(node.inputs[0]) as u64,
                         dst_byte_off: arena.offset(node.id) as u64,
                         outer: outer as u32,
@@ -3667,13 +3696,21 @@ impl CudaExecutable {
                         src_off: (arena.offset(node.inputs[0]) / 4) as u32,
                         g_off: (arena.offset(node.inputs[1]) / 4) as u32,
                         b_off: (arena.offset(node.inputs[2]) / 4) as u32,
-                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        dst_off: (arena.offset(gn_act.get(&node.id).map_or(node.id, |f| f.out)) / 4)
+                            as u32,
                         n: in_shape.dim(0).unwrap_static() as u32,
                         c: in_shape.dim(1).unwrap_static() as u32,
-                        h: in_shape.dim(2).unwrap_static() as u32,
-                        w: in_shape.dim(3).unwrap_static() as u32,
+                        // Every axis after the channels, as one plane: the
+                        // kernel reads [N, C, h*w] contiguous, and a volume's
+                        // depth was dropped when only dims 2 and 3 were read
+                        // (`rlx-cuda/tests/conv3d_net_parity.rs`).
+                        h: spatial_extent(in_shape),
+                        w: 1,
                         num_groups: *num_groups as u32,
                         eps_bits: eps.to_bits(),
+                        act: gn_act.get(&node.id).map_or(0, |f| f.act),
+                        alpha_bits: gn_act.get(&node.id).map_or(0, |f| f.alpha.to_bits()),
+                        stats_off: (gn_stats_scratch_off / 4) as u32,
                     });
                 }
                 Op::BatchNormInference { eps } => {
@@ -3742,8 +3779,8 @@ impl CudaExecutable {
                     let x_shape = &graph.node(node.inputs[0]).shape;
                     let n = x_shape.dim(0).unwrap_static() as u32;
                     let c = x_shape.dim(1).unwrap_static() as u32;
-                    let h = x_shape.dim(2).unwrap_static() as u32;
-                    let w = x_shape.dim(3).unwrap_static() as u32;
+                    // All spatial axes as one plane, as in the forward.
+                    let (h, w) = (spatial_extent(x_shape), 1);
                     let eps_bits = eps.to_bits();
                     let num_groups = *num_groups as u32;
                     match &node.op {
@@ -5050,6 +5087,8 @@ impl CudaExecutable {
         Self {
             ctx,
             exact_f32_matmul: false,
+            conv_f16: false,
+            conv_half_scratch: None,
             blas,
             blas_lt,
             blas_lt_workspace,
@@ -5139,3 +5178,36 @@ fn byte_off_u32(off: usize, what: &str) -> u32 {
         )
     })
 }
+
+/// The product of a `[N, C, ...]` shape's axes after the channels (1 for
+/// rank 2): the plane a group norm reduces over with its channels.
+fn spatial_extent(shape: &rlx_ir::Shape) -> u32 {
+    (2..shape.rank())
+        .map(|i| shape.dim(i).unwrap_static() as u32)
+        .product()
+}
+
+/// Bytes of the split group norm's statistics: (mean, M2) as f32 per (batch,
+/// group, `GN_CHUNK` chunk) of the largest `GroupNorm`. One region serves them
+/// all: the stream runs each norm's two kernels before the next norm's.
+fn group_norm_stats_bytes(graph: &rlx_ir::Graph) -> usize {
+    graph
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.op {
+            rlx_ir::Op::GroupNorm { num_groups, .. } => {
+                let s = &graph.node(node.inputs[0]).shape;
+                let g = num_groups.max(1);
+                let count = s.dim(1).unwrap_static() / g * spatial_extent(s) as usize;
+                Some(
+                    s.dim(0).unwrap_static() * g * count.div_ceil(GN_CHUNK as usize).max(1) * 2 * 4,
+                )
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// `GN_CHUNK` in `group_norm.cu`: elements of a group one block reduces.
+pub(crate) const GN_CHUNK: u32 = 8192;

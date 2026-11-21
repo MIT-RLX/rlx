@@ -55,9 +55,9 @@ pub use arch::{
 pub use config::{MlxArchConfig, MlxConfig, MlxQuantConfig, MlxQuantMode};
 pub use dequant::{
     QuantizedLayer, dequant_affine_f32, dequant_matmul_affine, dequant_matmul_mxfp4,
-    dequant_matvec_affine, dequant_matvec_mxfp4, dequant_mxfp4_f32, dequant_mxfp4_weights_f32,
-    dequant_mxfp8_f32, grouped_matmul_mxfp4_bt, mxfp4_scale_e8m0_to_f32, pack_factor,
-    validate_dequant_matmul_dims,
+    dequant_matvec_affine, dequant_matvec_mxfp4, dequant_matvec_mxfp8, dequant_mxfp4_f32,
+    dequant_mxfp4_weights_f32, dequant_mxfp8_f32, dequant_scale_fp8_e4m3, grouped_matmul_mxfp4_bt,
+    mxfp4_scale_e8m0_to_f32, pack_factor, validate_dequant_matmul_dims,
 };
 #[cfg(feature = "io")]
 pub use graph::{

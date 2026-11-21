@@ -473,6 +473,7 @@ fn dequant_gguf_bytes(scheme: QuantScheme, bytes: &[u8], n: usize) -> Result<Vec
         GgufMXFP4 => rlx_gguf::mx_dequant::dequant_mxfp4(bytes, n),
         GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(bytes, n),
         GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(bytes, n),
+        GgufQ2_0G64 => rlx_gguf::q2_dequant::dequant_q2_0_g64(bytes, n),
         other => return Err(format!("unsupported GGUF scheme {other:?}")),
     };
     r.map_err(|e| e.to_string())

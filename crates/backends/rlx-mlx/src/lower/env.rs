@@ -2177,6 +2177,18 @@ pub fn lower_with_env_writeback(
                                     rlx_mlx_io::dequant_mxfp4_weights_f32(ws, ss, *group_size, n, k)
                                         .map_err(|e| MlxError(format!("mxfp4 bank: {e:#}")))?
                                 }
+                                // FP8 E4M3 codes × decoded f32 group scales.
+                                rlx_ir::QuantScheme::MlxMxfp8 { group_size } => {
+                                    let gs = *group_size as usize;
+                                    let ng = k / gs;
+                                    (0..n * k)
+                                        .map(|i| {
+                                            let (r, c) = (i / k, i % k);
+                                            rlx_mlx_io::dequant_scale_fp8_e4m3(ws[i])
+                                                * ss[r * ng + c / gs]
+                                        })
+                                        .collect()
+                                }
                                 rlx_ir::QuantScheme::MlxAffine { bits, group_size } => {
                                     let bb = &biases.as_ref().unwrap()[e * sb..(e + 1) * sb];
                                     rlx_mlx_io::dequant_affine_f32(
@@ -2187,7 +2199,7 @@ pub fn lower_with_env_writeback(
                                 }
                                 other => {
                                     return Err(MlxError(format!(
-                                        "DequantGroupedMatMulMlx: expected MlxAffine/MlxMxfp4, got {other:?}"
+                                        "DequantGroupedMatMulMlx: expected MlxAffine/MlxMxfp4/MlxMxfp8, got {other:?}"
                                     )));
                                 }
                             };
@@ -2223,9 +2235,26 @@ pub fn lower_with_env_writeback(
                                 m, k, n, num_experts, *group_size as usize,
                             );
                         }
+                        rlx_ir::QuantScheme::MlxMxfp8 { group_size } => {
+                            let slab = w_bytes.len() / num_experts.max(1);
+                            let sb = scales.len() / num_experts.max(1);
+                            for r in 0..m {
+                                let e = (idx_f32[r] as usize).min(num_experts - 1);
+                                let y = rlx_mlx_io::dequant_matvec_mxfp8(
+                                    &x_f32[r * k..(r + 1) * k],
+                                    &w_bytes[e * slab..(e + 1) * slab],
+                                    &scales[e * sb..(e + 1) * sb],
+                                    *group_size,
+                                    k,
+                                    n,
+                                )
+                                .map_err(|e| MlxError(format!("mxfp8 grouped: {e:#}")))?;
+                                out_host[r * n..(r + 1) * n].copy_from_slice(&y);
+                            }
+                        }
                         other => {
                             return Err(MlxError(format!(
-                                "DequantGroupedMatMulMlx: expected MlxAffine/MlxMxfp4, got {other:?}"
+                                "DequantGroupedMatMulMlx: expected MlxAffine/MlxMxfp4/MlxMxfp8, got {other:?}"
                             )));
                         }
                     }

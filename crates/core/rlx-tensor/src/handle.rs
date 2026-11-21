@@ -131,7 +131,8 @@ impl Inner {
     }
 }
 
-#[cfg(test)]
+// Reads results back via `to_vec_f64`, which needs `eval`.
+#[cfg(all(test, feature = "eval"))]
 mod tests {
     use crate::Tensor;
 

@@ -132,7 +132,8 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         && params.scheme_id != 21u && params.scheme_id != 22u && params.scheme_id != 23u
         && params.scheme_id != 24u && params.scheme_id != 25u
         && params.scheme_id != 28u && params.scheme_id != 29u
-        && params.scheme_id != 30u && params.scheme_id != 31u) {
+        && params.scheme_id != 30u && params.scheme_id != 31u
+        && params.scheme_id != 32u && params.scheme_id != 256u) {
         let dst_base = params.dst_f32_off + gid * 256u;
 
         if (params.scheme_id == 3u) {
@@ -762,6 +763,25 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         return;
     }
 
+    if (params.scheme_id == 256u) {
+        // Packed BF16 (wgpu's `BF16_SCHEME_ID`): one value per 2-byte block.
+        arena[params.dst_f32_off + gid] = dq_read_bf16(gid * 2u);
+        return;
+    }
+
+    if (params.scheme_id == 32u) {
+        // ggml Q2_0: f16 d | 16 two-bit bytes (18 bytes / 64 elements).
+        let off = gid * 18u;
+        let d = dq_read_f16(off);
+        let qs_rel = off + 2u;
+        let dst_base = params.dst_f32_off + gid * 64u;
+        for (var j: u32 = 0u; j < 64u; j = j + 1u) {
+            let q = (read_w(qs_rel + (j >> 2u)) >> ((j & 3u) * 2u)) & 3u;
+            arena[dst_base + j] = f32(i32(q) - 1) * d;
+        }
+        return;
+    }
+
     if (params.scheme_id == 30u || params.scheme_id == 31u) {
         // FP8 block (HF fp8 / DeepSeek-V3): f32 scale | 128 codes (132 bytes /
         // 128 elems), E4M3 (30) or E5M2 (31); see `dq_fp8`.
@@ -899,38 +919,39 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         else { s = ldexp(1.0, i32(u32(e)) - 127); }
         let qs_rel = off + 1u;
         let dst_base = params.dst_f32_off + gid * 32u;
+        // ggml block_mxfp4: byte j holds values j (low) and j + 16 (high).
         for (var j: u32 = 0u; j < 32u / 2u; j = j + 1u) {
             let bx = read_w(qs_rel + j);
-            arena[dst_base + 2u * j] = s * FP4_E2M1[bx & 0x0Fu];
-            arena[dst_base + 2u * j + 1u] = s * FP4_E2M1[bx >> 4];
+            arena[dst_base + j] = s * FP4_E2M1[bx & 0x0Fu];
+            arena[dst_base + j + 16u] = s * FP4_E2M1[bx >> 4];
         }
         return;
     }
 
-    // ── 16-elem block schemes: NVFP4 ──────────────────────────────
+    // ── 64-elem block schemes: NVFP4 ──────────────────────────────
     if (params.scheme_id == 11u) {
-        // NVFP4: E4M3 scale + 8 nibbles = 9 bytes / 16 elements.
-        let off = gid * 9u;
-        let e = read_w(off);
-        // Inline E4M3 decode.
-        var s: f32;
-        let sign_b = (u32(e) >> 7) & 1u;
-        let exp_v = (u32(e) >> 3) & 0x0Fu;
-        let mant = u32(e) & 0x7u;
-        if (exp_v == 0u) {
-            s = select((f32(mant) / 8.0) * exp2(-6.0), 0.0, mant == 0u);
-        } else if (exp_v == 0x0Fu && mant == 0x7u) {
-            s = 0.0;
-        } else {
-            s = (1.0 + f32(mant) / 8.0) * ldexp(1.0, i32(exp_v) - 7);
-        }
-        if (sign_b != 0u) { s = -s; }
-        let qs_rel = off + 1u;
-        let dst_base = params.dst_f32_off + gid * 16u;
-        for (var j: u32 = 0u; j < 16u / 2u; j = j + 1u) {
-            let bx = read_w(qs_rel + j);
-            arena[dst_base + 2u * j] = s * FP4_E2M1[bx & 0x0Fu];
-            arena[dst_base + 2u * j + 1u] = s * FP4_E2M1[bx >> 4];
+        // ggml block_nvfp4: 4 UE4M3 scales + 32 nibble bytes = 36 bytes / 64
+        // elements; sub-block sb: byte 8sb+j holds 16sb+j (low), 16sb+j+8
+        // (high). UE4M3: 0 and 0x7F are 0, the sign bit is ignored.
+        let off = gid * 36u;
+        let dst_base = params.dst_f32_off + gid * 64u;
+        for (var sb: u32 = 0u; sb < 4u; sb = sb + 1u) {
+            let e = u32(read_w(off + sb));
+            let exp_v = (e >> 3u) & 0x0Fu;
+            let mant = e & 0x7u;
+            var s: f32;
+            if (e == 0u || e == 0x7Fu) {
+                s = 0.0;
+            } else if (exp_v == 0u) {
+                s = f32(mant) * exp2(-9.0);
+            } else {
+                s = (1.0 + f32(mant) / 8.0) * ldexp(1.0, i32(exp_v) - 7);
+            }
+            for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+                let bx = read_w(off + 4u + sb * 8u + j);
+                arena[dst_base + sb * 16u + j] = s * FP4_E2M1[bx & 0x0Fu];
+                arena[dst_base + sb * 16u + j + 8u] = s * FP4_E2M1[bx >> 4];
+            }
         }
         return;
     }

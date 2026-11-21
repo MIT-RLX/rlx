@@ -237,17 +237,52 @@ fn launch_sites_pass_the_declared_number_of_arguments() {
                 continue;
             };
 
-            // Count `.arg(` from here until the matching `.launch(`.
+            // Count `.arg(` from here until the matching `.launch(`. Inside a
+            // `for x in [a, b, …] { … }` body an `.arg(` runs once per element
+            // (`conv3d_cot` passes 24 scalars that way); a loop over anything
+            // but a one-line array literal cannot be counted, so the site is
+            // skipped (reported) rather than miscounted.
             let mut args = 0usize;
             let mut found_launch = false;
+            let mut uncountable = false;
+            // (elements, brace depth inside the loop body) per open `for`
+            let mut loops: Vec<(usize, i32)> = Vec::new();
+            let mut depth = 0i32;
             for l in lines.iter().skip(i).take(80) {
-                args += l.matches(".arg(").count();
+                let t = l.trim_start();
+                let mut opened = None;
+                if t.starts_with("for ") && t.contains(" in ") {
+                    let rest = t.split_once(" in ").map(|(_, r)| r.trim()).unwrap_or("");
+                    match rest.strip_prefix('[').and_then(|r| r.split_once(']')) {
+                        Some((elems, tail)) if tail.trim().starts_with('{') => {
+                            opened =
+                                Some(elems.split(',').filter(|e| !e.trim().is_empty()).count());
+                        }
+                        _ => uncountable = true,
+                    }
+                }
+                let mult = loops.iter().map(|(n, _)| *n).product::<usize>() * opened.unwrap_or(1);
+                args += l.matches(".arg(").count() * mult;
+                let before = depth;
+                for c in l.chars() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            loops.retain(|(_, d)| depth >= *d);
+                        }
+                        _ => {}
+                    }
+                }
+                if let (Some(n), true) = (opened, depth > before) {
+                    loops.push((n, depth));
+                }
                 if l.contains(".launch(") || l.contains(".launch_cooperative(") {
                     found_launch = true;
                     break;
                 }
             }
-            if !found_launch {
+            if !found_launch || uncountable {
                 skipped += 1;
                 continue;
             }

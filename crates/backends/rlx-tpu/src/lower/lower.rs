@@ -3554,6 +3554,7 @@ impl<'a> LowerCtx<'a> {
             | QuantScheme::GgufQ5_1
             | QuantScheme::GgufQ1_0
             | QuantScheme::GgufQ2_0
+            | QuantScheme::GgufQ2_0G64
             | QuantScheme::GgufPtq1_0
             | QuantScheme::GgufBF16
             | QuantScheme::Fp8E4m3B128

@@ -2702,9 +2702,36 @@ impl WgpuExecutable {
                                         continue;
                                     }
                                     let total = params.batch * params.heads * seq_q_s;
+                                    let hd_v = if params.v_head_dim == 0 {
+                                        params.head_dim
+                                    } else {
+                                        params.v_head_dim
+                                    };
+                                    // Many rows per head (prefill, encoders): 64 rows per
+                                    // workgroup sharing staged K/V tiles.
+                                    let tiled = (seq_q_s >= ATTENTION_TILED_MIN_ROWS
+                                        && !rlx_ir::env::flag("RLX_WGPU_ATTENTION_UNTILED"))
+                                    .then(|| {
+                                        crate::kernels::attention_tiled_kernel(
+                                            &dev.device,
+                                            params.head_dim,
+                                            hd_v,
+                                        )
+                                    })
+                                    .flatten();
+                                    let bh = params.batch * params.heads;
+                                    let gy = bh.min(65_535);
+                                    if let Some(ak) = tiled {
+                                        pass.set_pipeline(&ak.pipeline);
+                                        pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                        pass.dispatch_workgroups(
+                                            seq_q_s.div_ceil(64),
+                                            gy,
+                                            bh.div_ceil(gy),
+                                        );
                                     // Few rows (decode, short prefill): a workgroup per row;
                                     // a thread per row could not fill the GPU.
-                                    if total <= ATTENTION_COOP_MAX_ROWS
+                                    } else if total <= ATTENTION_COOP_MAX_ROWS
                                         && !rlx_ir::env::flag("RLX_WGPU_ATTENTION_SERIAL")
                                     {
                                         let ak = crate::kernels::attention_coop_kernel(&dev.device);
@@ -4373,7 +4400,7 @@ impl WgpuExecutable {
                         || src_is_weight
                         || dst_is_weight
                         || host_cache.has_deferred_writes()
-                        || crate::device::coop_discrete_backend()
+                        || crate::device::discrete_hosts_copies()
                         || rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY")
                     {
                         let n_f32 = (nbytes as usize) / 4;
@@ -6143,7 +6170,7 @@ fn buffer_copy_two_windows(
         || nbytes == 0
         || crate::buffer::is_weight_off(src as usize)
         || crate::buffer::is_weight_off(dst as usize)
-        || crate::device::coop_discrete_backend()
+        || crate::device::discrete_hosts_copies()
         || rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY")
         || rlx_ir::env::flag("RLX_WGPU_NO_TWO_WINDOW")
     {
@@ -6215,8 +6242,8 @@ fn weight_to_act_copy(src: u64, dst: u64) -> bool {
 
 /// GPU copy within the activation arena, or `None` when it has to stage
 /// through the host: an operand in the weight buffer, a sharded arena, a span
-/// wider than one storage binding, a discrete cooperative-matrix backend, or
-/// `RLX_WGPU_HOST_BUFFER_COPY`. The same decision the step's own GPU path
+/// wider than one storage binding, discrete Vulkan/DX12 with
+/// `RLX_WGPU_DISCRETE_HOST`, or `RLX_WGPU_HOST_BUFFER_COPY`. The same decision the step's own GPU path
 /// makes, minus pending host writes — which a step encoded mid-section never
 /// has.
 fn buffer_copy_gpu_window(
@@ -6228,7 +6255,7 @@ fn buffer_copy_gpu_window(
 ) -> Option<(u64, u64)> {
     if crate::buffer::is_weight_off(src as usize)
         || crate::buffer::is_weight_off(dst as usize)
-        || crate::device::coop_discrete_backend()
+        || crate::device::discrete_hosts_copies()
         || rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY")
         || nbytes == 0
     {
@@ -6314,6 +6341,10 @@ fn encode_arena_copy(
 /// it the per-row kernel launches too few threads to occupy a GPU; above it
 /// there are enough rows to.
 const ATTENTION_COOP_MAX_ROWS: u32 = 16_384;
+/// Query rows per (batch, head) from which `attention_tiled` takes over: one
+/// workgroup covers 64, so below this most of its threads would idle and the
+/// per-row kernels win.
+const ATTENTION_TILED_MIN_ROWS: u32 = 32;
 
 fn gguf_step_is_gpu_only(step: &Step, active_extent: Option<(usize, usize)>) -> bool {
     let Step::DequantMatmulGguf {

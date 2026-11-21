@@ -325,6 +325,28 @@ pub fn plan_f32_uniform_with(graph: &Graph, align: usize, reuse: bool) -> Memory
         }
     }
 
+    // Elided broadcasts (`Step::BinaryBroadcast`): the Binary reads the
+    // Expand's *input*, so that input lives as long as the Expand's output
+    // would, or its slot is recycled before the read. Every Expand input is
+    // extended (they are small broadcast sources), which keeps this
+    // independent of the compile-time elide set — as rlx-cuda's planner does.
+    for id in schedule.iter() {
+        let node = graph.node(*id);
+        if !matches!(node.op, Op::Expand { .. }) {
+            continue;
+        }
+        let Some(&src) = node.inputs.first() else {
+            continue;
+        };
+        let own = *alias_of.get(id).unwrap_or(id);
+        let Some(&de) = death.get(&own) else { continue };
+        let src = *alias_of.get(&src).unwrap_or(&src);
+        death
+            .entry(src)
+            .and_modify(|d| *d = (*d).max(de))
+            .or_insert(de);
+    }
+
     // Free extents, kept sorted by offset so adjacent ones can be merged. A
     // first-fit over this is enough: the allocation order is the schedule, so
     // the fragmentation a smarter fit would avoid mostly does not arise.

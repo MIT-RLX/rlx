@@ -1519,8 +1519,11 @@ unsafe fn exec_dequant_grouped_mat_mul_mlx_inner(
     // only the per-row code decode differs (FP4 LUT vs `code·scale+bias`).
     let gs = match scheme {
         rlx_ir::quant::QuantScheme::MlxAffine { group_size, .. }
-        | rlx_ir::quant::QuantScheme::MlxMxfp4 { group_size } => group_size as usize,
-        other => panic!("DequantGroupedMatMulMlx: expected MlxAffine/MlxMxfp4, got {other:?}"),
+        | rlx_ir::quant::QuantScheme::MlxMxfp4 { group_size }
+        | rlx_ir::quant::QuantScheme::MlxMxfp8 { group_size } => group_size as usize,
+        other => {
+            panic!("DequantGroupedMatMulMlx: expected MlxAffine/MlxMxfp4/MlxMxfp8, got {other:?}")
+        }
     };
     let n_groups = k / gs;
     let sb_per_expert = n * n_groups; // scales/biases f32 per expert
@@ -1594,6 +1597,10 @@ unsafe fn exec_dequant_grouped_mat_mul_mlx_inner(
                     // with m=1, which allocated + decoded the whole f32 expert weight
                     // for every routed row). Bit-exact accumulation order.
                     rlx_mlx_io::dequant_matvec_mxfp4(row, w_slab, s_slab, group_size, k, n)
+                }
+                // FP8 E4M3 codes × decoded f32 group scales (biases zero).
+                rlx_ir::quant::QuantScheme::MlxMxfp8 { group_size } => {
+                    rlx_mlx_io::dequant_matvec_mxfp8(row, w_slab, s_slab, group_size, k, n)
                 }
                 _ => unreachable!(),
             };

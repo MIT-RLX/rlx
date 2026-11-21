@@ -108,7 +108,7 @@ pub fn codecs() -> Vec<Codec> {
     };
     use crate::mx_dequant::{dequant_mxfp4, dequant_nvfp4};
     use crate::q1_dequant::dequant_q1_0;
-    use crate::q2_dequant::dequant_q2_0;
+    use crate::q2_dequant::{dequant_q2_0, dequant_q2_0_g64};
     use crate::tq_dequant::{dequant_tq1_0, dequant_tq2_0};
     use crate::{
         dequant_q2_k, dequant_q3_k, dequant_q4_0, dequant_q4_1, dequant_q4_k, dequant_q5_0,
@@ -308,8 +308,8 @@ pub fn codecs() -> Vec<Codec> {
         Codec {
             name: "NVFP4",
             ty: GgmlType::NVFP4,
-            block_elems: 16,
-            block_bytes: 9,
+            block_elems: 64,
+            block_bytes: 36,
             grid: Grid::MiniFloat,
             dequant: dequant_nvfp4,
         },
@@ -325,6 +325,14 @@ pub fn codecs() -> Vec<Codec> {
         Codec {
             name: "Q2_0",
             ty: GgmlType::Q2_0,
+            block_elems: 64,
+            block_bytes: 18,
+            grid: Grid::Ternary,
+            dequant: dequant_q2_0_g64,
+        },
+        Codec {
+            name: "PQ2_0",
+            ty: GgmlType::PQ2_0,
             block_elems: 128,
             block_bytes: 34,
             grid: Grid::Ternary,
@@ -332,23 +340,6 @@ pub fn codecs() -> Vec<Codec> {
         },
     ]
 }
-
-/// Schemes whose encoder and decoder are known to disagree on nibble layout.
-///
-/// **This is a live bug, not a scheme property.** `quantize_mxfp4_block` packs
-/// element `j` and element `j + block/2` into one byte (the "halves" layout every
-/// other nibble-packed GGUF scheme in this crate uses — see
-/// [`crate::dequant_q4_0_block`]), while `dequant_mxfp4_block` reads byte `i` as
-/// elements `2i` and `2i+1` ("interleaved"). Encoding then decoding therefore
-/// drops half of every block and interleaves zeros.
-///
-/// The CPU decoder, the GPU `dequant_gguf` kernel (`scheme_id == 10`), and the
-/// existing unit tests all agree on *interleaved* — but they were written against
-/// each other, so their agreement is not evidence. Resolving it requires checking
-/// a real MXFP4 GGUF file against ggml, so the invariant suite pins the
-/// disagreement rather than guessing which side to change. See
-/// `mxfp4_layout_disagreement_is_pinned`.
-pub const NIBBLE_LAYOUT_DISAGREEMENT: &[&str] = &["MXFP4", "NVFP4"];
 
 /// Schemes whose grid does not contain exact zero.
 ///
@@ -652,10 +643,14 @@ mod tests {
             if matches!(c.grid, Grid::Lut) {
                 continue;
             }
-            if NIBBLE_LAYOUT_DISAGREEMENT.contains(&c.name) {
-                continue; // see mxfp4_layout_disagreement_is_pinned
-            }
+            // MXFP4's E8M0 scale is a power of two, and 2.5 is not E2M1 · 2^k for
+            // any k (its neighbours are 2 and 3): 20% is the format's floor
+            // there, not a scale-recovery defect. ggml's encoder agrees.
+            let pow2_scale = c.ty == GgmlType::MXFP4;
             for &v in &[1.0f32, -1.0, 0.375, -2.5] {
+                if pow2_scale && v == -2.5 {
+                    continue;
+                }
                 let err =
                     constant_block_error(&c, v, 2).unwrap_or_else(|e| panic!("{}: {e}", c.name));
                 let rel = err / v.abs();
@@ -683,9 +678,6 @@ mod tests {
             if matches!(c.grid, Grid::Lut) {
                 continue;
             }
-            if NIBBLE_LAYOUT_DISAGREEMENT.contains(&c.name) {
-                continue; // see mxfp4_layout_disagreement_is_pinned
-            }
             let src = test_vector(c.block_elems * 4, 0xABCD);
             // 1e-3 is far tighter than the coarsest grid here (~2.0 for 1.5 bpw
             // over ±3), so this passes only when the second projection genuinely
@@ -698,43 +690,6 @@ mod tests {
             failures.is_empty(),
             "value idempotence violated:\n  {}",
             failures.join("\n  ")
-        );
-    }
-
-    /// Pins the MXFP4 / NVFP4 encoder-vs-decoder nibble-layout disagreement.
-    ///
-    /// The encoder writes the halves layout; the decoder reads interleaved.
-    /// Round-tripping therefore loses half of every block. This test *asserts
-    /// the breakage* so that:
-    ///   * it cannot be forgotten, and
-    ///   * fixing only one side turns the suite red rather than green-by-luck.
-    ///
-    /// When the layout question is settled against a real GGUF file, delete this
-    /// test and remove the names from [`NIBBLE_LAYOUT_DISAGREEMENT`]; the normal
-    /// invariants then cover both schemes.
-    #[test]
-    fn mxfp4_layout_disagreement_is_pinned() {
-        let all = codecs();
-        let c = all.iter().find(|c| c.name == "MXFP4").unwrap();
-        // Every value here is exactly representable in E2M1 with a unity scale,
-        // so a consistent codec would reproduce them bit-for-bit.
-        let mut src = vec![0.0f32; 32];
-        for (i, v) in [-3.0f32, 3.0, -6.0, 6.0].iter().enumerate() {
-            src[i] = *v;
-        }
-        let out = c.round_trip(&src).unwrap();
-        assert_eq!(
-            &out[0..8],
-            &[-3.0, 0.0, 3.0, 0.0, -6.0, 0.0, 6.0, 0.0],
-            "MXFP4 layout disagreement changed shape — if the encoder and decoder \
-             now agree, remove MXFP4/NVFP4 from NIBBLE_LAYOUT_DISAGREEMENT and \
-             delete this test"
-        );
-        assert_ne!(
-            &out[0..4],
-            &src[0..4],
-            "MXFP4 now round-trips exactly-representable values — the bug is fixed, \
-             so this pin should be deleted"
         );
     }
 

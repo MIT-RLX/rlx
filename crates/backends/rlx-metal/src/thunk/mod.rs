@@ -123,6 +123,34 @@ use rlx_ir::op::{Activation, BinaryOp, CmpOp};
 use rlx_ir::{DType, Shape};
 use std::sync::Arc;
 
+/// Elements of a group a statistics threadgroup reduces (`GN_CHUNK` in the
+/// MSL; they must agree).
+pub(crate) const GN_CHUNK: usize = 8192;
+
+/// The split group norm's statistics scratch: (mean, M2) as f32 per (batch,
+/// group, chunk) for every `GroupNorm` node, each node its own slice so that
+/// norms a concurrent encoder overlaps do not share one. Total bytes, and
+/// each node's byte offset into it.
+pub(crate) fn group_norm_stats_layout(
+    graph: &rlx_ir::Graph,
+) -> (usize, std::collections::HashMap<rlx_ir::NodeId, usize>) {
+    let mut at = std::collections::HashMap::new();
+    let mut total = 0usize;
+    for node in graph.nodes() {
+        if let rlx_ir::Op::GroupNorm { num_groups, .. } = node.op {
+            let num_groups = num_groups.max(1);
+            let s = &graph.node(node.inputs[0]).shape;
+            let dims: Vec<usize> = (0..s.rank()).map(|i| s.dim(i).unwrap_static()).collect();
+            let spatial: usize = dims[2..].iter().product();
+            let count = dims[1] / num_groups * spatial;
+            let chunks = count.div_ceil(GN_CHUNK).max(1);
+            at.insert(node.id, total);
+            total += (dims[0] * num_groups * chunks * 2 * 4).next_multiple_of(256);
+        }
+    }
+    (total, at)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HalfFlag {
     F32,
@@ -325,6 +353,14 @@ pub enum Thunk {
         num_groups: u32,
         eps: f32,
         dt: HalfFlag,
+        /// This node's (mean, M2)-per-chunk slice, a byte offset into the
+        /// group-norm statistics scratch (`group_norm_stats_layout`).
+        stats: usize,
+        /// Activation applied as the result is written: 0 none, 1 ReLU,
+        /// 2 LeakyReLU (`alpha`), 3 SiLU. The graph's activation node is a
+        /// Nop then, and `dst` is its slot.
+        act: u32,
+        alpha: f32,
     },
     /// NCHW LayerNorm2d (normalize across C at each spatial position).
     LayerNorm2d {
@@ -842,6 +878,20 @@ pub enum Thunk {
         cols: u32,
         dt: HalfFlag,
     },
+    /// Last-axis softmax of `src` plus up to two broadcast addends, out of
+    /// place into `dst` (`softmax_lastax_add*`). Each addend is `(offset,
+    /// mid, post)`: score element `i` reads addend element
+    /// `(i / (mid*post)) * post + i % post`. The graph's adds are Nops then
+    /// (`rlx_opt::memory::softmax_addends`). With none, the out-of-place f16
+    /// softmax.
+    SoftmaxAdd {
+        src: usize,
+        dst: usize,
+        rows: u32,
+        cols: u32,
+        adds: [Option<(usize, u32, u32)>; 2],
+        dt: HalfFlag,
+    },
     /// Fused dense / soft-label softmax cross-entropy. `logits [N,C]`,
     /// `targets [N,C]` → per-row loss `[N]`. f32 only (matches the rlx
     /// SCE contract). One threadgroup per row.
@@ -997,6 +1047,9 @@ pub enum Thunk {
         scheme: rlx_ir::quant::QuantScheme,
         /// Scales/biases stored BF16 (2B) — decode per-expert (matches CPU).
         scale_bf16: bool,
+        /// Scales/biases stored as decoded f32. Neither flag: FP4/FP8 scales
+        /// are raw E8M0 bytes (a `U8` tensor).
+        scale_f32: bool,
     },
     /// Scatter-add. See CPU's Thunk::ScatterAdd.
     ScatterAdd {
@@ -2520,6 +2573,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Conv3dBackwardWeight { .. } => "conv3d_backward_weight",
         Thunk::Rope { .. } => "rope",
         Thunk::Softmax { .. } => "softmax",
+        Thunk::SoftmaxAdd { .. } => "softmax_add",
         Thunk::SoftmaxCrossEntropyDense { .. } => "softmax_cross_entropy_dense",
         Thunk::SoftmaxCrossEntropyWithLogits { .. } => "softmax_cross_entropy_with_logits",
         Thunk::SoftmaxCrossEntropyBackward { .. } => "softmax_cross_entropy_backward",
@@ -2640,6 +2694,7 @@ impl Thunk {
             | Thunk::LayerNorm { .. }
             | Thunk::RmsNorm { .. }
             | Thunk::Softmax { .. }
+            | Thunk::SoftmaxAdd { .. }
             | Thunk::SoftmaxCrossEntropyDense { .. }
             | Thunk::Cumsum { .. }
             | Thunk::CumScan { .. }
@@ -3324,6 +3379,12 @@ fn mlp_io(t: &Thunk) -> Option<(Vec<usize>, Vec<usize>)> {
         } => (vec![*src, *weight], vec![*dst]),
         FusedSwiGLU { src, dst, .. } => (vec![*src], vec![*dst]),
         Softmax { data, .. } => (vec![*data], vec![*data]),
+        SoftmaxAdd { src, dst, adds, .. } => (
+            std::iter::once(*src)
+                .chain(adds.iter().flatten().map(|a| a.0))
+                .collect(),
+            vec![*dst],
+        ),
         Rope {
             src, cos, sin, dst, ..
         } => (vec![*src, *cos, *sin], vec![*dst]),
@@ -5740,6 +5801,9 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             ..
         } => vec![*state, *gate, *rev, *tw_re, *tw_im],
         Thunk::Softmax { src, .. } => vec![*src],
+        Thunk::SoftmaxAdd { src, adds, .. } => std::iter::once(*src)
+            .chain(adds.iter().flatten().map(|a| a.0))
+            .collect(),
         Thunk::SoftmaxCrossEntropyDense {
             logits, targets, ..
         } => vec![*logits, *targets],

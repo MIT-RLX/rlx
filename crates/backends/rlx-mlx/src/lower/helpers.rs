@@ -303,12 +303,19 @@ pub(crate) fn dequant_gguf_weight(
             .map_err(|e| MlxError(format!("GGUF Q1_0 dequant: {e}"))),
         Q::GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(w_bytes, elems)
             .map_err(|e| MlxError(format!("GGUF Q2_0 dequant: {e}"))),
+        Q::GgufQ2_0G64 => rlx_gguf::q2_dequant::dequant_q2_0_g64(w_bytes, elems)
+            .map_err(|e| MlxError(format!("GGUF Q2_0 (group 64) dequant: {e}"))),
         Q::GgufFV5 => rlx_gguf::fv5_dequant::dequant_fv5(w_bytes, elems)
             .map_err(|e| MlxError(format!("GGUF FV5 dequant: {e}"))),
         Q::GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b(w_bytes, elems)
             .map_err(|e| MlxError(format!("GGUF FV5B dequant: {e}"))),
         Q::GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0(w_bytes, elems)
             .map_err(|e| MlxError(format!("GGUF G8_0 dequant: {e}"))),
+        Q::GgufPtq1_0 => rlx_gguf::ptq1_dequant::dequant_ptq1_0(w_bytes, elems)
+            .map_err(|e| MlxError(format!("GGUF PTQ1_0 dequant: {e}"))),
+        // Packed BF16 projections: widened once on the host like the others.
+        Q::GgufBF16 => rlx_gguf::dequant_typed(rlx_gguf::GgmlType::BF16, w_bytes, elems, "bf16")
+            .map_err(|e| MlxError(format!("GGUF BF16 dequant: {e}"))),
         Q::Fp8E4m3B128 | Q::Fp8E5m2B128 => {
             rlx_ir::lowp_codec::fp8_b128::dequant_scheme(*scheme, w_bytes, elems)
                 .map_err(|e| MlxError(format!("FP8 block dequant: {e}")))

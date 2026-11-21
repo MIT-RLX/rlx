@@ -319,6 +319,116 @@ fn conv_transpose3d_grouped_dilated() {
     conv_transpose3d_case(2, 2);
 }
 
+/// The U-Net upsample (kernel 2, stride 2, no padding), the case every 3-D
+/// decoder here uses.
+#[test]
+fn conv_transpose3d_upsample() {
+    let (n, cin, cout, d) = (1usize, 6usize, 4usize, [3usize, 4, 5]);
+    let xs = f32s(n * cin * d.iter().product::<usize>(), |i| {
+        (i as f32 * 0.43).sin()
+    });
+    let ws = f32s(cin * cout * 8, |i| 0.05 * (i as f32 % 13.0) - 0.3);
+    let mut g = Graph::new("conv_transpose3d_up");
+    let x = g.input("x", sh(&[n, cin, d[0], d[1], d[2]]));
+    let weight = g.input("w", sh(&[cin, cout, 2, 2, 2]));
+    let y = g.conv_transpose3d(x, weight, [2, 2, 2], [0, 0, 0], [1, 1, 1], [0, 0, 0], 1);
+    g.set_outputs(vec![y]);
+    parity(g, &[("x", &xs), ("w", &ws)]);
+}
+
+/// SegResNet's 96³ upsample (64 → 32 channels) plans as one direct step: no
+/// index table, and every texture within a browser's 16384 side. (The
+/// gather form built output × taps tables, 14.5e9 entries, and a
+/// 442368 × 16384 texture.)
+#[test]
+fn conv_transpose3d_volume_plans_without_tables() {
+    let mut g = Graph::new("conv_transpose3d_volume");
+    let x = g.input("x", sh(&[1, 64, 48, 48, 48]));
+    let weight = g.input("w", sh(&[64, 32, 2, 2, 2]));
+    let y = g.conv_transpose3d(x, weight, [2, 2, 2], [0, 0, 0], [1, 1, 1], [0, 0, 0], 1);
+    g.set_outputs(vec![y]);
+    let plan = rlx_webgl::build_plan(&g).expect("plan");
+    let tables: usize = plan.index_table_stats().iter().map(|t| t.1).sum();
+    assert!(
+        tables < 1 << 20,
+        "index tables of {tables} entries: {:?}",
+        plan.index_table_stats()
+    );
+    assert!(
+        plan.max_texture_side() <= 16384,
+        "texture {:?}",
+        plan.largest_texture()
+    );
+}
+
+/// Depthwise, strided and dilated, batch 2, non-square: the direct step's
+/// index arithmetic on the cases the im2col forms covered.
+#[test]
+fn conv2d_depthwise_strided_dilated() {
+    let (n, c, h, w) = (2usize, 5usize, 9usize, 7usize);
+    let xs = f32s(n * c * h * w, |i| (i as f32 * 0.29).sin());
+    let ws = f32s(c * 9, |i| 0.06 * (i as f32 % 13.0) - 0.4);
+    let mut g = Graph::new("conv2d_depthwise");
+    let x = g.input("x", sh(&[n, c, h, w]));
+    let weight = g.input("w", sh(&[c, 1, 3, 3]));
+    let y = g.conv2d(x, weight, [3, 3], [2, 1], [2, 1], [2, 1], c);
+    g.set_outputs(vec![y]);
+    parity(g, &[("x", &xs), ("w", &ws)]);
+}
+
+/// An EfficientNet block's 2-D convs at 256² (a 3×3 stem to 32 channels, a
+/// 96-channel depthwise 3×3) plan as direct steps with no index tables: the
+/// im2col form held 151 MB of tables for one 64-channel 3×3 conv there.
+#[test]
+fn conv2d_image_plans_without_tables() {
+    for (cin, cout, groups) in [(3usize, 32usize, 1usize), (96, 96, 96)] {
+        let mut g = Graph::new("conv2d_image");
+        let x = g.input("x", sh(&[1, cin, 256, 256]));
+        let weight = g.input("w", sh(&[cout, cin / groups, 3, 3]));
+        let y = g.conv2d(x, weight, [3, 3], [2, 2], [1, 1], [1, 1], groups);
+        g.set_outputs(vec![y]);
+        let plan = rlx_webgl::build_plan(&g).expect("plan");
+        let tables: usize = plan.index_table_stats().iter().map(|t| t.1).sum();
+        assert!(
+            tables < 1 << 20,
+            "groups {groups}: tables {:?}",
+            plan.index_table_stats()
+        );
+    }
+}
+
+/// A 3-D pool written as a reshape to window axes and a reduce over them
+/// (SynthSeg's max pool; a mean too, keep_dim either way, anisotropic
+/// windows) plans as one `Pool3d` step with no reduce tables.
+#[test]
+fn reshape_reduce_pool3d() {
+    let (n, c, d, h, w) = (2usize, 3usize, 4usize, 6usize, 6usize);
+    for (op, keep, k) in [
+        (ReduceOp::Max, false, [2, 2, 2]),
+        (ReduceOp::Mean, true, [1, 3, 2]),
+    ] {
+        let xs = f32s(n * c * d * h * w, |i| (i as f32 * 0.61).sin());
+        let mut g = Graph::new("pool_as_reduce");
+        let x = g.input("x", sh(&[n, c, d, h, w]));
+        let win = [n, c, d / k[0], k[0], h / k[1], k[1], w / k[2], k[2]];
+        let y = g.reshape(x, win.iter().map(|&v| v as i64).collect(), sh(&win));
+        let out: Vec<usize> = if keep {
+            vec![n, c, d / k[0], 1, h / k[1], 1, w / k[2], 1]
+        } else {
+            vec![n, c, d / k[0], h / k[1], w / k[2]]
+        };
+        let y = g.reduce(y, op, vec![3, 5, 7], keep, sh(&out));
+        g.set_outputs(vec![y]);
+        let plan = rlx_webgl::build_plan(&g).expect("plan");
+        assert!(
+            plan.index_table_stats().is_empty(),
+            "{:?}",
+            plan.index_table_stats()
+        );
+        parity(g, &[("x", &xs)]);
+    }
+}
+
 /// A segmentation head as rlx-segment builds it: a biased dilated 3-D conv
 /// (`FusedConvBiasAct`, rank 5) + GELU, a group norm over channels, then a
 /// biased 1×1×1 conv to classes and the argmax over them. Folded and fused,

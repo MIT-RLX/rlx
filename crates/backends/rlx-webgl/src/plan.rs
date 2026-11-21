@@ -366,6 +366,28 @@ pub enum Step {
         /// applied to each output element as it is written (`fold_activations`)
         act: Option<Act>,
     },
+    /// NCDHW transposed 3-D convolution computed directly, one output
+    /// element per fragment summing, over its group's `cin/groups` input
+    /// channels and the taps `t` with `o + pad − t·dil = i·stride` for an
+    /// input position `0 ≤ i < din`, `x[n, ic, i] · w[ic, oc mod cout/g, t]`.
+    /// Weight `[cin, cout/groups, kD, kH, kW]`; output padding is in `dout`.
+    /// (The gather form's index tables are output × taps entries: 14.5e9
+    /// for a 32-channel 96³ upsample.)
+    ConvTranspose3d {
+        out: usize,
+        x: usize,
+        w: usize,
+        n: usize,
+        cin: usize,
+        din: [usize; 3],
+        cout: usize,
+        dout: [usize; 3],
+        k: [usize; 3],
+        stride: [usize; 3],
+        pad: [usize; 3],
+        dil: [usize; 3],
+        groups: usize,
+    },
     /// ArgMax / ArgMin along the middle axis of `src` viewed as
     /// `[outer, len, inner]` → `[outer, inner]` f32 indices (first extreme
     /// wins), positions computed rather than read from a table.
@@ -489,6 +511,7 @@ impl Step {
             | Step::Linalg { out, .. }
             | Step::Custom { out, .. }
             | Step::Conv3d { out, .. }
+            | Step::ConvTranspose3d { out, .. }
             | Step::ArgAxis { out, .. }
             | Step::Conv1ArgMax { out, .. }
             | Step::GroupNorm { out, .. }
@@ -549,6 +572,7 @@ impl Step {
                 v
             }
             Step::Custom { input, .. } => vec![*input],
+            Step::ConvTranspose3d { x, w, .. } => vec![*x, *w],
             Step::Conv3d { x, w, bias, .. } | Step::Conv1ArgMax { x, w, bias, .. } => {
                 let mut v = vec![*x, *w];
                 v.extend(bias);
@@ -626,6 +650,10 @@ impl Step {
                 }
             }
             Step::Custom { input, .. } => g(input),
+            Step::ConvTranspose3d { x, w, .. } => {
+                g(x);
+                g(w);
+            }
             Step::Conv3d { x, w, bias, .. } | Step::Conv1ArgMax { x, w, bias, .. } => {
                 g(x);
                 g(w);
@@ -1309,48 +1337,6 @@ fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// `out[o] = Σ_r x[x_idx[o·red + r]] · w[w_idx[o·red + r]]` (`PAD` in `x_idx`
-/// reads zero): gather each output's window and its weights side by side,
-/// multiply, and sum the window. Grouped / transposed convs, where outputs do
-/// not share one `[patch, cout]` matmul.
-fn window_dot(
-    b: &mut Builder,
-    x: usize,
-    w: usize,
-    out: usize,
-    x_idx: Vec<u32>,
-    w_idx: Vec<u32>,
-    red: usize,
-) {
-    let len = x_idx.len();
-    let p_slot = b.alloc(&[len / red, red]);
-    b.emit(Step::Gather {
-        out: p_slot,
-        src: x,
-        idx: x_idx,
-    });
-    let w_slot = b.alloc(&[len / red, red]);
-    b.emit(Step::Gather {
-        out: w_slot,
-        src: w,
-        idx: w_idx,
-    });
-    let m_slot = b.alloc(&[len / red, red]);
-    b.emit(Step::Binary {
-        out: m_slot,
-        a: p_slot,
-        b: w_slot,
-        op: Bin::Mul,
-    });
-    b.emit(Step::Reduce {
-        out,
-        src: m_slot,
-        groups: (0..len as u32).collect(),
-        fanin: red,
-        op: Red::Sum,
-    });
-}
-
 /// Conv/pool spatial output size along one axis.
 fn conv_out(sz: usize, k: usize, s: usize, p: usize, d: usize) -> usize {
     (sz + 2 * p - (d * (k - 1) + 1)) / s + 1
@@ -1430,6 +1416,7 @@ pub fn build_plan(graph: &Graph) -> Result<Plan> {
     };
     show("input", graph);
     let g = fold_conv3d_bias(graph.clone());
+    let g = pool_reduce_windows(g);
     let g = rlx_autodiff::decompose_backward_ops_except(g, NATIVE_BACKWARD);
     show("decomposed", &g);
     let g = rlx_fusion::unfuse_dit_modulation(g);
@@ -2340,157 +2327,41 @@ fn lower(graph: &Graph) -> Result<Plan> {
                 dilation,
                 groups,
             } => {
-                // Forward conv as im2col-gather + matmul + output transpose-gather.
-                // input [N,Cin,H,W], weight [Cout,Cin,kH,kW], out [N,Cout,Hout,Wout].
+                // NCHW conv as a depth-1 `Step::Conv3d`: one output element
+                // per fragment, positions computed in the shader. (The im2col
+                // and window-gather forms built index tables of output ×
+                // taps entries: an EfficientNet's convs held GBs of them,
+                // past a wasm32 heap.) input [N,Cin,H,W], weight
+                // [Cout,Cin/g,kH,kW], out [N,Cout,Hout,Wout].
                 let in_dims = input_dims(0)?;
                 let w_dims = input_dims(1)?;
                 if in_dims.len() != 4 || w_dims.len() != 4 || dims.len() != 4 {
                     return Err(WebglError("conv requires 4D NCHW".into()));
                 }
-                if *groups != 1 {
-                    // Grouped / depthwise: each output reads only its group's
-                    // channels, so a shared [patch, cout] matmul does not
-                    // apply. Gather every output's window and its weights side
-                    // by side, multiply, and sum the window:
-                    //   out[n,co,ho,wo] = Σ_{ci,ki,kj} x[n, g·cin_g + ci, ·, ·] · w[co, ci, ki, kj]
-                    // with g = co / cout_g. (Depthwise k-tap convs — LFM2's
-                    // ShortConv — are `red = k`, so this stays small.)
-                    let g = *groups;
-                    let (cin, cout) = (in_dims[1], w_dims[0]);
-                    if cin % g != 0 || cout % g != 0 || w_dims[1] != cin / g {
-                        return Err(WebglError(format!(
-                            "conv groups={g}: cin {cin} / cout {cout} / weight {w_dims:?} do not divide"
-                        )));
-                    }
-                    let (cin_g, cout_g) = (cin / g, cout / g);
-                    let (kh, kw) = (kernel_size[0], kernel_size[1]);
-                    let (sh, sw) = (stride[0], stride[1]);
-                    let (ph, pw) = (padding[0], padding[1]);
-                    let (dh, dw) = (dilation[0], dilation[1]);
-                    let (h, w) = (in_dims[2], in_dims[3]);
-                    let red = cin_g * kh * kw;
-                    let out_n = total(&dims);
-                    let (xs, ws) = (strides(&in_dims), strides(&w_dims));
-                    let mut x_idx = vec![PAD; out_n * red];
-                    let mut w_idx = vec![0u32; out_n * red];
-                    for o in 0..out_n {
-                        let oc = unravel(o, &dims); // [n, co, ho, wo]
-                        let grp = oc[1] / cout_g;
-                        for ci in 0..cin_g {
-                            for ki in 0..kh {
-                                for kj in 0..kw {
-                                    let r = (ci * kh + ki) * kw + kj;
-                                    w_idx[o * red + r] =
-                                        (oc[1] * ws[0] + ci * ws[1] + ki * ws[2] + kj * ws[3])
-                                            as u32;
-                                    let ih = oc[2] * sh + ki * dh;
-                                    let iw = oc[3] * sw + kj * dw;
-                                    if ih >= ph && iw >= pw && ih - ph < h && iw - pw < w {
-                                        x_idx[o * red + r] = (oc[0] * xs[0]
-                                            + (grp * cin_g + ci) * xs[1]
-                                            + (ih - ph) * xs[2]
-                                            + (iw - pw) * xs[3])
-                                            as u32;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let p_slot = b.alloc(&[out_n, red]);
-                    b.emit(Step::Gather {
-                        out: p_slot,
-                        src: input_slot(0)?,
-                        idx: x_idx,
-                    });
-                    let w_slot = b.alloc(&[out_n, red]);
-                    b.emit(Step::Gather {
-                        out: w_slot,
-                        src: input_slot(1)?,
-                        idx: w_idx,
-                    });
-                    let m_slot = b.alloc(&[out_n, red]);
-                    b.emit(Step::Binary {
-                        out: m_slot,
-                        a: p_slot,
-                        b: w_slot,
-                        op: Bin::Mul,
-                    });
-                    b.emit(Step::Reduce {
-                        out,
-                        src: m_slot,
-                        groups: (0..(out_n * red) as u32).collect(),
-                        fanin: red,
-                        op: Red::Sum,
-                    });
-                } else {
-                    let cin = in_dims[1];
-                    let cout = w_dims[0];
-                    let (kh, kw) = (kernel_size[0], kernel_size[1]);
-                    let (sh, sw) = (stride[0], stride[1]);
-                    let (ph, pw) = (padding[0], padding[1]);
-                    let (dh, dw) = (dilation[0], dilation[1]);
-                    let (hout, wout) = (dims[2], dims[3]);
-                    let patch = cin * kh * kw;
-                    let npos = dims[0] * hout * wout;
-
-                    // im2col patches P[pos, col] (PAD where the window hits padding).
-                    let p_idx = im2col_idx(&in_dims, kh, kw, sh, sw, ph, pw, dh, dw, hout, wout);
-                    let p_slot = b.alloc(&[npos, patch]);
-                    b.emit(Step::Gather {
-                        out: p_slot,
-                        src: input_slot(0)?,
-                        idx: p_idx,
-                    });
-
-                    // Weight → [patch, cout]: W2[col, co] = weight[co, ci, ki, kj].
-                    let w_strides = strides(&w_dims);
-                    let mut w_idx = vec![0u32; patch * cout];
-                    for col in 0..patch {
-                        let ci = col / (kh * kw);
-                        let r2 = col % (kh * kw);
-                        let (ki, kj) = (r2 / kw, r2 % kw);
-                        for co in 0..cout {
-                            w_idx[col * cout + co] = (co * w_strides[0]
-                                + ci * w_strides[1]
-                                + ki * w_strides[2]
-                                + kj * w_strides[3])
-                                as u32;
-                        }
-                    }
-                    let w2_slot = b.alloc(&[patch, cout]);
-                    b.emit(Step::Gather {
-                        out: w2_slot,
-                        src: input_slot(1)?,
-                        idx: w_idx,
-                    });
-
-                    // M[pos, co] = P @ W2.
-                    let m_slot = b.alloc(&[npos, cout]);
-                    b.emit(Step::MatMul {
-                        out: m_slot,
-                        a: p_slot,
-                        b: w2_slot,
-                        m: npos,
-                        k: patch,
-                        n: cout,
-                        batch: 1,
-                        b_batched: false,
-                    });
-
-                    // Scatter to NCHW: out[n,co,ho,wo] = M[(n·Hout·Wout + ho·Wout + wo), co].
-                    let out_n = total(&dims);
-                    let mut o_idx = vec![0u32; out_n];
-                    for o in 0..out_n {
-                        let oc = unravel(o, &dims); // [n, co, ho, wo]
-                        let pos = oc[0] * (hout * wout) + oc[2] * wout + oc[3];
-                        o_idx[o] = (pos * cout + oc[1]) as u32;
-                    }
-                    b.emit(Step::Gather {
-                        out,
-                        src: m_slot,
-                        idx: o_idx,
-                    });
+                let g = *groups;
+                let (cin, cout) = (in_dims[1], w_dims[0]);
+                if g == 0 || cin % g != 0 || cout % g != 0 || w_dims[1] != cin / g {
+                    return Err(WebglError(format!(
+                        "conv groups={g}: cin {cin} / cout {cout} / weight {w_dims:?} do not divide"
+                    )));
                 }
+                b.emit(Step::Conv3d {
+                    out,
+                    x: input_slot(0)?,
+                    w: input_slot(1)?,
+                    bias: None,
+                    n: in_dims[0],
+                    cin,
+                    din: [1, in_dims[2], in_dims[3]],
+                    cout,
+                    dout: [1, dims[2], dims[3]],
+                    k: [1, kernel_size[0], kernel_size[1]],
+                    stride: [1, stride[0], stride[1]],
+                    pad: [0, padding[0], padding[1]],
+                    dil: [1, dilation[0], dilation[1]],
+                    groups: g,
+                    act: None,
+                });
             }
             Op::Conv3d {
                 stride,
@@ -2546,7 +2417,8 @@ fn lower(graph: &Graph) -> Result<Plan> {
                 groups,
                 ..
             } => {
-                // Gather form of the CPU scatter kernel: input [N,Cin,D,H,W],
+                // Direct gather form of the CPU scatter kernel (`Step::ConvTranspose3d`):
+                // input [N,Cin,D,H,W],
                 // weight [Cin,Cout/g,kD,kH,kW], out [N,Cout,Do,Ho,Wo] (output
                 // padding is already folded into the output shape).
                 //   out[n,oc,o] = Σ_{ic∈grp(oc), t} x[n,ic,i] · w[ic, oc mod Cout/g, t]
@@ -2568,52 +2440,21 @@ fn lower(graph: &Graph) -> Result<Plan> {
                         "conv_transpose3d groups={g}: cin {cin} / cout {cout} / weight {w_dims:?} do not divide"
                     )));
                 }
-                let (cin_g, cout_g) = (cin / g, cout / g);
-                let ks = [w_dims[2], w_dims[3], w_dims[4]];
-                let kvol = ks[0] * ks[1] * ks[2];
-                let red = cin_g * kvol;
-                let osp = [dims[2], dims[3], dims[4]];
-                let npos_n = osp[0] * osp[1] * osp[2];
-                let xs = strides(&in_dims);
-                let unravel3 =
-                    |p: usize, e: [usize; 3]| [p / (e[1] * e[2]), p / e[2] % e[1], p % e[2]];
-                let out_n = total(&dims);
-                let mut x_idx = vec![PAD; out_n * red];
-                let mut w_idx = vec![0u32; out_n * red];
-                for o in 0..out_n {
-                    let (n, oc, p) = (o / (cout * npos_n), o / npos_n % cout, o % npos_n);
-                    let op = unravel3(p, osp);
-                    let (grp, oc_off) = (oc / cout_g, oc % cout_g);
-                    for r in 0..red {
-                        let (ic, tl) = (grp * cin_g + r / kvol, r % kvol);
-                        let t = unravel3(tl, ks);
-                        w_idx[o * red + r] = ((ic * cout_g + oc_off) * kvol + tl) as u32;
-                        let mut lin = Some(n * xs[0] + ic * xs[1]);
-                        for a in 0..3 {
-                            let num = (op[a] + padding[a]).checked_sub(t[a] * dilation[a]);
-                            lin = match (lin, num) {
-                                (Some(l), Some(v))
-                                    if v % stride[a] == 0 && v / stride[a] < in_dims[a + 2] =>
-                                {
-                                    Some(l + v / stride[a] * xs[a + 2])
-                                }
-                                _ => None,
-                            };
-                        }
-                        if let Some(l) = lin {
-                            x_idx[o * red + r] = l as u32;
-                        }
-                    }
-                }
-                window_dot(
-                    &mut b,
-                    input_slot(0)?,
-                    input_slot(1)?,
+                b.emit(Step::ConvTranspose3d {
                     out,
-                    x_idx,
-                    w_idx,
-                    red,
-                );
+                    x: input_slot(0)?,
+                    w: input_slot(1)?,
+                    n: in_dims[0],
+                    cin,
+                    din: [in_dims[2], in_dims[3], in_dims[4]],
+                    cout,
+                    dout: [dims[2], dims[3], dims[4]],
+                    k: [w_dims[2], w_dims[3], w_dims[4]],
+                    stride: *stride,
+                    pad: *padding,
+                    dil: *dilation,
+                    groups: g,
+                });
             }
             Op::Im2Col {
                 kernel_size,
@@ -3248,6 +3089,106 @@ fn lower(graph: &Graph) -> Result<Plan> {
 /// large as the activation itself, per layer. Backend-private like rlx-cpu's
 /// and wgpu's folds: `Op::Conv3d` is two inputs in the IR contract, and this
 /// graph only goes on to the planner.
+/// A 3-D max / mean pool written as a reshape to window axes and a reduce
+/// over them — `[n, c, D, a, H, b, W, e]` over axes {3, 5, 7}, SynthSeg's
+/// pool, which the graph holds as three single-axis reduces — becomes the NCDHW `Pool` it is (kernel = stride = `[a, b, e]`,
+/// unpadded; the linear order is the same), which lowers to one
+/// [`Step::Pool3d`]. Left alone, each of the three reduces has a group
+/// entry per input element (2.5 GB of tables for SynthSeg's QC at 224³).
+fn pool_reduce_windows(g: Graph) -> Graph {
+    // `Graph::reduce` over non-adjacent axes chains one reduce per axis,
+    // last axis first: match the chain from its end, axis 3 ← 5 ← 7.
+    let mut readers: HashMap<NodeId, usize> = HashMap::new();
+    for n in g.nodes() {
+        for i in &n.inputs {
+            *readers.entry(*i).or_default() += 1;
+        }
+    }
+    let inner = |id: NodeId| readers.get(&id) == Some(&1) && !g.outputs.contains(&id);
+    let link = |id: NodeId, axis: usize, want: Option<(ReduceOp, bool)>| {
+        let n = g.node(id);
+        match &n.op {
+            Op::Reduce {
+                op: op @ (ReduceOp::Max | ReduceOp::Mean),
+                axes,
+                keep_dim,
+            } if axes.as_slice() == [axis] && want.is_none_or(|w| w == (*op, *keep_dim)) => {
+                Some(((*op, *keep_dim), n.inputs[0]))
+            }
+            _ => None,
+        }
+    };
+    // last reduce → (op, 8-D source, its dims); the two inner reduces
+    let mut chains: HashMap<NodeId, (ReduceOp, NodeId, Vec<usize>)> = HashMap::new();
+    let mut skip: HashSet<NodeId> = HashSet::new();
+    for n in g.nodes() {
+        let Some((kind, r5)) = link(n.id, 3, None) else {
+            continue;
+        };
+        let Some((_, r7)) = link(r5, 5, Some(kind)).filter(|_| inner(r5)) else {
+            continue;
+        };
+        let Some((_, src)) = link(r7, 7, Some(kind)).filter(|_| inner(r7)) else {
+            continue;
+        };
+        let Ok(d) = dims_of(&g.node(src).shape) else {
+            continue;
+        };
+        if d.len() == 8 {
+            chains.insert(n.id, (kind.0, src, d));
+            skip.extend([r5, r7]);
+        }
+    }
+    if chains.is_empty() {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        if skip.contains(&node.id) {
+            continue;
+        }
+        let id = if let Some((op, src, d)) = chains.get(&node.id) {
+            let dt = node.shape.dtype();
+            let vol = [d[0], d[1], d[2] * d[3], d[4] * d[5], d[6] * d[7]];
+            let x = out.reshape(
+                id_map[src],
+                vol.iter().map(|&v| v as i64).collect(),
+                rlx_ir::Shape::new(&vol, dt),
+            );
+            let k = vec![d[3], d[5], d[7]];
+            let pooled = [d[0], d[1], d[2], d[4], d[6]];
+            let p = out.add_node(
+                Op::Pool {
+                    kind: *op,
+                    kernel_size: k.clone(),
+                    stride: k,
+                    padding: vec![0; 3],
+                },
+                vec![x],
+                rlx_ir::Shape::new(&pooled, dt),
+            );
+            // `keep_dim` keeps the window axes as ones
+            let want = dims_of(&node.shape).unwrap_or_default();
+            if want == pooled {
+                p
+            } else {
+                out.reshape(
+                    p,
+                    want.iter().map(|&v| v as i64).collect(),
+                    node.shape.clone(),
+                )
+            }
+        } else {
+            let ins: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+            out.add_node(node.op.clone(), ins, node.shape.clone())
+        };
+        id_map.insert(node.id, id);
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
 fn fold_conv3d_bias(g: Graph) -> Graph {
     let is_target = |n: &rlx_ir::Node| {
         matches!(&n.op, Op::FusedConvBiasAct { kernel_size, has_residual: false, .. } if kernel_size.len() == 3)
@@ -3518,6 +3459,7 @@ fn widen_tall_slots(plan: &mut Plan) {
             // read and written by linear index
             Step::Leaf { .. }
             | Step::Conv3d { .. }
+            | Step::ConvTranspose3d { .. }
             | Step::ArgAxis { .. }
             | Step::Conv1ArgMax { .. }
             | Step::GroupNorm { .. }

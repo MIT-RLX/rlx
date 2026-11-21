@@ -44,6 +44,10 @@ rlx-runtime = { workspace = true, features = ["cpu"] }
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 rlx-runtime = { workspace = true, features = ["cpu", "metal", "gpu", "mlx"] }
 
+[[example]]
+name = "emeans_train"
+required-features = ["emeans"]
+
 [lints]
 workspace = true
 

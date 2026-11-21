@@ -101,7 +101,8 @@ extern "C" __global__ void dequant_gguf(
         && scheme_id != 19u && scheme_id != 20u
         && scheme_id != 21u && scheme_id != 22u && scheme_id != 23u
         && scheme_id != 24u && scheme_id != 25u && scheme_id != 28u
-        && scheme_id != 29u && scheme_id != 30u && scheme_id != 31u) {
+        && scheme_id != 29u && scheme_id != 30u && scheme_id != 31u
+        && scheme_id != 32u) {
         float* dst = arena + dst_f32_off + gid * 256u;
 
         if (scheme_id == 3u) {
@@ -648,6 +649,19 @@ extern "C" __global__ void dequant_gguf(
         return;
     }
 
+    if (scheme_id == 32u) {
+        // ggml Q2_0: f16 d | 16 two-bit bytes (18 bytes / 64 elements).
+        unsigned int off = gid * 18u;
+        float d = dq_read_f16(w_base, off);
+        const unsigned char* qs = w_base + off + 2u;
+        float* dst = arena + dst_f32_off + gid * 64u;
+        for (unsigned int j = 0u; j < 64u; ++j) {
+            unsigned int q = (qs[j >> 2u] >> ((j & 3u) * 2u)) & 3u;
+            dst[j] = (float)((int)q - 1) * d;
+        }
+        return;
+    }
+
     if (scheme_id == 30u || scheme_id == 31u) {
         // FP8 block (HF fp8 / DeepSeek-V3): f32 scale | 128 codes (132 bytes /
         // 128 elems), E4M3 (30) or E5M2 (31). Codes decode by building the f32
@@ -794,40 +808,44 @@ extern "C" __global__ void dequant_gguf(
         float s = (e == 0xFFu) ? 0.0f : exp2f((float)((int)(unsigned int)e - 127));
         const unsigned char* qs = w_base + off + 1u;
         float* dst = arena + dst_f32_off + gid * 32u;
+        // ggml block_mxfp4: byte j holds values j (low) and j + 16 (high).
         for (unsigned int j = 0u; j < 16u; ++j) {
             unsigned char bx = qs[j];
-            dst[2u * j] = s * FP4[bx & 0x0Fu];
-            dst[2u * j + 1u] = s * FP4[bx >> 4];
+            dst[j] = s * FP4[bx & 0x0Fu];
+            dst[j + 16u] = s * FP4[bx >> 4];
         }
         return;
     }
 
-    // ── 16-elem schemes: NVFP4 ──
+    // ── 64-elem schemes: NVFP4 ──
     if (scheme_id == 11u) {
+        // ggml block_nvfp4: 4 UE4M3 scales + 32 nibble bytes = 36 bytes / 64
+        // elements; sub-block sb: byte 8sb+j holds 16sb+j (low), 16sb+j+8
+        // (high). UE4M3: 0 and 0x7F are 0, the sign bit is ignored.
         static const float FP4[16] = {
             0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
             -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
         };
-        unsigned int off = gid * 9u;
-        unsigned char e = w_base[off];
-        unsigned int sign_b = ((unsigned int)e >> 7) & 1u;
-        unsigned int exp_v = ((unsigned int)e >> 3) & 0x0Fu;
-        unsigned int mant = (unsigned int)e & 0x7u;
-        float s;
-        if (exp_v == 0u) {
-            s = (mant == 0u) ? 0.0f : ((float)mant / 8.0f) * exp2f(-6.0f);
-        } else if (exp_v == 0x0Fu && mant == 0x7u) {
-            s = 0.0f;
-        } else {
-            s = (1.0f + (float)mant / 8.0f) * exp2f((float)((int)exp_v - 7));
-        }
-        if (sign_b != 0u) s = -s;
-        const unsigned char* qs = w_base + off + 1u;
-        float* dst = arena + dst_f32_off + gid * 16u;
-        for (unsigned int j = 0u; j < 8u; ++j) {
-            unsigned char bx = qs[j];
-            dst[2u * j] = s * FP4[bx & 0x0Fu];
-            dst[2u * j + 1u] = s * FP4[bx >> 4];
+        unsigned int off = gid * 36u;
+        const unsigned char* qs = w_base + off + 4u;
+        float* dst = arena + dst_f32_off + gid * 64u;
+        for (unsigned int sb = 0u; sb < 4u; ++sb) {
+            unsigned int e = (unsigned int)w_base[off + sb];
+            unsigned int exp_v = (e >> 3) & 0x0Fu;
+            unsigned int mant = e & 0x7u;
+            float s;
+            if (e == 0u || e == 0x7Fu) {
+                s = 0.0f;
+            } else if (exp_v == 0u) {
+                s = (float)mant * exp2f(-9.0f);
+            } else {
+                s = (1.0f + (float)mant / 8.0f) * exp2f((float)((int)exp_v - 7));
+            }
+            for (unsigned int j = 0u; j < 8u; ++j) {
+                unsigned char bx = qs[sb * 8u + j];
+                dst[sb * 16u + j] = s * FP4[bx & 0x0Fu];
+                dst[sb * 16u + j + 8u] = s * FP4[bx >> 4];
+            }
         }
         return;
     }

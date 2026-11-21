@@ -40,6 +40,13 @@ impl Backend for CudaBackend {
         let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
         let mut inner = CudaExecutable::compile_rng(graph, options.rng);
         inner.set_exact_f32_matmul(options.exact_f32_matmul);
+        // The graph runs f32 (above), but under `AlwaysF16` its 3-D
+        // convolutions — most of a volumetric network's work — run in f16 on
+        // tensor cores, converting at their boundary.
+        inner.set_conv_f16(matches!(
+            options.policy,
+            Some(rlx_opt::PrecisionPolicy::AlwaysF16)
+        ));
         Box::new(CudaExecutableWrapper { inner, io_manifest })
     }
 
@@ -54,6 +61,10 @@ impl Backend for CudaBackend {
         ));
         let mut inner = CudaExecutable::compile_rng(graph, options.rng);
         inner.set_exact_f32_matmul(options.exact_f32_matmul);
+        inner.set_conv_f16(matches!(
+            options.policy,
+            Some(rlx_opt::PrecisionPolicy::AlwaysF16)
+        ));
         Box::new(CudaExecutableWrapper { inner, io_manifest })
     }
 }

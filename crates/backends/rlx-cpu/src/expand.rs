@@ -462,7 +462,11 @@ fn per_channel_source(g: &Graph, mut id: NodeId, c: usize) -> Option<NodeId> {
         }
     }
     let sh = &g.node(id).shape;
-    (peeled > 0 && sh.rank() == 1 && sh.dims()[0] == rlx_ir::Dim::Static(c) && sh.dtype() == rlx_ir::DType::F32).then_some(id)
+    (peeled > 0
+        && sh.rank() == 1
+        && sh.dims()[0] == rlx_ir::Dim::Static(c)
+        && sh.dtype() == rlx_ir::DType::F32)
+        .then_some(id)
 }
 
 /// `Conv3d → Add(bias broadcast from [C_out])` as the **3-input** `Op::Conv3d` whose thunk adds
@@ -500,7 +504,9 @@ pub fn fold_conv3d_bias_add(g: Graph) -> Graph {
             {
                 continue;
             }
-            let rlx_ir::Dim::Static(c_out) = conv.shape.dims()[1] else { continue };
+            let rlx_ir::Dim::Static(c_out) = conv.shape.dims()[1] else {
+                continue;
+            };
             if let Some(bias) = per_channel_source(&g, add.inputs[bi], c_out) {
                 fold.insert(add.id, (conv.id, bias));
                 folded_convs.insert(conv.id);
@@ -520,7 +526,11 @@ pub fn fold_conv3d_bias_add(g: Graph) -> Graph {
         let new_id = match fold.get(&node.id) {
             Some(&(conv_id, bias)) => {
                 let conv = g.node(conv_id);
-                let ins = vec![id_map[&conv.inputs[0]], id_map[&conv.inputs[1]], id_map[&bias]];
+                let ins = vec![
+                    id_map[&conv.inputs[0]],
+                    id_map[&conv.inputs[1]],
+                    id_map[&bias],
+                ];
                 out.add_node(conv.op.clone(), ins, node.shape.clone())
             }
             None => {
@@ -546,11 +556,26 @@ mod conv3d_bias_tests {
         let w = g.param("w", Shape::new(&[3, 2, 3, 3, 3], DType::F32));
         let b = g.param("b", Shape::new(&[3], DType::F32));
         let y = g.conv3d(x, w, [1, 1, 1], [1, 1, 1], [1, 1, 1], 1);
-        let br = g.add_node(Op::Reshape { new_shape: vec![1, 3, 1, 1, 1] }, vec![b], Shape::new(&[1, 3, 1, 1, 1], DType::F32));
-        let z = g.binary(rlx_ir::op::BinaryOp::Add, y, br, Shape::new(&[1, 3, 4, 4, 4], DType::F32));
+        let br = g.add_node(
+            Op::Reshape {
+                new_shape: vec![1, 3, 1, 1, 1],
+            },
+            vec![b],
+            Shape::new(&[1, 3, 1, 1, 1], DType::F32),
+        );
+        let z = g.binary(
+            rlx_ir::op::BinaryOp::Add,
+            y,
+            br,
+            Shape::new(&[1, 3, 4, 4, 4], DType::F32),
+        );
         g.set_outputs(vec![z]);
         let f = fold_conv3d_bias_add(g);
-        let convs: Vec<_> = f.nodes().iter().filter(|n| matches!(n.op, Op::Conv3d { .. })).collect();
+        let convs: Vec<_> = f
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Conv3d { .. }))
+            .collect();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].inputs.len(), 3);
         assert!(!f.nodes().iter().any(|n| matches!(n.op, Op::Binary(_))));
@@ -564,8 +589,19 @@ mod conv3d_bias_tests {
         let w = g.param("w", Shape::new(&[3, 2, 3, 3, 3], DType::F32));
         let b = g.param("b", Shape::new(&[3], DType::F32));
         let y = g.conv3d(x, w, [1, 1, 1], [1, 1, 1], [1, 1, 1], 1);
-        let br = g.add_node(Op::Reshape { new_shape: vec![1, 3, 1, 1, 1] }, vec![b], Shape::new(&[1, 3, 1, 1, 1], DType::F32));
-        let z = g.binary(rlx_ir::op::BinaryOp::Add, y, br, Shape::new(&[1, 3, 4, 4, 4], DType::F32));
+        let br = g.add_node(
+            Op::Reshape {
+                new_shape: vec![1, 3, 1, 1, 1],
+            },
+            vec![b],
+            Shape::new(&[1, 3, 1, 1, 1], DType::F32),
+        );
+        let z = g.binary(
+            rlx_ir::op::BinaryOp::Add,
+            y,
+            br,
+            Shape::new(&[1, 3, 4, 4, 4], DType::F32),
+        );
         g.set_outputs(vec![z, y]);
         let f = fold_conv3d_bias_add(g);
         assert!(f.nodes().iter().any(|n| matches!(n.op, Op::Binary(_))));

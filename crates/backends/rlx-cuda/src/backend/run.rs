@@ -33,9 +33,10 @@ use crate::kernels::{
     fused_binary_unary_kernel, fused_residual_ln_kernel, fused_residual_rms_norm_kernel,
     fused_swiglu_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
     gated_residual_kernel, gather_axis_kernel, gather_backward_kernel, gather_elements_kernel,
-    gather_kernel, gather_nd_kernel, group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel,
-    group_norm_bwd_input_kernel, group_norm_kernel, grouped_matmul_kernel, im2col_kernel,
-    interpolate3d_kernel, kimi_delta_chunk_kernel, kv_append_kernel, layer_norm_bwd_gamma_kernel,
+    gather_kernel, gather_nd_kernel, group_norm_apply_kernel, group_norm_bwd_beta_kernel,
+    group_norm_bwd_gamma_kernel, group_norm_bwd_input_kernel, group_norm_kernel,
+    group_norm_stats_kernel, grouped_matmul_kernel, im2col_kernel, interpolate3d_kernel,
+    kimi_delta_chunk_kernel, kv_append_kernel, layer_norm_bwd_gamma_kernel,
     layer_norm_bwd_input_kernel, layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel,
     matmul_kernel, matmul_kernel_tiled, matmul_tma_kernel, matmul_wmma_kernel,
     maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, pad_kernel, pool1d_kernel,
@@ -1829,9 +1830,24 @@ impl CudaExecutable {
                     if outer_s == 0 {
                         continue;
                     }
-                    let kernel = reduce_kernel(&self.ctx);
+                    // Rows of a few elements (a 2x2x2 pool's): a thread a row,
+                    // not a block (`reduce_rows`, same accumulation).
+                    let short = *inner <= REDUCE_ROWS_MAX;
+                    let kernel = if short {
+                        crate::kernels::reduce_rows_kernel(&self.ctx)
+                    } else {
+                        reduce_kernel(&self.ctx)
+                    };
                     let cfg = LaunchConfig {
-                        grid_dim: (outer_s, 1, 1),
+                        grid_dim: (
+                            if short {
+                                outer_s.div_ceil(256)
+                            } else {
+                                outer_s
+                            },
+                            1,
+                            1,
+                        ),
                         block_dim: (256, 1, 1),
                         shared_mem_bytes: 0,
                     };
@@ -1861,9 +1877,24 @@ impl CudaExecutable {
                     if rows_s == 0 {
                         continue;
                     }
-                    let kernel = softmax_kernel(&self.ctx);
+                    // Short axes: a warp a vector when contiguous, a thread a
+                    // vector when strided (coalesced across vectors).
+                    let short = *axis_len <= SOFTMAX_ROWS_MAX;
+                    let (kernel, grid) = if short && *stride == 1 {
+                        (
+                            crate::kernels::softmax_warp_kernel(&self.ctx),
+                            rows_s.div_ceil(8),
+                        )
+                    } else if short {
+                        (
+                            crate::kernels::softmax_rows_kernel(&self.ctx),
+                            rows_s.div_ceil(256),
+                        )
+                    } else {
+                        (softmax_kernel(&self.ctx), rows_s)
+                    };
                     let cfg = LaunchConfig {
-                        grid_dim: (rows_s, 1, 1),
+                        grid_dim: (grid, 1, 1),
                         block_dim: (256, 1, 1),
                         shared_mem_bytes: 0,
                     };
@@ -4299,7 +4330,7 @@ impl CudaExecutable {
                         launcher.launch(cfg).expect("rlx-cuda: slice launch failed");
                     }
                 }
-                Step::ArgReduceHost {
+                Step::ArgReduce {
                     src_byte_off,
                     dst_byte_off,
                     outer,
@@ -4307,16 +4338,35 @@ impl CudaExecutable {
                     inner,
                     is_max,
                 } => {
-                    crate::host_misc::run_argreduce(
-                        &stream,
-                        self.arena.f32_buf_mut(),
-                        *src_byte_off as usize,
-                        *dst_byte_off as usize,
-                        *outer as usize,
-                        *reduced as usize,
-                        *inner as usize,
-                        *is_max,
-                    );
+                    // A block a row for long last-axis rows, else a thread an
+                    // output (coalesced over `inner`).
+                    let row = *inner == 1 && *reduced > ARGREDUCE_ROW_MIN;
+                    let (kernel, grid) = if row {
+                        (crate::kernels::argreduce_row_kernel(&self.ctx), *outer)
+                    } else {
+                        let total = *outer as u64 * *inner as u64;
+                        (
+                            crate::kernels::argreduce_kernel(&self.ctx),
+                            total.div_ceil(256) as u32,
+                        )
+                    };
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let (in_off, out_off) = (*src_byte_off / 4, *dst_byte_off / 4);
+                    let is_max = *is_max as u32;
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(outer)
+                        .arg(reduced)
+                        .arg(inner)
+                        .arg(&in_off)
+                        .arg(&out_off)
+                        .arg(&is_max);
+                    unsafe { launcher.launch(cfg) }.expect("rlx-cuda: argreduce launch failed");
                 }
                 Step::AxialRope2d {
                     in_off,
@@ -5453,31 +5503,86 @@ impl CudaExecutable {
                     w,
                     num_groups,
                     eps_bits,
+                    act,
+                    alpha_bits,
+                    stats_off,
                 } => {
-                    let kernel = group_norm_kernel(&self.ctx);
-                    let grid = n * num_groups;
-                    let cfg = LaunchConfig {
-                        grid_dim: (grid, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    let mut launcher = stream.launch_builder(&kernel.function);
-                    launcher
-                        .arg(self.arena.f32_buf_mut())
-                        .arg(src_off)
-                        .arg(g_off)
-                        .arg(b_off)
-                        .arg(dst_off)
-                        .arg(n)
-                        .arg(c)
-                        .arg(h)
-                        .arg(w)
-                        .arg(num_groups)
-                        .arg(eps_bits);
-                    unsafe {
+                    // Split: per-chunk statistics, then merge + normalise, one
+                    // block a chunk (`group_norm.cu`). One block a group left
+                    // a handful of groups to a handful of blocks.
+                    // `RLX_CUDA_GROUP_NORM=single`: the one-block-a-group
+                    // kernel, to time the two against each other.
+                    // (The single-block kernel has no activation epilogue.)
+                    if *act == 0
+                        && rlx_ir::env::var("RLX_CUDA_GROUP_NORM").is_some_and(|v| v == "single")
+                    {
+                        let kernel = group_norm_kernel(&self.ctx);
+                        let cfg = LaunchConfig {
+                            grid_dim: (n * num_groups, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let mut launcher = stream.launch_builder(&kernel.function);
                         launcher
-                            .launch(cfg)
-                            .expect("rlx-cuda: group_norm launch failed");
+                            .arg(self.arena.f32_buf_mut())
+                            .arg(src_off)
+                            .arg(g_off)
+                            .arg(b_off)
+                            .arg(dst_off)
+                            .arg(n)
+                            .arg(c)
+                            .arg(h)
+                            .arg(w)
+                            .arg(num_groups)
+                            .arg(eps_bits);
+                        unsafe {
+                            launcher
+                                .launch(cfg)
+                                .expect("rlx-cuda: group_norm launch failed");
+                        }
+                    } else {
+                        let plane = *h * *w;
+                        let count = (*c / (*num_groups).max(1)) * plane;
+                        let chunks = count.div_ceil(super::compile::GN_CHUNK).max(1);
+                        let cfg = LaunchConfig {
+                            grid_dim: (chunks, n * num_groups, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let stats = group_norm_stats_kernel(&self.ctx);
+                        let mut launcher = stream.launch_builder(&stats.function);
+                        launcher
+                            .arg(self.arena.f32_buf_mut())
+                            .arg(src_off)
+                            .arg(stats_off)
+                            .arg(c)
+                            .arg(&plane)
+                            .arg(num_groups);
+                        unsafe {
+                            launcher
+                                .launch(cfg)
+                                .expect("rlx-cuda: group_norm_stats launch failed");
+                        }
+                        let apply = group_norm_apply_kernel(&self.ctx);
+                        let mut launcher = stream.launch_builder(&apply.function);
+                        launcher
+                            .arg(self.arena.f32_buf_mut())
+                            .arg(src_off)
+                            .arg(g_off)
+                            .arg(b_off)
+                            .arg(dst_off)
+                            .arg(stats_off)
+                            .arg(c)
+                            .arg(&plane)
+                            .arg(num_groups)
+                            .arg(eps_bits)
+                            .arg(act)
+                            .arg(alpha_bits);
+                        unsafe {
+                            launcher
+                                .launch(cfg)
+                                .expect("rlx-cuda: group_norm_apply launch failed");
+                        }
                     }
                 }
                 Step::GroupNormBackwardInput {
@@ -8046,61 +8151,212 @@ impl CudaExecutable {
                 } => {
                     // Tier 1: cuDNN nd-conv (NCDHW + 3-D pads/strides/dilations).
                     // Opt out with `RLX_CUDA_NO_CUDNN=1` (parity / kernel-only).
+                    // f32: cuDNN or `conv3d_cot` (eight output channels a thread),
+                    // whichever this shape runs faster. Neither wins everywhere
+                    // (cot 1.65x on SegResNet's 16-128 channel convs, cuDNN 1.4x
+                    // on SwinUNETR's wide ones), so the first eager run of a
+                    // shape times both — outside graph capture — and the choice
+                    // is kept for the process. `RLX_CUDA_CONV3D=cot|cudnn` forces
+                    // one; `naive` the one-output kernel.
                     let try_cudnn = self.dnn.is_some()
                         && self.dnn_workspace.is_some()
                         && !rlx_ir::env::flag("RLX_CUDA_NO_CUDNN");
-                    let used_cudnn = if try_cudnn {
-                        let handle = self.dnn.expect("dnn handle");
-                        let workspace = self.dnn_workspace.as_ref().expect("dnn workspace");
-                        let mut workspace = workspace.lock().unwrap();
-                        let (ws_ptr, _ws_record) = workspace.device_ptr_mut(&stream);
-                        let (arena_ptr, _arena_record) =
-                            self.arena.f32_buf_mut().device_ptr_mut(&stream);
-                        let r = unsafe {
-                            cudnn_conv3d_forward(
-                                handle,
-                                ws_ptr,
-                                CUDNN_WORKSPACE_BYTES,
-                                arena_ptr,
-                                *n,
-                                *c_in,
-                                *c_out,
-                                *d,
-                                *h,
-                                *w,
-                                *d_out,
-                                *h_out,
-                                *w_out,
-                                *kd,
-                                *kh,
-                                *kw,
-                                *sd,
-                                *sh,
-                                *sw,
-                                *pd,
-                                *ph,
-                                *pw,
-                                *dd,
-                                *dh,
-                                *dw,
-                                *groups,
-                                *in_off,
-                                *w_off,
-                                *out_off,
-                            )
-                        };
-                        if let Err(ref e) = r {
-                            log_fallback("conv3d.cudnn", e);
-                        }
-                        r.is_ok()
-                    } else {
-                        false
+                    let conv_env = rlx_ir::env::var("RLX_CUDA_CONV3D");
+                    let cot_ok = *groups <= 1
+                        && *kh * *kw <= 27
+                        && !conv_env.as_deref().is_some_and(|v| v == "naive");
+                    let conv_key = [
+                        *n,
+                        *c_in,
+                        *c_out,
+                        *d,
+                        *h,
+                        *w,
+                        *kd,
+                        *kh,
+                        *kw,
+                        *sd,
+                        *sh,
+                        *sw,
+                        *pd,
+                        *ph,
+                        *pw,
+                        *dd,
+                        *dh,
+                        *dw,
+                        self.conv_f16 as u32,
+                    ];
+                    let tuned: Option<bool> = match conv_env.as_deref() {
+                        Some("cot") => Some(true),
+                        Some("cudnn") => Some(false),
+                        _ if cot_ok && try_cudnn => conv3d_cot_choice(&conv_key),
+                        _ => None,
                     };
+                    let capturing = !matches!(
+                        stream.capture_status(),
+                        Ok(cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
+                    );
+                    let tune = cot_ok && try_cudnn && tuned.is_none() && !capturing;
+                    if tune {
+                        let _ = stream.synchronize();
+                    }
+                    let tune_t0 = std::time::Instant::now();
+                    let try_cudnn = try_cudnn && !(cot_ok && tuned == Some(true));
+                    // f16 on tensor cores (`set_conv_f16`): input and filter
+                    // converted into the half scratch, the output widened back.
+                    let used_half =
+                        try_cudnn && self.conv_f16 && self.conv_half_scratch.is_some() && {
+                            let nx = *n * *c_in * *d * *h * *w;
+                            let nw = *c_out * (*c_in / (*groups).max(1)) * *kd * *kh * *kw;
+                            let ny = *n * *c_out * *d_out * *h_out * *w_out;
+                            let f16 = 0u32;
+                            let mut ok = true;
+                            for (src, len, dst) in [(*in_off, nx, 0u64), (*w_off, nw, nx as u64)] {
+                                let kernel = crate::kernels::cast_f32_to_half_kernel(&self.ctx);
+                                let (grid, block) = dispatch_grid_1d(len, 256);
+                                let cfg = LaunchConfig {
+                                    grid_dim: (grid, 1, 1),
+                                    block_dim: (block, 1, 1),
+                                    shared_mem_bytes: 0,
+                                };
+                                let src_view = self
+                                    .arena
+                                    .f32_buf()
+                                    .slice(src as usize..(src + len) as usize);
+                                let dst_view = self
+                                    .conv_half_scratch
+                                    .as_mut()
+                                    .unwrap()
+                                    .slice_mut(dst as usize..dst as usize + len as usize);
+                                let mut dst_view = dst_view;
+                                let mut launcher = stream.launch_builder(&kernel.function);
+                                launcher
+                                    .arg(&src_view)
+                                    .arg(&mut dst_view)
+                                    .arg(&len)
+                                    .arg(&f16);
+                                ok &= unsafe { launcher.launch(cfg) }.is_ok();
+                            }
+                            let (scratch_ptr, _sr) = self
+                                .conv_half_scratch
+                                .as_mut()
+                                .unwrap()
+                                .device_ptr_mut(&stream);
+                            let handle = self.dnn.expect("dnn handle");
+                            let workspace = self.dnn_workspace.as_ref().expect("dnn workspace");
+                            let mut workspace = workspace.lock().unwrap();
+                            let (ws_ptr, _ws_record) = workspace.device_ptr_mut(&stream);
+                            let y_dev = scratch_ptr + (nx as u64 + nw as u64) * 2;
+                            let r = ok
+                                && unsafe {
+                                    super::helpers::cudnn_conv3d_forward_raw(
+                                        handle,
+                                        ws_ptr,
+                                        CUDNN_WORKSPACE_BYTES,
+                                        *n,
+                                        *c_in,
+                                        *c_out,
+                                        *d,
+                                        *h,
+                                        *w,
+                                        *d_out,
+                                        *h_out,
+                                        *w_out,
+                                        *kd,
+                                        *kh,
+                                        *kw,
+                                        *sd,
+                                        *sh,
+                                        *sw,
+                                        *pd,
+                                        *ph,
+                                        *pw,
+                                        *dd,
+                                        *dh,
+                                        *dw,
+                                        *groups,
+                                        true,
+                                        scratch_ptr,
+                                        scratch_ptr + nx as u64 * 2,
+                                        y_dev,
+                                    )
+                                }
+                                .map_err(|e| log_fallback("conv3d.cudnn_f16", e))
+                                .is_ok();
+                            if r {
+                                let (arena_ptr, _ar) =
+                                    self.arena.f32_buf_mut().device_ptr_mut(&stream);
+                                let kernel = crate::kernels::widen_half_to_f32_kernel(&self.ctx);
+                                let (grid, block) = dispatch_grid_1d(ny, 256);
+                                let cfg = LaunchConfig {
+                                    grid_dim: (grid.min(65535), 1, 1),
+                                    block_dim: (block, 1, 1),
+                                    shared_mem_bytes: 0,
+                                };
+                                let dst = arena_ptr + *out_off as u64 * 4;
+                                let ny64 = ny as u64;
+                                let mut launcher = stream.launch_builder(&kernel.function);
+                                launcher.arg(&y_dev).arg(&dst).arg(&ny64).arg(&f16);
+                                unsafe { launcher.launch(cfg) }.is_ok()
+                            } else {
+                                false
+                            }
+                        };
+                    let used_cudnn = used_half
+                        || if try_cudnn {
+                            let handle = self.dnn.expect("dnn handle");
+                            let workspace = self.dnn_workspace.as_ref().expect("dnn workspace");
+                            let mut workspace = workspace.lock().unwrap();
+                            let (ws_ptr, _ws_record) = workspace.device_ptr_mut(&stream);
+                            let (arena_ptr, _arena_record) =
+                                self.arena.f32_buf_mut().device_ptr_mut(&stream);
+                            let r = unsafe {
+                                cudnn_conv3d_forward(
+                                    handle,
+                                    ws_ptr,
+                                    CUDNN_WORKSPACE_BYTES,
+                                    arena_ptr,
+                                    *n,
+                                    *c_in,
+                                    *c_out,
+                                    *d,
+                                    *h,
+                                    *w,
+                                    *d_out,
+                                    *h_out,
+                                    *w_out,
+                                    *kd,
+                                    *kh,
+                                    *kw,
+                                    *sd,
+                                    *sh,
+                                    *sw,
+                                    *pd,
+                                    *ph,
+                                    *pw,
+                                    *dd,
+                                    *dh,
+                                    *dw,
+                                    *groups,
+                                    *in_off,
+                                    *w_off,
+                                    *out_off,
+                                )
+                            };
+                            if let Err(ref e) = r {
+                                log_fallback("conv3d.cudnn", e);
+                            }
+                            r.is_ok()
+                        } else {
+                            false
+                        };
                     record_conv3d_path(used_cudnn);
                     if rlx_ir::env::flag("RLX_CUDA_LOG_CONV_PATH") {
                         eprintln!(
                             "rlx-cuda-convpath: {} n={} c_in={} c_out={} {}x{}x{} k={}x{}x{} g={}",
-                            if used_cudnn {
+                            if used_half {
+                                "CUDNN_CONV3D_F16"
+                            } else if used_cudnn {
                                 "CUDNN_CONV3D"
                             } else {
                                 "KERNEL_CONV3D"
@@ -8117,10 +8373,46 @@ impl CudaExecutable {
                             groups
                         );
                     }
-                    if used_cudnn {
+                    // Under `set_conv_f16` cuDNN's half conv (with its casts) is
+                    // timed against f32 `conv3d_cot` too: on narrow convs the
+                    // casts cost more than the tensor cores save (SynthSeg).
+                    let tune_cudnn = (tune && used_cudnn).then(|| {
+                        let _ = stream.synchronize();
+                        tune_t0.elapsed()
+                    });
+                    if used_cudnn && tune_cudnn.is_none() {
                         continue;
                     }
 
+                    // `conv3d_cot`, timed against cuDNN's run above when tuning.
+                    if cot_ok {
+                        let cot_t0 = std::time::Instant::now();
+                        let kernel = crate::kernels::conv3d_cot_kernel(&self.ctx);
+                        let m = *n * *d_out * *h_out * *w_out;
+                        let cfg = LaunchConfig {
+                            grid_dim: (m.div_ceil(256), c_out.div_ceil(8), 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let mut launcher = stream.launch_builder(&kernel.function);
+                        launcher.arg(self.arena.f32_buf_mut());
+                        for v in [
+                            n, c_in, c_out, d, h, w, d_out, h_out, w_out, kd, kh, kw, sd, sh, sw,
+                            pd, ph, pw, dd, dh, dw, in_off, w_off, out_off,
+                        ] {
+                            launcher.arg(v);
+                        }
+                        unsafe {
+                            launcher
+                                .launch(cfg)
+                                .expect("rlx-cuda: conv3d_cot launch failed");
+                        }
+                        if let Some(t_cudnn) = tune_cudnn {
+                            let _ = stream.synchronize();
+                            record_conv3d_cot_choice(conv_key, cot_t0.elapsed() < t_cudnn);
+                        }
+                        continue;
+                    }
                     // Fallback: custom direct-convolution kernel.
                     let kernel = conv3d_kernel(&self.ctx);
                     let total = n * c_out * d_out * h_out * w_out;
@@ -8447,3 +8739,37 @@ fn widen_half_weight(
             .expect("rlx-cuda: widen_half_to_f32 launch failed");
     }
 }
+
+/// Per 3-D conv shape and conv precision (f32, or cuDNN half under
+/// `set_conv_f16`), whether `conv3d_cot` outran cuDNN (see the
+/// `Step::Conv3d` arm). Process-wide: the shapes of every graph share it.
+static CONV3D_COT_CHOICE: std::sync::Mutex<Option<HashMap<[u32; 19], bool>>> =
+    std::sync::Mutex::new(None);
+
+fn conv3d_cot_choice(key: &[u32; 19]) -> Option<bool> {
+    CONV3D_COT_CHOICE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(key).copied())
+}
+
+fn record_conv3d_cot_choice(key: [u32; 19], cot: bool) {
+    CONV3D_COT_CHOICE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(key, cot);
+}
+
+/// Longest reduced row `reduce_rows` takes (one thread a row); longer
+/// rows take `reduce`, a block a row.
+const REDUCE_ROWS_MAX: u32 = 32;
+
+/// Longest softmax axis `softmax_rows` takes (one thread a vector); longer
+/// axes take `softmax`, a block a vector.
+const SOFTMAX_ROWS_MAX: u32 = 64;
+
+/// Shortest last-axis row `argreduce_row` (a block a row) takes; shorter
+/// rows and middle axes take `argreduce`, a thread an output.
+const ARGREDUCE_ROW_MIN: u32 = 1024;

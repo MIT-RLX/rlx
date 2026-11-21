@@ -75,4 +75,6 @@ pub use stream::{CommandStream, SyncStream};
 pub use symmetric::{
     CollectiveError, LocalTransport, Rank, SymmetricBuffer, SymmetricHeap, SymmetricTransport,
 };
-pub use transport::{ProcessGroup, ReduceMode, Transport, default_barrier, env_reduce_mode};
+pub use transport::{
+    InProcessTransport, ProcessGroup, ReduceMode, Transport, default_barrier, env_reduce_mode,
+};

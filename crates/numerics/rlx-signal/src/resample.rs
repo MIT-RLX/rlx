@@ -142,14 +142,12 @@ pub fn upfirdn(h: &[f64], x: &[f64], up: usize, down: usize) -> Vec<f64> {
     let padded_len = len_x + hpp - 1;
     let (mut x_idx, mut y_idx, mut t) = (0usize, 0usize, 0usize);
     while x_idx < padded_len && y_idx < out_len {
-        let mut h_idx = t * hpp;
         let first = x_idx as isize - hpp as isize + 1;
         let mut acc = out[y_idx];
-        for xc in first..=x_idx as isize {
+        for (h_idx, xc) in (t * hpp..).zip(first..=x_idx as isize) {
             if xc >= 0 && (xc as usize) < len_x {
                 acc = x[xc as usize].mul_add(ht[h_idx], acc);
             }
-            h_idx += 1;
         }
         out[y_idx] = acc;
         y_idx += 1;

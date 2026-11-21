@@ -41,6 +41,7 @@ pub fn dequant_scheme(scheme: QuantScheme, bytes: &[u8], n: usize) -> Result<Vec
         GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(bytes, n),
         GgufQ1_0 => rlx_gguf::q1_dequant::dequant_q1_0(bytes, n),
         GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(bytes, n),
+        GgufQ2_0G64 => rlx_gguf::q2_dequant::dequant_q2_0_g64(bytes, n),
         other => {
             return Err(format!(
                 "rlx-qnn: unsupported single-buffer DequantMatMul scheme {other:?} \

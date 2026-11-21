@@ -111,9 +111,9 @@ pub fn emit(h: &Header, cfg: &Config) -> String {
             if p.ty.is("char", 2) && !p.ty.konst {
                 o += &format!("    {n}_a, _keep = strarray({n})\n", n = p.name);
                 args.push(format!("{}_a", p.name));
-            } else if h.callbacks.iter().any(|c| c.name == p.ty.base) {
-                args.push(format!("({n} || Fiddle::NULL)", n = p.name));
-            } else if p.ty.ptr > 0 && !p.ty.is("char", 1) {
+            } else if h.callbacks.iter().any(|c| c.name == p.ty.base)
+                || (p.ty.ptr > 0 && !p.ty.is("char", 1))
+            {
                 args.push(format!("({n} || Fiddle::NULL)", n = p.name));
             } else {
                 args.push(p.name.clone());

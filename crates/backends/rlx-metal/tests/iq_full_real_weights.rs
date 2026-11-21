@@ -62,7 +62,7 @@ fn scheme_id_for(dtype: GgmlType) -> Option<u32> {
 fn scheme_block_elems(scheme_id: u32) -> usize {
     match scheme_id {
         6 | 10 => 32,
-        11 => 16,
+        11 => 64,
         _ => 256,
     }
 }

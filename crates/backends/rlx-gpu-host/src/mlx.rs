@@ -220,10 +220,12 @@ pub fn run_dequant_grouped_matmul_mlx<A: DeviceArena>(
     let (bits, group_size, is_mxfp4) = match scheme {
         QuantScheme::MlxAffine { bits, group_size } => (bits, group_size as usize, false),
         QuantScheme::MlxMxfp4 { group_size } => (4, group_size as usize, true),
-        other => {
-            panic!("rlx-gpu-host grouped mlx: expected MlxAffine or MlxMxfp4, got {other:?}")
-        }
+        QuantScheme::MlxMxfp8 { group_size } => (8, group_size as usize, false),
+        other => panic!(
+            "rlx-gpu-host grouped mlx: expected MlxAffine, MlxMxfp4 or MlxMxfp8, got {other:?}"
+        ),
     };
+    let is_mxfp8 = matches!(scheme, QuantScheme::MlxMxfp8 { .. });
     let n_groups = k / group_size.max(1);
     let per_expert_w = match mlx_weight_bytes(scheme, k, n) {
         Ok(v) => v,
@@ -304,7 +306,24 @@ pub fn run_dequant_grouped_matmul_mlx<A: DeviceArena>(
 
     let tt = std::time::Instant::now();
     let mut out_host = vec![0f32; m * n];
-    if is_mxfp4 {
+    if is_mxfp8 {
+        // FP8 E4M3 codes × decoded group scales; no bias.
+        let slab = w_host.len() / ne.max(1);
+        let pe = n * n_groups;
+        for r in 0..m {
+            let e = idx_compact[r] as usize;
+            let y = rlx_mlx_io::dequant_matvec_mxfp8(
+                &x_host[r * k..(r + 1) * k],
+                &w_host[e * slab..(e + 1) * slab],
+                &scales[e * pe..(e + 1) * pe],
+                group_size as u32,
+                k,
+                n,
+            )
+            .unwrap_or_else(|err| panic!("rlx-gpu-host grouped mxfp8: {err}"));
+            out_host[r * n..(r + 1) * n].copy_from_slice(&y);
+        }
+    } else if is_mxfp4 {
         // MXFP4 has no per-group bias; `biases` (zeroed) is ignored.
         rlx_cpu::thunk::dequant_grouped_matmul_mxfp4_bt(
             x_host,

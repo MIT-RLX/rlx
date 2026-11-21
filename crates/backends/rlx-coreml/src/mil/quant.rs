@@ -574,11 +574,15 @@ impl<'a> LowerCtx<'a> {
             &Shape::new(&[nb_total, QK], DType::F32),
             &all_qs,
         )?);
+        // Per-chunk (`[nb, 1]`) or per-value (`[nb, 32]`) scales, as the split
+        // produced them — NVFP4 and the K-quants' sub-block scales are the
+        // latter, exactly as in the dense on-device path.
+        let per_value = |len: usize| if len == nb_total * QK { QK } else { 1 };
         let sc_name = format!("{out_name}_sc");
         self.operations.push(make_const(
             &mut self.blob,
             &sc_name,
-            &Shape::new(&[nb_total, 1], DType::F32),
+            &Shape::new(&[nb_total, per_value(all_sc.len())], DType::F32),
             &all_sc,
         )?);
         let mul_name = format!("{out_name}_mul");
@@ -593,7 +597,7 @@ impl<'a> LowerCtx<'a> {
             self.operations.push(make_const(
                 &mut self.blob,
                 &off_name,
-                &Shape::new(&[nb_total, 1], DType::F32),
+                &Shape::new(&[nb_total, per_value(all_off.len())], DType::F32),
                 &all_off,
             )?);
             let sub_name = format!("{out_name}_dq");
@@ -682,7 +686,6 @@ impl<'a> LowerCtx<'a> {
         let node = self.graph.node(id);
         let out_shape = node.shape.clone();
         let in_shape = self.graph.shape(node.inputs[0]).clone();
-        let m = dim_static(&in_shape, in_shape.rank() - 2)?;
         let k = dim_static(&in_shape, in_shape.rank() - 1)?;
         let n = dim_static(&out_shape, out_shape.rank() - 1)?;
 
@@ -694,23 +697,123 @@ impl<'a> LowerCtx<'a> {
         let num_experts = bytes.len() / slab_bytes.max(1);
         let total = num_experts * n * k;
         let wf = dequant_scheme(scheme, bytes, total)?;
+        self.emit_grouped_from_bank(id, out_name, &wf, num_experts)
+    }
+
+    /// MLX-format MoE experts (`Op::DequantGroupedMatMulMlx`: affine, MXFP4 or
+    /// MXFP8 codes + per-group scales / biases), decoded on the host into one
+    /// f32 bank, then the same gather + matmul as the GGUF grouped op. Scales
+    /// and biases are f32 or BF16 params holding the decoded values, the
+    /// grouped op's convention on every backend.
+    pub(crate) fn lower_dequant_grouped_matmul_mlx(
+        &mut self,
+        id: NodeId,
+        scheme: QuantScheme,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let k = dim_static(
+            self.graph.shape(node.inputs[0]),
+            self.graph.shape(node.inputs[0]).rank() - 1,
+        )?;
+        let n = dim_static(&node.shape, node.shape.rank() - 1)?;
+        let num_experts = dim_static(self.graph.shape(node.inputs[2]), 0)?;
+        let (w, sc, bi) = (node.inputs[1], node.inputs[2], node.inputs[3]);
+        let bytes = self.quant_bytes(w)?.to_vec();
+        let scales = self.decoded_param(sc)?;
+        let biases = self.decoded_param(bi)?;
+        let slab = bytes.len() / num_experts.max(1);
+        let per = scales.len() / num_experts.max(1);
+        let mut wf = Vec::with_capacity(num_experts * n * k);
+        for e in 0..num_experts {
+            let ws = &bytes[e * slab..(e + 1) * slab];
+            let ss = &scales[e * per..(e + 1) * per];
+            let dq = match scheme {
+                QuantScheme::MlxAffine { bits, group_size } => rlx_mlx_io::dequant_affine_f32(
+                    ws,
+                    ss,
+                    &biases[e * per..(e + 1) * per],
+                    bits as u32,
+                    group_size,
+                    n,
+                    k / group_size as usize,
+                ),
+                QuantScheme::MlxMxfp4 { group_size } => {
+                    rlx_mlx_io::dequant_mxfp4_weights_f32(ws, ss, group_size, n, k)
+                }
+                QuantScheme::MlxMxfp8 { group_size } => {
+                    let gs = group_size as usize;
+                    Ok((0..n * k)
+                        .map(|i| {
+                            rlx_mlx_io::dequant_scale_fp8_e4m3(ws[i])
+                                * ss[i / k * (k / gs) + i % k / gs]
+                        })
+                        .collect())
+                }
+                other => {
+                    return Err(CoremlError::Unsupported(format!(
+                        "DequantGroupedMatMulMlx scheme {other:?}"
+                    )));
+                }
+            }
+            .map_err(|e| CoremlError::Runtime(format!("MLX expert dequant: {e:#}")))?;
+            wf.extend(dq);
+        }
+        self.emit_grouped_from_bank(id, out_name, &wf, num_experts)
+    }
+
+    /// A param's values as f32: from the f32 map, or a BF16 typed param.
+    fn decoded_param(&self, id: NodeId) -> Result<Vec<f32>> {
+        let Op::Param { name } = &self.graph.node(id).op else {
+            return Err(CoremlError::Unsupported(
+                "grouped MLX scales must be params".into(),
+            ));
+        };
+        if let Some(v) = self.params.get(name) {
+            return Ok(v.clone());
+        }
+        match self.typed_params.get(name) {
+            Some((b, DType::BF16)) => Ok(b
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::bf16::from_le_bytes(*c).to_f32())
+                .collect()),
+            _ => Err(CoremlError::Runtime(format!(
+                "grouped MLX param '{name}' is not f32 or BF16"
+            ))),
+        }
+    }
+
+    /// `out[r] = x[r] · bank[expert[r]]ᵀ` with `bank` `[E, n, k]` f32 baked as a
+    /// const (input 0 = x, last input = f32 expert ids).
+    fn emit_grouped_from_bank(
+        &mut self,
+        id: NodeId,
+        out_name: &str,
+        wf: &[f32],
+        num_experts: usize,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let out_shape = node.shape.clone();
+        let in_shape = self.graph.shape(node.inputs[0]).clone();
+        let m = dim_static(&in_shape, in_shape.rank() - 2)?;
+        let k = dim_static(&in_shape, in_shape.rank() - 1)?;
+        let n = dim_static(&out_shape, out_shape.rank() - 1)?;
+        let idx_input = *node.inputs.last().unwrap();
 
         let weight = format!("{out_name}_wdq");
         self.operations.push(make_const(
             &mut self.blob,
             &weight,
             &Shape::new(&[num_experts, n, k], DType::F32),
-            &wf,
+            wf,
         )?);
 
         let input = self.val(node.inputs[0]);
-        let eidx = self.val(node.inputs[2]);
+        let eidx = self.val(idx_input);
         let eidx_i32 = format!("{out_name}_eidx");
-        let eidx_shape = self
-            .graph
-            .shape(node.inputs[2])
-            .clone()
-            .with_dtype(DType::I32);
+        let eidx_shape = self.graph.shape(idx_input).clone().with_dtype(DType::I32);
         self.emit(
             "cast",
             &eidx_i32,

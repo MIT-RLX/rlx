@@ -1450,6 +1450,9 @@ impl<'a> LowerCtx<'a> {
             Op::DequantMoEWeights { scheme } => {
                 self.lower_dequant_moe_weights(id, *scheme, &out_name)?;
             }
+            Op::DequantGroupedMatMulMlx { scheme } => {
+                self.lower_dequant_grouped_matmul_mlx(id, *scheme, &out_name)?;
+            }
             Op::DequantGroupedMatMul { scheme } => {
                 if self.opts.ondevice_dequant && scheme_supports_ondevice_block_dequant(*scheme) {
                     self.lower_dequant_grouped_matmul_ondevice(id, *scheme, &out_name)?;

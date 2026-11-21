@@ -595,6 +595,53 @@ void main() {
     o = vec4(uAct < 0 ? s : actF(uAct, s), 0.0, 0.0, 1.0);
 }"#;
 
+// Direct NCDHW transposed conv3d, one output element per fragment; must
+// match `exec_cpu`'s `Step::ConvTranspose3d` (same summation order). A tap
+// reaches input `i = (o + p − t·d) / s` along an axis when that divides
+// evenly and lands inside the input.
+const FS_CONVT3D: &str = r#"uniform highp sampler2D X; uniform highp sampler2D W;
+uniform int uXCols; uniform int uWCols; uniform int uOutCols; uniform int uTotal;
+uniform int uCin; uniform int uCout; uniform int uGroups;
+uniform ivec3 uIn; uniform ivec3 uOut; uniform ivec3 uK; uniform ivec3 uS; uniform ivec3 uP; uniform ivec3 uD;
+out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    int lin = p.y * uOutCols + p.x;
+    if (lin >= uTotal) { o = vec4(0.0); return; }
+    int ow = lin % uOut.z; int t = lin / uOut.z;
+    int oh = t % uOut.y; t /= uOut.y;
+    int od = t % uOut.x; t /= uOut.x;
+    int co = t % uCout; int n = t / uCout;
+    int cinG = uCin / uGroups; int coutG = uCout / uGroups;
+    int g = co / coutG; int coG = co % coutG;
+    int kVol = uK.x * uK.y * uK.z; int inHW = uIn.y * uIn.z; int inVol = uIn.x * inHW;
+    float s = 0.0;
+    for (int ci = 0; ci < cinG; ci++) {
+        int ic = g * cinG + ci;
+        int xb = (n * uCin + ic) * inVol;
+        int wb = (ic * coutG + coG) * kVol;
+        for (int kd = 0; kd < uK.x; kd++) {
+            int vd = od + uP.x - kd * uD.x;
+            if (vd < 0 || vd % uS.x != 0 || vd / uS.x >= uIn.x) continue;
+            int id = vd / uS.x;
+            for (int kh = 0; kh < uK.y; kh++) {
+                int vh = oh + uP.y - kh * uD.y;
+                if (vh < 0 || vh % uS.y != 0 || vh / uS.y >= uIn.y) continue;
+                int ih = vh / uS.y;
+                for (int kw = 0; kw < uK.z; kw++) {
+                    int vw = ow + uP.z - kw * uD.z;
+                    if (vw < 0 || vw % uS.z != 0 || vw / uS.z >= uIn.z) continue;
+                    int xi = xb + id * inHW + ih * uIn.z + vw / uS.z;
+                    int wi = wb + (kd * uK.y + kh) * uK.z + kw;
+                    s += texelFetch(X, ivec2(xi % uXCols, xi / uXCols), 0).r
+                       * texelFetch(W, ivec2(wi % uWCols, wi / uWCols), 0).r;
+                }
+            }
+        }
+    }
+    o = vec4(s, 0.0, 0.0, 1.0);
+}"#;
+
 // Conv weights [cout, tap] regrouped for [`fs_conv3d_quads`] with `uT`
 // targets: texel `(pass·tap + j)·uT + q` holds tap `j` of quad
 // `g = pass·uT + q`, output channels 4g .. 4g+3 (zero past `uCout`) — a
@@ -1013,6 +1060,7 @@ pub struct GlBackend {
     complex_cast: WebGlProgram,
     binary_c64: WebGlProgram,
     conv3d: WebGlProgram,
+    convt3d: WebGlProgram,
     /// [`fs_conv3d_quads`] / [`fs_unpack_quads`] for 1 ..= 4 targets
     conv3d_quads: Vec<WebGlProgram>,
     unpack_quads: Vec<WebGlProgram>,
@@ -1140,6 +1188,7 @@ impl GlBackend {
             complex_cast: plain(FS_COMPLEX_CAST)?,
             binary_c64: plain(FS_BINARY_C64)?,
             conv3d: with_act(FS_CONV3D)?,
+            convt3d: plain(FS_CONVT3D)?,
             conv3d_quads: (1..=max_targets)
                 .map(|t| plain(&fs_conv3d_quads(t)))
                 .collect::<Result<_>>()?,
@@ -2527,6 +2576,52 @@ impl GlBackend {
                     self.set_ivec3(p, "uP", *pad);
                     self.set_ivec3(p, "uD", *dil);
                     self.draw_banded(c, r, cin / groups * k.iter().product::<usize>());
+                    tex[*out] = Some(t);
+                }
+                Step::ConvTranspose3d {
+                    out,
+                    x,
+                    w,
+                    n,
+                    cin,
+                    din,
+                    cout,
+                    dout,
+                    k,
+                    stride,
+                    pad,
+                    dil,
+                    groups,
+                } => {
+                    let (r, c) = dims(*out);
+                    let p = &self.convt3d;
+                    let t = self.begin(p, c, r)?;
+                    self.bind_tex_unit(p, "X", 0, self.tex(tex, *x)?);
+                    self.bind_tex_unit(p, "W", 1, self.tex(tex, *w)?);
+                    self.set_i32(p, "uXCols", dims(*x).1 as i32);
+                    self.set_i32(p, "uWCols", dims(*w).1 as i32);
+                    self.set_i32(p, "uOutCols", c as i32);
+                    self.set_i32(
+                        p,
+                        "uTotal",
+                        (n * cout * dout.iter().product::<usize>()) as i32,
+                    );
+                    self.set_i32(p, "uCin", *cin as i32);
+                    self.set_i32(p, "uCout", *cout as i32);
+                    self.set_i32(p, "uGroups", *groups as i32);
+                    self.set_ivec3(p, "uIn", *din);
+                    self.set_ivec3(p, "uOut", *dout);
+                    self.set_ivec3(p, "uK", *k);
+                    self.set_ivec3(p, "uS", *stride);
+                    self.set_ivec3(p, "uP", *pad);
+                    self.set_ivec3(p, "uD", *dil);
+                    // taps reached per output: about cin/g · k³ / s³
+                    let reach = k
+                        .iter()
+                        .zip(stride)
+                        .map(|(k, s)| k.div_ceil(*s))
+                        .product::<usize>();
+                    self.draw_banded(c, r, cin / groups * reach);
                     tex[*out] = Some(t);
                 }
                 Step::ArgAxis {

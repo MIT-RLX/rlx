@@ -435,6 +435,15 @@ pub fn discrete_hosts_ops() -> bool {
     coop_discrete_backend() && rlx_ir::env::flag("RLX_WGPU_DISCRETE_HOST")
 }
 
+/// Whether a `BufferCopy` inside the activation arena stages through the host
+/// on discrete Vulkan/DX12: the same opt-in as [`discrete_hosts_ops`]. These
+/// copies were left hosted when that policy flipped, so every striped plan on
+/// Vulkan blocked on the host (and could not run in a browser-style
+/// no-readback setting) while Metal ran the identical GPU copies.
+pub fn discrete_hosts_copies() -> bool {
+    discrete_hosts_ops()
+}
+
 pub fn coop_discrete_backend() -> bool {
     wgpu_device()
         .map(|d| matches!(d.backend, wgpu::Backend::Vulkan | wgpu::Backend::Dx12))

@@ -20,7 +20,8 @@ fn scheme_block_elems(scheme_id: u32) -> usize {
     match scheme_id {
         6 => 32,  // IQ4_NL
         10 => 32, // MXFP4
-        11 => 16, // NVFP4
+        11 => 64, // NVFP4
+        32 => 64, // Q2_0 (ggml)
         _ => 256, // K-quants, IQ4_XS, IQ2/3/1, TQ
     }
 }
@@ -154,6 +155,7 @@ fn cpu_dequant(scheme_id: u32, bytes: &[u8], elems: usize) -> Vec<f32> {
         16 => rlx_gguf::iq_dequant::dequant_iq3_s(bytes, elems).unwrap(),
         17 => rlx_gguf::iq_dequant::dequant_iq1_s(bytes, elems).unwrap(),
         18 => rlx_gguf::iq_dequant::dequant_iq1_m(bytes, elems).unwrap(),
+        32 => rlx_gguf::q2_dequant::dequant_q2_0_g64(bytes, elems).unwrap(),
         _ => panic!("cpu_dequant: bad scheme_id {scheme_id}"),
     }
 }
@@ -234,4 +236,27 @@ fn iq1_m_msl_matches_cpu_reference() {
 #[test]
 fn tq2_0_msl_matches_cpu_reference() {
     parity_quantized(9, rlx_gguf::GgmlType::TQ2_0, 256, 2, 1e-3, "TQ2_0");
+}
+
+/// Encoded through `rlx_gguf::quantize`, decoded by the MSL kernel and by
+/// `rlx_gguf` (whose decoders are checked against ggml's in rlx-gguf).
+fn encode_parity(scheme_id: u32, ggml: rlx_gguf::GgmlType, elems: usize, name: &str) {
+    let w: Vec<f32> = (0..elems).map(|i| (i as f32 * 0.021).sin() * 0.6).collect();
+    let packed = rlx_gguf::quantize(&w, ggml).expect("quantize");
+    parity(scheme_id, &packed, elems, 1e-6, name);
+}
+
+#[test]
+fn mxfp4_msl_matches_cpu_reference() {
+    encode_parity(10, rlx_gguf::GgmlType::MXFP4, 512, "MXFP4");
+}
+
+#[test]
+fn nvfp4_msl_matches_cpu_reference() {
+    encode_parity(11, rlx_gguf::GgmlType::NVFP4, 512, "NVFP4");
+}
+
+#[test]
+fn q2_0_group_64_msl_matches_cpu_reference() {
+    encode_parity(32, rlx_gguf::GgmlType::Q2_0, 512, "Q2_0 (group 64)");
 }

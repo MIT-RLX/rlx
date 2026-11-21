@@ -147,6 +147,7 @@ Vulkan/DX12 visibility correct.
 | `RLX_WGPU_SCHEDULE=1` | Log compiled dispatch schedule |
 | `RLX_DISPATCH_REPORT=1` | Per-step dispatch report |
 | `RLX_WGPU_NO_PACKED_BSHD_ATTN=1` | Disable packed QKV attention stride path |
+| `RLX_WGPU_ATTENTION_UNTILED=1` | Use the per-row attention kernels instead of `attention_tiled` (≥ 32 query rows per head) |
 | `RLX_WGPU_DUMP_NODES=1` | Per-node max-abs dump after run (debug) |
 | `RLX_WGPU_FORCE_HOST=1` | Host-fallback all risky SPIR-V paths |
 | `RLX_WGPU_SHARD_GPU=1` | Opt out of discrete/sharded host packing (unsafe for Kitten NSF) |

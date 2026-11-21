@@ -20,7 +20,9 @@ const CO: usize = 4;
 const S: usize = 6;
 
 fn ramp(len: usize, seed: usize) -> Vec<f32> {
-    (0..len).map(|i| (((i * 7919 + seed * 104_729) % 1000) as f32 / 500.0) - 1.0).collect()
+    (0..len)
+        .map(|i| (((i * 7919 + seed * 104_729) % 1000) as f32 / 500.0) - 1.0)
+        .collect()
 }
 
 /// `act(conv3d(x, w) + b)`, then `· scale + shift` per channel with `norm` (a batch norm at
@@ -28,13 +30,18 @@ fn ramp(len: usize, seed: usize) -> Vec<f32> {
 fn layer(act: Option<Activation>, kernel: usize, norm: bool, keep_conv: bool) -> Graph {
     let mut g = Graph::new("conv3d_epilogue");
     let x = g.input("x", Shape::new(&[N, CI, S, S, S], DType::F32));
-    let w = g.param("w", Shape::new(&[CO, CI, kernel, kernel, kernel], DType::F32));
+    let w = g.param(
+        "w",
+        Shape::new(&[CO, CI, kernel, kernel, kernel], DType::F32),
+    );
     let b = g.param("b", Shape::new(&[CO], DType::F32));
     let p = kernel / 2;
     let y = g.conv3d(x, w, [1, 1, 1], [p, p, p], [1, 1, 1], 1);
     let out = Shape::new(&[N, CO, S, S, S], DType::F32);
     let br = g.add_node(
-        Op::Reshape { new_shape: vec![1, CO as i64, 1, 1, 1] },
+        Op::Reshape {
+            new_shape: vec![1, CO as i64, 1, 1, 1],
+        },
         vec![b],
         Shape::new(&[1, CO, 1, 1, 1], DType::F32),
     );
@@ -44,7 +51,13 @@ fn layer(act: Option<Activation>, kernel: usize, norm: bool, keep_conv: bool) ->
         Some(act) => g.activation(act, z, out.clone()),
         None => {
             let slope = g.param("slope", Shape::new(&[1], DType::F32));
-            let slope = g.add_node(Op::Reshape { new_shape: vec![1; 5] }, vec![slope], Shape::new(&[1; 5], DType::F32));
+            let slope = g.add_node(
+                Op::Reshape {
+                    new_shape: vec![1; 5],
+                },
+                vec![slope],
+                Shape::new(&[1; 5], DType::F32),
+            );
             let scaled = g.binary(BinaryOp::Mul, z, slope, out.clone());
             g.binary(BinaryOp::Max, z, scaled, out.clone())
         }
@@ -53,7 +66,9 @@ fn layer(act: Option<Activation>, kernel: usize, norm: bool, keep_conv: bool) ->
         let per_channel = |g: &mut Graph, name: &str| {
             let p = g.param(name, Shape::new(&[CO], DType::F32));
             g.add_node(
-                Op::Reshape { new_shape: vec![1, CO as i64, 1, 1, 1] },
+                Op::Reshape {
+                    new_shape: vec![1, CO as i64, 1, 1, 1],
+                },
                 vec![p],
                 Shape::new(&[1, CO, 1, 1, 1], DType::F32),
             )
@@ -83,14 +98,24 @@ fn run(act: Option<Activation>, kernel: usize, norm: bool, keep_conv: bool) -> V
 
 #[test]
 fn a_fused_bias_and_activation_equals_the_unfused_layer() {
-    for act in [Some(Activation::Elu), Some(Activation::Relu), Some(Activation::Sigmoid), Some(Activation::Tanh), None] {
+    for act in [
+        Some(Activation::Elu),
+        Some(Activation::Relu),
+        Some(Activation::Sigmoid),
+        Some(Activation::Tanh),
+        None,
+    ] {
         for kernel in [1, 3, 5] {
             for norm in [false, true] {
                 let fused = run(act, kernel, norm, false);
                 let unfused = run(act, kernel, norm, true);
                 assert_eq!(fused.len(), unfused.len());
                 for (i, (a, b)) in fused.iter().zip(&unfused).enumerate() {
-                    assert_eq!(a.to_bits(), b.to_bits(), "{act:?} k{kernel} norm {norm} element {i}: {a} vs {b}");
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{act:?} k{kernel} norm {norm} element {i}: {a} vs {b}"
+                    );
                 }
             }
         }
